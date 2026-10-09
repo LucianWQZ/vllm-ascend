@@ -51,6 +51,7 @@ from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
 from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftWindowPolicyDecision,
     DraftWindowPolicyState,
+    build_draft_window_source_capability,
 )
 from vllm_ascend.worker.v2.spec_decode.pcp_utils import (
     disable_target_pcp_for_replicated_draft,
@@ -85,6 +86,22 @@ class AscendAutoRegressiveSpeculator(AutoRegressiveSpeculator):
         if hasattr(self, "_draft_window_policy"):
             raise RuntimeError("draft-window policy is already configured")
         self._draft_window_policy = decision
+
+    def _initialize_draft_window_source_capability(self) -> None:
+        """Bind eligible P2 inventory/source state after attention setup."""
+        policy = getattr(self, "_draft_window_policy", None)
+        if policy is None:
+            return
+        if hasattr(self, "_draft_window_source_capability"):
+            raise RuntimeError("draft-window source capability is already initialized")
+        self._draft_window_source_capability = build_draft_window_source_capability(
+            policy=policy,
+            runtime_route=policy.normalized_method,
+            attn_groups=self.attn_groups,
+            block_tables=self.block_tables,
+            causal=True,
+            vllm_config=self.vllm_config,
+        )
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         """Override the upstream __init__ for Ascend NPUs.
@@ -324,6 +341,7 @@ class AscendAutoRegressiveSpeculator(AutoRegressiveSpeculator):
             # Use the first executable draft attention layer as the architecture
             # discriminator and cache it for ACL graph parameter updates.
             self.attn_backend = _get_graph_update_backend(self.attn_groups)
+        self._initialize_draft_window_source_capability()
         if issubclass(self.attn_backend, AscendDSABackend):
             self.attn_architecture = "DSA"
         elif issubclass(self.attn_backend, AscendMLABackend):

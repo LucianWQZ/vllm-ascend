@@ -21,6 +21,7 @@ from vllm_ascend.worker.v2.attn_utils import build_attn_metadata_wrapper
 from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftWindowPolicyDecision,
     DraftWindowPolicyState,
+    build_draft_window_source_capability,
 )
 
 logger = logging.getLogger(__name__)
@@ -34,6 +35,23 @@ class AscendDFlashSpeculator(DFlashSpeculator):
         if hasattr(self, "_draft_window_policy"):
             raise RuntimeError("draft-window policy is already configured")
         self._draft_window_policy = decision
+
+    def _initialize_draft_window_source_capability(self) -> None:
+        """Bind eligible P2 inventory/source state after attention setup."""
+        policy = getattr(self, "_draft_window_policy", None)
+        if policy is None:
+            return
+        if hasattr(self, "_draft_window_source_capability"):
+            raise RuntimeError("draft-window source capability is already initialized")
+        runtime_route = self._speculator_name.lower()
+        self._draft_window_source_capability = build_draft_window_source_capability(
+            policy=policy,
+            runtime_route=runtime_route,
+            attn_groups=self.attn_groups,
+            block_tables=self.block_tables,
+            causal=self._group_causal,
+            vllm_config=self.vllm_config,
+        )
 
     def build_draft_attn_metadatas(self, num_reqs_padded, seq_lens_cpu_upper_bound):
         num_tokens_padded = num_reqs_padded * self.num_query_per_req
@@ -116,6 +134,7 @@ class AscendDFlashSpeculator(DFlashSpeculator):
                 attn_backends[layer_name] = attn_layers[layer_name].get_attn_backend()
 
         self.attn_backends = attn_backends
+        self._initialize_draft_window_source_capability()
 
     def propose(
         self,

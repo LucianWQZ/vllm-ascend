@@ -44,6 +44,10 @@ def test_patch_swaps_upstream_selector_walk_kernel():
 
 def test_dflash2_inherits_dflash_policy_receiver():
     assert AscendDFlash2Speculator._configure_draft_window is AscendDFlashSpeculator._configure_draft_window
+    assert (
+        AscendDFlash2Speculator._initialize_draft_window_source_capability
+        is AscendDFlashSpeculator._initialize_draft_window_source_capability
+    )
 
 
 def _spec_config(arch: str) -> SimpleNamespace:
