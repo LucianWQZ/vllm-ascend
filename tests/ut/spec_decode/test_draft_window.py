@@ -42,11 +42,13 @@ def _speculative_config(
     *,
     configured_k: int = 3,
     dynamic_k: bool = False,
+    draft_architectures: tuple[str, ...] = ("DraftModel",),
 ) -> SimpleNamespace:
     return SimpleNamespace(
         method=method,
         num_speculative_tokens=configured_k,
         uses_dynamic_speculative_decoding=lambda: dynamic_k,
+        draft_model_config=SimpleNamespace(architectures=list(draft_architectures)),
     )
 
 
@@ -56,12 +58,14 @@ def _vllm_config(
     target_model_type: str = "qwen3",
     configured_k: int = 3,
     dynamic_k: bool = False,
+    draft_architectures: tuple[str, ...] = ("DraftModel",),
 ) -> SimpleNamespace:
     return SimpleNamespace(
         speculative_config=_speculative_config(
             method,
             configured_k=configured_k,
             dynamic_k=dynamic_k,
+            draft_architectures=draft_architectures,
         ),
         model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type=target_model_type)),
     )
@@ -118,10 +122,13 @@ def _patch_factory(
         "_configure_eligible_draft_window",
         lambda speculator, decision: configured_decisions.append((speculator, decision)),
     )
+    monkeypatch.setattr(spec_decode_factory.logger, "warning", lambda message: warnings.append(message))
     monkeypatch.setattr(
         spec_decode_factory.logger,
         "warning_once",
-        lambda message: warnings.append(message),
+        lambda _message: (_ for _ in ()).throw(
+            AssertionError("forced-OFF warnings must be scoped to each factory-created speculator")
+        ),
     )
     return baseline_speculator, baseline_calls, configured_decisions, warnings
 
@@ -162,6 +169,40 @@ def test_extracted_baseline_factory_preserves_dispatch_order(
     device = torch.device("cpu")
     with patch(constructor_path) as constructor:
         assert spec_decode_factory._init_speculator_baseline(config, device) is constructor.return_value
+        constructor.assert_called_once_with(config, device)
+
+
+@pytest.mark.parametrize(
+    ("config", "constructor_path"),
+    [
+        (
+            _baseline_vllm_config("dspark", use_dspark=True, use_eagle=True),
+            "vllm_ascend.worker.v2.spec_decode.dspark.speculator.AscendDSparkSpeculator",
+        ),
+        (
+            _baseline_vllm_config("mtp", use_eagle=True),
+            "vllm_ascend.worker.v2.spec_decode.mtp.speculator.AscendMTPSpeculator",
+        ),
+        (
+            _baseline_vllm_config("eagle3", use_eagle=True),
+            "vllm_ascend.worker.v2.spec_decode.eagle.speculator.AscendEagleSpeculator",
+        ),
+    ],
+)
+def test_public_config_off_factory_reaches_real_baseline_dispatch(
+    config: SimpleNamespace,
+    constructor_path: str,
+) -> None:
+    device = torch.device("cpu")
+    baseline_speculator = object()
+    with (
+        patch(
+            "vllm_ascend.worker.v2.spec_decode.get_ascend_config",
+            return_value=SimpleNamespace(draft_window_size=None),
+        ),
+        patch(constructor_path, return_value=baseline_speculator) as constructor,
+    ):
+        assert spec_decode_factory.init_speculator(config, device) is baseline_speculator
         constructor.assert_called_once_with(config, device)
 
 
@@ -251,12 +292,23 @@ def test_policy_normalizes_method_and_explicit_model_family() -> None:
     decision = resolve_draft_window_policy(
         requested_window_size=-1,
         method="  DSPARK  ",
-        target_model_type="  DeepSeek-V4_1  ",
+        target_model_type="  DeepSeek_V4_1  ",
     )
 
     assert decision.normalized_method == "dspark"
     assert decision.target_model_type == "deepseek_v4_1"
     assert decision.state is DraftWindowPolicyState.FORCED_OFF
+
+
+def test_model_type_normalization_does_not_rewrite_separators() -> None:
+    decision = resolve_draft_window_policy(
+        requested_window_size=512,
+        method="dspark",
+        target_model_type="DeepSeek-V4",
+    )
+
+    assert decision.target_model_type == "deepseek-v4"
+    assert decision.state is DraftWindowPolicyState.ELIGIBLE_ON
 
 
 def test_unknown_configured_method_fails_closed() -> None:
@@ -302,7 +354,6 @@ def test_config_off_factory_preserves_baseline_and_emits_no_warning(
     assert baseline_calls == [(config, device)]
     assert configured == []
     assert warnings == []
-    assert not hasattr(baseline, "_draft_window_policy")
 
 
 @pytest.mark.parametrize(
@@ -346,7 +397,66 @@ def test_forced_off_factory_skips_all_window_downstream_work(
     assert configured == []
     assert len(warnings) == 1
     assert warning_fragment in warnings[0]
-    assert not hasattr(baseline, "_draft_window_policy")
+
+
+def test_forced_off_warning_is_emitted_once_per_created_speculator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    warnings: list[str] = []
+    created = [object(), object()]
+    monkeypatch.setattr(
+        spec_decode_factory,
+        "get_ascend_config",
+        lambda: SimpleNamespace(draft_window_size=512),
+    )
+    monkeypatch.setattr(
+        spec_decode_factory,
+        "_init_speculator_baseline",
+        lambda _config, _device: created.pop(0),
+    )
+    monkeypatch.setattr(spec_decode_factory.logger, "warning", lambda message: warnings.append(message))
+    monkeypatch.setattr(
+        spec_decode_factory.logger,
+        "warning_once",
+        lambda _message: (_ for _ in ()).throw(
+            AssertionError("process-global warning deduplication violates the instance-scoped contract")
+        ),
+    )
+    config = _vllm_config("mtp")
+
+    first = spec_decode_factory.init_speculator(config, torch.device("cpu"))
+    second = spec_decode_factory.init_speculator(config, torch.device("cpu"))
+
+    assert first is not second
+    assert len(warnings) == 2
+    assert all("MTP" in message for message in warnings)
+
+
+def test_unknown_forced_off_reason_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _baseline, baseline_calls, configured, _warnings = _patch_factory(
+        monkeypatch,
+        requested_window_size=512,
+    )
+    monkeypatch.setattr(
+        spec_decode_factory,
+        "resolve_draft_window_policy",
+        lambda **_kwargs: DraftWindowPolicyDecision(
+            state=DraftWindowPolicyState.FORCED_OFF,
+            requested_window_size=512,
+            effective_window_size=None,
+            normalized_method="future_method",
+            target_model_type="future_model",
+            reason="future_forced_off_reason",
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="future_forced_off_reason"):
+        spec_decode_factory.init_speculator(_vllm_config("mtp"), torch.device("cpu"))
+
+    assert baseline_calls == []
+    assert configured == []
 
 
 @pytest.mark.parametrize(
@@ -490,6 +600,10 @@ def test_speculator_owner_rejects_noneligible_policy(owner_type: type[Any]) -> N
         (189, 3, 64, 64, (128, 61, 127)),
         (190, 3, 64, 64, (128, 62, 127)),
         (130, 0, 64, 64, (64, 66, 127)),
+        (300, 0, 64, 64, (192, 108, 127)),
+        (300, 0, 65, 64, (192, 108, 128)),
+        (300, 0, 66, 64, (192, 108, 129)),
+        (300, 0, 127, 64, (128, 172, 190)),
         (4096, 3, 512, 16, (3584, 512, 527)),
         (100, 4, 3, 64, (64, 36, 66)),
     ],
@@ -608,6 +722,39 @@ def test_direct_prefix_capacity_preserves_alignment_slack(
         )
         == expected_columns
     )
+
+
+def test_direct_prefix_capacity_covers_zero_offset_projection() -> None:
+    capacity = compute_direct_prefix_capacity(
+        window_size=32,
+        legacy_block_size=96,
+        block_span_tokens=48,
+    )
+    projection = project_direct_prefix(
+        window_start=96,
+        window_visible_length=127,
+        block_span_tokens=48,
+    )
+
+    assert projection.first_token_offset == 0
+    assert projection.required_columns <= capacity
+
+
+def test_direct_prefix_capacity_rejects_non_default_geometry() -> None:
+    projection = project_direct_prefix(
+        window_start=64,
+        window_visible_length=47,
+        block_span_tokens=48,
+    )
+
+    assert projection.first_token_offset == 16
+    assert projection.required_columns == 2
+    with pytest.raises(ValueError, match="divide legacy block size"):
+        compute_direct_prefix_capacity(
+            window_size=32,
+            legacy_block_size=16,
+            block_span_tokens=48,
+        )
 
 
 def test_same_absolute_anchor_projects_per_group_without_realigning() -> None:

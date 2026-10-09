@@ -16,6 +16,13 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 #
+"""MRV2 speculative-decoder factory for Ascend.
+
+The serving lifecycle initializes the process-wide ``AscendConfig`` before
+constructing ``NPUModelRunner``.  Direct callers of :func:`init_speculator`
+must establish the same precondition.
+"""
+
 import torch
 from vllm.config import VllmConfig
 from vllm.logger import logger
@@ -53,15 +60,10 @@ def init_speculator(
         return _init_speculator_baseline(vllm_config, device)
 
     if decision.state is DraftWindowPolicyState.FORCED_OFF:
-        if decision.reason == "mtp":
-            logger.warning_once(
-                "MRV2 draft_window_size is ignored for MTP because MTP reuses target layers; forcing the window OFF."
-            )
-        else:
-            logger.warning_once(
-                "MRV2 draft_window_size is ignored for DeepSeek-V4 co-trained DSpark; forcing the window OFF."
-            )
-        return _init_speculator_baseline(vllm_config, device)
+        warning_message = _forced_off_warning_message(decision)
+        speculator = _init_speculator_baseline(vllm_config, device)
+        logger.warning(warning_message)
+        return speculator
 
     assert decision.effective_window_size is not None
     future_offset = resolve_static_future_offset(
@@ -76,6 +78,23 @@ def init_speculator(
     speculator = _init_speculator_baseline(vllm_config, device)
     _configure_eligible_draft_window(speculator, decision)
     return speculator
+
+
+def _forced_off_warning_message(decision: DraftWindowPolicyDecision) -> str:
+    """Return the exhaustive diagnostic for a forced-OFF decision.
+
+    ``init_speculator`` is the single construction point for an Ascend MRV2
+    speculator.  It emits this message once after each successful construction,
+    which gives the warning instance scope without mutable deduplication state.
+    The vLLM ``warning_once`` helper instead uses a process-global cache.
+    """
+    if decision.reason == "mtp":
+        message = "MRV2 draft_window_size is ignored for MTP because MTP reuses target layers; forcing the window OFF."
+    elif decision.reason == "deepseek_v4_cotrained_dspark":
+        message = "MRV2 draft_window_size is ignored for DeepSeek-V4 co-trained DSpark; forcing the window OFF."
+    else:
+        raise RuntimeError(f"unknown forced-OFF draft-window policy reason: {decision.reason!r}")
+    return message
 
 
 def _configure_eligible_draft_window(

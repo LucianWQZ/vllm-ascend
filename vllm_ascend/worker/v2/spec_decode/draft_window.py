@@ -62,7 +62,7 @@ def _normalize_method(method: str) -> str:
 
 
 def _normalize_model_type(model_type: str) -> str:
-    return model_type.strip().lower().replace("-", "_")
+    return model_type.strip().lower()
 
 
 def _is_deepseek_v4_target(normalized_model_type: str) -> bool:
@@ -281,11 +281,19 @@ def compute_direct_prefix_capacity(
     legacy_block_size: int,
     block_span_tokens: int,
 ) -> int:
-    """Return the zero-offset direct-prefix capacity in source columns."""
+    """Return source-column capacity for the default zero-offset geometry.
+
+    Every legacy-aligned anchor must also be block-span aligned.  Requiring
+    ``block_span_tokens`` to divide ``legacy_block_size`` makes that invariant
+    hold for every possible anchor rather than only for a particular request.
+    Offset-aware layouts must use a separate capacity contract.
+    """
     if block_span_tokens <= 0:
         raise ValueError("block span must be greater than 0")
     capacity_tokens = compute_window_capacity_tokens(
         window_size=window_size,
         legacy_block_size=legacy_block_size,
     )
+    if legacy_block_size % block_span_tokens != 0:
+        raise ValueError("zero-offset direct-prefix capacity requires block span to divide legacy block size")
     return (capacity_tokens + block_span_tokens - 1) // block_span_tokens
