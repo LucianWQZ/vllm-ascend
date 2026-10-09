@@ -48,6 +48,10 @@ from vllm_ascend.worker.v2.attn_utils import (
 )
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
 from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
+from vllm_ascend.worker.v2.spec_decode.draft_window import (
+    DraftWindowPolicyDecision,
+    DraftWindowPolicyState,
+)
 from vllm_ascend.worker.v2.spec_decode.pcp_utils import (
     disable_target_pcp_for_replicated_draft,
     prepare_replicated_pcp_config,
@@ -73,6 +77,14 @@ class AscendAutoRegressiveSpeculator(AutoRegressiveSpeculator):
     """
 
     model_state: "AscendModelState"
+
+    def _configure_draft_window(self, decision: DraftWindowPolicyDecision) -> None:
+        """Attach the eligible P1 policy contract without enabling a window."""
+        if decision.state is not DraftWindowPolicyState.ELIGIBLE_ON:
+            raise ValueError("draft-window owner requires an ELIGIBLE_ON policy decision")
+        if hasattr(self, "_draft_window_policy"):
+            raise RuntimeError("draft-window policy is already configured")
+        self._draft_window_policy = decision
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         """Override the upstream __init__ for Ascend NPUs.

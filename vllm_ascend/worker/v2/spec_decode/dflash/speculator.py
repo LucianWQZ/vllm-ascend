@@ -18,11 +18,23 @@ from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
 
 from vllm_ascend.utils import vllm_version_is
 from vllm_ascend.worker.v2.attn_utils import build_attn_metadata_wrapper
+from vllm_ascend.worker.v2.spec_decode.draft_window import (
+    DraftWindowPolicyDecision,
+    DraftWindowPolicyState,
+)
 
 logger = logging.getLogger(__name__)
 
 
 class AscendDFlashSpeculator(DFlashSpeculator):
+    def _configure_draft_window(self, decision: DraftWindowPolicyDecision) -> None:
+        """Attach the eligible P1 policy contract without enabling a window."""
+        if decision.state is not DraftWindowPolicyState.ELIGIBLE_ON:
+            raise ValueError("draft-window owner requires an ELIGIBLE_ON policy decision")
+        if hasattr(self, "_draft_window_policy"):
+            raise RuntimeError("draft-window policy is already configured")
+        self._draft_window_policy = decision
+
     def build_draft_attn_metadatas(self, num_reqs_padded, seq_lens_cpu_upper_bound):
         num_tokens_padded = num_reqs_padded * self.num_query_per_req
         with build_attn_metadata_wrapper():

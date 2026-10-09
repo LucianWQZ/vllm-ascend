@@ -25,6 +25,9 @@ import torch
 from vllm.config.compilation import CUDAGraphMode
 
 from vllm_ascend.worker.v2.spec_decode import init_speculator
+from vllm_ascend.worker.v2.spec_decode.dflash.speculator import (
+    AscendDFlashSpeculator,
+)
 from vllm_ascend.worker.v2.spec_decode.dflash2.speculator import (
     AscendDFlash2Speculator,
     _selector_walk_kernel_ascend,
@@ -39,6 +42,10 @@ def test_patch_swaps_upstream_selector_walk_kernel():
     assert upstream._selector_walk_kernel is _selector_walk_kernel_ascend
 
 
+def test_dflash2_inherits_p1_policy_receiver_without_enabling_window():
+    assert AscendDFlash2Speculator._configure_draft_window is AscendDFlashSpeculator._configure_draft_window
+
+
 def _spec_config(arch: str) -> SimpleNamespace:
     return SimpleNamespace(
         method="dflash",
@@ -50,12 +57,22 @@ def _spec_config(arch: str) -> SimpleNamespace:
 
 def test_init_speculator_routes_dflash2_draft_model():
     cfg = SimpleNamespace(speculative_config=_spec_config("DFlash2DraftModel"))
-    with patch("vllm_ascend.worker.v2.spec_decode.dflash2.speculator.AscendDFlash2Speculator") as d2:
+    with (
+        patch(
+            "vllm_ascend.worker.v2.spec_decode.get_ascend_config",
+            return_value=SimpleNamespace(draft_window_size=None),
+        ),
+        patch("vllm_ascend.worker.v2.spec_decode.dflash2.speculator.AscendDFlash2Speculator") as d2,
+    ):
         assert init_speculator(cfg, torch.device("cpu")) is d2.return_value
         d2.assert_called_once_with(cfg, torch.device("cpu"))
 
     cfg = SimpleNamespace(speculative_config=_spec_config("DFlashDraftModel"))
     with (
+        patch(
+            "vllm_ascend.worker.v2.spec_decode.get_ascend_config",
+            return_value=SimpleNamespace(draft_window_size=None),
+        ),
         patch("vllm_ascend.worker.v2.spec_decode.dflash2.speculator.AscendDFlash2Speculator") as d2,
         patch("vllm_ascend.worker.v2.spec_decode.dflash.speculator.AscendDFlashSpeculator") as d1,
     ):

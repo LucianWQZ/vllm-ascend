@@ -25,6 +25,10 @@ def test_init_speculator_dispatches_extract_hidden_states(monkeypatch):
         SimpleNamespace(speculative_config=SimpleNamespace(method="extract_hidden_states")),
     )
     device = torch.device("cpu")
+    monkeypatch.setattr(
+        "vllm_ascend.worker.v2.spec_decode.get_ascend_config",
+        lambda: SimpleNamespace(draft_window_size=None),
+    )
 
     if vllm_version_is("0.28.0"):
         with pytest.raises(

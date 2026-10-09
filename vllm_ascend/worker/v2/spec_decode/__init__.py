@@ -18,8 +18,17 @@
 #
 import torch
 from vllm.config import VllmConfig
+from vllm.logger import logger
 
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.utils import vllm_version_is
+from vllm_ascend.worker.v2.spec_decode.draft_window import (
+    DraftWindowPolicyDecision,
+    DraftWindowPolicyState,
+    resolve_draft_window_policy,
+    resolve_static_future_offset,
+    validate_eligible_window_numbers,
+)
 
 
 def init_speculator(
@@ -29,6 +38,58 @@ def init_speculator(
     """Override GPU init_speculator for Ascend NPUs.
     Use AscendEagleSpeculator when eagle is used.
     """
+    speculative_config = vllm_config.speculative_config
+    assert speculative_config is not None
+    requested_window_size = get_ascend_config().draft_window_size
+    target_hf_config = getattr(getattr(vllm_config, "model_config", None), "hf_config", None)
+    target_model_type = getattr(target_hf_config, "model_type", "") or ""
+    decision = resolve_draft_window_policy(
+        requested_window_size=requested_window_size,
+        method=speculative_config.method,
+        target_model_type=target_model_type,
+    )
+
+    if decision.state is DraftWindowPolicyState.CONFIG_OFF:
+        return _init_speculator_baseline(vllm_config, device)
+
+    if decision.state is DraftWindowPolicyState.FORCED_OFF:
+        if decision.reason == "mtp":
+            logger.warning_once(
+                "MRV2 draft_window_size is ignored for MTP because MTP reuses target layers; forcing the window OFF."
+            )
+        else:
+            logger.warning_once(
+                "MRV2 draft_window_size is ignored for DeepSeek-V4 co-trained DSpark; forcing the window OFF."
+            )
+        return _init_speculator_baseline(vllm_config, device)
+
+    assert decision.effective_window_size is not None
+    future_offset = resolve_static_future_offset(
+        normalized_method=decision.normalized_method,
+        configured_k=speculative_config.num_speculative_tokens,
+        uses_dynamic_k=speculative_config.uses_dynamic_speculative_decoding(),
+    )
+    validate_eligible_window_numbers(
+        window_size=decision.effective_window_size,
+        future_offset=future_offset,
+    )
+    speculator = _init_speculator_baseline(vllm_config, device)
+    _configure_eligible_draft_window(speculator, decision)
+    return speculator
+
+
+def _configure_eligible_draft_window(
+    speculator,
+    decision: DraftWindowPolicyDecision,
+) -> None:
+    speculator._configure_draft_window(decision)
+
+
+def _init_speculator_baseline(
+    vllm_config: VllmConfig,
+    device: torch.device,
+):
+    """Run the pre-window factory dispatch without changing its branch order."""
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
     if speculative_config.method == "extract_hidden_states":
