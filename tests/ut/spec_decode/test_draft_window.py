@@ -1352,7 +1352,8 @@ def test_full_source_references_canonical_owners_without_exposing_writes() -> No
         0,
         block_tables.input_block_tables[0],
     )
-    assert source.references_persistent_num_blocks(block_tables.num_blocks.gpu)
+    assert source.references_current_num_blocks_gpu_view(block_tables.num_blocks.gpu)
+    assert source.references_persistent_num_blocks_cpu(block_tables.num_blocks.cpu)
     assert source.logical_block_sizes == (64,)
     assert source.kernel_block_sizes == (64,)
     assert source.source_identity.input_block_table_ptrs == (block_tables.input_block_tables[0].data_ptr(),)
@@ -1406,10 +1407,24 @@ def test_full_source_contract_with_real_ascend_block_tables(
         0,
         block_tables.input_block_tables[0],
     )
-    assert source.references_persistent_num_blocks(block_tables.num_blocks.gpu)
+    assert source.references_current_num_blocks_gpu_view(block_tables.num_blocks.gpu)
+    assert source.references_persistent_num_blocks_cpu(block_tables.num_blocks.cpu)
     assert source.logical_block_sizes == tuple(block_tables.block_sizes)
     assert source.kernel_block_sizes == tuple(block_tables.kernel_block_sizes)
     assert block_tables.cp_size == 1
+
+
+def test_full_source_distinguishes_stable_cpu_owner_from_rotating_gpu_view() -> None:
+    _inventory_value, source, block_tables = _inventory_and_source()
+    original_gpu_view = block_tables.num_blocks.gpu
+    replacement_gpu_view = original_gpu_view.clone()
+
+    block_tables.num_blocks.gpu = replacement_gpu_view
+
+    assert source.references_current_num_blocks_gpu_view(replacement_gpu_view)
+    assert not source.references_current_num_blocks_gpu_view(original_gpu_view)
+    assert source.references_persistent_num_blocks_cpu(block_tables.num_blocks.cpu)
+    source.validate_owner_bindings()
 
 
 def test_full_source_detects_canonical_table_replacement() -> None:

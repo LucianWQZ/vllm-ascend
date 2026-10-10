@@ -244,7 +244,13 @@ class FullDraftKVSource:
         self._validate_global_group_id(global_group_id)
         return self._input_block_tables[global_group_id] is tensor
 
-    def references_persistent_num_blocks(self, tensor: torch.Tensor) -> bool:
+    def references_current_num_blocks_gpu_view(self, tensor: torch.Tensor) -> bool:
+        """Return whether ``tensor`` is the accelerator view active right now.
+
+        ``UvaBackedTensor`` may rotate this view, so it is intentionally not a
+        persistent source identity. The stable owner check is the CPU method
+        below.
+        """
         return self._block_tables_owner.num_blocks.gpu is tensor
 
     def references_persistent_num_blocks_cpu(self, tensor: torch.Tensor) -> bool:
@@ -2106,6 +2112,10 @@ def _mutable_reference_keys(value: Any) -> set[tuple[str, Any]]:
                     )
                 )
             return
+        if isinstance(current, np.ndarray):
+            keys.add(("object", current_id))
+            keys.add(("numpy_storage", _numpy_storage_owner_id(current)))
+            return
         if isinstance(current, Mapping):
             keys.add(("object", current_id))
             for key, item in current.items():
@@ -2150,3 +2160,19 @@ def _mutable_reference_keys(value: Any) -> set[tuple[str, Any]]:
 
     visit(value)
     return keys
+
+
+def _numpy_storage_owner_id(array: np.ndarray) -> int:
+    """Return a stable in-process identity for NumPy views of one buffer."""
+    owner: Any = array
+    seen: set[int] = set()
+    while id(owner) not in seen:
+        seen.add(id(owner))
+        if isinstance(owner, np.ndarray) and owner.base is not None:
+            owner = owner.base
+            continue
+        if isinstance(owner, memoryview):
+            owner = owner.obj
+            continue
+        break
+    return id(owner)

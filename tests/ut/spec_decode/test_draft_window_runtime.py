@@ -7,6 +7,7 @@ from enum import Enum
 from types import SimpleNamespace
 from typing import Any
 
+import numpy as np
 import pytest
 import torch
 
@@ -591,6 +592,20 @@ def test_store_rejects_target_nested_alias_and_cleans_generation() -> None:
     assert target["nested"][0]["tensor"] is target_tensor
     recovered = _materialize(runtime, mapping_epoch=2)
     assert recovered.identity.mapping_epoch == 2
+
+
+def test_store_rejects_numpy_view_aliasing_target_storage() -> None:
+    runtime, _capability, _block_tables = _runtime_fixture()
+    inputs = _materialize(runtime, mapping_epoch=1)
+    target_buffer = np.arange(8, dtype=np.int32)
+    target = {"nested": [{"buffer": target_buffer}]}
+    draft = {"nested": [{"buffer": target_buffer[2:6]}]}
+
+    with pytest.raises(ValueError, match="mutable storage aliases Target metadata"):
+        runtime.publish_metadata(inputs, draft, target_metadata=target)
+
+    np.testing.assert_array_equal(target_buffer, np.arange(8, dtype=np.int32))
+    assert _materialize(runtime, mapping_epoch=2).identity.mapping_epoch == 2
 
 
 def test_store_requires_target_metadata_and_rejects_none() -> None:

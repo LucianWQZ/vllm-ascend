@@ -249,19 +249,22 @@ class DraftWindowEagerMixin:
         if epoch_source is None:
             yield
             return
-        if dummy_run or is_profile:
+        bypass_for_terminal_prefill = False
+        if not dummy_run and not is_profile:
+            bypass_for_terminal_prefill = _requires_terminal_prefill_baseline_bypass(input_batch)
+        if dummy_run or is_profile or bypass_for_terminal_prefill:
             if self._draft_window_bypass_active or self._draft_window_proposal_context is not None:
                 raise RuntimeError("a draft-window proposal scope is already active")
             self._draft_window_bypass_active = True
             try:
-                # Startup/profile work must exercise the unmodified upstream
-                # metadata path without allocating a production generation.
+                # Startup/profile and a terminal pure-prefill proposal exercise
+                # the unmodified upstream metadata path without allocating a
+                # production Window generation. Mixed or continuing chunked
+                # prefill is rejected by the classifier above.
                 yield
             finally:
                 self._draft_window_bypass_active = False
             return
-        if bool(input_batch.has_prefill) or bool(np.any(input_batch.is_prefilling_np[: input_batch.num_reqs])):
-            raise NotImplementedError("MRV2 draft-window P4a does not support mixed/chunked prefill")
         context = epoch_source.begin(input_batch)
         self._draft_window_proposal_context = context
         succeeded = False
@@ -461,16 +464,9 @@ class DraftWindowEagerMixin:
         upstream. ``UPSTREAM_DRIFT_GUARD`` tests pin the source contract.
         """
         if query_start_loc_np is not None:
-            query_start_loc_cpu = torch.empty(
-                num_reqs_padded + 1,
-                dtype=torch.int32,
-            )
-            query_start_loc_cpu[: num_reqs + 1] = torch.from_numpy(query_start_loc_np[: num_reqs + 1])
-            query_start_loc_cpu[num_reqs:] = query_start_loc_cpu[num_reqs]
-            max_query_len = int((query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]).max())
-        else:
-            query_start_loc_cpu = torch.clamp(self.arange[: num_reqs_padded + 1], max=num_reqs) * self.num_query_per_req
-            max_query_len = self.num_query_per_req
+            raise NotImplementedError("MRV2 draft-window P4a requires the uniform DFlash/DSpark query layout")
+        query_start_loc_cpu = torch.clamp(self.arange[: num_reqs_padded + 1], max=num_reqs) * self.num_query_per_req
+        max_query_len = self.num_query_per_req
 
         if len(read_inputs.block_tables) != len(self.block_tables.input_block_tables):
             raise ValueError("Draft attention read block-table group count does not match the configured cache groups")
@@ -553,12 +549,53 @@ def _proposal_fingerprint(
     return request_ids, tuple(int(value) for value in mapping[:num_reqs])
 
 
+def _requires_terminal_prefill_baseline_bypass(
+    input_batch: InputBatch | Any,
+) -> bool:
+    """Classify the only prefill shape allowed by the P4a decode-only route.
+
+    Upstream invokes the speculator after every target step, including the step
+    that completes an ordinary prompt. That terminal pure-prefill proposal must
+    use the baseline full-context metadata path so a Window-enabled request can
+    reach decode. A mixed prefill/decode batch or a batch that remains in
+    prefill after this step is still outside P4a and fails before epoch/workspace
+    creation.
+    """
+    num_reqs = int(input_batch.num_reqs)
+    is_prefilling = np.asarray(input_batch.is_prefilling_np)[:num_reqs]
+    if is_prefilling.ndim != 1 or is_prefilling.shape[0] != num_reqs:
+        raise ValueError("prefill classification does not cover active requests")
+    has_prefill = bool(input_batch.has_prefill)
+    any_prefill = bool(np.any(is_prefilling))
+    if has_prefill != any_prefill:
+        raise RuntimeError("InputBatch has_prefill disagrees with is_prefilling_np")
+    if not any_prefill:
+        return False
+    if not bool(np.all(is_prefilling)):
+        raise NotImplementedError("MRV2 draft-window P4a does not support mixed prefill/decode proposals")
+
+    def active_int_array(name: str) -> np.ndarray:
+        values = np.asarray(getattr(input_batch, name))
+        if values.ndim != 1 or values.shape[0] < num_reqs:
+            raise ValueError(f"{name} does not cover active requests")
+        if not np.issubdtype(values.dtype, np.integer):
+            raise TypeError(f"{name} must contain integers")
+        return values[:num_reqs].astype(np.int64, copy=False)
+
+    computed = active_int_array("num_computed_prefill_tokens_np")
+    scheduled = active_int_array("num_scheduled_tokens")
+    prefill_len = active_int_array("prefill_len_np")
+    if bool(np.any(computed + scheduled < prefill_len)):
+        raise NotImplementedError("MRV2 draft-window P4a does not support continuing chunked prefill proposals")
+    return True
+
+
 def _isolate_draft_metadata_from_target(
     draft_metadata: Any,
     target_metadata: Any,
 ) -> Any:
     """Clone only Draft-side mutable references that alias real Target state."""
-    target_object_ids, target_tensor_storage = _collect_mutable_identity(target_metadata)
+    target_object_ids, target_tensor_storage, target_numpy_arrays = _collect_mutable_identity(target_metadata)
     memo: dict[int, Any] = {}
 
     def isolate(value: Any) -> Any:
@@ -586,6 +623,14 @@ def _isolate_draft_metadata_from_target(
                 cloned = value.clone()
                 memo[value_id] = cloned
                 return cloned
+            return value
+        if isinstance(value, np.ndarray):
+            if value_id in target_object_ids or any(
+                np.shares_memory(value, target_array) for target_array in target_numpy_arrays
+            ):
+                cloned_array = value.copy()
+                memo[value_id] = cloned_array
+                return cloned_array
             return value
         if isinstance(value, dict):
             result = {} if value_id in target_object_ids else value
@@ -653,9 +698,10 @@ def _isolate_draft_metadata_from_target(
 
 def _collect_mutable_identity(
     value: Any,
-) -> tuple[set[int], set[tuple[str, int]]]:
+) -> tuple[set[int], set[tuple[str, int]], tuple[np.ndarray, ...]]:
     object_ids: set[int] = set()
     tensor_storage: set[tuple[str, int]] = set()
+    numpy_arrays: list[np.ndarray] = []
     seen: set[int] = set()
 
     def visit(current: Any) -> None:
@@ -682,6 +728,10 @@ def _collect_mutable_identity(
         if isinstance(current, torch.Tensor):
             object_ids.add(current_id)
             tensor_storage.add(_tensor_storage_key(current))
+            return
+        if isinstance(current, np.ndarray):
+            object_ids.add(current_id)
+            numpy_arrays.append(current)
             return
         if isinstance(current, Mapping):
             object_ids.add(current_id)
@@ -718,7 +768,7 @@ def _collect_mutable_identity(
                     continue
 
     visit(value)
-    return object_ids, tensor_storage
+    return object_ids, tensor_storage, tuple(numpy_arrays)
 
 
 def _tensor_storage_key(tensor: torch.Tensor) -> tuple[str, int]:

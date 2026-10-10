@@ -122,6 +122,14 @@ def _input_batch(
 ) -> SimpleNamespace:
     num_reqs = len(req_ids)
     idx_mapping_np = np.array(mapping, dtype=np.intp)
+    if has_prefill:
+        prefill_len_np = np.full(num_reqs, 4, dtype=np.int32)
+        num_computed_prefill_tokens_np = np.zeros(num_reqs, dtype=np.int32)
+        num_scheduled_tokens = np.full(num_reqs, 4, dtype=np.int32)
+    else:
+        prefill_len_np = np.full(num_reqs, 4, dtype=np.int32)
+        num_computed_prefill_tokens_np = prefill_len_np.copy()
+        num_scheduled_tokens = np.ones(num_reqs, dtype=np.int32)
     return SimpleNamespace(
         req_ids=list(req_ids),
         num_reqs=num_reqs,
@@ -130,6 +138,9 @@ def _input_batch(
         seq_lens_cpu_upper_bound=torch.tensor(upper, dtype=torch.int32),
         has_prefill=has_prefill,
         is_prefilling_np=np.full(num_reqs, has_prefill, dtype=np.bool_),
+        prefill_len_np=prefill_len_np,
+        num_computed_prefill_tokens_np=num_computed_prefill_tokens_np,
+        num_scheduled_tokens=num_scheduled_tokens,
     )
 
 
@@ -532,13 +543,64 @@ def test_apply_time_upper_uses_actual_dflash_or_dspark_query_width(
         assert harness.captured_read_inputs.seq_lens_cpu_upper_bound.tolist() == expected_upper
 
 
-def test_mixed_or_chunked_prefill_fails_before_materialization() -> None:
+def test_terminal_pure_prefill_uses_baseline_then_decode_uses_window() -> None:
+    harness, batch = _harness()
+    batch = _input_batch(has_prefill=True)
+    harness.input_batch = batch
+
+    with harness._draft_window_proposal_scope(
+        batch,
+        dummy_run=False,
+        is_profile=False,
+    ):
+        result = harness._build_draft_attn_metadata(
+            num_reqs=2,
+            num_reqs_padded=4,
+            num_tokens_padded=8,
+            seq_lens_cpu_upper_bound=batch.seq_lens_cpu_upper_bound,
+            step=4,
+            causal=False,
+        )
+
+    assert result == {"baseline": True}
+    assert harness.baseline_builder_calls == 1
+    assert harness.builder_events == []
+    assert harness._draft_window_epoch_source._next_epoch == 0
+    assert harness._draft_window_proposal_context is None
+    assert harness._draft_window_live_inputs is None
+    assert harness._draft_window_runtime_state.workspace.bound_identity is None
+
+    batch.has_prefill = False
+    batch.is_prefilling_np.fill(False)
+    batch.num_computed_prefill_tokens_np[:] = batch.prefill_len_np
+    with harness._draft_window_proposal_scope(
+        batch,
+        dummy_run=False,
+        is_profile=False,
+    ):
+        metadata = harness._build_draft_attn_metadata(
+            num_reqs=2,
+            num_reqs_padded=4,
+            num_tokens_padded=8,
+            seq_lens_cpu_upper_bound=batch.seq_lens_cpu_upper_bound,
+            step=4,
+            causal=False,
+        )
+
+    assert "draft.layer" in metadata
+    assert harness.builder_events == ["builder"]
+    assert harness._draft_window_epoch_source._next_epoch == 1
+    assert harness._draft_window_runtime_state.workspace.bound_identity is None
+
+
+def test_mixed_prefill_decode_fails_before_materialization() -> None:
     harness, batch = _harness()
     batch.has_prefill = True
     batch.is_prefilling_np[:] = np.array([True, False])
+    batch.num_computed_prefill_tokens_np[:] = np.array([0, 4])
 
     with (
-        pytest.raises(NotImplementedError, match="mixed/chunked prefill"),
+        pytest.raises(NotImplementedError, match="mixed prefill/decode"),
         harness._draft_window_proposal_scope(
             batch,
             dummy_run=False,
@@ -547,6 +609,28 @@ def test_mixed_or_chunked_prefill_fails_before_materialization() -> None:
     ):
         pass
 
+    assert harness._draft_window_runtime_state.workspace.bound_identity is None
+
+
+def test_chunked_prefill_fails_before_materialization() -> None:
+    harness, batch = _harness()
+    batch.has_prefill = True
+    batch.is_prefilling_np.fill(True)
+    batch.prefill_len_np[:] = np.array([8, 4])
+    batch.num_computed_prefill_tokens_np.fill(0)
+    batch.num_scheduled_tokens[:] = np.array([4, 4])
+
+    with (
+        pytest.raises(NotImplementedError, match="chunked prefill"),
+        harness._draft_window_proposal_scope(
+            batch,
+            dummy_run=False,
+            is_profile=False,
+        ),
+    ):
+        pass
+
+    assert harness._draft_window_epoch_source._next_epoch == 0
     assert harness._draft_window_runtime_state.workspace.bound_identity is None
 
 
@@ -570,6 +654,18 @@ def test_metadata_isolation_clones_nested_target_aliases_without_mutating_target
     assert target["layer"].slot_mapping is shared
     assert target["layer"].nested is target_nested
     assert target["layer"].nested[0]["tensor"].tolist() == [11, 12]
+
+
+def test_metadata_isolation_clones_numpy_views_that_alias_target_storage() -> None:
+    target_buffer = np.arange(8, dtype=np.int32)
+    target = {"nested": [{"buffer": target_buffer}]}
+    draft = {"nested": [{"buffer": target_buffer[2:6]}]}
+
+    isolated = _isolate_draft_metadata_from_target(draft, target)
+
+    assert not np.shares_memory(isolated["nested"][0]["buffer"], target_buffer)
+    isolated["nested"][0]["buffer"].fill(99)
+    np.testing.assert_array_equal(target_buffer, np.arange(8, dtype=np.int32))
 
 
 @dataclass
@@ -793,6 +889,104 @@ def test_window_off_uses_exact_upstream_super_path_with_full_parity(
         baseline["seq_lens_cpu_upper_bound"],
         ascend_off["seq_lens_cpu_upper_bound"],
     )
+
+
+def test_window_on_vendor_assembly_matches_upstream_for_full_equivalent_reads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = _off_parity_harness()
+    positions = torch.arange(8, dtype=torch.int64)
+    is_prefilling = torch.tensor([False, False])
+    baseline = _capture_off_builder_kwargs(
+        monkeypatch,
+        harness,
+        through_ascend_override=False,
+        positions=positions,
+        is_prefilling=is_prefilling,
+    )
+    captured: list[dict[str, Any]] = []
+
+    def capture(**kwargs: Any) -> dict[str, Any]:
+        captured.append(kwargs)
+        return kwargs
+
+    monkeypatch.setattr(ascend_attn_utils, "build_attn_metadata", capture)
+    cpu_exact = harness.input_buffers.seq_lens.clone()
+    read_inputs = AscendDraftAttentionReadInputs(
+        block_tables=tuple(table[:4] for table in harness.block_tables.input_block_tables),
+        seq_lens=harness.input_buffers.seq_lens,
+        seq_lens_cpu_exact=cpu_exact,
+        seq_lens_cpu_upper_bound=torch.tensor([194, 134, 0, 0], dtype=torch.int32),
+        max_seq_len=harness.draft_max_seq_len,
+    )
+    with (
+        build_attn_metadata_wrapper(),
+        build_draft_attn_metadata_factory(positions, 8, is_prefilling),
+    ):
+        harness._build_ascend_draft_attn_metadata(
+            num_reqs=2,
+            num_reqs_padded=4,
+            num_tokens_padded=8,
+            read_inputs=read_inputs,
+            causal=False,
+            query_start_loc_np=None,
+            dcp_local_seq_lens=None,
+        )
+
+    assert len(captured) == 1
+    vendor = captured[0]
+    assert set(vendor) == set(baseline) | {"seq_lens_cpu"}
+    for name in ("attn_groups", "num_reqs", "num_tokens", "max_query_len", "max_seq_len", "causal"):
+        assert vendor[name] == baseline[name]
+    assert vendor["kv_cache_config"] is baseline["kv_cache_config"]
+    for name in (
+        "query_start_loc_gpu",
+        "seq_lens",
+        "slot_mappings",
+        "positions",
+        "is_prefilling",
+    ):
+        assert vendor[name].data_ptr() == baseline[name].data_ptr()
+        torch.testing.assert_close(vendor[name], baseline[name])
+    torch.testing.assert_close(vendor["query_start_loc_cpu"], baseline["query_start_loc_cpu"])
+    torch.testing.assert_close(vendor["seq_lens_cpu_upper_bound"], baseline["seq_lens_cpu_upper_bound"])
+    assert vendor["block_tables"][0].data_ptr() == baseline["block_tables"][0].data_ptr()
+    torch.testing.assert_close(vendor["block_tables"][0], baseline["block_tables"][0])
+    assert vendor["seq_lens_cpu"] is cpu_exact
+
+
+def test_window_on_vendor_assembly_rejects_nonuniform_query_layout() -> None:
+    harness = _off_parity_harness()
+    read_inputs = AscendDraftAttentionReadInputs(
+        block_tables=tuple(table[:4] for table in harness.block_tables.input_block_tables),
+        seq_lens=harness.input_buffers.seq_lens,
+        seq_lens_cpu_exact=harness.input_buffers.seq_lens.clone(),
+        seq_lens_cpu_upper_bound=torch.tensor([194, 134, 0, 0], dtype=torch.int32),
+        max_seq_len=harness.draft_max_seq_len,
+    )
+    harness._call_ascend_draft_attn_metadata_builder = MagicMock(return_value={})
+
+    with pytest.raises(NotImplementedError, match="uniform DFlash/DSpark query layout"):
+        harness._build_ascend_draft_attn_metadata(
+            num_reqs=2,
+            num_reqs_padded=4,
+            num_tokens_padded=8,
+            read_inputs=read_inputs,
+            causal=False,
+            query_start_loc_np=np.array([0, 1, 3], dtype=np.int32),
+            dcp_local_seq_lens=None,
+        )
+
+    harness._call_ascend_draft_attn_metadata_builder.assert_not_called()
+
+
+def test_eager_module_has_no_hidden_global_or_contextvar_transport() -> None:
+    import vllm_ascend.worker.v2.spec_decode.draft_window_eager as eager_module
+
+    source = inspect.getsource(eager_module)
+    tree = ast.parse(source)
+    assert not any(isinstance(node, ast.Global) for node in ast.walk(tree))
+    assert not any(isinstance(node, ast.Name) and node.id == "ContextVar" for node in ast.walk(tree))
 
 
 @pytest.mark.parametrize(
