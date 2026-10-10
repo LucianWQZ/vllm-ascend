@@ -1944,6 +1944,14 @@ def test_eligible_owner_builds_p2_capability_from_set_attn_state(
         "build_draft_window_runtime_state",
         lambda capability: runtime_calls.append(capability) or expected_runtime_state,
     )
+    p4b_initialize = None
+    if owner_type is AscendAutoRegressiveSpeculator:
+        p4b_initialize = MagicMock()
+        monkeypatch.setattr(
+            owner,
+            "_initialize_eagle3_draft_window_state",
+            p4b_initialize,
+        )
 
     owner._initialize_draft_window_source_capability()
 
@@ -1961,6 +1969,8 @@ def test_eligible_owner_builds_p2_capability_from_set_attn_state(
         assert hasattr(owner, "_draft_window_epoch_source")
     else:
         assert not hasattr(owner, "_draft_window_epoch_source")
+        assert p4b_initialize is not None
+        p4b_initialize.assert_called_once_with()
 
 
 def test_dflash2_owner_passes_explicit_runtime_route_to_inventory(

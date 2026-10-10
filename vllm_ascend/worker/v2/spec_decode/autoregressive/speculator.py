@@ -17,12 +17,14 @@
 # This file is a part of the vllm-ascend project.
 #
 import logging
+from collections.abc import Mapping
 from contextlib import contextmanager
 from copy import copy
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
+import vllm.v1.worker.gpu.spec_decode.speculator as upstream_speculator_module
 from vllm.config import VllmConfig, replace, set_current_vllm_config
 from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.attention.backend import AttentionBackend
@@ -49,10 +51,15 @@ from vllm_ascend.worker.v2.attn_utils import (
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
 from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
 from vllm_ascend.worker.v2.spec_decode.draft_window import (
+    DraftMetadataInputs,
     DraftWindowPolicyDecision,
     DraftWindowPolicyState,
     build_draft_window_runtime_state,
     build_draft_window_source_capability,
+)
+from vllm_ascend.worker.v2.spec_decode.draft_window_eager import _isolate_draft_metadata_from_target
+from vllm_ascend.worker.v2.spec_decode.draft_window_eagle3 import (
+    Eagle3DraftWindowMixin,
 )
 from vllm_ascend.worker.v2.spec_decode.pcp_utils import (
     disable_target_pcp_for_replicated_draft,
@@ -65,7 +72,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class AscendAutoRegressiveSpeculator(AutoRegressiveSpeculator):
+class AscendAutoRegressiveSpeculator(Eagle3DraftWindowMixin, AutoRegressiveSpeculator):
     """Shared Ascend spec-decode loop for AscendEagle/AscendMTPSpeculator.
 
     GQA, MLA, DSA, and SFA draft decode state share one path. The current MTP path
@@ -109,6 +116,12 @@ class AscendAutoRegressiveSpeculator(AutoRegressiveSpeculator):
         runtime_state = build_draft_window_runtime_state(capability)
         self._draft_window_source_capability = capability
         self._draft_window_runtime_state = runtime_state
+        try:
+            self._initialize_eagle3_draft_window_state()
+        except BaseException:
+            del self._draft_window_source_capability
+            del self._draft_window_runtime_state
+            raise
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         """Override the upstream __init__ for Ascend NPUs.
@@ -307,6 +320,11 @@ class AscendAutoRegressiveSpeculator(AutoRegressiveSpeculator):
             disable_target_pcp_for_replicated_draft(self),
             build_attn_metadata_wrapper(),
             torch_gather_wrapper(),
+            self._eagle3_draft_window_proposal_scope(
+                input_batch,
+                dummy_run=dummy_run,
+                is_profile=bool(is_profile),
+            ),
         ):
             return super().propose(
                 input_batch,
@@ -439,6 +457,30 @@ class AscendAutoRegressiveSpeculator(AutoRegressiveSpeculator):
         """Thin override: delegate to upstream single-step ``_generate_draft``,
         then apply Ascend-specific attention-metadata updates required by the
         FIA operator."""
+        if self._eagle3_window_is_active():
+            if cudagraph_runtime_mode != CUDAGraphMode.NONE:
+                raise NotImplementedError("MRV2 Eagle3 Draft Window supports serialized eager execution only")
+            inputs = self._eagle3_window_live_inputs
+            if inputs is None:
+                raise RuntimeError("Eagle3 Draft forward has no active Window generation")
+            stored_metadata = self._draft_window_runtime_state.read_metadata(inputs.identity)
+            if attn_metadata is not stored_metadata:
+                raise RuntimeError("Eagle3 Draft forward did not receive metadata from the Draft-only store")
+            try:
+                super()._generate_draft(
+                    num_reqs,
+                    num_tokens_padded,
+                    attn_metadata,
+                    slot_mappings,
+                    num_tokens_across_dp,
+                    cudagraph_runtime_mode,
+                )
+            except BaseException:
+                self._finish_eagle3_window_step(inputs, succeeded=False)
+                raise
+            self._finish_eagle3_window_step(inputs, succeeded=True)
+            return
+
         super()._generate_draft(
             num_reqs,
             num_tokens_padded,
@@ -466,6 +508,17 @@ class AscendAutoRegressiveSpeculator(AutoRegressiveSpeculator):
         ``_multi_step_decode`` which iterates over steps and calls
         ``_generate_draft`` per step.
         """
+        if self._eagle3_window_is_active():
+            if batch_desc.cg_mode != CUDAGraphMode.NONE:
+                raise NotImplementedError("MRV2 Eagle3 Draft Window does not support graph decode")
+            if skip_attn:
+                raise RuntimeError("a real Eagle3 Window proposal cannot skip Draft attention")
+            if seq_lens_cpu_upper_bound is None:
+                raise ValueError("Eagle3 Window decode requires Target CPU upper lengths")
+            self._snapshot_eagle3_decode_step_one(
+                num_reqs=num_reqs,
+                num_reqs_padded=batch_desc.num_reqs or num_reqs,
+            )
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             assert self.decode_cudagraph_manager is not None
             self.decode_cudagraph_manager.run_fullgraph(batch_desc)
@@ -489,6 +542,45 @@ class AscendAutoRegressiveSpeculator(AutoRegressiveSpeculator):
             num_tokens,
             cudagraph_runtime_mode=cudagraph_runtime_mode,
         )
+        if self._eagle3_window_is_active():
+            input_batch = self.input_batch
+            assert input_batch is not None
+            if cudagraph_runtime_mode != CUDAGraphMode.NONE:
+                raise NotImplementedError("MRV2 Eagle3 first-pass Window supports eager execution only")
+            if self.replicated_pcp:
+                raise NotImplementedError("MRV2 Eagle3 Draft Window does not support replicated PCP")
+            if slot_mappings is None:
+                raise ValueError("Eagle3 Window first pass requires full physical slot mappings")
+            target_metadata = self._require_eagle3_target_metadata(attn_metadata)
+            inputs = self._materialize_eagle3_first_pass(
+                num_reqs=num_reqs,
+                num_reqs_padded=num_reqs,
+            )
+            try:
+                draft_metadata = self._build_eagle3_private_attn_metadata(
+                    inputs=inputs,
+                    num_reqs=num_reqs,
+                    num_reqs_padded=num_reqs,
+                    num_tokens_padded=num_tokens,
+                    query_start_loc_np=input_batch.query_start_loc_np,
+                    target_metadata=target_metadata,
+                    first_pass=True,
+                )
+                super()._prefill(
+                    num_reqs,
+                    num_tokens,
+                    draft_metadata,
+                    slot_mappings,
+                    num_tokens_across_dp,
+                    cudagraph_runtime_mode,
+                    mm_inputs,
+                )
+            except BaseException:
+                self._finish_eagle3_window_step(inputs, succeeded=False)
+                raise
+            self._finish_eagle3_window_step(inputs, succeeded=True)
+            return
+
         # Draft prefill reuses target metadata, but the target metadata may
         # also contain target-only attention layers (e.g. GDN layers).
         if attn_metadata is not None and self.draft_attn_layer_names is not None:
@@ -518,6 +610,34 @@ class AscendAutoRegressiveSpeculator(AutoRegressiveSpeculator):
         query_start_loc_np: np.ndarray | None = None,
     ) -> dict[str, Any] | None:
         assert self.input_batch is not None
+        if self._eagle3_window_is_active():
+            if num_query_per_req != 1:
+                raise ValueError("Eagle3 autoregressive Window steps require one query per request")
+            if query_start_loc_np is not None:
+                raise ValueError("Eagle3 autoregressive decode requires the uniform one-query layout")
+            if causal is not True:
+                raise ValueError("Eagle3 Draft Window requires causal Draft attention")
+            target_metadata = self._require_eagle3_target_metadata()
+            inputs = self._materialize_eagle3_decode_step(
+                step=step,
+                num_reqs=num_reqs,
+                num_reqs_padded=num_reqs_padded,
+                seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+            )
+            try:
+                return self._build_eagle3_private_attn_metadata(
+                    inputs=inputs,
+                    num_reqs=num_reqs,
+                    num_reqs_padded=num_reqs_padded,
+                    num_tokens_padded=num_tokens_padded,
+                    query_start_loc_np=None,
+                    target_metadata=target_metadata,
+                    first_pass=False,
+                )
+            except BaseException:
+                if self._eagle3_window_live_inputs is inputs:
+                    self._finish_eagle3_window_step(inputs, succeeded=False)
+                raise
         with build_draft_attn_metadata_factory(
             self.input_buffers.positions,
             num_tokens_padded,
@@ -540,6 +660,111 @@ class AscendAutoRegressiveSpeculator(AutoRegressiveSpeculator):
                     continue
                 metadata.attn_state = AscendAttentionState.DecodeOnly
         return attn_metadata
+
+    def _build_eagle3_private_attn_metadata(
+        self,
+        *,
+        inputs: DraftMetadataInputs,
+        num_reqs: int,
+        num_reqs_padded: int,
+        num_tokens_padded: int,
+        query_start_loc_np: np.ndarray | None,
+        target_metadata: Mapping[Any, Any],
+        first_pass: bool,
+    ) -> dict[str, Any]:
+        """Build one Draft-only metadata object from validated read inputs.
+
+        This is the narrow Ascend-owned assembly seam required by R-REPO-01.
+        It duplicates only upstream query-layout/builder kwargs; proposal,
+        positions, slot calculation, forward, and sampling stay upstream.
+        """
+        read_inputs = self._validated_eagle3_read_inputs(inputs, inputs.identity)
+        if query_start_loc_np is not None:
+            query_start_loc_cpu = torch.empty(num_reqs_padded + 1, dtype=torch.int32)
+            query_start_loc_cpu[: num_reqs + 1] = torch.from_numpy(query_start_loc_np[: num_reqs + 1])
+            query_start_loc_cpu[num_reqs:] = query_start_loc_cpu[num_reqs]
+            query_lengths = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+            max_query_len = int(query_lengths.max().item()) if query_lengths.numel() else 0
+        else:
+            query_start_loc_cpu = torch.clamp(self.arange[: num_reqs_padded + 1], max=num_reqs)
+            max_query_len = 1
+
+        if len(read_inputs.block_tables) != len(self.block_tables.input_block_tables):
+            raise ValueError("Eagle3 Window read tables do not match configured cache groups")
+        if read_inputs.seq_lens.shape[0] != num_reqs_padded:
+            raise ValueError("Eagle3 Window read lengths do not match padded requests")
+        if self.block_tables.cp_size != 1:
+            raise NotImplementedError("MRV2 Eagle3 Draft Window does not support DCP")
+        if self.model_state.attn_metadata is not target_metadata:
+            raise RuntimeError("Target metadata owner changed before Eagle3 Draft metadata build")
+
+        builder_kwargs = dict(
+            attn_groups=self.attn_groups,
+            num_reqs=num_reqs_padded,
+            num_tokens=num_tokens_padded,
+            query_start_loc_gpu=self.input_buffers.query_start_loc[: num_reqs_padded + 1],
+            query_start_loc_cpu=query_start_loc_cpu,
+            max_query_len=max_query_len,
+            seq_lens=read_inputs.seq_lens,
+            seq_lens_cpu=read_inputs.seq_lens_cpu_exact,
+            dcp_local_seq_lens=None,
+            max_seq_len=read_inputs.max_seq_len,
+            block_tables=list(read_inputs.block_tables),
+            # The write carrier is always the canonical full slot owner.
+            slot_mappings=self.block_tables.slot_mappings[:, :num_tokens_padded],
+            kv_cache_config=self.kv_cache_config,
+            causal=True,
+            seq_lens_cpu_upper_bound=read_inputs.seq_lens_cpu_upper_bound,
+        )
+        input_batch = self.input_batch
+        assert input_batch is not None
+        is_prefilling = torch.from_numpy(input_batch.is_prefilling_np)
+        with build_draft_attn_metadata_factory(
+            self.input_buffers.positions,
+            num_tokens_padded,
+            is_prefilling,
+        ):
+            metadata = self._call_eagle3_draft_attn_metadata_builder(**builder_kwargs)
+        if not isinstance(metadata, dict) or not metadata:
+            raise RuntimeError("eligible Eagle3 Window route produced no Draft metadata")
+        if self.model_state.attn_metadata is not target_metadata:
+            raise RuntimeError("Target metadata owner changed during Eagle3 Draft metadata build")
+
+        # Isolate before assigning per-layer state: a buggy/reusing builder
+        # must not let the state write below mutate a Target-owned object.
+        metadata = _isolate_draft_metadata_from_target(metadata, target_metadata)
+        for layer_name, layer_metadata in metadata.items():
+            if layer_metadata is None:
+                continue
+            if first_pass:
+                target_layer_metadata = target_metadata.get(layer_name)
+                if target_layer_metadata is None or not hasattr(target_layer_metadata, "attn_state"):
+                    raise RuntimeError(f"Target metadata has no first-pass state for Draft layer {layer_name!r}")
+                layer_metadata.attn_state = target_layer_metadata.attn_state
+            else:
+                layer_metadata.attn_state = AscendAttentionState.DecodeOnly
+
+        self._draft_window_runtime_state.publish_metadata(
+            inputs,
+            metadata,
+            target_metadata=target_metadata,
+        )
+        return self._draft_window_runtime_state.read_metadata(inputs.identity)
+
+    def _call_eagle3_draft_attn_metadata_builder(self, **builder_kwargs: Any) -> dict[str, Any]:
+        """Call the existing Ascend-patched builder with explicit read state."""
+        return upstream_speculator_module.build_attn_metadata(**builder_kwargs)
+
+    def _require_eagle3_target_metadata(
+        self,
+        passed_metadata: dict[str, Any] | None = None,
+    ) -> Mapping[Any, Any]:
+        target_metadata = self.model_state.attn_metadata
+        if not isinstance(target_metadata, Mapping) or not target_metadata:
+            raise ValueError("Window ON requires non-empty Target metadata from model_state.attn_metadata")
+        if passed_metadata is not None and passed_metadata is not target_metadata:
+            raise RuntimeError("Eagle3 first pass did not receive the real Target metadata owner")
+        return target_metadata
 
     def build_draft_attn_metadatas(
         self,

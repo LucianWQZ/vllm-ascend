@@ -454,18 +454,95 @@ class SingleGroupDirectPrefixProvider:
                 "scalar plan capacity does not match provider geometry: "
                 f"{plan.window_capacity_tokens} != {expected_capacity}"
             )
+        return self._describe_interval(
+            window_start=plan.window_start,
+            window_visible_length=plan.window_visible_length,
+            valid_num_blocks=valid_num_blocks,
+        )
+
+    def describe_frozen_step(
+        self,
+        proposal_plan: DraftWindowScalarPlan,
+        *,
+        full_exact_end: int,
+        valid_num_blocks: int,
+    ) -> DraftWindowReadDescriptor:
+        """Project one Eagle3 step using the proposal-frozen anchor.
+
+        ``describe`` validates the one-shot ``E + K`` contract used by P2 and
+        parallel drafting. Eagle3 instead freezes ``S`` from proposal-entry
+        ``L0 + K`` and advances only the real per-step end ``E_s``. This method
+        keeps that distinction explicit and refuses to infer a new anchor from
+        ``E_s``.
+        """
+        self.full_source.validate_owner_bindings()
+        if not isinstance(valid_num_blocks, int) or isinstance(valid_num_blocks, bool):
+            raise TypeError("valid_num_blocks must be a Python int")
+        if valid_num_blocks < 0:
+            raise ValueError("valid_num_blocks must be greater than or equal to 0")
+        if self.inventory.method != "eagle3":
+            raise ValueError("frozen per-step projection is defined only for Eagle3")
+        proposal_offset = proposal_plan.full_horizon_end - proposal_plan.full_exact_end
+        if proposal_offset != self.expected_future_offset:
+            raise ValueError(
+                "proposal future offset does not match configured static future offset: "
+                f"offset={proposal_offset} expected={self.expected_future_offset}"
+            )
+        expected_start = compute_legacy_anchor(
+            full_context_length=proposal_plan.full_exact_end,
+            future_offset=proposal_offset,
+            window_size=self.inventory.window_size,
+            legacy_block_size=self.legacy_block_size,
+        )
+        if proposal_plan.window_start != expected_start:
+            raise ValueError(
+                "proposal plan does not use the canonical frozen anchor: "
+                f"{proposal_plan.window_start} != {expected_start}"
+            )
+        if not proposal_plan.window_start <= full_exact_end <= proposal_plan.full_horizon_end:
+            raise ValueError(
+                "Eagle3 step end is outside the frozen proposal interval: "
+                f"start={proposal_plan.window_start} end={full_exact_end} "
+                f"horizon={proposal_plan.full_horizon_end}"
+            )
+        expected_capacity = compute_window_capacity_tokens(
+            window_size=self.inventory.window_size,
+            legacy_block_size=self.legacy_block_size,
+        )
+        if proposal_plan.window_capacity_tokens != expected_capacity:
+            raise ValueError(
+                "proposal plan capacity does not match provider geometry: "
+                f"{proposal_plan.window_capacity_tokens} != {expected_capacity}"
+            )
+        return self._describe_interval(
+            window_start=proposal_plan.window_start,
+            window_visible_length=compute_visible_length(
+                full_exact_end=full_exact_end,
+                window_start=proposal_plan.window_start,
+            ),
+            valid_num_blocks=valid_num_blocks,
+        )
+
+    def _describe_interval(
+        self,
+        *,
+        window_start: int,
+        window_visible_length: int,
+        valid_num_blocks: int,
+    ) -> DraftWindowReadDescriptor:
+        """Project a previously validated absolute interval onto FullSource."""
         span = self._group.block_span_tokens
         assert span is not None
         projection = project_direct_prefix(
-            window_start=plan.window_start,
-            window_visible_length=plan.window_visible_length,
+            window_start=window_start,
+            window_visible_length=window_visible_length,
             block_span_tokens=span,
         )
         if projection.first_token_offset != 0:
             raise NotImplementedError(
                 "MRV2 direct-prefix provider cannot consume a nonzero first-token "
                 f"offset: gid={self._group.global_group_id} "
-                f"start={plan.window_start} span={span} "
+                f"start={window_start} span={span} "
                 f"offset={projection.first_token_offset}"
             )
         if projection.required_columns > self._capacity_columns:
@@ -1871,6 +1948,7 @@ class DraftWindowRuntimeState:
         self._active_inputs: DraftMetadataInputs | None = None
         self._last_mapping_epoch = -1
         self._next_generation_id = 0
+        self._last_retired_identity: DraftWindowGenerationIdentity | None = None
 
     def materialize(
         self,
@@ -1920,8 +1998,112 @@ class DraftWindowRuntimeState:
             phase=phase,
             step=step,
         )
+        self._last_retired_identity = None
+        return self._materialize_identity(
+            identity=identity,
+            bound_source=bound_source,
+            read_descriptors=read_descriptors,
+            device_window_exact=device_window_exact,
+            cpu_window_exact=cpu_window_exact,
+            cpu_window_upper=cpu_window_upper,
+            cpu_valid_num_blocks=cpu_valid_num_blocks,
+        )
+
+    def materialize_serialized_step(
+        self,
+        *,
+        previous_identity: DraftWindowGenerationIdentity,
+        ordered_request_ids: Sequence[str],
+        idx_mapping: torch.Tensor,
+        read_descriptors: Sequence[DraftWindowReadDescriptor],
+        device_window_exact: torch.Tensor | None,
+        cpu_window_exact: torch.Tensor,
+        cpu_window_upper: torch.Tensor,
+        cpu_valid_num_blocks: torch.Tensor | None = None,
+        num_reqs_padded: int,
+        step: int,
+        execution_lane: int,
+    ) -> DraftMetadataInputs:
+        """Materialize the next serialized AR step under one mapping epoch.
+
+        The ordinary :meth:`materialize` contract remains strictly monotonic:
+        only this continuation API may reuse a mapping epoch. It requires the
+        immediately preceding generation to have retired successfully, keeps
+        request/source/provider identity fixed, and advances the step by one.
+        This models several Eagle3 forwards within one proposal without lying
+        that the batch mapping changed between those forwards.
+        """
+        if self._active_inputs is not None:
+            raise RuntimeError("cannot refresh a Draft Window while the previous reader is active")
+        if self._last_retired_identity != previous_identity:
+            raise RuntimeError("serialized step does not continue the most recently retired generation")
+        if previous_identity.mapping_epoch != self._last_mapping_epoch:
+            raise RuntimeError("serialized step mapping epoch is not the active proposal epoch")
+        if previous_identity.normalized_method != "eagle3":
+            raise RuntimeError("serialized per-step continuation is supported only for Eagle3")
+        if previous_identity.phase not in (
+            DraftWindowExecutionPhase.PROPOSAL,
+            DraftWindowExecutionPhase.STEP,
+        ):
+            raise RuntimeError("serialized step has an invalid predecessor phase")
+        if step != previous_identity.step + 1:
+            raise RuntimeError(
+                "serialized Draft Window steps must strictly advance by one: "
+                f"previous={previous_identity.step} current={step}"
+            )
+        request_fingerprint = tuple(ordered_request_ids)
+        if request_fingerprint != previous_identity.ordered_request_fingerprint:
+            raise RuntimeError("serialized step request fingerprint changed within one proposal")
+        if num_reqs_padded != previous_identity.padded_request_count:
+            raise RuntimeError("serialized step padded request count changed within one proposal")
+        if execution_lane != previous_identity.execution_lane:
+            raise RuntimeError("serialized step execution lane changed within one proposal")
+
+        descriptor_fingerprint = tuple(read_descriptors)
+        bound_source = self.capability.full_source.bind_batch(idx_mapping)
+        if bound_source.source_identity != previous_identity.source_identity:
+            raise RuntimeError("serialized step FullSource identity changed within one proposal")
+        identity = DraftWindowGenerationIdentity(
+            generation_id=self._next_generation_id,
+            mapping_epoch=previous_identity.mapping_epoch,
+            ordered_request_fingerprint=request_fingerprint,
+            actual_request_count=len(request_fingerprint),
+            padded_request_count=num_reqs_padded,
+            normalized_method=previous_identity.normalized_method,
+            global_group_id=previous_identity.global_group_id,
+            read_descriptor_fingerprint=descriptor_fingerprint,
+            provider_id=previous_identity.provider_id,
+            provider_version=previous_identity.provider_version,
+            source_identity=bound_source.source_identity,
+            execution_lane=execution_lane,
+            phase=DraftWindowExecutionPhase.STEP,
+            step=step,
+        )
+        self._last_retired_identity = None
+        return self._materialize_identity(
+            identity=identity,
+            bound_source=bound_source,
+            read_descriptors=read_descriptors,
+            device_window_exact=device_window_exact,
+            cpu_window_exact=cpu_window_exact,
+            cpu_window_upper=cpu_window_upper,
+            cpu_valid_num_blocks=cpu_valid_num_blocks,
+        )
+
+    def _materialize_identity(
+        self,
+        *,
+        identity: DraftWindowGenerationIdentity,
+        bound_source: FullDraftKVSource,
+        read_descriptors: Sequence[DraftWindowReadDescriptor],
+        device_window_exact: torch.Tensor | None,
+        cpu_window_exact: torch.Tensor,
+        cpu_window_upper: torch.Tensor,
+        cpu_valid_num_blocks: torch.Tensor | None,
+    ) -> DraftMetadataInputs:
+        """Acquire and populate the one serialized backing for an identity."""
         lease = self._lease_pool.acquire(owner=self, identity=identity)
-        self._last_mapping_epoch = mapping_epoch
+        self._last_mapping_epoch = max(self._last_mapping_epoch, identity.mapping_epoch)
         self._next_generation_id += 1
         try:
             self.workspace.materialize(
@@ -2010,6 +2192,7 @@ class DraftWindowRuntimeState:
         self.metadata_store.discard(expected_identity)
         self._lease_pool.retire(lease, expected_identity)
         self._active_inputs = None
+        self._last_retired_identity = expected_identity if lease.state is DraftWindowLeaseState.RETIRED else None
 
     def _abort_active(self, identity: DraftWindowGenerationIdentity) -> None:
         inputs = self._active_inputs
@@ -2019,6 +2202,7 @@ class DraftWindowRuntimeState:
         self.metadata_store.discard_for_abort(identity)
         self._lease_pool.retire(inputs.lease, identity)
         self._active_inputs = None
+        self._last_retired_identity = None
 
     def _require_active_inputs(self, inputs: DraftMetadataInputs) -> None:
         if self._active_inputs is not inputs:
