@@ -37,6 +37,24 @@ class _FakeCompletionToken:
         return self.complete
 
 
+class _RaisingCompletionToken(_FakeCompletionToken):
+    def __init__(self) -> None:
+        super().__init__()
+        self.raise_on_query = True
+
+    def is_complete(self) -> bool:
+        if self.raise_on_query:
+            raise RuntimeError("completion query failed")
+        return super().is_complete()
+
+
+class _SlottedTensorHolder:
+    __slots__ = ("tensor",)
+
+    def __init__(self, tensor: torch.Tensor) -> None:
+        self.tensor = tensor
+
+
 def _runtime_fixture(
     *,
     max_num_reqs: int = 128,
@@ -192,6 +210,27 @@ def test_workspace_reuse_clears_shrunk_rows_and_tails() -> None:
     assert second.cpu_window_exact.tolist() == [32, 0]
 
 
+def test_workspace_materializes_an_empty_batch_without_stale_state() -> None:
+    runtime, _capability, _block_tables = _runtime_fixture()
+
+    inputs = _materialize(
+        runtime,
+        mapping_epoch=1,
+        idx_mapping=torch.empty(0, dtype=torch.int32),
+        request_ids=(),
+        descriptors=(),
+        num_reqs_padded=0,
+        exact=(),
+        upper=(),
+    )
+
+    assert inputs.actual_request_count == 0
+    assert inputs.padded_request_count == 0
+    assert inputs.window_block_table.shape == (0, 3)
+    assert inputs.active_table_columns == ()
+    runtime.retire_generation(inputs.identity)
+
+
 @pytest.mark.parametrize(
     ("change", "message"),
     [
@@ -227,7 +266,11 @@ def test_same_mapping_tensor_rewrite_cannot_reuse_generation_state() -> None:
         idx_mapping=idx_mapping,
         request_ids=("B", "A"),
     )
-    runtime.publish_metadata(generation_a, {"generation": "A"})
+    runtime.publish_metadata(
+        generation_a,
+        {"generation": "A"},
+        target_metadata={},
+    )
 
     idx_mapping.copy_(torch.tensor([4, 17], dtype=torch.int32))
     assert idx_mapping.data_ptr() == pointer
@@ -277,7 +320,7 @@ def test_request_reorder_finish_add_and_same_row_replacement_are_stale(
         read_descriptor_fingerprint=inputs.identity.read_descriptor_fingerprint[: len(fingerprint)],
     )
     payload = {"generation": "original"}
-    runtime.publish_metadata(inputs, payload)
+    runtime.publish_metadata(inputs, payload, target_metadata={})
 
     with pytest.raises(RuntimeError, match="generation identity"):
         inputs.validate_for(stale)
@@ -348,6 +391,33 @@ def test_incomplete_reader_blocks_reuse_until_completion() -> None:
     replacement = _materialize(runtime, mapping_epoch=2)
     assert replacement.lease.state is DraftWindowLeaseState.ACQUIRED
     assert inputs.lease.state is DraftWindowLeaseState.RETIRED
+
+
+def test_completion_query_failure_keeps_lane_owned_and_can_be_retried() -> None:
+    runtime, _capability, _block_tables = _runtime_fixture()
+    inputs = _materialize(runtime, mapping_epoch=1)
+    event = _RaisingCompletionToken()
+    runtime.publish_metadata(
+        inputs,
+        {"generation": "A"},
+        target_metadata={},
+    )
+    runtime.mark_reader_pending(inputs, event)
+
+    with pytest.raises(RuntimeError, match="completion query failed"):
+        runtime.retire_generation(inputs.identity)
+
+    assert inputs.lease.state is DraftWindowLeaseState.READER_PENDING
+    with pytest.raises(RuntimeError, match="no active draft metadata"):
+        runtime.read_metadata(inputs.identity)
+    with pytest.raises(RuntimeError, match="execution lane 0 is still in use"):
+        _materialize(runtime, mapping_epoch=2)
+
+    event.raise_on_query = False
+    event.complete = True
+    runtime.retire_generation(inputs.identity)
+    assert inputs.lease.state is DraftWindowLeaseState.RETIRED
+    assert _materialize(runtime, mapping_epoch=2).identity.mapping_epoch == 2
 
 
 def test_lease_rejects_wrong_generation_double_acquire_and_double_retire() -> None:
@@ -477,6 +547,37 @@ def test_store_rejects_target_nested_alias_and_cleans_generation() -> None:
     assert recovered.identity.mapping_epoch == 2
 
 
+def test_store_requires_target_metadata_and_rejects_none() -> None:
+    runtime, _capability, _block_tables = _runtime_fixture()
+    inputs = _materialize(runtime, mapping_epoch=1)
+
+    with pytest.raises(TypeError, match="target_metadata"):
+        runtime.publish_metadata(inputs, {"draft": []})
+
+    with pytest.raises(ValueError, match="Target metadata is required"):
+        runtime.publish_metadata(
+            inputs,
+            {"draft": []},
+            target_metadata=None,
+        )
+
+    assert _materialize(runtime, mapping_epoch=2).identity.mapping_epoch == 2
+
+
+def test_store_rejects_target_alias_reachable_through_slotted_holder() -> None:
+    runtime, _capability, _block_tables = _runtime_fixture()
+    inputs = _materialize(runtime, mapping_epoch=1)
+    shared = torch.tensor([11], dtype=torch.int32)
+    target = {"holder": _SlottedTensorHolder(shared)}
+    draft = {"holder": _SlottedTensorHolder(shared)}
+
+    with pytest.raises(ValueError, match="mutable storage aliases Target metadata"):
+        runtime.publish_metadata(inputs, draft, target_metadata=target)
+
+    assert target["holder"].tensor is shared
+    assert _materialize(runtime, mapping_epoch=2).identity.mapping_epoch == 2
+
+
 def test_store_isolates_target_identity_and_content_then_invalidates_on_retire() -> None:
     runtime, _capability, _block_tables = _runtime_fixture()
     inputs = _materialize(runtime, mapping_epoch=1)
@@ -496,7 +597,7 @@ def test_store_isolates_target_identity_and_content_then_invalidates_on_retire()
     assert id(target["nested"]) == nested_identity
     assert target["nested"][0]["tensor"].tolist() == [11]
     with pytest.raises(RuntimeError, match="active draft metadata"):
-        runtime.publish_metadata(inputs, {"other": []})
+        runtime.publish_metadata(inputs, {"other": []}, target_metadata=target)
     with pytest.raises(RuntimeError, match="no active draft metadata"):
         runtime.read_metadata(inputs.identity)
 
@@ -505,7 +606,7 @@ def test_store_stale_read_and_wrong_retire_do_not_destroy_active_entry() -> None
     runtime, _capability, _block_tables = _runtime_fixture()
     inputs = _materialize(runtime, mapping_epoch=1)
     payload = {"value": [1]}
-    runtime.publish_metadata(inputs, payload)
+    runtime.publish_metadata(inputs, payload, target_metadata={})
     wrong = replace(inputs.identity, mapping_epoch=2)
 
     with pytest.raises(RuntimeError, match="generation identity"):

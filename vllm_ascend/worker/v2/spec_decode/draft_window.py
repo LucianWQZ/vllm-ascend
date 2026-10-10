@@ -1716,15 +1716,16 @@ class DraftMetadataStore:
         inputs: DraftMetadataInputs,
         metadata: Any,
         *,
-        target_metadata: Any | None = None,
+        target_metadata: Any,
     ) -> None:
         inputs.validate_for(inputs.identity)
         if self._entry is not None:
             raise RuntimeError("cannot overwrite active draft metadata")
-        if target_metadata is not None:
-            shared = _mutable_reference_keys(metadata) & _mutable_reference_keys(target_metadata)
-            if shared:
-                raise ValueError("Draft metadata mutable storage aliases Target metadata")
+        if target_metadata is None:
+            raise ValueError("Target metadata is required for Draft isolation validation")
+        shared = _mutable_reference_keys(metadata) & _mutable_reference_keys(target_metadata)
+        if shared:
+            raise ValueError("Draft metadata mutable storage aliases Target metadata")
         self._entry = _DraftMetadataStoreEntry(inputs=inputs, metadata=metadata)
 
     def read(self, expected_identity: DraftWindowGenerationIdentity) -> Any:
@@ -1781,7 +1782,13 @@ class DraftWindowRuntimeState:
         step: int,
         execution_lane: int,
     ) -> DraftMetadataInputs:
-        """Acquire, bind, and materialize one generation or cleanly fail."""
+        """Acquire, bind, and materialize one generation or cleanly fail.
+
+        ``mapping_epoch`` is the caller's monotonic attestation for the exact
+        ``idx_mapping`` contents supplied to this call.  A future live caller
+        must advance it whenever that mapping generation changes; a pointer,
+        object identity, or unrelated counter is not a valid substitute.
+        """
         _require_nonnegative_python_int(mapping_epoch, "mapping epoch")
         if mapping_epoch <= self._last_mapping_epoch:
             raise ValueError(
@@ -1832,7 +1839,7 @@ class DraftWindowRuntimeState:
         inputs: DraftMetadataInputs,
         metadata: Any,
         *,
-        target_metadata: Any | None = None,
+        target_metadata: Any,
     ) -> None:
         try:
             self._require_active_inputs(inputs)
@@ -2005,10 +2012,26 @@ def _mutable_reference_keys(value: Any) -> set[tuple[str, Any]]:
                 visit(getattr(current, data_field.name))
             return
         values = getattr(current, "__dict__", None)
-        if isinstance(values, dict):
+        slot_names: list[str] = []
+        for owner_type in type(current).__mro__:
+            declared_slots = owner_type.__dict__.get("__slots__", ())
+            if isinstance(declared_slots, str):
+                declared_slots = (declared_slots,)
+            if isinstance(declared_slots, (tuple, list)):
+                slot_names.extend(
+                    name for name in declared_slots if isinstance(name, str) and name not in ("__dict__", "__weakref__")
+                )
+        if isinstance(values, dict) or slot_names:
             keys.add(("object", current_id))
-            for item in values.values():
-                visit(item)
+            if isinstance(values, dict):
+                for item in values.values():
+                    visit(item)
+            for name in slot_names:
+                try:
+                    visit(getattr(current, name))
+                except AttributeError:
+                    # Uninitialized slots carry no reachable mutable state.
+                    continue
 
     visit(value)
     return keys
