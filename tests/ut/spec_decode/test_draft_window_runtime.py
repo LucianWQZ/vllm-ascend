@@ -3,6 +3,7 @@
 """CPU-only contracts for the MRV2 draft-window P3 read plane."""
 
 from dataclasses import FrozenInstanceError, replace
+from enum import Enum
 from types import SimpleNamespace
 from typing import Any
 
@@ -55,11 +56,20 @@ class _SlottedTensorHolder:
         self.tensor = tensor
 
 
+class _ImmutablePhase(Enum):
+    DECODE = "decode"
+
+
 def _runtime_fixture(
     *,
     max_num_reqs: int = 128,
     row_width: int = 8,
 ) -> tuple[Any, Any, SimpleNamespace]:
+    canonical_counts = torch.full(
+        (1, max_num_reqs),
+        row_width,
+        dtype=torch.int32,
+    )
     block_tables = SimpleNamespace(
         block_sizes=[64],
         kernel_block_sizes=[64],
@@ -69,7 +79,10 @@ def _runtime_fixture(
                 row_width,
             )
         ],
-        num_blocks=SimpleNamespace(gpu=torch.full((1, max_num_reqs), row_width, dtype=torch.int32)),
+        num_blocks=SimpleNamespace(
+            gpu=canonical_counts.clone(),
+            cpu=canonical_counts,
+        ),
     )
     group = DraftWindowGroupInventory(
         global_group_id=0,
@@ -184,6 +197,39 @@ def test_workspace_materializes_once_without_aliasing_canonical_source() -> None
     assert not inputs.valid_num_blocks.is_set_to(block_tables.num_blocks.gpu)
     torch.testing.assert_close(block_tables.input_block_tables[0], canonical_table_before)
     torch.testing.assert_close(block_tables.num_blocks.gpu, canonical_counts_before)
+
+
+def test_workspace_same_source_mode_avoids_device_to_host_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, _capability, block_tables = _runtime_fixture()
+    descriptors = (_descriptor(), _descriptor())
+    cpu_exact = torch.tensor([96, 64, 0, 0], dtype=torch.int32)
+    cpu_upper = torch.tensor([128, 64, 0, 0], dtype=torch.int32)
+    cpu_valid = torch.tensor([8, 8, 0, 0], dtype=torch.int32)
+
+    def forbidden_cpu(_tensor: torch.Tensor, *_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("same-source production materialization must not call Tensor.cpu()")
+
+    monkeypatch.setattr(torch.Tensor, "cpu", forbidden_cpu)
+    inputs = runtime.materialize(
+        mapping_epoch=1,
+        ordered_request_ids=("A", "B"),
+        idx_mapping=torch.tensor([17, 93], dtype=torch.int32),
+        read_descriptors=descriptors,
+        device_window_exact=None,
+        cpu_window_exact=cpu_exact,
+        cpu_window_upper=cpu_upper,
+        cpu_valid_num_blocks=cpu_valid,
+        num_reqs_padded=4,
+        phase=DraftWindowExecutionPhase.PROPOSAL,
+        step=0,
+        execution_lane=0,
+    )
+
+    assert inputs.device_window_exact.tolist() == [96, 64, 0, 0]
+    assert inputs.valid_num_blocks.tolist() == [8, 8, 0, 0]
+    assert not inputs.valid_num_blocks.is_set_to(block_tables.num_blocks.gpu)
 
 
 def test_workspace_reuse_clears_shrunk_rows_and_tails() -> None:
@@ -600,6 +646,19 @@ def test_store_isolates_target_identity_and_content_then_invalidates_on_retire()
         runtime.publish_metadata(inputs, {"other": []}, target_metadata=target)
     with pytest.raises(RuntimeError, match="no active draft metadata"):
         runtime.read_metadata(inputs.identity)
+
+
+def test_store_does_not_treat_shared_immutable_enum_as_mutable_alias() -> None:
+    runtime, _capability, _block_tables = _runtime_fixture()
+    inputs = _materialize(runtime, mapping_epoch=1)
+
+    runtime.publish_metadata(
+        inputs,
+        {"phase": _ImmutablePhase.DECODE, "draft": torch.tensor([1])},
+        target_metadata={"phase": _ImmutablePhase.DECODE, "target": torch.tensor([2])},
+    )
+
+    assert runtime.read_metadata(inputs.identity)["phase"] is _ImmutablePhase.DECODE
 
 
 def test_store_stale_read_and_wrong_retire_do_not_destroy_active_entry() -> None:

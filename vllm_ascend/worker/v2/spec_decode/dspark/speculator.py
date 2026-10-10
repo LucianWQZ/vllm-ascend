@@ -41,10 +41,13 @@ from vllm_ascend.worker.v2.spec_decode.draft_window import (
     build_draft_window_runtime_state,
     build_draft_window_source_capability,
 )
+from vllm_ascend.worker.v2.spec_decode.draft_window_eager import (
+    DraftWindowEagerMixin,
+)
 from vllm_ascend.worker.v2.spec_decode.pcp_utils import prepare_replicated_pcp_config
 
 
-class AscendDSparkSpeculator(DSparkSpeculator):
+class AscendDSparkSpeculator(DraftWindowEagerMixin, DSparkSpeculator):
     _speculator_name = "DSpark"
 
     def _configure_draft_window(self, decision: DraftWindowPolicyDecision) -> None:
@@ -76,6 +79,7 @@ class AscendDSparkSpeculator(DSparkSpeculator):
         runtime_state = build_draft_window_runtime_state(capability)
         self._draft_window_source_capability = capability
         self._draft_window_runtime_state = runtime_state
+        self._initialize_draft_window_eager_state()
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         vllm_config, self.replicated_pcp = prepare_replicated_pcp_config(vllm_config)
@@ -227,6 +231,11 @@ class AscendDSparkSpeculator(DSparkSpeculator):
             build_attn_metadata_wrapper(),
             build_draft_attn_metadata_factory(
                 self.input_buffers.positions, self.max_num_tokens, torch.from_numpy(self.input_batch.is_prefilling_np)
+            ),
+            self._draft_window_proposal_scope(
+                input_batch,
+                dummy_run=dummy_run,
+                is_profile=is_profile,
             ),
         ):
             return super().propose(

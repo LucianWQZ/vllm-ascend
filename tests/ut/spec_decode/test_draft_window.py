@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pytest
 import torch
 from vllm.v1.kv_cache_interface import (
@@ -64,6 +65,7 @@ from vllm_ascend.worker.v2.spec_decode.draft_window import (
     compute_visible_length,
     compute_window_capacity_tokens,
     gather_valid_num_blocks,
+    gather_valid_num_blocks_cpu,
     project_direct_prefix,
     resolve_draft_window_policy,
     resolve_static_future_offset,
@@ -435,6 +437,7 @@ def test_forced_off_factory_skips_all_window_downstream_work(
     assert len(warnings) == 1
     assert warning_fragment in warnings[0]
     assert not hasattr(baseline, "_draft_window_runtime_state")
+    assert not hasattr(baseline, "_draft_window_epoch_source")
 
 
 def test_forced_off_warning_is_emitted_once_per_created_speculator(
@@ -902,6 +905,7 @@ def _p2_runtime_context(**changes: Any) -> DraftWindowRuntimeContext:
         sequence_parallel=False,
         dsa_context_parallel=False,
         flashcomm=False,
+        prefix_caching=False,
     )
     return replace(context, **changes)
 
@@ -922,6 +926,7 @@ def _p2_vllm_config(
             pass_config=SimpleNamespace(enable_sp=False),
         ),
         scheduler_config=SimpleNamespace(async_scheduling=False),
+        cache_config=SimpleNamespace(enable_prefix_caching=False),
         parallel_config=SimpleNamespace(
             tensor_parallel_size=1,
             data_parallel_size=1,
@@ -978,7 +983,10 @@ def _block_tables(
             torch.arange(max_num_reqs * row_width, dtype=torch.int32).reshape(max_num_reqs, row_width)
             for _ in range(num_groups)
         ],
-        num_blocks=SimpleNamespace(gpu=torch.zeros((num_groups, max_num_reqs), dtype=torch.int32)),
+        num_blocks=SimpleNamespace(
+            gpu=torch.zeros((num_groups, max_num_reqs), dtype=torch.int32),
+            cpu=torch.zeros((num_groups, max_num_reqs), dtype=torch.int32),
+        ),
         cp_size=1,
         slot_mappings=torch.arange(32, dtype=torch.int32).reshape(num_groups, -1),
         compute_slot_mappings=MagicMock(name="compute_slot_mappings"),
@@ -996,6 +1004,8 @@ class _CpuOnlyBlockTableBuffer:
         device: torch.device | None = None,
     ) -> None:
         self.gpu = torch.zeros(shape, dtype=dtype, device=device or torch.device("cpu"))
+        self.cpu = torch.zeros(shape, dtype=dtype, device="cpu")
+        self.np = self.cpu.numpy()
 
 
 def _inventory(
@@ -1483,6 +1493,40 @@ def test_valid_counts_gather_persistent_rows_into_batch_order_and_clear_padding(
     assert out.tolist() == [6, 4, 5, 0, 0, 0]
 
 
+def test_cpu_valid_counts_follow_canonical_owner_and_rotated_gpu_view() -> None:
+    inventory, _source, block_tables = _inventory_and_source()
+    canonical_cpu = torch.tensor([[1, 4, 2, 6, 3, 5]], dtype=torch.int32)
+    block_tables.num_blocks.cpu.copy_(canonical_cpu)
+    source = build_full_draft_kv_source(
+        inventory=inventory,
+        block_tables=block_tables,
+    )
+    original_identity = source.source_identity
+
+    # UvaBackedTensor rotates its accelerator view. The canonical CPU owner,
+    # not that transient view pointer, is the stable source identity.
+    block_tables.num_blocks.gpu = canonical_cpu.clone()
+    source.validate_owner_bindings()
+    assert source.source_identity == original_identity
+
+    gathered = gather_valid_num_blocks_cpu(
+        source,
+        global_group_id=0,
+        idx_mapping_np=np.array([3, 1, 5], dtype=np.intp),
+        num_reqs=3,
+        num_reqs_padded=5,
+    )
+    assert gathered.tolist() == [6, 4, 5, 0, 0]
+
+
+def test_cpu_valid_counts_reject_replaced_canonical_owner() -> None:
+    _inventory_value, source, block_tables = _inventory_and_source()
+    block_tables.num_blocks.cpu = torch.zeros_like(block_tables.num_blocks.cpu)
+
+    with pytest.raises(RuntimeError, match="canonical persistent num_blocks.cpu"):
+        source.validate_owner_bindings()
+
+
 @pytest.mark.parametrize("alias_kind", ["persistent_counts", "input_table", "idx_mapping"])
 def test_valid_count_output_cannot_alias_borrowed_full_source(
     alias_kind: str,
@@ -1839,6 +1883,7 @@ def test_config_off_owner_does_not_enter_p2_inventory(
 
     assert not hasattr(owner, "_draft_window_source_capability")
     assert not hasattr(owner, "_draft_window_runtime_state")
+    assert not hasattr(owner, "_draft_window_epoch_source")
 
 
 @pytest.mark.parametrize(
@@ -1897,6 +1942,10 @@ def test_eligible_owner_builds_p2_capability_from_set_attn_state(
     assert calls[0]["vllm_config"] is owner.vllm_config
     assert calls[0]["runtime_route"] == runtime_route
     assert calls[0]["causal"] == causal
+    if owner_type in (AscendDFlashSpeculator, AscendDSparkSpeculator):
+        assert hasattr(owner, "_draft_window_epoch_source")
+    else:
+        assert not hasattr(owner, "_draft_window_epoch_source")
 
 
 def test_dflash2_owner_passes_explicit_runtime_route_to_inventory(
@@ -1932,6 +1981,7 @@ def test_dflash2_owner_passes_explicit_runtime_route_to_inventory(
     assert runtime_calls == []
     assert not hasattr(owner, "_draft_window_source_capability")
     assert not hasattr(owner, "_draft_window_runtime_state")
+    assert not hasattr(owner, "_draft_window_epoch_source")
 
 
 @pytest.mark.parametrize(
@@ -1972,6 +2022,7 @@ def test_p3_runtime_initialization_failure_leaves_no_partial_owner_state(
 
     assert not hasattr(owner, "_draft_window_source_capability")
     assert not hasattr(owner, "_draft_window_runtime_state")
+    assert not hasattr(owner, "_draft_window_epoch_source")
 
 
 def test_runtime_context_uses_actual_eager_and_topology_configuration() -> None:
@@ -1997,6 +2048,20 @@ def test_runtime_context_flashcomm_env_fails_closed(
     assert context.flashcomm is True
     inventory = _inventory(runtime_context=context)
     with pytest.raises(NotImplementedError, match="FlashComm"):
+        inventory.require_single_group_direct_prefix()
+
+
+def test_runtime_context_prefix_cache_fails_before_source_and_workspace() -> None:
+    vllm_config = _p2_vllm_config()
+    vllm_config.cache_config.enable_prefix_caching = True
+    context = build_draft_window_runtime_context(
+        vllm_config,
+        SimpleNamespace(cp_size=1),
+    )
+
+    assert context.prefix_caching is True
+    inventory = _inventory(runtime_context=context)
+    with pytest.raises(NotImplementedError, match="prefix cache"):
         inventory.require_single_group_direct_prefix()
 
 

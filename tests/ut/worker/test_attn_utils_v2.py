@@ -905,6 +905,113 @@ class _CaptureStateBuilder(_PrefillStateBuilder):
         return common_attn_metadata.is_prefilling
 
 
+class _CommonMetadataCaptureBuilder:
+    consumes_pcp_context = False
+
+    def __init__(self):
+        self.common_attn_metadata = None
+
+    def build(self, common_prefix_len, common_attn_metadata, **_kwargs):
+        assert common_prefix_len == 0
+        self.common_attn_metadata = common_attn_metadata
+        return common_attn_metadata
+
+
+def _build_with_explicit_cpu_exact(
+    *,
+    seq_lens_cpu: torch.Tensor,
+    seq_lens_cpu_upper_bound: torch.Tensor,
+) -> _CommonMetadataCaptureBuilder:
+    builder = _CommonMetadataCaptureBuilder()
+    attn_group = SimpleNamespace(
+        layer_names=["layer.0"],
+        get_metadata_builder=lambda _: builder,
+    )
+    positions = torch.arange(8, dtype=torch.int64)
+    is_prefilling = torch.tensor([False, False])
+    attn_utils.build_attn_metadata(
+        attn_groups=[[attn_group]],
+        num_reqs=2,
+        num_tokens=8,
+        query_start_loc_gpu=torch.tensor([0, 4, 8], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 4, 8], dtype=torch.int32),
+        max_query_len=4,
+        seq_lens=torch.tensor([96, 64], dtype=torch.int32),
+        max_seq_len=112,
+        block_tables=(torch.zeros((2, 2), dtype=torch.int32),),
+        slot_mappings=(torch.arange(8, dtype=torch.int64),),
+        kv_cache_config=SimpleNamespace(
+            kv_cache_groups=[SimpleNamespace(kv_cache_spec=object())],
+        ),
+        seq_lens_np=np.array([900, 901], dtype=np.int32),
+        seq_lens_cpu=seq_lens_cpu,
+        seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+        positions=positions,
+        is_prefilling=is_prefilling,
+    )
+    assert builder.common_attn_metadata.positions is positions
+    assert builder.common_attn_metadata.is_prefilling is is_prefilling
+    return builder
+
+
+def test_build_attn_metadata_explicit_cpu_exact_seam_preserves_ascend_fields() -> None:
+    cpu_exact = torch.tensor([96, 64], dtype=torch.int32)
+    cpu_upper = torch.tensor([112, 64], dtype=torch.int32)
+
+    builder = _build_with_explicit_cpu_exact(
+        seq_lens_cpu=cpu_exact,
+        seq_lens_cpu_upper_bound=cpu_upper,
+    )
+    common = builder.common_attn_metadata
+
+    assert common.seq_lens_cpu is cpu_exact
+    assert common.seq_lens_cpu_upper_bound is cpu_upper
+    assert common.seq_lens_cpu_is_explicit is True
+    assert common._seq_lens_cpu is None
+
+
+@pytest.mark.parametrize(
+    ("cpu_exact", "cpu_upper", "error", "message"),
+    [
+        (
+            torch.tensor([96.0, 64.0]),
+            torch.tensor([112, 64], dtype=torch.int32),
+            TypeError,
+            "must use int32",
+        ),
+        (
+            torch.tensor([[96, 64]], dtype=torch.int32),
+            torch.tensor([112, 64], dtype=torch.int32),
+            ValueError,
+            "one-dimensional",
+        ),
+        (
+            torch.tensor([96], dtype=torch.int32),
+            torch.tensor([112], dtype=torch.int32),
+            ValueError,
+            "match num_reqs",
+        ),
+        (
+            torch.tensor([96, 64], dtype=torch.int32),
+            torch.tensor([95, 64], dtype=torch.int32),
+            ValueError,
+            "greater than or equal to exact",
+        ),
+    ],
+)
+def test_build_attn_metadata_rejects_invalid_explicit_cpu_exact(
+    cpu_exact: torch.Tensor,
+    cpu_upper: torch.Tensor,
+    error: type[Exception],
+    message: str,
+) -> None:
+    with pytest.raises(error, match=message):
+        _build_with_explicit_cpu_exact(
+            seq_lens_cpu=cpu_exact,
+            seq_lens_cpu_upper_bound=cpu_upper,
+        )
+
+
 @pytest.mark.parametrize("cache_only_backend", [False, True])
 @pytest.mark.parametrize("for_cudagraph_capture", [False, True])
 def test_build_attn_metadata_propagates_prefill_and_pcp_context(monkeypatch, for_cudagraph_capture, cache_only_backend):

@@ -237,6 +237,7 @@ def build_attn_metadata(
     dcp_local_seq_lens: torch.Tensor | None = None,
     # extra attributes for ascend npus.
     seq_lens_np: np.ndarray | None = None,
+    seq_lens_cpu: torch.Tensor | None = None,
     seq_lens_cpu_upper_bound: torch.Tensor | None = None,
     num_computed_tokens_cpu: torch.Tensor | None = None,
     positions: torch.Tensor | None = None,
@@ -255,11 +256,31 @@ def build_attn_metadata(
     # seq_lens_np is used for ascend npus, it maybe None in spec_decode case,
     # we fill it with max_seq_len in case `attn_metadata_builder.build` raise
     # an error.
-    if seq_lens_np is None:
-        seq_lens_np = np.full(num_reqs, max_seq_len, dtype=np.int32)
-    seq_lens_cpu = torch.from_numpy(seq_lens_np)[:num_reqs]
+    seq_lens_cpu_is_explicit = seq_lens_cpu is not None
+    if seq_lens_cpu is None:
+        if seq_lens_np is None:
+            seq_lens_np = np.full(num_reqs, max_seq_len, dtype=np.int32)
+        seq_lens_cpu = torch.from_numpy(seq_lens_np)[:num_reqs]
+    else:
+        if seq_lens_cpu.device.type != "cpu":
+            raise ValueError("explicit seq_lens_cpu must live on CPU")
+        if seq_lens_cpu.dtype != torch.int32:
+            raise TypeError("explicit seq_lens_cpu must use int32")
+        if seq_lens_cpu.ndim != 1:
+            raise ValueError("explicit seq_lens_cpu must be one-dimensional")
+        if seq_lens_cpu.shape[0] != num_reqs:
+            raise ValueError("explicit seq_lens_cpu must match num_reqs")
     if seq_lens_cpu_upper_bound is None:
         seq_lens_cpu_upper_bound = seq_lens_cpu
+    elif seq_lens_cpu_is_explicit:
+        if seq_lens_cpu_upper_bound.device.type != "cpu":
+            raise ValueError("seq_lens_cpu_upper_bound must live on CPU")
+        if seq_lens_cpu_upper_bound.dtype != torch.int32:
+            raise TypeError("seq_lens_cpu_upper_bound must use int32")
+        if seq_lens_cpu_upper_bound.ndim != 1 or seq_lens_cpu_upper_bound.shape[0] != num_reqs:
+            raise ValueError("seq_lens_cpu_upper_bound must match num_reqs")
+        if bool(torch.any(seq_lens_cpu_upper_bound < seq_lens_cpu)):
+            raise ValueError("CPU sequence-length upper must be greater than or equal to exact")
 
     # Upstream speculative-decoding callers do not provide Ascend's separate
     # scheduled-token and padded-input-token counts. Without these fields,
@@ -299,6 +320,7 @@ def build_attn_metadata(
             query_start_loc=query_start_loc_gpu,
             query_start_loc_cpu=query_start_loc_cpu,
             seq_lens_cpu=seq_lens_cpu,
+            seq_lens_cpu_is_explicit=seq_lens_cpu_is_explicit,
             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
             seq_lens=seq_lens[:num_reqs],
             num_reqs=num_reqs,

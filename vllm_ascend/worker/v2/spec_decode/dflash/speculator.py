@@ -24,11 +24,14 @@ from vllm_ascend.worker.v2.spec_decode.draft_window import (
     build_draft_window_runtime_state,
     build_draft_window_source_capability,
 )
+from vllm_ascend.worker.v2.spec_decode.draft_window_eager import (
+    DraftWindowEagerMixin,
+)
 
 logger = logging.getLogger(__name__)
 
 
-class AscendDFlashSpeculator(DFlashSpeculator):
+class AscendDFlashSpeculator(DraftWindowEagerMixin, DFlashSpeculator):
     def _configure_draft_window(self, decision: DraftWindowPolicyDecision) -> None:
         """Attach the eligible P1 policy contract without enabling a window."""
         if decision.state is not DraftWindowPolicyState.ELIGIBLE_ON:
@@ -59,6 +62,7 @@ class AscendDFlashSpeculator(DFlashSpeculator):
         runtime_state = build_draft_window_runtime_state(capability)
         self._draft_window_source_capability = capability
         self._draft_window_runtime_state = runtime_state
+        self._initialize_draft_window_eager_state()
 
     def build_draft_attn_metadatas(self, num_reqs_padded, seq_lens_cpu_upper_bound):
         num_tokens_padded = num_reqs_padded * self.num_query_per_req
@@ -173,7 +177,14 @@ class AscendDFlashSpeculator(DFlashSpeculator):
             # TODO: Remove this guard once main2main includes upstream vLLM
             # #54856 (facd9a74a1), which resets the profiling DP counts.
             sync_state = None
-        with build_attn_metadata_wrapper():
+        with (
+            build_attn_metadata_wrapper(),
+            self._draft_window_proposal_scope(
+                input_batch,
+                dummy_run=dummy_run,
+                is_profile=is_profile,
+            ),
+        ):
             return super().propose(
                 input_batch,
                 attn_metadata,

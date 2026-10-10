@@ -339,6 +339,13 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         elif self.speculative_config and self.speculative_config.parallel_drafting:
             seq_lens = common_attn_metadata.seq_lens
 
+        use_explicit_cpu_exact = bool(
+            self.speculative_config
+            and self.speculative_config.parallel_drafting
+            and common_attn_metadata.seq_lens_cpu_is_explicit
+        )
+        metadata_seq_lens_cpu = common_attn_metadata.seq_lens_cpu[:num_reqs] if use_explicit_cpu_exact else seq_lens
+
         attn_state = common_attn_metadata.attn_state
 
         # Get attn_mask from singleton AttentionMaskBuilder
@@ -348,7 +355,7 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         query_start_loc = query_start_loc_cpu.pin_memory().to(self.device, non_blocking=True)
 
         actual_seq_lengths_q = query_start_loc_cpu[1:].tolist()
-        seq_lens_list = seq_lens.tolist()
+        seq_lens_list = metadata_seq_lens_cpu.tolist()
         # Sequence-parallel (or cudagraph) padding makes the model runner insert a
         # dummy padding request into query_start_loc to satisfy the FIA TND-layout
         # constraint (sum of q lengths == hidden_states.shape[0]), bumping the
@@ -374,6 +381,10 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             padding_len = num_reqs_fia - len(seq_lens_list)
             seq_lens_list = seq_lens_list + [1] * padding_len
             seq_lens = torch.cat([seq_lens, seq_lens.new_ones(padding_len)])
+            if use_explicit_cpu_exact:
+                metadata_seq_lens_cpu = torch.cat([metadata_seq_lens_cpu, metadata_seq_lens_cpu.new_ones(padding_len)])
+            else:
+                metadata_seq_lens_cpu = seq_lens
         if block_table is not None and block_table.shape[0] < num_reqs_fia:
             block_table = torch.cat(
                 [
@@ -397,7 +408,7 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             block_tables=block_table,
             query_start_loc=query_start_loc,
             seq_lens=seq_lens,
-            seq_lens_cpu=seq_lens,
+            seq_lens_cpu=metadata_seq_lens_cpu,
             seq_lens_list=seq_lens_list,
             max_query_len=common_attn_metadata.max_query_len,
             actual_seq_lengths_q=actual_seq_lengths_q,
