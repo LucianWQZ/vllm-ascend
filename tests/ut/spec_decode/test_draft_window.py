@@ -14,6 +14,7 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     SlidingWindowSpec,
 )
+from vllm.v1.worker.gpu import block_table as upstream_block_table
 from vllm.v1.worker.utils import AttentionGroup
 
 import vllm_ascend.worker.v2.spec_decode as spec_decode_factory
@@ -33,6 +34,8 @@ from vllm_ascend.attention.sfa_v1 import (
     AscendSFABackend,
     AscendSFAMetadataBuilder,
 )
+from vllm_ascend.worker.v2 import block_table as ascend_block_table
+from vllm_ascend.worker.v2.block_table import AscendBlockTables
 from vllm_ascend.worker.v2.spec_decode.autoregressive.speculator import (
     AscendAutoRegressiveSpeculator,
 )
@@ -53,6 +56,7 @@ from vllm_ascend.worker.v2.spec_decode.draft_window import (
     SingleGroupDirectPrefixProvider,
     build_draft_window_inventory,
     build_draft_window_runtime_context,
+    build_draft_window_source_capability,
     build_full_draft_kv_source,
     compute_direct_prefix_capacity,
     compute_draft_window_scalar_plan,
@@ -901,6 +905,34 @@ def _p2_runtime_context(**changes: Any) -> DraftWindowRuntimeContext:
     return replace(context, **changes)
 
 
+def _p2_vllm_config(
+    *,
+    configured_k: int = 64,
+    additional_config: dict[str, Any] | None = None,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            enforce_eager=True,
+            num_speculative_tokens=configured_k,
+            uses_dynamic_speculative_decoding=lambda: False,
+        ),
+        compilation_config=SimpleNamespace(
+            cudagraph_mode=SimpleNamespace(name="FULL"),
+            pass_config=SimpleNamespace(enable_sp=False),
+        ),
+        scheduler_config=SimpleNamespace(async_scheduling=False),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=1,
+            data_parallel_size=1,
+            pipeline_parallel_size=1,
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=1,
+            use_sequence_parallel_moe=False,
+        ),
+        additional_config=additional_config or {},
+    )
+
+
 def _full_attention_spec(block_size: int = 64) -> FullAttentionSpec:
     return FullAttentionSpec(
         block_size=block_size,
@@ -950,6 +982,19 @@ def _block_tables(
         slot_mappings=torch.arange(32, dtype=torch.int32).reshape(num_groups, -1),
         compute_slot_mappings=MagicMock(name="compute_slot_mappings"),
     )
+
+
+class _CpuOnlyBlockTableBuffer:
+    """Minimal storage shim that lets the real BlockTables ctor run on CPU."""
+
+    def __init__(
+        self,
+        shape: tuple[int, ...],
+        *,
+        dtype: torch.dtype,
+        device: torch.device | None = None,
+    ) -> None:
+        self.gpu = torch.zeros(shape, dtype=dtype, device=device or torch.device("cpu"))
 
 
 def _inventory(
@@ -1268,6 +1313,24 @@ def test_p2_inventory_fail_closes_unverified_runtime_modes(
         inventory.require_single_group_direct_prefix()
 
 
+def test_failure_free_inventory_invariant_uses_runtime_error() -> None:
+    inventory = _inventory()
+    impossible_group = replace(
+        inventory.groups[0],
+        layout_category=DraftWindowLayoutCategory.UNKNOWN,
+        block_span_tokens=None,
+        capability_failures=(),
+    )
+    forged_inventory = replace(
+        inventory,
+        groups=(impossible_group,),
+        capability_failures=(),
+    )
+
+    with pytest.raises(RuntimeError, match="failure-free inventory"):
+        forged_inventory.require_single_group_direct_prefix()
+
+
 def test_full_source_references_canonical_owners_without_exposing_writes() -> None:
     inventory, source, block_tables = _inventory_and_source()
     table_before = block_tables.input_block_tables[0].clone()
@@ -1291,6 +1354,51 @@ def test_full_source_references_canonical_owners_without_exposing_writes() -> No
     torch.testing.assert_close(block_tables.num_blocks.gpu, counts_before)
     torch.testing.assert_close(block_tables.slot_mappings, slots_before)
     block_tables.compute_slot_mappings.assert_not_called()
+
+
+def test_full_source_contract_with_real_ascend_block_tables(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        upstream_block_table,
+        "StagedWriteTensor",
+        _CpuOnlyBlockTableBuffer,
+    )
+    monkeypatch.setattr(
+        upstream_block_table,
+        "UvaBackedTensor",
+        _CpuOnlyBlockTableBuffer,
+    )
+    monkeypatch.setattr(
+        ascend_block_table.triton,
+        "next_power_of_2",
+        lambda value: 1 << (value - 1).bit_length(),
+        raising=False,
+    )
+    block_tables = AscendBlockTables(
+        block_sizes=[64],
+        max_num_reqs=6,
+        max_num_batched_tokens=32,
+        max_num_blocks_per_group=[8],
+        device=torch.device("cpu"),
+        kernel_block_sizes=[64],
+    )
+    inventory = _inventory(block_tables=block_tables)
+
+    source = build_full_draft_kv_source(
+        inventory=inventory,
+        block_tables=block_tables,
+        idx_mapping=torch.tensor([0, 1], dtype=torch.int64),
+    )
+
+    assert source.references_input_block_table(
+        0,
+        block_tables.input_block_tables[0],
+    )
+    assert source.references_persistent_num_blocks(block_tables.num_blocks.gpu)
+    assert source.logical_block_sizes == tuple(block_tables.block_sizes)
+    assert source.kernel_block_sizes == tuple(block_tables.kernel_block_sizes)
+    assert block_tables.cp_size == 1
 
 
 def test_full_source_detects_canonical_table_replacement() -> None:
@@ -1318,10 +1426,12 @@ def test_full_source_binds_exact_current_batch_mapping_without_copying() -> None
         )
 
     batch_source = static_source.bind_batch(current_idx_mapping)
-    assert not static_source.references_idx_mapping(current_idx_mapping)
+    assert not static_source.references_same_idx_mapping_tensor(current_idx_mapping)
     assert static_source.source_identity.idx_mapping_ptr is None
-    assert batch_source.references_idx_mapping(current_idx_mapping)
+    assert batch_source.references_same_idx_mapping_tensor(current_idx_mapping)
     assert batch_source.source_identity.idx_mapping_ptr == current_idx_mapping.data_ptr()
+    current_idx_mapping.copy_(torch.tensor([1, 3], dtype=torch.int32))
+    assert batch_source.references_same_idx_mapping_tensor(current_idx_mapping)
     assert batch_source.references_input_block_table(
         0,
         block_tables.input_block_tables[0],
@@ -1416,13 +1526,16 @@ def test_valid_count_output_cannot_alias_borrowed_full_source(
     torch.testing.assert_close(idx_mapping, idx_mapping_before)
 
 
-def test_valid_counts_follow_reorder_subset_and_never_reuse_stale_tail() -> None:
+@pytest.mark.parametrize("idx_dtype", [torch.int32, torch.int64])
+def test_valid_counts_follow_reorder_subset_and_never_reuse_stale_tail(
+    idx_dtype: torch.dtype,
+) -> None:
     inventory, _source, block_tables = _inventory_and_source()
     block_tables.num_blocks.gpu[0] = torch.tensor(
         [2, 7, 4, 1, 6, 3],
         dtype=torch.int32,
     )
-    idx_mapping = torch.tensor([4, 1, 2, 0, 0, 0], dtype=torch.int32)
+    idx_mapping = torch.tensor([4, 1, 2, 0, 0, 0], dtype=idx_dtype)
     source = build_full_draft_kv_source(
         inventory=inventory,
         block_tables=block_tables,
@@ -1438,7 +1551,7 @@ def test_valid_counts_follow_reorder_subset_and_never_reuse_stale_tail() -> None
         out=out,
     ).tolist() == [6, 7, 4, 0]
 
-    idx_mapping[:2] = torch.tensor([2, 4], dtype=torch.int32)
+    idx_mapping[:2] = torch.tensor([2, 4], dtype=idx_dtype)
     assert gather_valid_num_blocks(
         source,
         global_group_id=0,
@@ -1472,6 +1585,7 @@ def test_valid_count_does_not_infer_from_zero_block_ids() -> None:
         inventory=inventory,
         full_source=source,
         legacy_block_size=64,
+        expected_future_offset=0,
     )
     descriptor = provider.describe(
         DraftWindowScalarPlan(
@@ -1496,6 +1610,7 @@ def test_provider_returns_read_only_descriptor_at_exact_coverage_boundary() -> N
         inventory=inventory,
         full_source=source,
         legacy_block_size=64,
+        expected_future_offset=64,
     )
 
     descriptor = provider.describe(
@@ -1528,6 +1643,7 @@ def test_provider_non_boundary_projection_uses_canonical_anchor() -> None:
         inventory=inventory,
         full_source=source,
         legacy_block_size=64,
+        expected_future_offset=0,
     )
 
     descriptor = provider.describe(
@@ -1556,6 +1672,7 @@ def test_provider_allows_proven_span_dividing_legacy_geometry() -> None:
         inventory=inventory,
         full_source=source,
         legacy_block_size=64,
+        expected_future_offset=64,
     )
 
     descriptor = provider.describe(
@@ -1583,6 +1700,7 @@ def test_provider_rejects_noncanonical_plan_even_when_group_offset_is_zero() -> 
         inventory=inventory,
         full_source=source,
         legacy_block_size=64,
+        expected_future_offset=0,
     )
     noncanonical_plan = DraftWindowScalarPlan(
         full_exact_end=96,
@@ -1615,6 +1733,7 @@ def test_provider_rejects_span_not_dividing_legacy_without_realigning_anchor() -
             inventory=inventory,
             full_source=source,
             legacy_block_size=64,
+            expected_future_offset=0,
         )
 
 
@@ -1624,6 +1743,7 @@ def test_provider_t10_source_shortage_is_a_hard_error() -> None:
         inventory=inventory,
         full_source=source,
         legacy_block_size=64,
+        expected_future_offset=0,
     )
     plan = DraftWindowScalarPlan(
         full_exact_end=384,
@@ -1650,6 +1770,7 @@ def test_provider_rejects_stale_table_tail_even_when_row_width_is_large() -> Non
         inventory=inventory,
         full_source=source,
         legacy_block_size=64,
+        expected_future_offset=0,
     )
     plan = DraftWindowScalarPlan(
         full_exact_end=384,
@@ -1669,6 +1790,7 @@ def test_provider_detects_canonical_owner_replacement_before_describing() -> Non
         inventory=inventory,
         full_source=source,
         legacy_block_size=64,
+        expected_future_offset=0,
     )
     block_tables.input_block_tables[0] = torch.zeros_like(block_tables.input_block_tables[0])
 
@@ -1790,23 +1912,7 @@ def test_dflash2_owner_passes_explicit_runtime_route_to_inventory(
 
 
 def test_runtime_context_uses_actual_eager_and_topology_configuration() -> None:
-    vllm_config = SimpleNamespace(
-        speculative_config=SimpleNamespace(enforce_eager=True),
-        compilation_config=SimpleNamespace(
-            cudagraph_mode=SimpleNamespace(name="FULL"),
-            pass_config=SimpleNamespace(enable_sp=False),
-        ),
-        scheduler_config=SimpleNamespace(async_scheduling=False),
-        parallel_config=SimpleNamespace(
-            tensor_parallel_size=1,
-            data_parallel_size=1,
-            pipeline_parallel_size=1,
-            prefill_context_parallel_size=1,
-            decode_context_parallel_size=1,
-            use_sequence_parallel_moe=False,
-        ),
-        additional_config={},
-    )
+    vllm_config = _p2_vllm_config()
 
     context = build_draft_window_runtime_context(
         vllm_config,
@@ -1814,3 +1920,43 @@ def test_runtime_context_uses_actual_eager_and_topology_configuration() -> None:
     )
 
     assert context == _p2_runtime_context()
+
+
+def test_runtime_context_flashcomm_env_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLLM_ASCEND_ENABLE_FLASHCOMM1", "1")
+    context = build_draft_window_runtime_context(
+        _p2_vllm_config(),
+        SimpleNamespace(cp_size=1),
+    )
+
+    assert context.flashcomm is True
+    inventory = _inventory(runtime_context=context)
+    with pytest.raises(NotImplementedError, match="FlashComm"):
+        inventory.require_single_group_direct_prefix()
+
+
+def test_eagle3_provider_rejects_plan_offset_that_disagrees_with_configured_k() -> None:
+    block_tables = _block_tables(row_width=8)
+    capability = build_draft_window_source_capability(
+        policy=_p2_policy("eagle3"),
+        runtime_route="eagle3",
+        attn_groups=[[_attention_group()]],
+        block_tables=block_tables,
+        causal=True,
+        vllm_config=_p2_vllm_config(configured_k=64),
+    )
+    mismatched_plan = DraftWindowScalarPlan(
+        full_exact_end=257,
+        full_horizon_end=257,
+        window_start=128,
+        window_visible_length=129,
+        window_capacity_tokens=191,
+    )
+
+    with pytest.raises(ValueError, match=r"configured.*future offset.*64"):
+        capability.provider.describe(
+            mismatched_plan,
+            valid_num_blocks=5,
+        )

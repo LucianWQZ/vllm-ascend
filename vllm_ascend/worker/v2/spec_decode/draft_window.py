@@ -8,6 +8,7 @@ that interval would project onto the canonical full block tables. It still
 does not allocate a window table or connect one to attention.
 """
 
+import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
@@ -24,6 +25,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.worker.utils import AttentionGroup
 
+from vllm_ascend.ascend_config import validate_additional_config_bool
 from vllm_ascend.attention.attention_v1 import (
     AscendAttentionBackend,
     AscendAttentionMetadataBuilder,
@@ -169,7 +171,7 @@ class DraftWindowInventory:
             group.layout_category is not DraftWindowLayoutCategory.DENSE_GQA_DIRECT_PREFIX
             or group.block_span_tokens is None
         ):
-            raise AssertionError("a failure-free inventory must be direct-prefix")
+            raise RuntimeError("a failure-free inventory must be direct-prefix")
         return group
 
 
@@ -188,7 +190,12 @@ def _group_diagnostic_context(
 
 @dataclass(frozen=True, slots=True)
 class DraftWindowSourceIdentity:
-    """Stable P2 binding identity; generation identity is owned by P3."""
+    """Stable P2 owner identity; batch freshness is intentionally not encoded.
+
+    ``idx_mapping_ptr`` identifies one tensor allocation only. An in-place
+    rewrite keeps the same pointer, so P3 must add a caller-owned monotonic
+    batch/generation identity before a bound source can outlive one batch.
+    """
 
     block_tables_owner_id: int
     input_block_table_ptrs: tuple[int, ...]
@@ -236,7 +243,8 @@ class FullDraftKVSource:
     def references_persistent_num_blocks(self, tensor: torch.Tensor) -> bool:
         return self._persistent_num_blocks is tensor
 
-    def references_idx_mapping(self, tensor: torch.Tensor) -> bool:
+    def references_same_idx_mapping_tensor(self, tensor: torch.Tensor) -> bool:
+        """Return whether ``tensor`` is the same object, not whether it is fresh."""
         return self._idx_mapping is tensor
 
     def bind_batch(self, idx_mapping: torch.Tensor) -> "FullDraftKVSource":
@@ -245,7 +253,9 @@ class FullDraftKVSource:
         DFlash and DSpark consume ``input_batch.idx_mapping`` directly instead
         of populating ``DraftModelSpeculator.idx_mapping``. Binding is therefore
         explicit and per batch; no mapping is copied or guessed at set-attn
-        time.
+        time. The returned view is valid only for the caller-defined current
+        batch. P2 cannot detect an in-place rewrite of the mapping tensor and
+        callers must not cache this view across batch/proposal generations.
         """
         _validate_idx_mapping(idx_mapping)
         return FullDraftKVSource(
@@ -305,6 +315,7 @@ class SingleGroupDirectPrefixProvider:
     inventory: DraftWindowInventory
     full_source: FullDraftKVSource
     legacy_block_size: int
+    expected_future_offset: int
     _group: DraftWindowGroupInventory = field(init=False, repr=False)
     _capacity_columns: int = field(init=False, repr=False)
 
@@ -312,6 +323,25 @@ class SingleGroupDirectPrefixProvider:
         group = self.inventory.require_single_group_direct_prefix()
         if self.legacy_block_size <= 0:
             raise ValueError("legacy block size must be greater than 0")
+        if not isinstance(self.expected_future_offset, int) or isinstance(
+            self.expected_future_offset,
+            bool,
+        ):
+            raise TypeError("expected future offset must be a Python int")
+        if self.expected_future_offset < 0:
+            raise ValueError("expected future offset must be greater than or equal to 0")
+        method_future_offset = resolve_static_future_offset(
+            normalized_method=self.inventory.method,
+            configured_k=self.expected_future_offset,
+            uses_dynamic_k=False,
+        )
+        if method_future_offset != self.expected_future_offset:
+            raise ValueError(
+                "configured future offset does not match method semantics: "
+                f"method={self.inventory.method} "
+                f"offset={self.expected_future_offset} "
+                f"expected={method_future_offset}"
+            )
         if group.global_group_id >= self.full_source.num_groups:
             raise RuntimeError(f"inventory gid {group.global_group_id} has no canonical full source")
         self.full_source.validate_owner_bindings()
@@ -359,16 +389,12 @@ class SingleGroupDirectPrefixProvider:
         if plan.full_horizon_end < plan.full_exact_end:
             raise ValueError("scalar plan horizon cannot precede its exact end")
         future_offset = plan.full_horizon_end - plan.full_exact_end
-        method_future_offset = resolve_static_future_offset(
-            normalized_method=self.inventory.method,
-            configured_k=future_offset,
-            uses_dynamic_k=False,
-        )
-        if method_future_offset != future_offset:
+        if future_offset != self.expected_future_offset:
             raise ValueError(
-                "scalar plan future offset does not match method semantics: "
+                "scalar plan future offset does not match configured static "
+                "future offset: "
                 f"method={self.inventory.method} "
-                f"offset={future_offset} expected={method_future_offset}"
+                f"offset={future_offset} expected={self.expected_future_offset}"
             )
         expected_start = compute_legacy_anchor(
             full_context_length=plan.full_exact_end,
@@ -1077,12 +1103,19 @@ def build_draft_window_runtime_context(
     if bool(getattr(speculative_config, "enforce_eager", False)):
         mode_name = "NONE"
     additional_config = getattr(vllm_config, "additional_config", None) or {}
-    pass_config = getattr(compilation_config, "pass_config", None)
-    sequence_parallel = bool(
-        getattr(parallel_config, "use_sequence_parallel_moe", False) or getattr(pass_config, "enable_sp", False)
+    sequence_parallel = bool(getattr(parallel_config, "use_sequence_parallel_moe", False))
+    dsa_context_parallel = validate_additional_config_bool(
+        additional_config.get("enable_dsa_cp", False),
+        "additional_config.enable_dsa_cp",
     )
-    dsa_context_parallel = bool(additional_config.get("enable_dsa_cp", False))
-    flashcomm = bool(additional_config.get("enable_flashcomm1", False) or dsa_context_parallel)
+    flashcomm_explicitly_enabled = validate_additional_config_bool(
+        additional_config.get("enable_flashcomm1", False),
+        "additional_config.enable_flashcomm1",
+    ) or os.getenv("VLLM_ASCEND_ENABLE_FLASHCOMM1", "0").strip().lower() in (
+        "1",
+        "true",
+    )
+    flashcomm = flashcomm_explicitly_enabled or dsa_context_parallel
     return DraftWindowRuntimeContext(
         graph_mode=mode_name,
         async_scheduling=bool(getattr(scheduler_config, "async_scheduling", False)),
@@ -1132,6 +1165,11 @@ def build_draft_window_source_capability(
         # MRV1 aligned its anchor to the first executable draft kernel block.
         # With one verified consumer this is the only legacy anchor quantum.
         legacy_block_size=group.kernel_block_size,
+        expected_future_offset=resolve_static_future_offset(
+            normalized_method=policy.normalized_method,
+            configured_k=int(vllm_config.speculative_config.num_speculative_tokens),
+            uses_dynamic_k=bool(vllm_config.speculative_config.uses_dynamic_speculative_decoding()),
+        ),
     )
     return DraftWindowSourceCapability(
         inventory=inventory,
