@@ -21,6 +21,7 @@ from vllm_ascend.worker.v2.attn_utils import build_attn_metadata_wrapper
 from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftWindowPolicyDecision,
     DraftWindowPolicyState,
+    build_draft_window_runtime_state,
     build_draft_window_source_capability,
 )
 
@@ -37,14 +38,17 @@ class AscendDFlashSpeculator(DFlashSpeculator):
         self._draft_window_policy = decision
 
     def _initialize_draft_window_source_capability(self) -> None:
-        """Bind eligible P2 inventory/source state after attention setup."""
+        """Atomically bind eligible P2 source and P3 ownership state."""
         policy = getattr(self, "_draft_window_policy", None)
         if policy is None:
             return
-        if hasattr(self, "_draft_window_source_capability"):
-            raise RuntimeError("draft-window source capability is already initialized")
+        if hasattr(self, "_draft_window_source_capability") or hasattr(
+            self,
+            "_draft_window_runtime_state",
+        ):
+            raise RuntimeError("draft-window runtime ownership is already initialized")
         runtime_route = self._speculator_name.lower()
-        self._draft_window_source_capability = build_draft_window_source_capability(
+        capability = build_draft_window_source_capability(
             policy=policy,
             runtime_route=runtime_route,
             attn_groups=self.attn_groups,
@@ -52,6 +56,9 @@ class AscendDFlashSpeculator(DFlashSpeculator):
             causal=self._group_causal,
             vllm_config=self.vllm_config,
         )
+        runtime_state = build_draft_window_runtime_state(capability)
+        self._draft_window_source_capability = capability
+        self._draft_window_runtime_state = runtime_state
 
     def build_draft_attn_metadatas(self, num_reqs_padded, seq_lens_cpu_upper_bound):
         num_tokens_padded = num_reqs_padded * self.num_query_per_req

@@ -1,18 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
-"""Policy, scalar planning, and read-only source contracts for draft windows.
+"""Policy, source, and generation-scoped read-plane contracts for draft windows.
 
 P1 decides whether a configured window is eligible and describes its scalar
 interval. P2 inventories the actual draft attention consumers and records how
-that interval would project onto the canonical full block tables. It still
-does not allocate a window table or connect one to attention.
+that interval projects onto the canonical full block tables. P3 owns the
+materialized read state and its lifetime, but still does not connect it to
+attention.
 """
 
 import os
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from dataclasses import dataclass, field, fields, is_dataclass
 from enum import Enum
-from typing import Any
+from typing import Any, Protocol
 
 import torch
 from vllm.v1.kv_cache_interface import (
@@ -370,6 +372,16 @@ class SingleGroupDirectPrefixProvider:
             ) from error
         object.__setattr__(self, "_group", group)
         object.__setattr__(self, "_capacity_columns", capacity_columns)
+
+    @property
+    def global_group_id(self) -> int:
+        """Return the sole executable global cache-group id."""
+        return self._group.global_group_id
+
+    @property
+    def capacity_columns(self) -> int:
+        """Return the fixed narrow-table capacity proven by P2 geometry."""
+        return self._capacity_columns
 
     def describe(
         self,
@@ -1176,3 +1188,827 @@ def build_draft_window_source_capability(
         full_source=full_source,
         provider=provider,
     )
+
+
+class DraftWindowExecutionPhase(Enum):
+    """Typed identity for a future live/capture binding point."""
+
+    PROPOSAL = "proposal"
+    STEP = "step"
+
+
+@dataclass(frozen=True, slots=True)
+class DraftWindowGenerationIdentity:
+    """Immutable freshness identity for one materialized Draft read state.
+
+    ``mapping_epoch`` belongs to the caller.  Pointer and Python-object
+    identity are deliberately only part of ``source_identity`` diagnostics;
+    neither substitutes for the epoch or ordered stable request IDs.
+    """
+
+    generation_id: int
+    mapping_epoch: int
+    ordered_request_fingerprint: tuple[str, ...]
+    actual_request_count: int
+    padded_request_count: int
+    normalized_method: str
+    global_group_id: int
+    read_descriptor_fingerprint: tuple[DraftWindowReadDescriptor, ...]
+    provider_id: int
+    provider_version: int
+    source_identity: DraftWindowSourceIdentity
+    execution_lane: int
+    phase: DraftWindowExecutionPhase
+    step: int
+
+    def __post_init__(self) -> None:
+        _require_nonnegative_python_int(self.generation_id, "generation id")
+        _require_nonnegative_python_int(self.mapping_epoch, "mapping epoch")
+        _require_nonnegative_python_int(self.actual_request_count, "actual request count")
+        _require_nonnegative_python_int(self.padded_request_count, "padded request count")
+        _require_nonnegative_python_int(self.global_group_id, "global group id")
+        _require_nonnegative_python_int(self.execution_lane, "execution lane")
+        _require_nonnegative_python_int(self.step, "step")
+        if self.provider_id <= 0:
+            raise ValueError("provider id must be greater than 0")
+        if self.provider_version <= 0:
+            raise ValueError("provider version must be greater than 0")
+        if self.actual_request_count != len(self.ordered_request_fingerprint):
+            raise ValueError("actual request count must match the ordered request fingerprint")
+        if self.padded_request_count < self.actual_request_count:
+            raise ValueError("padded request count must be at least the actual request count")
+        if len(self.read_descriptor_fingerprint) != self.actual_request_count:
+            raise ValueError("read descriptor fingerprint must match the actual request count")
+        if any(descriptor.global_group_id != self.global_group_id for descriptor in self.read_descriptor_fingerprint):
+            raise ValueError("read descriptor fingerprint must use the generation global gid")
+        if any(not isinstance(request_id, str) or not request_id for request_id in self.ordered_request_fingerprint):
+            raise ValueError("request fingerprint must contain non-empty stable request IDs")
+        if len(set(self.ordered_request_fingerprint)) != len(self.ordered_request_fingerprint):
+            raise ValueError("request fingerprint must contain unique stable request IDs")
+        if not self.normalized_method or self.normalized_method != _normalize_method(self.normalized_method):
+            raise ValueError("normalized method must be a non-empty canonical method name")
+        if not isinstance(self.phase, DraftWindowExecutionPhase):
+            raise TypeError("phase must be a DraftWindowExecutionPhase")
+
+
+class DraftWindowCompletionToken(Protocol):
+    """Minimal completion contract; concrete NPU events remain a later gate."""
+
+    def is_complete(self) -> bool: ...
+
+
+class DraftWindowLeaseState(Enum):
+    """Observable states of the single serialized P3 execution lane."""
+
+    ACQUIRED = "acquired"
+    READER_PENDING = "reader_pending"
+    RETIRED_PENDING = "retired_pending"
+    RETIRED = "retired"
+
+
+class DraftWindowWorkspace:
+    """Fixed-capacity, stable-address backing for one serialized read lane."""
+
+    def __init__(
+        self,
+        *,
+        max_num_reqs: int,
+        table_capacity_columns: int,
+        table_template: torch.Tensor,
+        valid_count_template: torch.Tensor,
+    ) -> None:
+        if max_num_reqs <= 0:
+            raise ValueError("workspace request capacity must be greater than 0")
+        if table_capacity_columns <= 0:
+            raise ValueError("workspace table capacity must be greater than 0")
+        self.max_num_reqs = max_num_reqs
+        self.table_capacity_columns = table_capacity_columns
+        self.window_block_table = table_template.new_zeros((max_num_reqs, table_capacity_columns))
+        self.valid_num_blocks = valid_count_template.new_zeros(max_num_reqs)
+        self.device_window_exact = torch.zeros(
+            max_num_reqs,
+            dtype=torch.int32,
+            device=table_template.device,
+        )
+        self.cpu_window_exact = torch.zeros(max_num_reqs, dtype=torch.int32)
+        self.cpu_window_upper = torch.zeros(max_num_reqs, dtype=torch.int32)
+        self._bound_identity: DraftWindowGenerationIdentity | None = None
+        self._active_table_columns: tuple[int, ...] = ()
+
+    @property
+    def storage_pointers(self) -> tuple[int, ...]:
+        """Expose addresses for stability tests, never as freshness tokens."""
+        return (
+            self.window_block_table.data_ptr(),
+            self.valid_num_blocks.data_ptr(),
+            self.device_window_exact.data_ptr(),
+            self.cpu_window_exact.data_ptr(),
+            self.cpu_window_upper.data_ptr(),
+        )
+
+    @property
+    def bound_identity(self) -> DraftWindowGenerationIdentity | None:
+        return self._bound_identity
+
+    def materialize(
+        self,
+        *,
+        identity: DraftWindowGenerationIdentity,
+        full_source: FullDraftKVSource,
+        read_descriptors: Sequence[DraftWindowReadDescriptor],
+        device_window_exact: torch.Tensor,
+        cpu_window_exact: torch.Tensor,
+        cpu_window_upper: torch.Tensor,
+    ) -> None:
+        """Rewrite all active and inert state from the canonical full source."""
+        if self._bound_identity is not None:
+            raise RuntimeError("workspace is already bound to an active generation")
+        actual = identity.actual_request_count
+        padded = identity.padded_request_count
+        if padded > self.max_num_reqs:
+            raise RuntimeError(f"draft-window request capacity exceeded: padded={padded} capacity={self.max_num_reqs}")
+        if len(read_descriptors) != actual:
+            raise ValueError("read descriptor count must match the actual request count")
+        if tuple(read_descriptors) != identity.read_descriptor_fingerprint:
+            raise RuntimeError("read descriptors do not match the generation fingerprint")
+        _validate_window_length_input(
+            device_window_exact,
+            name="device Window exact",
+            padded_request_count=padded,
+            expected_device=self.device_window_exact.device,
+        )
+        _validate_window_length_input(
+            cpu_window_exact,
+            name="CPU Window exact",
+            padded_request_count=padded,
+            expected_device=torch.device("cpu"),
+        )
+        _validate_window_length_input(
+            cpu_window_upper,
+            name="CPU Window upper",
+            padded_request_count=padded,
+            expected_device=torch.device("cpu"),
+        )
+        workspace_tensors = (
+            self.window_block_table,
+            self.valid_num_blocks,
+            self.device_window_exact,
+            self.cpu_window_exact,
+            self.cpu_window_upper,
+        )
+        if any(
+            _shares_storage(supplied, backing)
+            for supplied in (
+                device_window_exact,
+                cpu_window_exact,
+                cpu_window_upper,
+            )
+            for backing in workspace_tensors
+        ):
+            raise ValueError("Window length inputs must not alias workspace backing")
+        if actual and not torch.equal(
+            device_window_exact[:actual].cpu(),
+            cpu_window_exact[:actual],
+        ):
+            raise ValueError("device and CPU Window exact lengths must agree for active requests")
+        if actual and bool(torch.any(cpu_window_exact[:actual] < 0)):
+            raise ValueError("Window exact lengths must be greater than or equal to 0")
+        if actual and bool(torch.any(cpu_window_upper[:actual] < cpu_window_exact[:actual])):
+            raise ValueError("CPU Window upper must be greater than or equal to exact")
+
+        full_source.validate_owner_bindings()
+        full_source._validate_global_group_id(identity.global_group_id)
+        if full_source.source_identity != identity.source_identity:
+            raise RuntimeError("materialization source identity does not match generation identity")
+        source_table = full_source._input_block_tables[identity.global_group_id]
+        if source_table.device != self.window_block_table.device:
+            raise ValueError("canonical source table and Window workspace must share a device")
+        if source_table.dtype != self.window_block_table.dtype:
+            raise TypeError("canonical source table and Window workspace must share a dtype")
+
+        self._zero_all()
+        try:
+            gather_valid_num_blocks(
+                full_source,
+                global_group_id=identity.global_group_id,
+                num_reqs=actual,
+                num_reqs_padded=padded,
+                out=self.valid_num_blocks,
+            )
+            active_columns: list[int] = []
+            for row, descriptor in enumerate(read_descriptors):
+                if descriptor.global_group_id != identity.global_group_id:
+                    raise ValueError("read descriptor global gid does not match generation identity")
+                if (
+                    descriptor.source_start_column < 0
+                    or descriptor.required_columns < 0
+                    or descriptor.safe_extent_tokens < 0
+                    or descriptor.valid_num_blocks < 0
+                ):
+                    raise ValueError("read descriptor extents must be greater than or equal to 0")
+                if descriptor.first_token_offset != 0:
+                    raise NotImplementedError("P3 supports only direct-prefix descriptors with zero token offset")
+                if descriptor.source_row_width != source_table.shape[1]:
+                    raise RuntimeError("read descriptor source row width is stale")
+                if descriptor.required_columns > self.table_capacity_columns:
+                    raise RuntimeError(
+                        "draft-window table capacity exceeded: "
+                        f"required={descriptor.required_columns} "
+                        f"capacity={self.table_capacity_columns}"
+                    )
+                gathered_valid = int(self.valid_num_blocks[row].item())
+                if gathered_valid > source_table.shape[1]:
+                    raise RuntimeError("current valid block count exceeds the canonical source row width")
+                if descriptor.valid_num_blocks != gathered_valid:
+                    raise RuntimeError(
+                        "read descriptor valid count is stale: "
+                        f"row={row} descriptor={descriptor.valid_num_blocks} "
+                        f"current={gathered_valid}"
+                    )
+                if descriptor.source_end_column > gathered_valid:
+                    raise RuntimeError(
+                        "draft-window source shortage during materialization: "
+                        f"row={row} end={descriptor.source_end_column} "
+                        f"valid={gathered_valid}"
+                    )
+                required = descriptor.required_columns
+                if required:
+                    self.window_block_table[row, :required].copy_(
+                        source_table[
+                            row,
+                            descriptor.source_start_column : descriptor.source_end_column,
+                        ]
+                    )
+                active_columns.append(required)
+            if actual:
+                self.device_window_exact[:actual].copy_(device_window_exact[:actual])
+                self.cpu_window_exact[:actual].copy_(cpu_window_exact[:actual])
+                self.cpu_window_upper[:actual].copy_(cpu_window_upper[:actual])
+            self._active_table_columns = tuple(active_columns)
+            self._bound_identity = identity
+        except BaseException:
+            self._zero_all()
+            raise
+
+    def build_inputs(self, lease: "DraftWindowLease") -> "DraftMetadataInputs":
+        identity = lease.identity
+        self.assert_bound(identity)
+        padded = identity.padded_request_count
+        return DraftMetadataInputs(
+            identity=identity,
+            window_block_table=self.window_block_table[:padded],
+            valid_num_blocks=self.valid_num_blocks[:padded],
+            device_window_exact=self.device_window_exact[:padded],
+            cpu_window_exact=self.cpu_window_exact[:padded],
+            cpu_window_upper=self.cpu_window_upper[:padded],
+            active_table_columns=self._active_table_columns,
+            actual_request_count=identity.actual_request_count,
+            padded_request_count=padded,
+            table_capacity_columns=self.table_capacity_columns,
+            _lease=lease,
+        )
+
+    def assert_bound(self, expected_identity: DraftWindowGenerationIdentity) -> None:
+        if self._bound_identity != expected_identity:
+            raise RuntimeError("workspace generation identity does not match the expected generation")
+
+    def reset(self, expected_identity: DraftWindowGenerationIdentity) -> None:
+        # Validation may fail before materialization binds the identity.  The
+        # lease pool already proved that ``expected_identity`` owns this lane,
+        # so an unbound workspace is safe to clear.  A different bound
+        # generation remains a hard error.
+        if self._bound_identity is not None:
+            self.assert_bound(expected_identity)
+        self._zero_all()
+
+    def _zero_all(self) -> None:
+        self.window_block_table.zero_()
+        self.valid_num_blocks.zero_()
+        self.device_window_exact.zero_()
+        self.cpu_window_exact.zero_()
+        self.cpu_window_upper.zero_()
+        self._active_table_columns = ()
+        self._bound_identity = None
+
+
+class DraftWindowLease:
+    """Generation handle whose retirement is coordinated by its runtime owner."""
+
+    def __init__(
+        self,
+        *,
+        owner: "DraftWindowRuntimeState",
+        identity: DraftWindowGenerationIdentity,
+        workspace: DraftWindowWorkspace,
+    ) -> None:
+        self._owner = owner
+        self.identity = identity
+        self.workspace = workspace
+        self._state = DraftWindowLeaseState.ACQUIRED
+        self._completion_token: DraftWindowCompletionToken | None = None
+
+    @property
+    def state(self) -> DraftWindowLeaseState:
+        return self._state
+
+    def assert_current(self, expected_identity: DraftWindowGenerationIdentity) -> None:
+        if self.identity != expected_identity:
+            raise RuntimeError("lease generation identity does not match the expected generation")
+        if self._state in (
+            DraftWindowLeaseState.RETIRED_PENDING,
+            DraftWindowLeaseState.RETIRED,
+        ):
+            raise RuntimeError("cannot use a retired lease")
+        self.workspace.assert_bound(expected_identity)
+
+    def retire(self, expected_identity: DraftWindowGenerationIdentity) -> None:
+        """Retire through the one runtime owner so store and backing agree."""
+        self._owner._retire_lease(self, expected_identity)
+
+
+class _DraftWindowLeasePool:
+    """One-lane pool; serialized eager is explicit and Async remains gated."""
+
+    def __init__(self, workspace: DraftWindowWorkspace) -> None:
+        self._workspace = workspace
+        self._current: DraftWindowLease | None = None
+
+    def acquire(
+        self,
+        *,
+        owner: "DraftWindowRuntimeState",
+        identity: DraftWindowGenerationIdentity,
+    ) -> DraftWindowLease:
+        self._reclaim_completed_reader()
+        if self._current is not None:
+            raise RuntimeError("draft-window execution lane 0 is still in use")
+        if identity.execution_lane != 0:
+            raise NotImplementedError("P3 supports only serialized execution lane 0")
+        lease = DraftWindowLease(
+            owner=owner,
+            identity=identity,
+            workspace=self._workspace,
+        )
+        self._current = lease
+        return lease
+
+    def require_current(
+        self,
+        lease: DraftWindowLease,
+        expected_identity: DraftWindowGenerationIdentity,
+    ) -> None:
+        if lease.identity != expected_identity:
+            raise RuntimeError("lease generation identity does not match the expected generation")
+        if self._current is not lease:
+            raise RuntimeError("cannot use a retired lease")
+
+    def mark_reader_pending(
+        self,
+        lease: DraftWindowLease,
+        token: DraftWindowCompletionToken,
+    ) -> None:
+        self.require_current(lease, lease.identity)
+        if lease._state is not DraftWindowLeaseState.ACQUIRED:
+            raise RuntimeError("a completion token is already bound to this lease")
+        if not callable(getattr(token, "is_complete", None)):
+            raise TypeError("completion token must implement is_complete()")
+        lease._completion_token = token
+        lease._state = DraftWindowLeaseState.READER_PENDING
+
+    def retire(
+        self,
+        lease: DraftWindowLease,
+        expected_identity: DraftWindowGenerationIdentity,
+    ) -> None:
+        self.require_current(lease, expected_identity)
+        if lease._state is DraftWindowLeaseState.ACQUIRED:
+            self._finish_retirement(lease)
+            return
+        if lease._state is DraftWindowLeaseState.READER_PENDING:
+            token = lease._completion_token
+            assert token is not None
+            if bool(token.is_complete()):
+                self._finish_retirement(lease)
+            else:
+                lease._state = DraftWindowLeaseState.RETIRED_PENDING
+            return
+        raise RuntimeError("cannot retire an already retired lease")
+
+    def _reclaim_completed_reader(self) -> None:
+        lease = self._current
+        if lease is None or lease._state is not DraftWindowLeaseState.RETIRED_PENDING:
+            return
+        token = lease._completion_token
+        assert token is not None
+        if bool(token.is_complete()):
+            self._finish_retirement(lease)
+
+    def _finish_retirement(self, lease: DraftWindowLease) -> None:
+        self._workspace.reset(lease.identity)
+        lease._state = DraftWindowLeaseState.RETIRED
+        self._current = None
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class DraftMetadataInputs:
+    """Immutable typed transport for one workspace binding.
+
+    The tensor references are workspace views protected by ``_lease``.  They
+    are read inputs only: positions, query layout, slot mappings, Target state,
+    and the canonical FullSource owner are intentionally absent.
+    """
+
+    identity: DraftWindowGenerationIdentity
+    window_block_table: torch.Tensor
+    valid_num_blocks: torch.Tensor
+    device_window_exact: torch.Tensor
+    cpu_window_exact: torch.Tensor
+    cpu_window_upper: torch.Tensor
+    active_table_columns: tuple[int, ...]
+    actual_request_count: int
+    padded_request_count: int
+    table_capacity_columns: int
+    _lease: DraftWindowLease = field(repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if self.actual_request_count != self.identity.actual_request_count:
+            raise ValueError("typed inputs actual request count disagrees with identity")
+        if self.padded_request_count != self.identity.padded_request_count:
+            raise ValueError("typed inputs padded request count disagrees with identity")
+        if len(self.active_table_columns) != self.actual_request_count:
+            raise ValueError("active table-column counts must match actual requests")
+        if self.table_capacity_columns <= 0:
+            raise ValueError("typed inputs table capacity must be greater than 0")
+        if any(columns < 0 or columns > self.table_capacity_columns for columns in self.active_table_columns):
+            raise ValueError("active table-column counts exceed typed input capacity")
+        if self.window_block_table.shape != (
+            self.padded_request_count,
+            self.table_capacity_columns,
+        ):
+            raise ValueError("Window table shape does not match padded rows and capacity")
+        for name, tensor in (
+            ("valid counts", self.valid_num_blocks),
+            ("device Window exact", self.device_window_exact),
+            ("CPU Window exact", self.cpu_window_exact),
+            ("CPU Window upper", self.cpu_window_upper),
+        ):
+            if tensor.ndim != 1 or tensor.shape[0] != self.padded_request_count:
+                raise ValueError(f"{name} shape does not match padded request count")
+        if self.valid_num_blocks.dtype != torch.int32:
+            raise TypeError("valid counts must use int32")
+        if self.window_block_table.dtype != torch.int32:
+            raise TypeError("Window block table must use int32")
+        if self.valid_num_blocks.device != self.window_block_table.device:
+            raise ValueError("valid counts and Window block table must share a device")
+        if self.device_window_exact.device != self.window_block_table.device:
+            raise ValueError("device Window exact and Window block table must share a device")
+        for name, tensor in (
+            ("device Window exact", self.device_window_exact),
+            ("CPU Window exact", self.cpu_window_exact),
+            ("CPU Window upper", self.cpu_window_upper),
+        ):
+            if tensor.dtype != torch.int32:
+                raise TypeError(f"{name} must use int32")
+        if self.cpu_window_exact.device.type != "cpu" or self.cpu_window_upper.device.type != "cpu":
+            raise ValueError("CPU Window lengths must live on CPU")
+        if self.actual_request_count and bool(
+            torch.any(
+                self.cpu_window_upper[: self.actual_request_count] < self.cpu_window_exact[: self.actual_request_count]
+            )
+        ):
+            raise ValueError("CPU Window upper must be greater than or equal to exact")
+        if self.padded_request_count > self.actual_request_count:
+            tail = slice(self.actual_request_count, self.padded_request_count)
+            inert_tensors = (
+                self.window_block_table[tail],
+                self.valid_num_blocks[tail],
+                self.device_window_exact[tail],
+                self.cpu_window_exact[tail],
+                self.cpu_window_upper[tail],
+            )
+            if any(bool(tensor.count_nonzero()) for tensor in inert_tensors):
+                raise ValueError("padded Draft metadata rows must be deterministically zero")
+
+    @property
+    def lease(self) -> DraftWindowLease:
+        return self._lease
+
+    def validate_for(self, expected_identity: DraftWindowGenerationIdentity) -> None:
+        if self.identity != expected_identity:
+            raise RuntimeError("typed inputs generation identity does not match the expected generation")
+        self._lease.assert_current(expected_identity)
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class _DraftMetadataStoreEntry:
+    inputs: DraftMetadataInputs
+    metadata: Any
+
+
+class DraftMetadataStore:
+    """Speculator-owned Draft-only metadata sink for one active generation."""
+
+    def __init__(self) -> None:
+        self._entry: _DraftMetadataStoreEntry | None = None
+
+    def publish(
+        self,
+        inputs: DraftMetadataInputs,
+        metadata: Any,
+        *,
+        target_metadata: Any | None = None,
+    ) -> None:
+        inputs.validate_for(inputs.identity)
+        if self._entry is not None:
+            raise RuntimeError("cannot overwrite active draft metadata")
+        if target_metadata is not None:
+            shared = _mutable_reference_keys(metadata) & _mutable_reference_keys(target_metadata)
+            if shared:
+                raise ValueError("Draft metadata mutable storage aliases Target metadata")
+        self._entry = _DraftMetadataStoreEntry(inputs=inputs, metadata=metadata)
+
+    def read(self, expected_identity: DraftWindowGenerationIdentity) -> Any:
+        if self._entry is None:
+            raise RuntimeError("no active draft metadata")
+        self._entry.inputs.validate_for(expected_identity)
+        return self._entry.metadata
+
+    def discard(self, expected_identity: DraftWindowGenerationIdentity) -> None:
+        if self._entry is None:
+            return
+        self._entry.inputs.validate_for(expected_identity)
+        self._entry = None
+
+    def discard_for_abort(self, identity: DraftWindowGenerationIdentity) -> None:
+        if self._entry is None:
+            return
+        if self._entry.inputs.identity != identity:
+            raise RuntimeError("active draft metadata belongs to a different generation")
+        self._entry = None
+
+
+class DraftWindowRuntimeState:
+    """The single speculator-owned P3 lifecycle and retirement owner."""
+
+    PROVIDER_VERSION = 1
+
+    def __init__(
+        self,
+        *,
+        capability: DraftWindowSourceCapability,
+        workspace: DraftWindowWorkspace,
+    ) -> None:
+        self.capability = capability
+        self.workspace = workspace
+        self.metadata_store = DraftMetadataStore()
+        self._lease_pool = _DraftWindowLeasePool(workspace)
+        self._active_inputs: DraftMetadataInputs | None = None
+        self._last_mapping_epoch = -1
+        self._next_generation_id = 0
+
+    def materialize(
+        self,
+        *,
+        mapping_epoch: int,
+        ordered_request_ids: Sequence[str],
+        idx_mapping: torch.Tensor,
+        read_descriptors: Sequence[DraftWindowReadDescriptor],
+        device_window_exact: torch.Tensor,
+        cpu_window_exact: torch.Tensor,
+        cpu_window_upper: torch.Tensor,
+        num_reqs_padded: int,
+        phase: DraftWindowExecutionPhase,
+        step: int,
+        execution_lane: int,
+    ) -> DraftMetadataInputs:
+        """Acquire, bind, and materialize one generation or cleanly fail."""
+        _require_nonnegative_python_int(mapping_epoch, "mapping epoch")
+        if mapping_epoch <= self._last_mapping_epoch:
+            raise ValueError(
+                f"mapping epoch must strictly increase: current={mapping_epoch} previous={self._last_mapping_epoch}"
+            )
+        request_fingerprint = tuple(ordered_request_ids)
+        descriptor_fingerprint = tuple(read_descriptors)
+        actual_request_count = len(request_fingerprint)
+        bound_source = self.capability.full_source.bind_batch(idx_mapping)
+        identity = DraftWindowGenerationIdentity(
+            generation_id=self._next_generation_id,
+            mapping_epoch=mapping_epoch,
+            ordered_request_fingerprint=request_fingerprint,
+            actual_request_count=actual_request_count,
+            padded_request_count=num_reqs_padded,
+            normalized_method=self.capability.inventory.method,
+            global_group_id=self.capability.provider.global_group_id,
+            read_descriptor_fingerprint=descriptor_fingerprint,
+            provider_id=id(self.capability.provider),
+            provider_version=self.PROVIDER_VERSION,
+            source_identity=bound_source.source_identity,
+            execution_lane=execution_lane,
+            phase=phase,
+            step=step,
+        )
+        lease = self._lease_pool.acquire(owner=self, identity=identity)
+        self._last_mapping_epoch = mapping_epoch
+        self._next_generation_id += 1
+        try:
+            self.workspace.materialize(
+                identity=identity,
+                full_source=bound_source,
+                read_descriptors=read_descriptors,
+                device_window_exact=device_window_exact,
+                cpu_window_exact=cpu_window_exact,
+                cpu_window_upper=cpu_window_upper,
+            )
+            inputs = self.workspace.build_inputs(lease)
+            self._active_inputs = inputs
+            return inputs
+        except BaseException:
+            self._lease_pool.retire(lease, identity)
+            self._active_inputs = None
+            raise
+
+    def publish_metadata(
+        self,
+        inputs: DraftMetadataInputs,
+        metadata: Any,
+        *,
+        target_metadata: Any | None = None,
+    ) -> None:
+        try:
+            self._require_active_inputs(inputs)
+            self.metadata_store.publish(
+                inputs,
+                metadata,
+                target_metadata=target_metadata,
+            )
+        except BaseException:
+            if self._active_inputs is inputs:
+                self._abort_active(inputs.identity)
+            raise
+
+    def read_metadata(self, expected_identity: DraftWindowGenerationIdentity) -> Any:
+        return self.metadata_store.read(expected_identity)
+
+    def mark_reader_pending(
+        self,
+        inputs: DraftMetadataInputs,
+        token: DraftWindowCompletionToken,
+    ) -> None:
+        self._require_active_inputs(inputs)
+        self._lease_pool.mark_reader_pending(inputs.lease, token)
+
+    @contextmanager
+    def generation_guard(
+        self,
+        inputs: DraftMetadataInputs,
+    ) -> Iterator[DraftMetadataInputs]:
+        """Abort this generation on an exception without retiring on success."""
+        self._require_active_inputs(inputs)
+        try:
+            yield inputs
+        except BaseException:
+            if self._active_inputs is inputs:
+                self._abort_active(inputs.identity)
+            raise
+
+    def retire_generation(self, expected_identity: DraftWindowGenerationIdentity) -> None:
+        inputs = self._active_inputs
+        if inputs is None:
+            raise RuntimeError("cannot use a retired lease")
+        self._retire_lease(inputs.lease, expected_identity)
+
+    def abort_generation(self, expected_identity: DraftWindowGenerationIdentity) -> None:
+        inputs = self._active_inputs
+        if inputs is None:
+            raise RuntimeError("cannot use a retired lease")
+        inputs.validate_for(expected_identity)
+        self._abort_active(expected_identity)
+
+    def _retire_lease(
+        self,
+        lease: DraftWindowLease,
+        expected_identity: DraftWindowGenerationIdentity,
+    ) -> None:
+        inputs = self._active_inputs
+        if inputs is None or inputs.lease is not lease:
+            raise RuntimeError("cannot use a retired lease")
+        inputs.validate_for(expected_identity)
+        self.metadata_store.discard(expected_identity)
+        self._lease_pool.retire(lease, expected_identity)
+        self._active_inputs = None
+
+    def _abort_active(self, identity: DraftWindowGenerationIdentity) -> None:
+        inputs = self._active_inputs
+        if inputs is None:
+            return
+        inputs.validate_for(identity)
+        self.metadata_store.discard_for_abort(identity)
+        self._lease_pool.retire(inputs.lease, identity)
+        self._active_inputs = None
+
+    def _require_active_inputs(self, inputs: DraftMetadataInputs) -> None:
+        if self._active_inputs is not inputs:
+            raise RuntimeError("typed inputs are not the active runtime generation")
+        inputs.validate_for(inputs.identity)
+
+
+def build_draft_window_runtime_state(
+    capability: DraftWindowSourceCapability,
+) -> DraftWindowRuntimeState:
+    """Allocate P3 state only after P2 has closed all capability gates."""
+    group = capability.inventory.require_single_group_direct_prefix()
+    if group.global_group_id != capability.provider.global_group_id:
+        raise RuntimeError("provider gid does not match the inventory candidate")
+    capability.full_source.validate_owner_bindings()
+    source_table = capability.full_source._input_block_tables[group.global_group_id]
+    persistent_counts = capability.full_source._persistent_num_blocks[group.global_group_id]
+    if source_table.dtype != torch.int32 or persistent_counts.dtype != torch.int32:
+        raise TypeError("P3 dense direct-prefix tables and valid counts must use int32")
+    if source_table.device != persistent_counts.device:
+        raise ValueError("P3 source table and valid counts must share a device")
+    workspace = DraftWindowWorkspace(
+        max_num_reqs=source_table.shape[0],
+        table_capacity_columns=capability.provider.capacity_columns,
+        table_template=source_table,
+        valid_count_template=persistent_counts,
+    )
+    return DraftWindowRuntimeState(
+        capability=capability,
+        workspace=workspace,
+    )
+
+
+def _validate_window_length_input(
+    tensor: torch.Tensor,
+    *,
+    name: str,
+    padded_request_count: int,
+    expected_device: torch.device,
+) -> None:
+    if tensor.ndim != 1:
+        raise ValueError(f"{name} must be one-dimensional")
+    if tensor.shape[0] < padded_request_count:
+        raise ValueError(f"{name} is too small for the padded request count")
+    if tensor.dtype != torch.int32:
+        raise TypeError(f"{name} must use int32")
+    if tensor.device != expected_device:
+        raise ValueError(f"{name} must live on {expected_device}")
+
+
+def _require_nonnegative_python_int(value: int, name: str) -> None:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise TypeError(f"{name} must be a Python int")
+    if value < 0:
+        raise ValueError(f"{name} must be greater than or equal to 0")
+
+
+def _mutable_reference_keys(value: Any) -> set[tuple[str, Any]]:
+    """Collect mutable object/storage identities without retaining Target state."""
+    keys: set[tuple[str, Any]] = set()
+    seen: set[int] = set()
+
+    def visit(current: Any) -> None:
+        if current is None or isinstance(current, (bool, int, float, complex, str, bytes)):
+            return
+        current_id = id(current)
+        if current_id in seen:
+            return
+        seen.add(current_id)
+        if isinstance(current, torch.Tensor):
+            keys.add(("object", current_id))
+            if current.untyped_storage().nbytes():
+                keys.add(
+                    (
+                        "tensor_storage",
+                        (str(current.device), current.untyped_storage().data_ptr()),
+                    )
+                )
+            return
+        if isinstance(current, Mapping):
+            keys.add(("object", current_id))
+            for key, item in current.items():
+                visit(key)
+                visit(item)
+            return
+        if isinstance(current, (list, set, bytearray)):
+            keys.add(("object", current_id))
+            for item in current:
+                visit(item)
+            return
+        if isinstance(current, tuple):
+            for item in current:
+                visit(item)
+            return
+        if is_dataclass(current) and not isinstance(current, type):
+            keys.add(("object", current_id))
+            for data_field in fields(current):
+                visit(getattr(current, data_field.name))
+            return
+        values = getattr(current, "__dict__", None)
+        if isinstance(values, dict):
+            keys.add(("object", current_id))
+            for item in values.values():
+                visit(item)
+
+    visit(value)
+    return keys

@@ -434,6 +434,7 @@ def test_forced_off_factory_skips_all_window_downstream_work(
     assert configured == []
     assert len(warnings) == 1
     assert warning_fragment in warnings[0]
+    assert not hasattr(baseline, "_draft_window_runtime_state")
 
 
 def test_forced_off_warning_is_emitted_once_per_created_speculator(
@@ -1828,10 +1829,16 @@ def test_config_off_owner_does_not_enter_p2_inventory(
         "build_draft_window_source_capability",
         lambda **_kwargs: (_ for _ in ()).throw(AssertionError("CONFIG_OFF/FORCED_OFF must not enter P2")),
     )
+    monkeypatch.setattr(
+        module,
+        "build_draft_window_runtime_state",
+        lambda _capability: (_ for _ in ()).throw(AssertionError("CONFIG_OFF/FORCED_OFF must not enter P3")),
+    )
 
     owner._initialize_draft_window_source_capability()
 
     assert not hasattr(owner, "_draft_window_source_capability")
+    assert not hasattr(owner, "_draft_window_runtime_state")
 
 
 @pytest.mark.parametrize(
@@ -1858,7 +1865,9 @@ def test_eligible_owner_builds_p2_capability_from_set_attn_state(
         owner._group_causal = causal
         owner._speculator_name = runtime_route.capitalize()
     expected_capability = object()
+    expected_runtime_state = object()
     calls: list[dict[str, Any]] = []
+    runtime_calls: list[object] = []
     module = __import__(owner_type.__module__, fromlist=["unused"])
 
     def build_capability(**kwargs: Any) -> object:
@@ -1870,11 +1879,18 @@ def test_eligible_owner_builds_p2_capability_from_set_attn_state(
         "build_draft_window_source_capability",
         build_capability,
     )
+    monkeypatch.setattr(
+        module,
+        "build_draft_window_runtime_state",
+        lambda capability: runtime_calls.append(capability) or expected_runtime_state,
+    )
 
     owner._initialize_draft_window_source_capability()
 
     assert owner._draft_window_source_capability is expected_capability
+    assert owner._draft_window_runtime_state is expected_runtime_state
     assert len(calls) == 1
+    assert runtime_calls == [expected_capability]
     assert calls[0]["policy"] is owner._draft_window_policy
     assert calls[0]["attn_groups"] is owner.attn_groups
     assert calls[0]["block_tables"] is owner.block_tables
@@ -1894,6 +1910,7 @@ def test_dflash2_owner_passes_explicit_runtime_route_to_inventory(
     owner.block_tables = object()
     owner.vllm_config = object()
     seen: dict[str, Any] = {}
+    runtime_calls: list[object] = []
 
     def reject_after_inventory(**kwargs: Any) -> object:
         seen.update(kwargs)
@@ -1903,12 +1920,58 @@ def test_dflash2_owner_passes_explicit_runtime_route_to_inventory(
         "vllm_ascend.worker.v2.spec_decode.dflash.speculator.build_draft_window_source_capability",
         reject_after_inventory,
     )
+    monkeypatch.setattr(
+        "vllm_ascend.worker.v2.spec_decode.dflash.speculator.build_draft_window_runtime_state",
+        lambda capability: runtime_calls.append(capability),
+    )
 
     with pytest.raises(NotImplementedError, match="DFlash2"):
         owner._initialize_draft_window_source_capability()
 
     assert seen["runtime_route"] == "dflash2"
+    assert runtime_calls == []
     assert not hasattr(owner, "_draft_window_source_capability")
+    assert not hasattr(owner, "_draft_window_runtime_state")
+
+
+@pytest.mark.parametrize(
+    "owner_type",
+    [
+        AscendAutoRegressiveSpeculator,
+        AscendDFlashSpeculator,
+        AscendDSparkSpeculator,
+    ],
+)
+def test_p3_runtime_initialization_failure_leaves_no_partial_owner_state(
+    owner_type: type[Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owner = object.__new__(owner_type)
+    owner._draft_window_policy = _p2_policy("eagle3")
+    owner.attn_groups = object()
+    owner.block_tables = object()
+    owner.vllm_config = object()
+    if owner_type is not AscendAutoRegressiveSpeculator:
+        owner._group_causal = True
+        owner._speculator_name = "Eagle3"
+    module = __import__(owner_type.__module__, fromlist=["unused"])
+    capability = object()
+    monkeypatch.setattr(
+        module,
+        "build_draft_window_source_capability",
+        lambda **_kwargs: capability,
+    )
+    monkeypatch.setattr(
+        module,
+        "build_draft_window_runtime_state",
+        lambda _capability: (_ for _ in ()).throw(RuntimeError("allocation failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="allocation failed"):
+        owner._initialize_draft_window_source_capability()
+
+    assert not hasattr(owner, "_draft_window_source_capability")
+    assert not hasattr(owner, "_draft_window_runtime_state")
 
 
 def test_runtime_context_uses_actual_eager_and_topology_configuration() -> None:
