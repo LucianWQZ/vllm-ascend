@@ -612,7 +612,7 @@ def test_mixed_prefill_decode_fails_before_materialization() -> None:
     assert harness._draft_window_runtime_state.workspace.bound_identity is None
 
 
-def test_chunked_prefill_fails_before_materialization() -> None:
+def test_continuing_pure_chunked_prefill_uses_baseline_without_window_state() -> None:
     harness, batch = _harness()
     batch.has_prefill = True
     batch.is_prefilling_np.fill(True)
@@ -620,18 +620,28 @@ def test_chunked_prefill_fails_before_materialization() -> None:
     batch.num_computed_prefill_tokens_np.fill(0)
     batch.num_scheduled_tokens[:] = np.array([4, 4])
 
-    with (
-        pytest.raises(NotImplementedError, match="chunked prefill"),
-        harness._draft_window_proposal_scope(
-            batch,
-            dummy_run=False,
-            is_profile=False,
-        ),
+    with harness._draft_window_proposal_scope(
+        batch,
+        dummy_run=False,
+        is_profile=False,
     ):
-        pass
+        result = harness._build_draft_attn_metadata(
+            num_reqs=2,
+            num_reqs_padded=4,
+            num_tokens_padded=8,
+            seq_lens_cpu_upper_bound=batch.seq_lens_cpu_upper_bound,
+            step=4,
+            causal=False,
+        )
 
+    assert result == {"baseline": True}
+    assert harness.baseline_builder_calls == 1
+    assert harness.builder_events == []
     assert harness._draft_window_epoch_source._next_epoch == 0
+    assert harness._draft_window_proposal_context is None
+    assert harness._draft_window_live_inputs is None
     assert harness._draft_window_runtime_state.workspace.bound_identity is None
+    assert harness._draft_window_runtime_state.metadata_store._entry is None
 
 
 def test_metadata_isolation_clones_nested_target_aliases_without_mutating_target() -> None:

@@ -249,18 +249,18 @@ class DraftWindowEagerMixin:
         if epoch_source is None:
             yield
             return
-        bypass_for_terminal_prefill = False
+        bypass_for_prefill = False
         if not dummy_run and not is_profile:
-            bypass_for_terminal_prefill = _requires_terminal_prefill_baseline_bypass(input_batch)
-        if dummy_run or is_profile or bypass_for_terminal_prefill:
+            bypass_for_prefill = _requires_prefill_baseline_bypass(input_batch)
+        if dummy_run or is_profile or bypass_for_prefill:
             if self._draft_window_bypass_active or self._draft_window_proposal_context is not None:
                 raise RuntimeError("a draft-window proposal scope is already active")
             self._draft_window_bypass_active = True
             try:
-                # Startup/profile and a terminal pure-prefill proposal exercise
-                # the unmodified upstream metadata path without allocating a
-                # production Window generation. Mixed or continuing chunked
-                # prefill is rejected by the classifier above.
+                # Startup/profile and pure-prefill proposals exercise the
+                # unmodified upstream metadata path without allocating a
+                # production Window generation. Mixed prefill/decode remains
+                # unsupported and is rejected by the classifier above.
                 yield
             finally:
                 self._draft_window_bypass_active = False
@@ -549,17 +549,16 @@ def _proposal_fingerprint(
     return request_ids, tuple(int(value) for value in mapping[:num_reqs])
 
 
-def _requires_terminal_prefill_baseline_bypass(
+def _requires_prefill_baseline_bypass(
     input_batch: InputBatch | Any,
 ) -> bool:
-    """Classify the only prefill shape allowed by the P4a decode-only route.
+    """Classify the pure-prefill phase that must use baseline full reads.
 
-    Upstream invokes the speculator after every target step, including the step
-    that completes an ordinary prompt. That terminal pure-prefill proposal must
-    use the baseline full-context metadata path so a Window-enabled request can
-    reach decode. A mixed prefill/decode batch or a batch that remains in
-    prefill after this step is still outside P4a and fails before epoch/workspace
-    creation.
+    Upstream invokes the speculator after every target step, including every
+    chunk of a long prompt and the chunk that completes it. A batch containing
+    only prefill requests uses the baseline full-context metadata path and
+    allocates no Window generation. A mixed prefill/decode batch remains outside
+    the supported route and fails before epoch/workspace creation.
     """
     num_reqs = int(input_batch.num_reqs)
     is_prefilling = np.asarray(input_batch.is_prefilling_np)[:num_reqs]
@@ -573,20 +572,6 @@ def _requires_terminal_prefill_baseline_bypass(
         return False
     if not bool(np.all(is_prefilling)):
         raise NotImplementedError("MRV2 draft-window P4a does not support mixed prefill/decode proposals")
-
-    def active_int_array(name: str) -> np.ndarray:
-        values = np.asarray(getattr(input_batch, name))
-        if values.ndim != 1 or values.shape[0] < num_reqs:
-            raise ValueError(f"{name} does not cover active requests")
-        if not np.issubdtype(values.dtype, np.integer):
-            raise TypeError(f"{name} must contain integers")
-        return values[:num_reqs].astype(np.int64, copy=False)
-
-    computed = active_int_array("num_computed_prefill_tokens_np")
-    scheduled = active_int_array("num_scheduled_tokens")
-    prefill_len = active_int_array("prefill_len_np")
-    if bool(np.any(computed + scheduled < prefill_len)):
-        raise NotImplementedError("MRV2 draft-window P4a does not support continuing chunked prefill proposals")
     return True
 
 

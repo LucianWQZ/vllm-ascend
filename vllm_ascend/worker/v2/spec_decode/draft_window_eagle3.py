@@ -32,7 +32,7 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_eager import (
     AscendDraftAttentionReadInputs,
     DraftWindowProposalContext,
     DraftWindowProposalEpochSource,
-    _requires_terminal_prefill_baseline_bypass,
+    _requires_prefill_baseline_bypass,
 )
 
 
@@ -144,10 +144,10 @@ class Eagle3DraftWindowMixin:
             yield
             return
 
-        bypass_for_terminal_prefill = False
+        bypass_for_prefill = False
         if not dummy_run and not is_profile:
-            bypass_for_terminal_prefill = _requires_terminal_prefill_baseline_bypass(input_batch)
-        if dummy_run or is_profile or bool(getattr(input_batch, "is_dummy", False)) or bypass_for_terminal_prefill:
+            bypass_for_prefill = _requires_prefill_baseline_bypass(input_batch)
+        if dummy_run or is_profile or bool(getattr(input_batch, "is_dummy", False)) or bypass_for_prefill:
             if self._eagle3_window_bypass_active or self._eagle3_window_proposal_context is not None:
                 raise RuntimeError("an Eagle3 Draft Window proposal scope is already active")
             self._eagle3_window_bypass_active = True

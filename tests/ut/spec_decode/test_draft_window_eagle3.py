@@ -16,6 +16,9 @@ import torch
 from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import (
     AutoRegressiveSpeculator,
+    _prepare_decode_inputs_kernel,
+    _prepare_prefill_inputs_kernel,
+    _update_draft_inputs_kernel,
     prepare_decode_inputs,
     prepare_prefill_inputs,
     update_draft_inputs,
@@ -623,6 +626,27 @@ def test_scheduler_prefill_classification_does_not_bypass_decode_first_pass() ->
     assert harness._eagle3_window_epoch_source._next_epoch == 1
 
 
+def test_continuing_pure_chunked_prefill_uses_baseline_without_window_state() -> None:
+    harness, _batch = _lifecycle_harness()
+    batch = _eagle3_input_batch(has_prefill=True)
+    batch.prefill_len_np[:] = 8
+    batch.num_computed_prefill_tokens_np[:] = 0
+    batch.num_scheduled_tokens[:] = 4
+
+    with harness._eagle3_draft_window_proposal_scope(
+        batch,
+        dummy_run=False,
+        is_profile=False,
+    ):
+        assert harness._eagle3_window_bypass_active
+        assert harness._eagle3_window_proposal_context is None
+
+    assert harness._eagle3_window_epoch_source._next_epoch == 0
+    assert harness._eagle3_window_live_inputs is None
+    assert harness._draft_window_runtime_state.workspace.bound_identity is None
+    assert harness._draft_window_runtime_state.metadata_store._entry is None
+
+
 def test_first_pass_freezes_l0_without_device_to_host_snapshot() -> None:
     harness, batch = _lifecycle_harness()
     harness._snapshot_eagle3_decode_step_one = MagicMock()
@@ -929,13 +953,26 @@ def test_eagle3_decode_build_and_forward_retire_each_step_without_baseline_metad
 ) -> None:
     speculator, batch = _integration_speculator()
     forwarded: list[dict[str, Any]] = []
+    builder_inputs: list[dict[str, Any]] = []
+    forward_carriers: list[tuple[list[int], list[int], int]] = []
+    batch.seq_lens_np[0] = 100
+    batch.seq_lens_cpu_upper_bound[0] = 105
+    speculator.input_buffers.seq_lens[0] = 100
 
     def builder(**kwargs: Any) -> dict[str, Any]:
+        builder_inputs.append(
+            {
+                "seq_lens_cpu": kwargs["seq_lens_cpu"].clone(),
+                "seq_lens_cpu_upper_bound": kwargs["seq_lens_cpu_upper_bound"].clone(),
+            }
+        )
         return {
             "draft.layer": SimpleNamespace(
                 attn_state="unset",
                 block_tables=kwargs["block_tables"][0],
                 seq_lens_cpu=kwargs["seq_lens_cpu"],
+                seq_lens_list=kwargs["seq_lens_cpu"].tolist(),
+                actual_seq_lengths_q=kwargs["query_start_loc_cpu"][1:].tolist(),
                 slot_mapping=kwargs["slot_mappings"],
             )
         }
@@ -950,6 +987,14 @@ def test_eagle3_decode_build_and_forward_retire_each_step_without_baseline_metad
         **_kwargs: Any,
     ) -> None:
         forwarded.append(metadata)
+        layer = metadata["draft.layer"]
+        forward_carriers.append(
+            (
+                list(layer.seq_lens_list),
+                list(layer.actual_seq_lengths_q),
+                int(layer.seq_lens_cpu[0]),
+            )
+        )
 
     monkeypatch.setattr(speculator, "_call_eagle3_draft_attn_metadata_builder", builder)
     monkeypatch.setattr(AutoRegressiveSpeculator, "_generate_draft", generate)
@@ -962,7 +1007,7 @@ def test_eagle3_decode_build_and_forward_retire_each_step_without_baseline_metad
     ):
         first = speculator._materialize_eagle3_first_pass(num_reqs=1, num_reqs_padded=1)
         speculator._finish_eagle3_window_step(first, succeeded=True)
-        speculator.input_buffers.seq_lens[0] = 65
+        speculator.input_buffers.seq_lens[0] = 101
         speculator._snapshot_eagle3_decode_step_one(num_reqs=1, num_reqs_padded=1)
 
         for step in (1, 2):
@@ -985,6 +1030,15 @@ def test_eagle3_decode_build_and_forward_retire_each_step_without_baseline_metad
             assert speculator._draft_window_runtime_state.workspace.bound_identity is None
 
     assert len(forwarded) == 2
+    assert [kwargs["seq_lens_cpu"].tolist() for kwargs in builder_inputs] == [[69], [70]]
+    assert [kwargs["seq_lens_cpu_upper_bound"].tolist() for kwargs in builder_inputs] == [[74], [75]]
+    assert [carrier[0] for carrier in forward_carriers] == [[69], [70]]
+    assert [carrier[1] for carrier in forward_carriers] == [[1], [1]]
+    # Baseline full lengths for the same two forwards are 101/102.  The only
+    # read-length delta is the proposal-frozen S=32 Window cap; the optimistic
+    # planning upper is not used as FIA's physical exact carrier.
+    full_exact = [101, 102]
+    assert [full - carrier[2] for full, carrier in zip(full_exact, forward_carriers, strict=True)] == [32, 32]
     speculator._update_decode_attn_metadata.assert_not_called()
 
 
@@ -1185,6 +1239,9 @@ def test_eagle3_upstream_drift_guard_pins_proposal_and_step_contracts() -> None:
         prepare_prefill_inputs: "196900ab1deabb6b75edd084866dc0654657bc9198f7d4825a94515990c0f43f",
         prepare_decode_inputs: "b2340a7c82ffc539865b5c668b9aedfa3a43d85a4b727af1a6310dd1dcd6b681",
         update_draft_inputs: "8571c138376ba65a6d52c021a57ba5026d83e86ec941266902da5116d51cfd28",
+        _prepare_prefill_inputs_kernel: "fc094fbcf36c318670ece79a9cbbde4013966270c30bbba5c435c5778b8e57cc",
+        _prepare_decode_inputs_kernel: "ebd9bbd1817b0d7da3def7442f64a0c82935b8040a528dd5f8554211572c150e",
+        _update_draft_inputs_kernel: "6a01da77eb14e736abc6504c9c1cc53383e4cf92f6bec820bb7b1b42728fcdf1",
     }
 
     assert {function: _upstream_method_ast_sha256(function) for function in expected} == expected

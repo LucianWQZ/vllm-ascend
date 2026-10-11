@@ -287,6 +287,29 @@ def test_parallel_drafting_builder_default_keeps_baseline_device_to_host_source(
     assert metadata.seq_lens_list == [96, 64]
 
 
+def test_autoregressive_window_builder_uses_exact_not_planning_upper() -> None:
+    builder = _parallel_drafting_builder()
+    builder.speculative_config = SimpleNamespace(parallel_drafting=False)
+    device_exact = torch.tensor([69, 0], dtype=torch.int32)
+    cpu_exact = device_exact.clone()
+    cpu_upper = torch.tensor([74, 0], dtype=torch.int32)
+    common = _parallel_drafting_common_metadata(
+        device_exact=device_exact,
+        cpu_exact=cpu_exact,
+        explicit=True,
+    )
+    common.seq_lens_cpu_upper_bound = cpu_upper
+
+    with patch.object(torch.Tensor, "pin_memory", lambda self: self):
+        metadata = builder.build(0, common)
+
+    assert metadata.seq_lens.data_ptr() == cpu_exact.data_ptr()
+    assert metadata.seq_lens_cpu.data_ptr() == cpu_exact.data_ptr()
+    assert metadata.seq_lens_list == [69, 0]
+    assert metadata.seq_lens_list != cpu_upper.tolist()
+    assert metadata.actual_seq_lengths_q == [4, 8]
+
+
 def test_pcp_metadata_keeps_expanded_slot_mapping() -> None:
     builder = AscendAttentionMetadataBuilder.__new__(AscendAttentionMetadataBuilder)
     builder.pcp_size = 2
