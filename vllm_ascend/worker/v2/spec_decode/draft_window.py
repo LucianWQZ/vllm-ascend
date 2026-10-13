@@ -1903,11 +1903,10 @@ class DraftMetadataStore:
         inputs.validate_for(inputs.identity)
         if self._entry is not None:
             raise RuntimeError("cannot overwrite active draft metadata")
-        if target_metadata is None:
-            raise ValueError("Target metadata is required for Draft isolation validation")
-        shared = _mutable_reference_keys(metadata) & _mutable_reference_keys(target_metadata)
-        if shared:
-            raise ValueError("Draft metadata mutable storage aliases Target metadata")
+        validate_draft_metadata_isolation(
+            metadata,
+            target_metadata=target_metadata,
+        )
         self._entry = _DraftMetadataStoreEntry(inputs=inputs, metadata=metadata)
 
     def read(self, expected_identity: DraftWindowGenerationIdentity) -> Any:
@@ -2258,6 +2257,25 @@ def _require_nonnegative_python_int(value: int, name: str) -> None:
         raise TypeError(f"{name} must be a Python int")
     if value < 0:
         raise ValueError(f"{name} must be greater than or equal to 0")
+
+
+def validate_draft_metadata_isolation(
+    metadata: Any,
+    *,
+    target_metadata: Any,
+) -> None:
+    """Reject any mutable object or storage shared with Target metadata.
+
+    P3's store and P6's graph carrier intentionally share this oracle.  The
+    latter builds metadata before graph replay and therefore must enforce the
+    same nested Tensor/NumPy/object isolation contract without publishing
+    through a Target-owned store.
+    """
+    if target_metadata is None:
+        raise ValueError("Target metadata is required for Draft isolation validation")
+    shared = _mutable_reference_keys(metadata) & _mutable_reference_keys(target_metadata)
+    if shared:
+        raise ValueError("Draft metadata mutable storage aliases Target metadata")
 
 
 def _mutable_reference_keys(value: Any) -> set[tuple[str, Any]]:

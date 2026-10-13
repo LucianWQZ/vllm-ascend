@@ -21,7 +21,11 @@ from vllm_ascend.compilation.acl_graph import (
 )
 from vllm_ascend.worker.v2.aclgraph_utils import collect_sorted_captured_token_sizes, model_capture_wrapper
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
+    DraftWindowGraphRoute,
     DraftWindowGraphStage,
+    assert_draft_window_graph_metadata_batch,
+    build_draft_window_graph_update_binding,
+    observe_draft_window_graph_capture,
     observe_draft_window_graph_source,
 )
 from vllm_ascend.worker.v2.utils import communicator_switch
@@ -70,10 +74,7 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
         progress_bar_desc: str = "Capturing CUDA graphs",
     ) -> None:
         """Capture ACL graphs for DFlash."""
-        observe_draft_window_graph_source(
-            self.speculator,
-            DraftWindowGraphStage.CAPTURE,
-        )
+        observe_draft_window_graph_capture(self.speculator)
         with communicator_switch(), model_capture_wrapper(self.speculator, False):
             super().capture(
                 forward_fn,
@@ -97,6 +98,29 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
         draft_attn_metadatas = self.speculator.build_draft_attn_metadatas(
             desc.num_reqs,
             self.speculator.input_batch.seq_lens_cpu_upper_bound,
+        )
+        graph_provider_present = hasattr(
+            self.speculator,
+            "_draft_window_graph_binding_provider",
+        )
+        speculator_name = getattr(self.speculator, "_speculator_name", None)
+        if graph_provider_present and not isinstance(speculator_name, str):
+            raise RuntimeError("Draft Window graph carrier requires an explicit speculator method")
+        graph_route = (
+            DraftWindowGraphRoute.DSPARK
+            if isinstance(speculator_name, str) and speculator_name.lower() == "dspark"
+            else DraftWindowGraphRoute.DFLASH
+        )
+        graph_mode_name = getattr(desc.cg_mode, "name", None)
+        if graph_provider_present and not isinstance(graph_mode_name, str):
+            raise RuntimeError("Draft Window graph carrier requires an explicit graph mode")
+        assert_draft_window_graph_metadata_batch(
+            self.speculator,
+            route=graph_route,
+            draft_attn_metadatas=draft_attn_metadatas,
+            num_reqs=desc.num_reqs,
+            num_tokens=desc.num_tokens,
+            graph_mode=graph_mode_name,
         )
         self.update_stream.wait_stream(torch.npu.current_stream())
         observe_draft_window_graph_source(
@@ -125,9 +149,10 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
             _EXTRA_CTX.is_draft_model = True
             _EXTRA_CTX.is_draft_model_prefill = False
             forward_context = get_forward_context()
-            observe_draft_window_graph_source(
+            graph_update_binding = build_draft_window_graph_update_binding(
                 self.speculator,
-                DraftWindowGraphStage.UPDATE,
+                route=graph_route,
+                draft_attn_metadatas=draft_attn_metadatas,
             )
             update_full_graph_params(
                 # FIXME(Ronald1995): support hybrid attn backend
@@ -138,5 +163,6 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
                 self.vllm_config,
                 self.speculator.speculative_config,
                 draft_attn_metadatas=draft_attn_metadatas,
+                draft_window_graph_update_binding=graph_update_binding,
             )
         return ret

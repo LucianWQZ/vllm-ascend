@@ -27,6 +27,10 @@ from vllm_ascend.worker.v2.spec_decode.draft_window import (
 from vllm_ascend.worker.v2.spec_decode.draft_window_eager import (
     DraftWindowEagerMixin,
 )
+from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
+    DraftWindowGraphRoute,
+    consume_draft_window_graph_metadata,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +69,13 @@ class AscendDFlashSpeculator(DraftWindowEagerMixin, DFlashSpeculator):
         self._initialize_draft_window_eager_state()
 
     def build_draft_attn_metadatas(self, num_reqs_padded, seq_lens_cpu_upper_bound):
+        graph_metadata = consume_draft_window_graph_metadata(
+            self,
+            route=DraftWindowGraphRoute.DFLASH,
+            expected_consumer_count=1,
+        )
+        if graph_metadata is not None:
+            return list(graph_metadata)
         num_tokens_padded = num_reqs_padded * self.num_query_per_req
         with build_attn_metadata_wrapper():
             attn_metadata = self._build_draft_attn_metadata(

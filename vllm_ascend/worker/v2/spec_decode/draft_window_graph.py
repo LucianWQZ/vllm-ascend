@@ -2,20 +2,23 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 """Ascend-only graph binding contracts for the Draft Window read plane.
 
-P5 deliberately does not enable Draft Window graph execution.  It defines the
-instance-owned descriptor and observation seam that P6 can use to test the
-expected P3 backing at live, capture, replay, graph-task update, and consumer
-boundaries.  These Python observations are not evidence that captured graph
-metadata or an NPU attention operator consumed that backing; P6 must establish
-the explicit read-carrier path and verify it on NPU before enabling Graph.
+P5 introduced the instance-owned descriptor and source-observation seam. P6
+adds a separate startup-capture identity namespace, persistent per-consumer
+read carriers, Draft-private metadata validation, and attribution at the real
+backend update entrance. The pinned upstream startup capture still has no safe
+Ascend-only carrier injection point, so capture and the user-visible Graph
+Window route remain fail closed.
 
-The provider never owns tensors.  P3's :class:`DraftWindowWorkspace` remains
-the sole mutable owner: addresses are stable, contents are generation-scoped,
-and every observation revalidates the active P3 lease and full identity.
+The provider owns only its explicitly registered persistent graph-carrier
+buffers. P3's :class:`DraftWindowWorkspace` remains the runtime materialization
+owner. Addresses are stable, contents and generations are explicit, and every
+boundary revalidates identity and ownership. These Python contracts are not
+evidence that an NPU operator consumed the backing.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Protocol
@@ -28,6 +31,7 @@ from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftWindowGenerationIdentity,
     DraftWindowLeaseState,
     DraftWindowRuntimeState,
+    validate_draft_metadata_isolation,
 )
 
 
@@ -51,8 +55,9 @@ class DraftWindowGraphStage(Enum):
 
 
 class DraftWindowGraphConsumerKind(Enum):
-    """Expected future carrier path, not backend-derived consumption proof."""
+    """Consumer kind, unresolved until derived at the backend update entry."""
 
+    UNRESOLVED = "unresolved"
     DIRECT_CAPTURED = "direct_captured"
     TASK_REBOUND = "task_rebound"
     BACKEND_DERIVED = "backend_derived"
@@ -64,6 +69,21 @@ class DraftWindowGraphMetadataOwner(Enum):
     DRAFT_METADATA_STORE = "draft_metadata_store"
     ATTENTION_BACKEND = "attention_backend"
     GRAPH_TASK = "graph_task"
+
+
+class DraftWindowGraphCarrierState(Enum):
+    """Lifecycle of one persistent per-consumer carrier backing."""
+
+    EMPTY = "empty"
+    BOUND = "bound"
+    SUBMITTED = "submitted"
+    UPDATED = "updated"
+
+
+class DraftWindowGraphTimelineStatus(Enum):
+    """What static source order can honestly say about update effectiveness."""
+
+    NEEDS_NPU_TIMELINE = "needs_npu_timeline"
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,6 +109,160 @@ class DraftWindowGraphBackingIdentity:
     device_window_exact: DraftWindowGraphTensorIdentity
     cpu_window_exact: DraftWindowGraphTensorIdentity
     cpu_window_upper: DraftWindowGraphTensorIdentity
+
+
+@dataclass(frozen=True, slots=True)
+class DraftWindowGraphRouteFingerprint:
+    """Complete capture/runtime compatibility key for one graph consumer.
+
+    This value deliberately contains no request generation.  It describes the
+    graph program, topology, cache geometry, and user-visible feature route
+    that must be identical when a later runtime generation binds to a captured
+    operand.
+    """
+
+    method: str
+    route: DraftWindowGraphRoute
+    graph_mode: str
+    backend_impl: str
+    builder_impl: str
+    global_group_id: int
+    layout: str
+    capture_descriptor: str
+    capture_bucket: tuple[int, int]
+    query_width: int
+    padded_request_count: int
+    padded_token_count: int
+    static_k: int
+    window_size: int
+    logical_block_size: int
+    kernel_block_size: int
+    block_span_tokens: int
+    tensor_parallel_size: int
+    data_parallel_size: int
+    pipeline_parallel_size: int
+    prefill_context_parallel_size: int
+    decode_context_parallel_size: int
+    sequence_parallel: bool
+    dsa_context_parallel: bool
+    flashcomm: bool
+    async_scheduling: bool
+    prefix_caching: bool
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.route, DraftWindowGraphRoute):
+            raise TypeError("graph route fingerprint requires a DraftWindowGraphRoute")
+        expected_method = _ROUTE_CONTRACTS[self.route][0]
+        if self.method != expected_method:
+            raise ValueError("graph route fingerprint method does not match its route")
+        if self.graph_mode not in {"FULL", "FULL_DECODE_ONLY", "PIECEWISE"}:
+            raise ValueError("graph route fingerprint requires an explicit graph mode")
+        integer_fields = (
+            ("global gid", self.global_group_id, 0),
+            ("capture request bucket", self.capture_bucket[0], 1),
+            ("capture token bucket", self.capture_bucket[1], 1),
+            ("query width", self.query_width, 1),
+            ("padded request count", self.padded_request_count, 1),
+            ("padded token count", self.padded_token_count, 1),
+            ("static K", self.static_k, 1),
+            ("window size", self.window_size, 1),
+            ("logical block size", self.logical_block_size, 1),
+            ("kernel block size", self.kernel_block_size, 1),
+            ("block span", self.block_span_tokens, 1),
+            ("TP", self.tensor_parallel_size, 1),
+            ("DP", self.data_parallel_size, 1),
+            ("PP", self.pipeline_parallel_size, 1),
+            ("PCP", self.prefill_context_parallel_size, 1),
+            ("DCP", self.decode_context_parallel_size, 1),
+        )
+        for name, value, minimum in integer_fields:
+            if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+                raise ValueError(f"graph route fingerprint {name} is invalid")
+        if self.capture_bucket != (
+            self.padded_request_count,
+            self.padded_token_count,
+        ):
+            raise ValueError("graph route fingerprint capture bucket does not match padded geometry")
+        if not self.capture_descriptor:
+            raise ValueError("graph route fingerprint capture descriptor must be non-empty")
+        if not self.backend_impl or not self.builder_impl:
+            raise ValueError("graph route fingerprint backend and builder must be explicit")
+        if self.route in (
+            DraftWindowGraphRoute.EAGLE3_FIRST_PASS,
+            DraftWindowGraphRoute.DFLASH,
+            DraftWindowGraphRoute.DSPARK,
+        ):
+            expected_tokens = self.padded_request_count * self.query_width
+        else:
+            if self.query_width != 1:
+                raise ValueError("Eagle3 AR graph consumers require query width 1")
+            expected_tokens = self.padded_request_count
+        if self.padded_token_count != expected_tokens:
+            raise ValueError("graph route fingerprint query width does not match padded tokens")
+        unsupported_topology = (
+            self.tensor_parallel_size != 1
+            or self.data_parallel_size != 1
+            or self.pipeline_parallel_size != 1
+            or self.prefill_context_parallel_size != 1
+            or self.decode_context_parallel_size != 1
+            or self.sequence_parallel
+            or self.dsa_context_parallel
+            or self.flashcomm
+            or self.async_scheduling
+            or self.prefix_caching
+        )
+        if unsupported_topology:
+            raise ValueError("graph route fingerprint is outside the P6 single-lane topology")
+
+
+@dataclass(frozen=True, slots=True)
+class DraftWindowGraphCaptureIdentity:
+    """Startup capture identity; never a request-generation surrogate."""
+
+    fingerprint: DraftWindowGraphRouteFingerprint
+    execution_lane: int
+    consumer_ordinal: int
+    provider_schema_version: int
+    backing_identity: DraftWindowGraphBackingIdentity
+
+
+@dataclass(frozen=True, slots=True)
+class DraftWindowGraphReadInputs:
+    """Only the persistent Draft read carrier presented to a metadata builder."""
+
+    window_block_table: torch.Tensor
+    valid_num_blocks: torch.Tensor
+    device_window_exact: torch.Tensor
+    cpu_window_exact: torch.Tensor
+    cpu_window_upper: torch.Tensor
+    actual_request_count: int
+    padded_request_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class DraftWindowGraphBackendAttribution:
+    """Consumer classification derived at the real backend update entrance."""
+
+    consumer_kind: DraftWindowGraphConsumerKind
+    metadata_owner: DraftWindowGraphMetadataOwner
+    backend_class: str
+    backend_impl: str
+    builder_impl: str
+    update_function_path: str
+    global_group_id: int
+    layer_group: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class DraftWindowGraphReplayUpdateTimeline:
+    """Static source-order evidence without inventing an effective replay."""
+
+    status: DraftWindowGraphTimelineStatus
+    materialized_generation_ids: tuple[int, ...]
+    submitted_replay_generation_ids: tuple[int, ...] | None
+    consumer_generation_ids: tuple[int, ...] | None
+    update_source_generation_ids: tuple[int, ...] | None
+    update_effective_generation_ids: tuple[int, ...] | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,6 +310,41 @@ class DraftWindowGraphBindingDescriptor:
     device_window_exact: torch.Tensor
     cpu_window_exact: torch.Tensor
     cpu_window_upper: torch.Tensor
+
+
+@dataclass(slots=True)
+class _DraftWindowGraphCarrierBacking:
+    """Persistent, provider-owned buffers for one captured consumer operand."""
+
+    window_block_table: torch.Tensor
+    valid_num_blocks: torch.Tensor
+    device_window_exact: torch.Tensor
+    cpu_window_exact: torch.Tensor
+    cpu_window_upper: torch.Tensor
+
+
+@dataclass(slots=True)
+class DraftWindowGraphReadCarrier:
+    """One persistent capture operand rebound to explicit runtime metadata."""
+
+    capture_identity: DraftWindowGraphCaptureIdentity
+    read_inputs: DraftWindowGraphReadInputs
+    runtime_identity: DraftWindowGraphBindingIdentity | None = None
+    metadata: Mapping[str, Any] | None = None
+    state: DraftWindowGraphCarrierState = DraftWindowGraphCarrierState.EMPTY
+    backend_attribution: DraftWindowGraphBackendAttribution | None = None
+    table_content_version: int = 0
+    length_content_version: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class DraftWindowGraphUpdateBinding:
+    """Exact submitted carrier set passed to the real backend update seam."""
+
+    provider: DraftWindowGraphBindingProvider
+    route: DraftWindowGraphRoute
+    carriers: tuple[DraftWindowGraphReadCarrier, ...]
+    metadata_object_ids: tuple[int, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -219,6 +428,24 @@ def _workspace_backing_identity(
     )
 
 
+def _carrier_backing_identity(
+    backing: _DraftWindowGraphCarrierBacking,
+) -> DraftWindowGraphBackingIdentity:
+    return DraftWindowGraphBackingIdentity(
+        owner_id=id(backing),
+        window_block_table=_tensor_identity(backing.window_block_table),
+        valid_num_blocks=_tensor_identity(backing.valid_num_blocks),
+        device_window_exact=_tensor_identity(backing.device_window_exact),
+        cpu_window_exact=_tensor_identity(backing.cpu_window_exact),
+        cpu_window_upper=_tensor_identity(backing.cpu_window_upper),
+    )
+
+
+def _class_path(value: type[Any] | Any) -> str:
+    value_type = value if isinstance(value, type) else type(value)
+    return f"{value_type.__module__}.{value_type.__qualname__}"
+
+
 def _shares_storage(left: torch.Tensor, right: torch.Tensor) -> bool:
     if left.device != right.device:
         return False
@@ -243,7 +470,7 @@ def _validate_route(
 
 
 class DraftWindowGraphBindingProvider:
-    """Instance-owned P5 binding/validation seam over one P3 runtime."""
+    """Instance-owned P5/P6 binding and carrier seam over one P3 runtime."""
 
     def __init__(
         self,
@@ -257,6 +484,16 @@ class DraftWindowGraphBindingProvider:
         self._observer = observer
         self._current_descriptor: DraftWindowGraphBindingDescriptor | None = None
         self._current_inputs: DraftMetadataInputs | None = None
+        self._carriers: dict[DraftWindowGraphCaptureIdentity, DraftWindowGraphReadCarrier] = {}
+        self._submitted_carriers: tuple[DraftWindowGraphReadCarrier, ...] = ()
+        self._timeline = DraftWindowGraphReplayUpdateTimeline(
+            status=DraftWindowGraphTimelineStatus.NEEDS_NPU_TIMELINE,
+            materialized_generation_ids=(),
+            submitted_replay_generation_ids=None,
+            consumer_generation_ids=None,
+            update_source_generation_ids=None,
+            update_effective_generation_ids=None,
+        )
         self._sequence = 0
 
     @property
@@ -264,11 +501,597 @@ class DraftWindowGraphBindingProvider:
         return self._observer
 
     @property
+    def timeline(self) -> DraftWindowGraphReplayUpdateTimeline:
+        return self._timeline
+
+    @property
+    def submitted_carriers(self) -> tuple[DraftWindowGraphReadCarrier, ...]:
+        return self._submitted_carriers
+
+    @property
     def current_descriptor(self) -> DraftWindowGraphBindingDescriptor:
         descriptor = self._current_descriptor
         if descriptor is None:
             raise RuntimeError("no active Draft Window graph binding")
         return descriptor
+
+    def register_capture_identity(
+        self,
+        *,
+        fingerprint: DraftWindowGraphRouteFingerprint,
+        execution_lane: int,
+        consumer_ordinal: int,
+    ) -> DraftWindowGraphCaptureIdentity:
+        """Allocate one stable per-consumer backing without a fake request.
+
+        Registration defines the address contract needed by a future safe
+        capture seam.  It does *not* attest that upstream startup capture used
+        this address; :func:`observe_draft_window_graph_capture` continues to
+        reject that claim under the current repository boundary.
+        """
+        if not isinstance(fingerprint, DraftWindowGraphRouteFingerprint):
+            raise TypeError("capture identity requires a graph route fingerprint")
+        for name, value in (
+            ("execution lane", execution_lane),
+            ("consumer ordinal", consumer_ordinal),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"capture identity {name} must be a non-negative integer")
+        if any(
+            registered.capture_identity.fingerprint == fingerprint
+            and registered.capture_identity.execution_lane == execution_lane
+            and registered.capture_identity.consumer_ordinal == consumer_ordinal
+            for registered in self._carriers.values()
+        ):
+            raise RuntimeError("capture consumer identity is already registered")
+        group = self._runtime_state.capability.inventory.require_single_group_direct_prefix()
+        expected = {
+            "method": self._runtime_state.capability.inventory.method,
+            "global gid": group.global_group_id,
+            "layout": group.layout_category.value,
+            "builder": _class_path(group.builder_class),
+            "window size": self._runtime_state.capability.inventory.window_size,
+            "logical block size": group.logical_block_size,
+            "kernel block size": group.kernel_block_size,
+            "block span": group.block_span_tokens,
+        }
+        actual = {
+            "method": fingerprint.method,
+            "global gid": fingerprint.global_group_id,
+            "layout": fingerprint.layout,
+            "builder": fingerprint.builder_impl,
+            "window size": fingerprint.window_size,
+            "logical block size": fingerprint.logical_block_size,
+            "kernel block size": fingerprint.kernel_block_size,
+            "block span": fingerprint.block_span_tokens,
+        }
+        for diagnostic, expected_value in expected.items():
+            if actual[diagnostic] != expected_value:
+                raise RuntimeError(f"capture identity {diagnostic} mismatch")
+
+        workspace = self._runtime_state.workspace
+        padded_reqs = fingerprint.padded_request_count
+        if padded_reqs > workspace.window_block_table.shape[0]:
+            raise RuntimeError("capture request bucket exceeds graph carrier workspace capacity")
+        backing = _DraftWindowGraphCarrierBacking(
+            window_block_table=torch.zeros_like(workspace.window_block_table[:padded_reqs]),
+            valid_num_blocks=torch.zeros_like(workspace.valid_num_blocks[:padded_reqs]),
+            device_window_exact=torch.zeros_like(workspace.device_window_exact[:padded_reqs]),
+            cpu_window_exact=torch.zeros_like(workspace.cpu_window_exact[:padded_reqs]),
+            cpu_window_upper=torch.zeros_like(workspace.cpu_window_upper[:padded_reqs]),
+        )
+        backing_identity = _carrier_backing_identity(backing)
+        capture_identity = DraftWindowGraphCaptureIdentity(
+            fingerprint=fingerprint,
+            execution_lane=execution_lane,
+            consumer_ordinal=consumer_ordinal,
+            provider_schema_version=2,
+            backing_identity=backing_identity,
+        )
+        if capture_identity in self._carriers:
+            raise RuntimeError("capture identity is already registered")
+        read_inputs = DraftWindowGraphReadInputs(
+            window_block_table=backing.window_block_table,
+            valid_num_blocks=backing.valid_num_blocks,
+            device_window_exact=backing.device_window_exact,
+            cpu_window_exact=backing.cpu_window_exact,
+            cpu_window_upper=backing.cpu_window_upper,
+            actual_request_count=0,
+            padded_request_count=fingerprint.padded_request_count,
+        )
+        self._carriers[capture_identity] = DraftWindowGraphReadCarrier(
+            capture_identity=capture_identity,
+            read_inputs=read_inputs,
+        )
+        return capture_identity
+
+    def bind_read_carrier(
+        self,
+        *,
+        capture_identity: DraftWindowGraphCaptureIdentity,
+        inputs: DraftMetadataInputs,
+        proposal_id: int,
+        metadata_builder: Callable[[DraftWindowGraphReadInputs], Mapping[str, Any]],
+        target_metadata: Any,
+    ) -> DraftWindowGraphReadCarrier:
+        """Copy one P3 generation into persistent graph backing and build metadata."""
+        if not isinstance(capture_identity, DraftWindowGraphCaptureIdentity):
+            raise TypeError("graph read carrier requires a capture identity")
+        carrier = self._require_registered_capture(capture_identity)
+        if carrier.state in (
+            DraftWindowGraphCarrierState.BOUND,
+            DraftWindowGraphCarrierState.SUBMITTED,
+        ):
+            raise RuntimeError("cannot overwrite an active Draft Window graph read carrier")
+        if not callable(metadata_builder):
+            raise TypeError("graph metadata builder must be callable")
+        if not isinstance(proposal_id, int) or isinstance(proposal_id, bool) or proposal_id < 0:
+            raise ValueError("graph proposal id must be a non-negative integer")
+
+        generation = inputs.identity
+        inputs.validate_for(generation)
+        if inputs.lease.workspace is not self._runtime_state.workspace:
+            raise RuntimeError("graph carrier inputs do not belong to the provider P3 workspace")
+        _validate_route(capture_identity.fingerprint.route, generation)
+        self._validate_runtime_capture_compatibility(capture_identity, generation)
+        self._runtime_state.capability.full_source.validate_owner_bindings()
+
+        read_inputs = carrier.read_inputs
+        sources_and_destinations = (
+            (inputs.window_block_table, read_inputs.window_block_table),
+            (inputs.valid_num_blocks, read_inputs.valid_num_blocks),
+            (inputs.device_window_exact, read_inputs.device_window_exact),
+            (inputs.cpu_window_exact, read_inputs.cpu_window_exact),
+            (inputs.cpu_window_upper, read_inputs.cpu_window_upper),
+        )
+        for source, destination in sources_and_destinations:
+            if (
+                source.shape != destination.shape
+                or source.dtype != destination.dtype
+                or source.device != destination.device
+            ):
+                raise RuntimeError("runtime generation does not fit capture backing geometry")
+            destination.copy_(source)
+        carrier.read_inputs = DraftWindowGraphReadInputs(
+            window_block_table=read_inputs.window_block_table,
+            valid_num_blocks=read_inputs.valid_num_blocks,
+            device_window_exact=read_inputs.device_window_exact,
+            cpu_window_exact=read_inputs.cpu_window_exact,
+            cpu_window_upper=read_inputs.cpu_window_upper,
+            actual_request_count=generation.actual_request_count,
+            padded_request_count=generation.padded_request_count,
+        )
+        runtime_identity = self._make_binding_identity(
+            generation,
+            proposal_id=proposal_id,
+            route=capture_identity.fingerprint.route,
+        )
+        metadata = metadata_builder(carrier.read_inputs)
+        if not isinstance(metadata, Mapping) or not metadata:
+            raise RuntimeError("explicit Draft Window graph carrier produced no Draft metadata")
+        validate_draft_metadata_isolation(
+            metadata,
+            target_metadata=target_metadata,
+        )
+        self._validate_metadata_uses_carrier(metadata, carrier.read_inputs)
+        self._runtime_state.publish_metadata(
+            inputs,
+            metadata,
+            target_metadata=target_metadata,
+        )
+        metadata = self._runtime_state.read_metadata(generation)
+
+        carrier.runtime_identity = runtime_identity
+        carrier.metadata = metadata
+        carrier.state = DraftWindowGraphCarrierState.BOUND
+        carrier.backend_attribution = None
+        carrier.table_content_version += 1
+        carrier.length_content_version += 1
+        self._submitted_carriers = ()
+        self._timeline = DraftWindowGraphReplayUpdateTimeline(
+            status=DraftWindowGraphTimelineStatus.NEEDS_NPU_TIMELINE,
+            materialized_generation_ids=tuple(
+                registered.runtime_identity.generation_id
+                for registered in self._carriers.values()
+                if registered.state is DraftWindowGraphCarrierState.BOUND and registered.runtime_identity is not None
+            ),
+            submitted_replay_generation_ids=None,
+            consumer_generation_ids=None,
+            update_source_generation_ids=None,
+            update_effective_generation_ids=None,
+        )
+        return carrier
+
+    def consume_metadata(
+        self,
+        *,
+        route: DraftWindowGraphRoute,
+        expected_consumer_count: int,
+    ) -> tuple[Mapping[str, Any], ...]:
+        """Submit exactly one explicit carrier set; baseline metadata is forbidden."""
+        if not isinstance(route, DraftWindowGraphRoute):
+            raise TypeError("graph metadata consumption requires a DraftWindowGraphRoute")
+        if not isinstance(expected_consumer_count, int) or expected_consumer_count <= 0:
+            raise ValueError("expected graph consumer count must be positive")
+        carriers = tuple(
+            sorted(
+                (
+                    carrier
+                    for carrier in self._carriers.values()
+                    if carrier.capture_identity.fingerprint.route is route
+                    and carrier.state is DraftWindowGraphCarrierState.BOUND
+                ),
+                key=lambda carrier: carrier.capture_identity.consumer_ordinal,
+            )
+        )
+        if len(carriers) != expected_consumer_count:
+            raise RuntimeError(
+                "graph Window provider requires an explicit Draft Window graph read carrier "
+                f"for every consumer: route={route.value} expected={expected_consumer_count} actual={len(carriers)}"
+            )
+        ordinals = tuple(carrier.capture_identity.consumer_ordinal for carrier in carriers)
+        if ordinals != tuple(range(expected_consumer_count)):
+            raise RuntimeError("graph read carrier consumer ordinals are not contiguous")
+        identities = tuple(carrier.runtime_identity for carrier in carriers)
+        if any(identity is None for identity in identities):
+            raise RuntimeError("graph read carrier has no runtime generation")
+        typed_identities = tuple(identity for identity in identities if identity is not None)
+        first = typed_identities[0]
+        for identity in typed_identities[1:]:
+            if identity.proposal_id != first.proposal_id:
+                raise RuntimeError("graph read carriers belong to different proposals")
+            if identity.mapping_epoch != first.mapping_epoch:
+                raise RuntimeError("graph read carriers have different mapping_epoch values")
+            if identity.ordered_request_fingerprint != first.ordered_request_fingerprint:
+                raise RuntimeError("graph read carriers have different request fingerprints")
+            if identity.global_group_id != first.global_group_id:
+                raise RuntimeError("graph read carriers have different global gids")
+        metadata = tuple(carrier.metadata for carrier in carriers)
+        if any(entry is None for entry in metadata):
+            raise RuntimeError("graph read carrier has no Draft-private metadata")
+        for carrier in carriers:
+            carrier.state = DraftWindowGraphCarrierState.SUBMITTED
+        self._submitted_carriers = carriers
+        generation_ids = tuple(identity.generation_id for identity in typed_identities)
+        self._timeline = DraftWindowGraphReplayUpdateTimeline(
+            status=DraftWindowGraphTimelineStatus.NEEDS_NPU_TIMELINE,
+            materialized_generation_ids=generation_ids,
+            submitted_replay_generation_ids=generation_ids,
+            consumer_generation_ids=None,
+            update_source_generation_ids=None,
+            update_effective_generation_ids=None,
+        )
+        self._observe_submitted(DraftWindowGraphStage.LIVE)
+        return tuple(entry for entry in metadata if entry is not None)
+
+    def assert_metadata_batch(
+        self,
+        *,
+        route: DraftWindowGraphRoute,
+        draft_attn_metadatas: Sequence[Mapping[str, Any]],
+        num_reqs: int | None = None,
+        num_tokens: int | None = None,
+        graph_mode: str | None = None,
+    ) -> None:
+        carriers = self._require_submitted_route(route)
+        actual_ids = tuple(id(metadata) for metadata in draft_attn_metadatas)
+        expected_ids = tuple(id(carrier.metadata) for carrier in carriers)
+        if actual_ids != expected_ids:
+            raise RuntimeError("baseline or Target-derived metadata cannot replace the explicit graph read carrier")
+        for carrier in carriers:
+            fingerprint = carrier.capture_identity.fingerprint
+            if num_reqs is not None and fingerprint.padded_request_count != num_reqs:
+                raise RuntimeError("graph replay capture bucket request count mismatch")
+            if num_tokens is not None and fingerprint.padded_token_count != num_tokens:
+                raise RuntimeError("graph replay capture bucket token count mismatch")
+            if graph_mode is not None and fingerprint.graph_mode != graph_mode:
+                raise RuntimeError("graph replay mode mismatch")
+
+    def prepare_update_binding(
+        self,
+        *,
+        route: DraftWindowGraphRoute,
+        draft_attn_metadatas: Sequence[Mapping[str, Any]],
+    ) -> DraftWindowGraphUpdateBinding:
+        self.assert_metadata_batch(
+            route=route,
+            draft_attn_metadatas=draft_attn_metadatas,
+        )
+        carriers = self._require_submitted_route(route)
+        return DraftWindowGraphUpdateBinding(
+            provider=self,
+            route=route,
+            carriers=carriers,
+            metadata_object_ids=tuple(id(metadata) for metadata in draft_attn_metadatas),
+        )
+
+    def validate_backend_update(
+        self,
+        binding: DraftWindowGraphUpdateBinding,
+        *,
+        attn_backend: Any,
+        impl_cls: type[Any],
+        builder_cls: type[Any],
+        draft_attn_metadatas: Sequence[Mapping[str, Any]],
+        update_function_path: str,
+    ) -> DraftWindowGraphBackendAttribution:
+        if binding.provider is not self:
+            raise RuntimeError("graph update binding belongs to another provider")
+        carriers = self._require_submitted_route(binding.route)
+        if carriers != binding.carriers:
+            raise RuntimeError("graph update carrier set changed before backend attribution")
+        if tuple(id(metadata) for metadata in draft_attn_metadatas) != binding.metadata_object_ids:
+            raise RuntimeError("graph update metadata differs from the submitted carrier batch")
+
+        backend_cls = attn_backend if isinstance(attn_backend, type) else type(attn_backend)
+        # Only this exact implementation has source-verified per-task rebinding
+        # of Draft block_tables and read lengths in P6. Subclasses/other
+        # backends must be inventoried independently instead of inheriting the
+        # classification by name.
+        from vllm_ascend.attention.attention_v1 import AscendAttentionBackendImpl
+
+        if impl_cls is not AscendAttentionBackendImpl:
+            raise RuntimeError("graph backend consumer classification is unresolved")
+        expected_update_path = "vllm_ascend.compilation.acl_graph.update_full_graph_params"
+        if update_function_path != expected_update_path:
+            raise RuntimeError("graph update function identity mismatch")
+
+        first_fingerprint = carriers[0].capture_identity.fingerprint
+        actual_backend_impl = _class_path(impl_cls)
+        actual_builder_impl = _class_path(builder_cls)
+        if actual_backend_impl != first_fingerprint.backend_impl:
+            raise RuntimeError("graph route fingerprint backend mismatch")
+        if actual_builder_impl != first_fingerprint.builder_impl:
+            raise RuntimeError("graph route fingerprint builder mismatch")
+        if any(
+            carrier.capture_identity.fingerprint.backend_impl != actual_backend_impl
+            or carrier.capture_identity.fingerprint.builder_impl != actual_builder_impl
+            for carrier in carriers
+        ):
+            raise RuntimeError("per-consumer backend or builder identity mismatch")
+
+        group = self._runtime_state.capability.inventory.require_single_group_direct_prefix()
+        expected_layers = set(group.layer_names)
+        for metadata in draft_attn_metadatas:
+            metadata_layers = set(metadata)
+            if not metadata_layers or not metadata_layers.issubset(expected_layers):
+                raise RuntimeError("Draft graph metadata layer group does not match backend inventory")
+        for carrier in carriers:
+            assert carrier.metadata is not None
+            self._validate_metadata_uses_carrier(
+                carrier.metadata,
+                carrier.read_inputs,
+            )
+        attribution = DraftWindowGraphBackendAttribution(
+            consumer_kind=DraftWindowGraphConsumerKind.TASK_REBOUND,
+            metadata_owner=DraftWindowGraphMetadataOwner.GRAPH_TASK,
+            backend_class=_class_path(backend_cls),
+            backend_impl=actual_backend_impl,
+            builder_impl=actual_builder_impl,
+            update_function_path=update_function_path,
+            global_group_id=group.global_group_id,
+            layer_group=group.layer_names,
+        )
+        for carrier in carriers:
+            carrier.backend_attribution = attribution
+            carrier.state = DraftWindowGraphCarrierState.UPDATED
+        generation_ids = tuple(
+            carrier.runtime_identity.generation_id for carrier in carriers if carrier.runtime_identity is not None
+        )
+        self._timeline = DraftWindowGraphReplayUpdateTimeline(
+            status=DraftWindowGraphTimelineStatus.NEEDS_NPU_TIMELINE,
+            materialized_generation_ids=generation_ids,
+            submitted_replay_generation_ids=generation_ids,
+            consumer_generation_ids=None,
+            update_source_generation_ids=generation_ids,
+            update_effective_generation_ids=None,
+        )
+        self._observe_submitted(DraftWindowGraphStage.UPDATE)
+        return attribution
+
+    def require_runtime_identity(
+        self,
+        expected: DraftWindowGenerationIdentity,
+    ) -> DraftWindowGraphReadCarrier:
+        for carrier in self._carriers.values():
+            runtime_identity = carrier.runtime_identity
+            if runtime_identity is not None and runtime_identity.generation_id == expected.generation_id:
+                if runtime_identity.mapping_epoch != expected.mapping_epoch:
+                    break
+                return carrier
+        raise RuntimeError("stale runtime binding is not active in the graph carrier bank")
+
+    def assert_update_effective_for(self, generation_id: int) -> None:
+        del generation_id
+        raise RuntimeError("effective graph update generation requires NPU timeline evidence")
+
+    def discard_bound_carriers(self) -> None:
+        """Release submitted/bound identities without replacing stable buffers."""
+        for carrier in self._carriers.values():
+            if carrier.state in (
+                DraftWindowGraphCarrierState.BOUND,
+                DraftWindowGraphCarrierState.SUBMITTED,
+            ):
+                carrier.state = DraftWindowGraphCarrierState.UPDATED
+                carrier.metadata = None
+        self._submitted_carriers = ()
+
+    def _require_registered_capture(
+        self,
+        capture_identity: DraftWindowGraphCaptureIdentity,
+    ) -> DraftWindowGraphReadCarrier:
+        carrier = self._carriers.get(capture_identity)
+        if carrier is not None:
+            return carrier
+        candidates = tuple(
+            registered
+            for registered in self._carriers.values()
+            if registered.capture_identity.backing_identity == capture_identity.backing_identity
+            and registered.capture_identity.execution_lane == capture_identity.execution_lane
+            and registered.capture_identity.consumer_ordinal == capture_identity.consumer_ordinal
+        )
+        if len(candidates) != 1:
+            raise RuntimeError("capture identity is not registered by this provider")
+        expected = candidates[0].capture_identity.fingerprint
+        actual = capture_identity.fingerprint
+        diagnostics = {
+            "method": "method",
+            "route": "route",
+            "graph_mode": "graph mode",
+            "backend_impl": "backend",
+            "builder_impl": "builder",
+            "global_group_id": "global gid",
+            "layout": "layout",
+            "capture_descriptor": "capture descriptor",
+            "capture_bucket": "capture bucket",
+            "query_width": "query width",
+            "padded_request_count": "padded request count",
+            "padded_token_count": "padded token count",
+            "static_k": "static K",
+            "window_size": "window size",
+            "logical_block_size": "logical block size",
+            "kernel_block_size": "kernel block size",
+            "block_span_tokens": "block span",
+            "tensor_parallel_size": "TP",
+            "data_parallel_size": "DP",
+            "pipeline_parallel_size": "PP",
+            "prefill_context_parallel_size": "PCP",
+            "decode_context_parallel_size": "DCP",
+            "sequence_parallel": "SP",
+            "dsa_context_parallel": "DSA-CP",
+            "flashcomm": "FlashComm",
+            "async_scheduling": "async",
+            "prefix_caching": "prefix cache",
+        }
+        for field_name, diagnostic in diagnostics.items():
+            if getattr(expected, field_name) != getattr(actual, field_name):
+                raise RuntimeError(f"capture identity {diagnostic} mismatch")
+        raise RuntimeError("capture identity is not registered by this provider")
+
+    def _validate_runtime_capture_compatibility(
+        self,
+        capture_identity: DraftWindowGraphCaptureIdentity,
+        generation: DraftWindowGenerationIdentity,
+    ) -> None:
+        fingerprint = capture_identity.fingerprint
+        comparisons = (
+            (generation.normalized_method, fingerprint.method, "method"),
+            (generation.global_group_id, fingerprint.global_group_id, "global gid"),
+            (generation.padded_request_count, fingerprint.padded_request_count, "padded request count"),
+            (generation.execution_lane, capture_identity.execution_lane, "lane"),
+        )
+        for actual, expected, diagnostic in comparisons:
+            if actual != expected:
+                raise RuntimeError(f"capture/runtime {diagnostic} mismatch")
+
+    @staticmethod
+    def _make_binding_identity(
+        generation: DraftWindowGenerationIdentity,
+        *,
+        proposal_id: int,
+        route: DraftWindowGraphRoute,
+    ) -> DraftWindowGraphBindingIdentity:
+        return DraftWindowGraphBindingIdentity(
+            method=generation.normalized_method,
+            route=route,
+            global_group_id=generation.global_group_id,
+            proposal_id=proposal_id,
+            generation_id=generation.generation_id,
+            mapping_epoch=generation.mapping_epoch,
+            ordered_request_fingerprint=generation.ordered_request_fingerprint,
+            actual_request_count=generation.actual_request_count,
+            padded_request_count=generation.padded_request_count,
+            provider_id=generation.provider_id,
+            provider_version=generation.provider_version,
+            source_owner_id=generation.source_identity.block_tables_owner_id,
+            execution_lane=generation.execution_lane,
+            phase=generation.phase,
+            step=generation.step,
+        )
+
+    @staticmethod
+    def _validate_metadata_uses_carrier(
+        metadata: Mapping[str, Any],
+        read_inputs: DraftWindowGraphReadInputs,
+    ) -> None:
+        expected_table_storage = _tensor_identity(read_inputs.window_block_table).storage_data_ptr
+        expected_device_storage = _tensor_identity(read_inputs.device_window_exact).storage_data_ptr
+        expected_cpu_storage = _tensor_identity(read_inputs.cpu_window_exact).storage_data_ptr
+        expected_lengths = read_inputs.cpu_window_exact.tolist()
+        for layer_name, layer_metadata in metadata.items():
+            if layer_metadata is None:
+                continue
+            block_tables = getattr(layer_metadata, "block_tables", None)
+            seq_lens = getattr(layer_metadata, "seq_lens", None)
+            seq_lens_cpu = getattr(layer_metadata, "seq_lens_cpu", None)
+            seq_lens_list = getattr(layer_metadata, "seq_lens_list", None)
+            if not isinstance(block_tables, torch.Tensor) or (
+                _tensor_identity(block_tables).storage_data_ptr != expected_table_storage
+            ):
+                raise RuntimeError(f"Draft graph metadata {layer_name!r} does not use carrier block tables")
+            if not isinstance(seq_lens, torch.Tensor) or (
+                _tensor_identity(seq_lens).storage_data_ptr != expected_device_storage
+            ):
+                raise RuntimeError(f"Draft graph metadata {layer_name!r} does not use carrier device lengths")
+            if not isinstance(seq_lens_cpu, torch.Tensor) or (
+                _tensor_identity(seq_lens_cpu).storage_data_ptr != expected_cpu_storage
+            ):
+                raise RuntimeError(f"Draft graph metadata {layer_name!r} does not use carrier CPU lengths")
+            if not isinstance(seq_lens_list, list) or seq_lens_list[: len(expected_lengths)] != expected_lengths:
+                raise RuntimeError(f"Draft graph metadata {layer_name!r} does not use carrier exact length values")
+
+    def _require_submitted_route(
+        self,
+        route: DraftWindowGraphRoute,
+    ) -> tuple[DraftWindowGraphReadCarrier, ...]:
+        if not self._submitted_carriers:
+            raise RuntimeError("no explicit Draft Window graph read carrier batch was submitted")
+        if any(carrier.capture_identity.fingerprint.route is not route for carrier in self._submitted_carriers):
+            raise RuntimeError("submitted graph read carrier route mismatch")
+        return self._submitted_carriers
+
+    def _observe_submitted(
+        self,
+        stage: DraftWindowGraphStage,
+    ) -> DraftWindowGraphSourceEvent:
+        carriers = self._submitted_carriers
+        if not carriers:
+            raise RuntimeError("no submitted graph read carrier batch to observe")
+        first_event: DraftWindowGraphSourceEvent | None = None
+        for carrier in carriers:
+            runtime_identity = carrier.runtime_identity
+            if runtime_identity is None:
+                raise RuntimeError("submitted graph carrier lost its runtime identity")
+            backing = carrier.capture_identity.backing_identity
+            event = DraftWindowGraphSourceEvent(
+                sequence=self._sequence,
+                stage=stage,
+                identity=runtime_identity,
+                consumer_kind=(
+                    carrier.backend_attribution.consumer_kind
+                    if carrier.backend_attribution is not None
+                    else DraftWindowGraphConsumerKind.UNRESOLVED
+                ),
+                metadata_owner=(
+                    carrier.backend_attribution.metadata_owner
+                    if carrier.backend_attribution is not None
+                    else DraftWindowGraphMetadataOwner.DRAFT_METADATA_STORE
+                ),
+                backing_identity=backing,
+                table_fingerprint=backing.window_block_table,
+                length_fingerprint=(
+                    backing.device_window_exact,
+                    backing.cpu_window_exact,
+                    backing.cpu_window_upper,
+                ),
+            )
+            self._sequence += 1
+            if first_event is None:
+                first_event = event
+            if self._observer is not None:
+                self._observer.record(event)
+        assert first_event is not None
+        return first_event
 
     def bind(
         self,
@@ -445,9 +1268,9 @@ def install_draft_window_graph_binding_provider(
 ) -> DraftWindowGraphBindingProvider:
     """Explicitly install one provider on an eligible speculator instance.
 
-    P5 has no automatic caller: CONFIG_OFF, FORCED_OFF, and the existing Graph
-    fail-closed gate therefore allocate no descriptor/provider/backing. P6 may
-    call this only after it has closed its method-specific runtime gates.
+    There is no automatic caller: CONFIG_OFF, FORCED_OFF, and the existing
+    Graph fail-closed gate therefore allocate no descriptor/provider/backing.
+    A later phase may call this only after closing its route-specific gates.
     """
     attribute = "_draft_window_graph_binding_provider"
     if hasattr(owner, attribute):
@@ -467,11 +1290,119 @@ def observe_draft_window_graph_source(
     owner: Any,
     stage: DraftWindowGraphStage,
 ) -> DraftWindowGraphSourceEvent | None:
-    """Observe one source point, or remain an exact no-op when P5 is absent."""
+    """Observe one source point, or remain an exact no-op when the provider is absent."""
     provider = getattr(owner, "_draft_window_graph_binding_provider", None)
     if provider is None:
         return None
     if not isinstance(provider, DraftWindowGraphBindingProvider):
         raise TypeError("invalid instance-owned Draft Window graph binding provider")
+    if provider.submitted_carriers:
+        if stage is DraftWindowGraphStage.CAPTURE:
+            raise RuntimeError("runtime generation cannot be used as a startup capture identity")
+        return provider._observe_submitted(stage)
     descriptor = provider.current_descriptor
     return provider.observe(stage, expected=descriptor.expectation)
+
+
+def observe_draft_window_graph_capture(owner: Any) -> None:
+    """Fail closed when P6 state is present at the unhooked startup capture.
+
+    The pinned upstream capture path builds private dummy metadata internally.
+    Ascend can observe around that call but cannot supply the persistent P6
+    carrier without modifying vLLM, mutating shared owners, or duplicating the
+    capture builder.  All are forbidden by R-REPO-01/Frozen invariants.
+    """
+    provider = getattr(owner, "_draft_window_graph_binding_provider", None)
+    if provider is None:
+        return
+    if not isinstance(provider, DraftWindowGraphBindingProvider):
+        raise TypeError("invalid instance-owned Draft Window graph binding provider")
+    raise RuntimeError(
+        "P6 has no safe Ascend-only capture carrier seam in the pinned vLLM; Graph Window capture remains fail closed"
+    )
+
+
+def consume_draft_window_graph_metadata(
+    owner: Any,
+    *,
+    route: DraftWindowGraphRoute,
+    expected_consumer_count: int,
+) -> tuple[Mapping[str, Any], ...] | None:
+    """Return explicit carrier metadata, or preserve exact OFF behavior."""
+    provider = getattr(owner, "_draft_window_graph_binding_provider", None)
+    if provider is None:
+        return None
+    if not isinstance(provider, DraftWindowGraphBindingProvider):
+        raise TypeError("invalid instance-owned Draft Window graph binding provider")
+    return provider.consume_metadata(
+        route=route,
+        expected_consumer_count=expected_consumer_count,
+    )
+
+
+def assert_draft_window_graph_metadata_batch(
+    owner: Any,
+    *,
+    route: DraftWindowGraphRoute,
+    draft_attn_metadatas: Sequence[Mapping[str, Any]],
+    num_reqs: int | None = None,
+    num_tokens: int | None = None,
+    graph_mode: str | None = None,
+) -> None:
+    """Defense-in-depth check immediately before replay/forward."""
+    provider = getattr(owner, "_draft_window_graph_binding_provider", None)
+    if provider is None:
+        return
+    if not isinstance(provider, DraftWindowGraphBindingProvider):
+        raise TypeError("invalid instance-owned Draft Window graph binding provider")
+    provider.assert_metadata_batch(
+        route=route,
+        draft_attn_metadatas=draft_attn_metadatas,
+        num_reqs=num_reqs,
+        num_tokens=num_tokens,
+        graph_mode=graph_mode,
+    )
+
+
+def build_draft_window_graph_update_binding(
+    owner: Any,
+    *,
+    route: DraftWindowGraphRoute,
+    draft_attn_metadatas: Sequence[Mapping[str, Any]],
+) -> DraftWindowGraphUpdateBinding | None:
+    """Build the typed binding passed through the actual UPDATE entrance."""
+    provider = getattr(owner, "_draft_window_graph_binding_provider", None)
+    if provider is None:
+        return None
+    if not isinstance(provider, DraftWindowGraphBindingProvider):
+        raise TypeError("invalid instance-owned Draft Window graph binding provider")
+    return provider.prepare_update_binding(
+        route=route,
+        draft_attn_metadatas=draft_attn_metadatas,
+    )
+
+
+def validate_draft_window_graph_backend_update(
+    binding: DraftWindowGraphUpdateBinding | None,
+    *,
+    attn_backend: Any,
+    impl_cls: type[Any],
+    builder_cls: type[Any],
+    draft_attn_metadatas: Sequence[Mapping[str, Any]] | None,
+    update_function_path: str,
+) -> DraftWindowGraphBackendAttribution | None:
+    """Derive consumer identity where the real backend implementation is known."""
+    if binding is None:
+        return None
+    if not isinstance(binding, DraftWindowGraphUpdateBinding):
+        raise TypeError("invalid Draft Window graph update binding")
+    if draft_attn_metadatas is None:
+        raise RuntimeError("Draft Window graph update requires Draft-private metadata")
+    return binding.provider.validate_backend_update(
+        binding,
+        attn_backend=attn_backend,
+        impl_cls=impl_cls,
+        builder_cls=builder_cls,
+        draft_attn_metadatas=draft_attn_metadatas,
+        update_function_path=update_function_path,
+    )

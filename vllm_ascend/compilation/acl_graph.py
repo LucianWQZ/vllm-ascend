@@ -309,6 +309,7 @@ def update_full_graph_params(
     vllm_config,
     speculative_config=None,
     draft_attn_metadatas=None,
+    draft_window_graph_update_binding=None,
 ):
     # vLLM >= 0.27.1 (main) makes get_current_vllm_config() raise
     # AssertionError outside set_current_vllm_config(); the SFA backend
@@ -317,6 +318,24 @@ def update_full_graph_params(
 
     with set_current_vllm_config(vllm_config):
         impl_cls = attn_backend.get_impl_cls()
+        builder_cls = attn_backend.get_builder_cls()
+        if draft_window_graph_update_binding is not None:
+            # Lazy import keeps the generic graph helper independent of spec
+            # decode when Draft Window is absent.  Attribution happens here,
+            # after the backend implementation is factually resolved and
+            # immediately before its real update entry.
+            from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
+                validate_draft_window_graph_backend_update,
+            )
+
+            validate_draft_window_graph_backend_update(
+                draft_window_graph_update_binding,
+                attn_backend=attn_backend,
+                impl_cls=impl_cls,
+                builder_cls=builder_cls,
+                draft_attn_metadatas=draft_attn_metadatas,
+                update_function_path=(f"{update_full_graph_params.__module__}.{update_full_graph_params.__qualname__}"),
+            )
         impl_cls.update_graph_params(
             update_stream,
             forward_context,

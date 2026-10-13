@@ -44,6 +44,10 @@ from vllm_ascend.worker.v2.spec_decode.draft_window import (
 from vllm_ascend.worker.v2.spec_decode.draft_window_eager import (
     DraftWindowEagerMixin,
 )
+from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
+    DraftWindowGraphRoute,
+    consume_draft_window_graph_metadata,
+)
 from vllm_ascend.worker.v2.spec_decode.pcp_utils import prepare_replicated_pcp_config
 
 
@@ -153,6 +157,13 @@ class AscendDSparkSpeculator(DraftWindowEagerMixin, DSparkSpeculator):
         self._initialize_draft_window_source_capability()
 
     def build_draft_attn_metadatas(self, num_reqs_padded, seq_lens_cpu_upper_bound):
+        graph_metadata = consume_draft_window_graph_metadata(
+            self,
+            route=DraftWindowGraphRoute.DSPARK,
+            expected_consumer_count=1,
+        )
+        if graph_metadata is not None:
+            return list(graph_metadata)
         num_tokens_padded = num_reqs_padded * self.num_query_per_req
         assert self.input_batch is not None
         # The draft attention metadata is built through the generic

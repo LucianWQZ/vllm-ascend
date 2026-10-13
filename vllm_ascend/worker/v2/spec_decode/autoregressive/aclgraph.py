@@ -31,7 +31,11 @@ from vllm_ascend.worker.v2.aclgraph_utils import (
     model_capture_wrapper,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
+    DraftWindowGraphRoute,
     DraftWindowGraphStage,
+    assert_draft_window_graph_metadata_batch,
+    build_draft_window_graph_update_binding,
+    observe_draft_window_graph_capture,
     observe_draft_window_graph_source,
 )
 from vllm_ascend.worker.v2.utils import communicator_switch
@@ -86,10 +90,7 @@ class AutoRegressiveAclGraphManager(SpeculatorCudaGraphManager):
     ) -> None:
         """Capture ACL graphs for autoregressive speculative decoding."""
 
-        observe_draft_window_graph_source(
-            self.speculator,
-            DraftWindowGraphStage.CAPTURE,
-        )
+        observe_draft_window_graph_capture(self.speculator)
         with communicator_switch(), model_capture_wrapper(self.speculator, self.is_draft_model_prefill):
             if self.is_draft_model_prefill:
                 super().capture(
@@ -155,6 +156,26 @@ class AutoRegressiveAclGraphManager(SpeculatorCudaGraphManager):
             desc.num_tokens,
             self.is_draft_model_prefill,
         )
+        graph_route = (
+            DraftWindowGraphRoute.EAGLE3_FIRST_PASS
+            if self.is_draft_model_prefill
+            else DraftWindowGraphRoute.EAGLE3_AR_STEP
+        )
+        graph_provider_present = hasattr(
+            self.speculator,
+            "_draft_window_graph_binding_provider",
+        )
+        graph_mode_name = getattr(desc.cg_mode, "name", None)
+        if graph_provider_present and not isinstance(graph_mode_name, str):
+            raise RuntimeError("Draft Window graph carrier requires an explicit graph mode")
+        assert_draft_window_graph_metadata_batch(
+            self.speculator,
+            route=graph_route,
+            draft_attn_metadatas=draft_attn_metadatas,
+            num_reqs=desc.num_reqs,
+            num_tokens=desc.num_tokens,
+            graph_mode=graph_mode_name,
+        )
         self.update_stream.wait_stream(torch.npu.current_stream())
         observe_draft_window_graph_source(
             self.speculator,
@@ -194,9 +215,10 @@ class AutoRegressiveAclGraphManager(SpeculatorCudaGraphManager):
             forward_context = get_forward_context()
             attn_backend = self.speculator.attn_backend
             assert attn_backend is not None, "Speculator attention backend is not initialized"
-            observe_draft_window_graph_source(
+            graph_update_binding = build_draft_window_graph_update_binding(
                 self.speculator,
-                DraftWindowGraphStage.UPDATE,
+                route=graph_route,
+                draft_attn_metadatas=draft_attn_metadatas,
             )
             update_full_graph_params(
                 # FIXME(Ronald1995): support hybrid attn backend
@@ -207,5 +229,6 @@ class AutoRegressiveAclGraphManager(SpeculatorCudaGraphManager):
                 draft_vllm_config,
                 self.speculator.speculative_config,
                 draft_attn_metadatas=draft_attn_metadatas,
+                draft_window_graph_update_binding=graph_update_binding,
             )
         return ret

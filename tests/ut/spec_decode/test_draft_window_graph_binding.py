@@ -573,13 +573,15 @@ def test_install_is_explicit_instance_owned_and_off_owner_allocates_nothing() ->
         install_draft_window_graph_binding_provider(eligible_owner)
 
 
-def test_dflash_manager_capture_spy_is_instance_scoped(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_dflash_manager_capture_rejects_runtime_generation_as_startup_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     runtime, _capability, _block_tables = _runtime_fixture(method="dflash")
     inputs = _materialize(runtime)
     spy = _SourceSpy()
     speculator = SimpleNamespace(_draft_window_runtime_state=runtime)
     provider = install_draft_window_graph_binding_provider(speculator, observer=spy)
-    descriptor = provider.bind(
+    provider.bind(
         inputs,
         proposal_id=10,
         route=DraftWindowGraphRoute.DFLASH,
@@ -597,13 +599,9 @@ def test_dflash_manager_capture_spy_is_instance_scoped(monkeypatch: pytest.Monke
     monkeypatch.setattr(dflash_aclgraph_module, "model_capture_wrapper", _no_op_context)
     monkeypatch.setattr(DFlashCudaGraphManager, "capture", lambda self, *args, **kwargs: None)
 
-    manager.capture(None, None, None, None, None, 1)
-
-    assert [event.stage for event in spy.events] == [
-        DraftWindowGraphStage.CAPTURE,
-        DraftWindowGraphStage.CONSUMER,
-    ]
-    assert all(event.identity == descriptor.identity for event in spy.events)
+    with pytest.raises(RuntimeError, match="safe Ascend-only capture carrier"):
+        manager.capture(None, None, None, None, None, 1)
+    assert spy.events == []
 
 
 @pytest.mark.parametrize(
@@ -623,7 +621,7 @@ def test_dflash_manager_capture_spy_is_instance_scoped(monkeypatch: pytest.Monke
         ),
     ],
 )
-def test_eagle3_manager_capture_spy_covers_first_pass_and_ar_step(
+def test_eagle3_manager_capture_rejects_runtime_identity_for_both_routes(
     monkeypatch: pytest.MonkeyPatch,
     is_first_pass: bool,
     phase: DraftWindowExecutionPhase,
@@ -635,7 +633,7 @@ def test_eagle3_manager_capture_spy_covers_first_pass_and_ar_step(
     spy = _SourceSpy()
     speculator = SimpleNamespace(_draft_window_runtime_state=runtime)
     provider = install_draft_window_graph_binding_provider(speculator, observer=spy)
-    descriptor = provider.bind(
+    provider.bind(
         inputs,
         proposal_id=10,
         route=route,
@@ -655,13 +653,9 @@ def test_eagle3_manager_capture_spy_covers_first_pass_and_ar_step(
     monkeypatch.setattr(SpeculatorCudaGraphManager, "capture", lambda self, *args, **kwargs: None)
     monkeypatch.setattr(CudaGraphManager, "capture", lambda self, *args, **kwargs: None)
 
-    manager.capture(None, None, None, None, None, None)
-
-    assert [event.stage for event in spy.events] == [
-        DraftWindowGraphStage.CAPTURE,
-        DraftWindowGraphStage.CONSUMER,
-    ]
-    assert all(event.identity == descriptor.identity for event in spy.events)
+    with pytest.raises(RuntimeError, match="safe Ascend-only capture carrier"):
+        manager.capture(None, None, None, None, None, None)
+    assert spy.events == []
 
 
 def test_graph_manager_without_provider_is_an_exact_observation_noop(
@@ -684,7 +678,9 @@ def test_graph_manager_without_provider_is_an_exact_observation_noop(
     assert not hasattr(speculator, "_draft_window_graph_binding_provider")
 
 
-def test_dflash_manager_replay_update_consumer_order(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_dflash_manager_rejects_p5_observation_without_p6_carrier_before_replay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     runtime, _capability, _block_tables = _runtime_fixture(method="dspark")
     inputs = _materialize(runtime)
     spy = _SourceSpy()
@@ -699,7 +695,7 @@ def test_dflash_manager_replay_update_consumer_order(monkeypatch: pytest.MonkeyP
         speculative_config=object(),
     )
     provider = install_draft_window_graph_binding_provider(speculator, observer=spy)
-    descriptor = provider.bind(
+    provider.bind(
         inputs,
         proposal_id=10,
         route=DraftWindowGraphRoute.DSPARK,
@@ -720,7 +716,12 @@ def test_dflash_manager_replay_update_consumer_order(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(dflash_aclgraph_module, "get_forward_context", lambda: object())
     monkeypatch.setattr(dflash_aclgraph_module, "update_full_graph_params", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(torch.npu, "current_stream", lambda: object())
-    monkeypatch.setattr(DFlashCudaGraphManager, "run_fullgraph", lambda self, desc: "replayed")
+    replayed: list[Any] = []
+    monkeypatch.setattr(
+        DFlashCudaGraphManager,
+        "run_fullgraph",
+        lambda self, desc: replayed.append(desc),
+    )
     monkeypatch.setattr(
         dflash_aclgraph_module,
         "_EXTRA_CTX",
@@ -728,13 +729,10 @@ def test_dflash_manager_replay_update_consumer_order(monkeypatch: pytest.MonkeyP
     )
 
     desc = SimpleNamespace(num_tokens=8, num_reqs=1, cg_mode=CUDAGraphMode.FULL)
-    assert manager.run_fullgraph(desc) == "replayed"
-    assert [event.stage for event in spy.events] == [
-        DraftWindowGraphStage.REPLAY,
-        DraftWindowGraphStage.CONSUMER,
-        DraftWindowGraphStage.UPDATE,
-    ]
-    assert all(event.identity == descriptor.identity for event in spy.events)
+    with pytest.raises(RuntimeError, match="explicit Draft Window graph read carrier"):
+        manager.run_fullgraph(desc)
+    assert replayed == []
+    assert spy.events == []
 
 
 @pytest.mark.parametrize(
@@ -754,7 +752,7 @@ def test_dflash_manager_replay_update_consumer_order(monkeypatch: pytest.MonkeyP
         ),
     ],
 )
-def test_eagle3_manager_replay_update_consumer_order(
+def test_eagle3_manager_rejects_p5_observation_without_p6_carrier_before_replay(
     monkeypatch: pytest.MonkeyPatch,
     is_first_pass: bool,
     phase: DraftWindowExecutionPhase,
@@ -774,7 +772,7 @@ def test_eagle3_manager_replay_update_consumer_order(
         speculative_config=object(),
     )
     provider = install_draft_window_graph_binding_provider(speculator, observer=spy)
-    descriptor = provider.bind(
+    provider.bind(
         inputs,
         proposal_id=10,
         route=route,
@@ -795,7 +793,12 @@ def test_eagle3_manager_replay_update_consumer_order(
     monkeypatch.setattr(ar_aclgraph_module, "get_forward_context", lambda: object())
     monkeypatch.setattr(ar_aclgraph_module, "update_full_graph_params", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(torch.npu, "current_stream", lambda: object())
-    monkeypatch.setattr(SpeculatorCudaGraphManager, "run_fullgraph", lambda self, desc: "replayed")
+    replayed: list[Any] = []
+    monkeypatch.setattr(
+        SpeculatorCudaGraphManager,
+        "run_fullgraph",
+        lambda self, desc: replayed.append(desc),
+    )
     monkeypatch.setattr(
         ar_aclgraph_module,
         "_EXTRA_CTX",
@@ -803,13 +806,10 @@ def test_eagle3_manager_replay_update_consumer_order(
     )
 
     desc = SimpleNamespace(num_tokens=8, num_reqs=1, cg_mode=CUDAGraphMode.FULL)
-    assert manager.run_fullgraph(desc) == "replayed"
-    assert [event.stage for event in spy.events] == [
-        DraftWindowGraphStage.REPLAY,
-        DraftWindowGraphStage.CONSUMER,
-        DraftWindowGraphStage.UPDATE,
-    ]
-    assert all(event.identity == descriptor.identity for event in spy.events)
+    with pytest.raises(RuntimeError, match="explicit Draft Window graph read carrier"):
+        manager.run_fullgraph(desc)
+    assert replayed == []
+    assert spy.events == []
 
 
 def test_graph_window_user_gate_remains_fail_closed() -> None:

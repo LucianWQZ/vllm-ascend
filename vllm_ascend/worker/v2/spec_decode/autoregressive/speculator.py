@@ -61,6 +61,10 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_eager import _isolate_draft_
 from vllm_ascend.worker.v2.spec_decode.draft_window_eagle3 import (
     Eagle3DraftWindowMixin,
 )
+from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
+    DraftWindowGraphRoute,
+    consume_draft_window_graph_metadata,
+)
 from vllm_ascend.worker.v2.spec_decode.pcp_utils import (
     disable_target_pcp_for_replicated_draft,
     prepare_replicated_pcp_config,
@@ -773,6 +777,17 @@ class AscendAutoRegressiveSpeculator(Eagle3DraftWindowMixin, AutoRegressiveSpecu
         is_draft_model_prefill: bool,
     ):
         """Build draft_attn_metadatas for partial-merged draft graph."""
+        route = (
+            DraftWindowGraphRoute.EAGLE3_FIRST_PASS if is_draft_model_prefill else DraftWindowGraphRoute.EAGLE3_AR_STEP
+        )
+        expected_consumer_count = 1 if is_draft_model_prefill else len(self.input_buffers.draft_seq_lens_cpus)
+        graph_metadata = consume_draft_window_graph_metadata(
+            self,
+            route=route,
+            expected_consumer_count=expected_consumer_count,
+        )
+        if graph_metadata is not None:
+            return list(graph_metadata)
         attn_metadata = self.model_state.attn_metadata
         attn_metadata = {
             name: metadata for name, metadata in attn_metadata.items() if name in self.draft_attn_layer_names
