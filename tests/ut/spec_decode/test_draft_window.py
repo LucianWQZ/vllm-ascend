@@ -393,6 +393,7 @@ def test_config_off_factory_preserves_baseline_and_emits_no_warning(
     assert baseline_calls == [(config, device)]
     assert configured == []
     assert warnings == []
+    assert not hasattr(baseline, "_draft_window_graph_binding_provider")
 
 
 @pytest.mark.parametrize(
@@ -438,6 +439,7 @@ def test_forced_off_factory_skips_all_window_downstream_work(
     assert warning_fragment in warnings[0]
     assert not hasattr(baseline, "_draft_window_runtime_state")
     assert not hasattr(baseline, "_draft_window_epoch_source")
+    assert not hasattr(baseline, "_draft_window_graph_binding_provider")
 
 
 def test_forced_off_warning_is_emitted_once_per_created_speculator(
@@ -1899,6 +1901,7 @@ def test_config_off_owner_does_not_enter_p2_inventory(
     assert not hasattr(owner, "_draft_window_source_capability")
     assert not hasattr(owner, "_draft_window_runtime_state")
     assert not hasattr(owner, "_draft_window_epoch_source")
+    assert not hasattr(owner, "_draft_window_graph_binding_provider")
 
 
 @pytest.mark.parametrize(

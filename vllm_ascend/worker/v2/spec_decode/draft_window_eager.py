@@ -33,6 +33,10 @@ from vllm_ascend.worker.v2.spec_decode.draft_window import (
     compute_draft_window_scalar_plan,
     gather_valid_num_blocks_cpu,
 )
+from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
+    DraftWindowGraphStage,
+    observe_draft_window_graph_source,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -363,6 +367,7 @@ class DraftWindowEagerMixin:
     ) -> AscendDraftAttentionReadInputs:
         """The single formal P4a validation and transport-narrowing boundary."""
         inputs.validate_for(expected_identity)
+        observe_draft_window_graph_source(self, DraftWindowGraphStage.LIVE)
         global_group_id = expected_identity.global_group_id
         block_tables = tuple(
             (inputs.window_block_table if gid == global_group_id else full_table[: inputs.padded_request_count])

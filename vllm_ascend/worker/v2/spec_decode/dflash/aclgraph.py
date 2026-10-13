@@ -20,6 +20,10 @@ from vllm_ascend.compilation.acl_graph import (
     update_full_graph_params,
 )
 from vllm_ascend.worker.v2.aclgraph_utils import collect_sorted_captured_token_sizes, model_capture_wrapper
+from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
+    DraftWindowGraphStage,
+    observe_draft_window_graph_source,
+)
 from vllm_ascend.worker.v2.utils import communicator_switch
 
 
@@ -66,6 +70,10 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
         progress_bar_desc: str = "Capturing CUDA graphs",
     ) -> None:
         """Capture ACL graphs for DFlash."""
+        observe_draft_window_graph_source(
+            self.speculator,
+            DraftWindowGraphStage.CAPTURE,
+        )
         with communicator_switch(), model_capture_wrapper(self.speculator, False):
             super().capture(
                 forward_fn,
@@ -77,6 +85,10 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
                 causal,
                 progress_bar_desc,
             )
+        observe_draft_window_graph_source(
+            self.speculator,
+            DraftWindowGraphStage.CONSUMER,
+        )
 
     def run_fullgraph(self, desc: BatchExecutionDescriptor) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         """Override run_fullgraph to update full graph params in run_fullgraph."""
@@ -87,7 +99,15 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
             self.speculator.input_batch.seq_lens_cpu_upper_bound,
         )
         self.update_stream.wait_stream(torch.npu.current_stream())
+        observe_draft_window_graph_source(
+            self.speculator,
+            DraftWindowGraphStage.REPLAY,
+        )
         ret = super().run_fullgraph(desc)
+        observe_draft_window_graph_source(
+            self.speculator,
+            DraftWindowGraphStage.CONSUMER,
+        )
 
         # refer to vllm.v1.worker.gpu.dp_utils.sync_cudagraph_and_dp_padding to
         # calculate num_tokens_across_dp.
@@ -105,6 +125,10 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
             _EXTRA_CTX.is_draft_model = True
             _EXTRA_CTX.is_draft_model_prefill = False
             forward_context = get_forward_context()
+            observe_draft_window_graph_source(
+                self.speculator,
+                DraftWindowGraphStage.UPDATE,
+            )
             update_full_graph_params(
                 # FIXME(Ronald1995): support hybrid attn backend
                 list(self.speculator.attn_backends.values())[0],

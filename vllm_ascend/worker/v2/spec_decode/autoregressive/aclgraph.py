@@ -30,6 +30,10 @@ from vllm_ascend.worker.v2.aclgraph_utils import (
     collect_sorted_captured_token_sizes,
     model_capture_wrapper,
 )
+from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
+    DraftWindowGraphStage,
+    observe_draft_window_graph_source,
+)
 from vllm_ascend.worker.v2.utils import communicator_switch
 
 
@@ -82,6 +86,10 @@ class AutoRegressiveAclGraphManager(SpeculatorCudaGraphManager):
     ) -> None:
         """Capture ACL graphs for autoregressive speculative decoding."""
 
+        observe_draft_window_graph_source(
+            self.speculator,
+            DraftWindowGraphStage.CAPTURE,
+        )
         with communicator_switch(), model_capture_wrapper(self.speculator, self.is_draft_model_prefill):
             if self.is_draft_model_prefill:
                 super().capture(
@@ -92,6 +100,10 @@ class AutoRegressiveAclGraphManager(SpeculatorCudaGraphManager):
                     attn_groups,
                     kv_cache_config,
                     progress_bar_desc=progress_bar_desc,
+                )
+                observe_draft_window_graph_source(
+                    self.speculator,
+                    DraftWindowGraphStage.CONSUMER,
                 )
                 return
 
@@ -123,6 +135,10 @@ class AutoRegressiveAclGraphManager(SpeculatorCudaGraphManager):
                 )
 
             CudaGraphManager.capture(self, create_forward_fn, progress_bar_desc=progress_bar_desc)
+        observe_draft_window_graph_source(
+            self.speculator,
+            DraftWindowGraphStage.CONSUMER,
+        )
 
     def run_fullgraph(self, desc: BatchExecutionDescriptor) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         """Replay the draft ACL graph and update its attention parameters."""
@@ -140,7 +156,15 @@ class AutoRegressiveAclGraphManager(SpeculatorCudaGraphManager):
             self.is_draft_model_prefill,
         )
         self.update_stream.wait_stream(torch.npu.current_stream())
+        observe_draft_window_graph_source(
+            self.speculator,
+            DraftWindowGraphStage.REPLAY,
+        )
         ret = super().run_fullgraph(desc)
+        observe_draft_window_graph_source(
+            self.speculator,
+            DraftWindowGraphStage.CONSUMER,
+        )
 
         # Mirror vLLM's DP graph-replay token-count metadata.
         num_tokens_across_dp = torch.full([self.speculator.dp_size], num_tokens)
@@ -170,6 +194,10 @@ class AutoRegressiveAclGraphManager(SpeculatorCudaGraphManager):
             forward_context = get_forward_context()
             attn_backend = self.speculator.attn_backend
             assert attn_backend is not None, "Speculator attention backend is not initialized"
+            observe_draft_window_graph_source(
+                self.speculator,
+                DraftWindowGraphStage.UPDATE,
+            )
             update_full_graph_params(
                 # FIXME(Ronald1995): support hybrid attn backend
                 attn_backend,

@@ -34,6 +34,10 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_eager import (
     DraftWindowProposalEpochSource,
     _requires_prefill_baseline_bypass,
 )
+from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
+    DraftWindowGraphStage,
+    observe_draft_window_graph_source,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -377,6 +381,7 @@ class Eagle3DraftWindowMixin:
     ) -> AscendDraftAttentionReadInputs:
         """The one formal P4b validation/narrowing boundary before building."""
         inputs.validate_for(expected_identity)
+        observe_draft_window_graph_source(self, DraftWindowGraphStage.LIVE)
         gid = expected_identity.global_group_id
         block_tables = tuple(
             inputs.window_block_table if group_id == gid else full_table[: inputs.padded_request_count]
