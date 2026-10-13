@@ -61,6 +61,7 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
     DraftWindowGraphRouteFingerprint,
     DraftWindowGraphStage,
     DraftWindowGraphTimelineStatus,
+    DraftWindowGraphWriteSideReference,
     assert_draft_window_graph_metadata_batch,
     build_draft_window_graph_update_binding,
     consume_draft_window_graph_metadata,
@@ -85,6 +86,9 @@ class _Metadata:
     positions: torch.Tensor
     query_start_loc: torch.Tensor
     nested: dict[str, Any]
+    attn_state: Any
+    num_actual_tokens: int
+    causal: bool
 
 
 class _SourceSpy:
@@ -111,6 +115,10 @@ def _runtime_fixture(
         block_sizes=[64],
         kernel_block_sizes=[64],
         input_block_tables=[canonical_table],
+        slot_mappings=torch.arange(
+            max_num_reqs * row_width,
+            dtype=torch.int32,
+        ).reshape(1, -1),
         num_blocks=SimpleNamespace(
             gpu=canonical_counts.clone(),
             cpu=canonical_counts,
@@ -251,13 +259,44 @@ def _target_metadata() -> dict[str, _Metadata]:
                 "tensor": torch.tensor([7], dtype=torch.int32),
                 "array": np.asarray([7], dtype=np.int32),
             },
+            attn_state=object(),
+            num_actual_tokens=8,
+            causal=True,
         )
     }
+
+
+def _write_side_reference(
+    runtime: Any,
+    capture: DraftWindowGraphCaptureIdentity,
+) -> DraftWindowGraphWriteSideReference:
+    fingerprint = capture.fingerprint
+    actual_tokens = fingerprint.padded_token_count
+    slot_mappings = runtime.capability.full_source._block_tables_owner.slot_mappings
+    query_start_loc = torch.arange(
+        0,
+        actual_tokens + 1,
+        fingerprint.query_width,
+        dtype=torch.int32,
+    )
+    return DraftWindowGraphWriteSideReference(
+        slot_mapping=slot_mappings[
+            fingerprint.global_group_id,
+            :actual_tokens,
+        ],
+        positions=torch.arange(actual_tokens, dtype=torch.int64),
+        query_start_loc=query_start_loc,
+        actual_seq_lengths_q=tuple(int(value) for value in query_start_loc[1:].tolist()),
+        attn_state=object(),
+        num_actual_tokens=actual_tokens,
+        causal=True,
+    )
 
 
 def _metadata_builder(
     target: dict[str, _Metadata],
     *,
+    write_side: DraftWindowGraphWriteSideReference,
     alias_target: bool = False,
 ):
     target_layer = target["draft.layers.0.self_attn"]
@@ -271,18 +310,46 @@ def _metadata_builder(
                 seq_lens=read_inputs.device_window_exact,
                 seq_lens_cpu=read_inputs.cpu_window_exact,
                 seq_lens_list=read_inputs.cpu_window_exact.tolist(),
-                actual_seq_lengths_q=[1, 2, 3, 4],
-                slot_mapping=target_layer.slot_mapping.clone(),
-                positions=target_layer.positions.clone(),
-                query_start_loc=target_layer.query_start_loc.clone(),
+                actual_seq_lengths_q=list(write_side.actual_seq_lengths_q),
+                slot_mapping=write_side.slot_mapping,
+                positions=write_side.positions,
+                query_start_loc=write_side.query_start_loc,
                 nested={
                     "tensor": target_layer.nested["tensor"].clone(),
                     "array": target_layer.nested["array"].copy(),
                 },
+                attn_state=write_side.attn_state,
+                num_actual_tokens=write_side.num_actual_tokens,
+                causal=write_side.causal,
             )
         }
 
     return build
+
+
+def _bind_read_carrier(
+    provider: Any,
+    runtime: Any,
+    capture: DraftWindowGraphCaptureIdentity,
+    inputs: DraftMetadataInputs,
+    target: dict[str, _Metadata],
+    *,
+    proposal_id: int = 10,
+    alias_target: bool = False,
+) -> Any:
+    write_side = _write_side_reference(runtime, capture)
+    return provider.bind_read_carrier(
+        capture_identity=capture,
+        inputs=inputs,
+        proposal_id=proposal_id,
+        metadata_builder=_metadata_builder(
+            target,
+            write_side=write_side,
+            alias_target=alias_target,
+        ),
+        target_metadata=target,
+        write_side_reference=write_side,
+    )
 
 
 def _register(
@@ -315,7 +382,7 @@ def test_capture_identity_is_not_a_runtime_generation_namespace() -> None:
             capture_identity=SimpleNamespace(generation_id=0, mapping_epoch=0),
             inputs=_materialize(runtime, mapping_epoch=10),
             proposal_id=10,
-            metadata_builder=_metadata_builder(_target_metadata()),
+            metadata_builder=lambda _read_inputs: _target_metadata(),
             target_metadata=_target_metadata(),
         )
 
@@ -354,7 +421,7 @@ def test_capture_route_fingerprint_mismatch_fails_closed(
             capture_identity=bad,
             inputs=inputs,
             proposal_id=10,
-            metadata_builder=_metadata_builder(target),
+            metadata_builder=lambda _read_inputs: target,
             target_metadata=target,
         )
 
@@ -408,13 +475,7 @@ def test_parallel_speculator_build_entry_consumes_only_explicit_carrier_metadata
     )
     target = _target_metadata()
     inputs = _materialize(runtime, mapping_epoch=10)
-    carrier = provider.bind_read_carrier(
-        capture_identity=capture,
-        inputs=inputs,
-        proposal_id=10,
-        metadata_builder=_metadata_builder(target),
-        target_metadata=target,
-    )
+    carrier = _bind_read_carrier(provider, runtime, capture, inputs, target)
 
     result = speculator_cls.build_draft_attn_metadatas(owner, 4, torch.zeros(4))
 
@@ -441,12 +502,14 @@ def test_explicit_carrier_builds_draft_private_metadata_and_preserves_target() -
     capture = _register(provider)
     inputs = _materialize(runtime, mapping_epoch=10)
 
+    write_side = _write_side_reference(runtime, capture)
     carrier = provider.bind_read_carrier(
         capture_identity=capture,
         inputs=inputs,
         proposal_id=10,
-        metadata_builder=_metadata_builder(target),
+        metadata_builder=_metadata_builder(target, write_side=write_side),
         target_metadata=target,
+        write_side_reference=write_side,
     )
     batch = consume_draft_window_graph_metadata(
         owner,
@@ -460,6 +523,11 @@ def test_explicit_carrier_builds_draft_private_metadata_and_preserves_target() -
     assert metadata.seq_lens is carrier.read_inputs.device_window_exact
     assert metadata.seq_lens_cpu is carrier.read_inputs.cpu_window_exact
     assert metadata.seq_lens_list == [96, 64, 0, 0]
+    assert metadata.slot_mapping is write_side.slot_mapping
+    assert metadata.positions is write_side.positions
+    assert metadata.query_start_loc is write_side.query_start_loc
+    assert metadata.actual_seq_lengths_q == list(write_side.actual_seq_lengths_q)
+    assert metadata.attn_state is write_side.attn_state
     assert carrier.capture_identity.backing_identity.owner_id != id(runtime.workspace)
     assert carrier.capture_identity.backing_identity.window_block_table.storage_data_ptr != (
         capability.full_source._input_block_tables[0].untyped_storage().data_ptr()
@@ -476,6 +544,133 @@ def test_explicit_carrier_builds_draft_private_metadata_and_preserves_target() -
     torch.testing.assert_close(block_tables.input_block_tables[0], canonical_before)
 
 
+def test_carrier_rejects_window_table_as_write_side_slot_mapping() -> None:
+    runtime, _capability, _block_tables = _runtime_fixture()
+    owner = SimpleNamespace(_draft_window_runtime_state=runtime)
+    provider = install_draft_window_graph_binding_provider(owner)
+    capture = _register(provider)
+    inputs = _materialize(runtime, mapping_epoch=10)
+    target = _target_metadata()
+    write_side = _write_side_reference(runtime, capture)
+
+    def poisoned_builder(read_inputs: Any) -> dict[str, _Metadata]:
+        metadata = _metadata_builder(target, write_side=write_side)(read_inputs)
+        metadata["draft.layers.0.self_attn"].slot_mapping = read_inputs.window_block_table.reshape(-1)[:8]
+        return metadata
+
+    with pytest.raises(RuntimeError, match="full slot mapping"):
+        provider.bind_read_carrier(
+            capture_identity=capture,
+            inputs=inputs,
+            proposal_id=10,
+            metadata_builder=poisoned_builder,
+            target_metadata=target,
+            write_side_reference=write_side,
+        )
+
+
+def test_carrier_rejects_noncanonical_write_side_slot_owner() -> None:
+    runtime, _capability, _block_tables = _runtime_fixture()
+    owner = SimpleNamespace(_draft_window_runtime_state=runtime)
+    provider = install_draft_window_graph_binding_provider(owner)
+    capture = _register(provider)
+    inputs = _materialize(runtime, mapping_epoch=10)
+    target = _target_metadata()
+    write_side = _write_side_reference(runtime, capture)
+    poisoned_reference = replace(
+        write_side,
+        slot_mapping=write_side.slot_mapping.clone(),
+    )
+
+    with pytest.raises(RuntimeError, match="canonical full slot mapping"):
+        provider.bind_read_carrier(
+            capture_identity=capture,
+            inputs=inputs,
+            proposal_id=10,
+            metadata_builder=_metadata_builder(target, write_side=poisoned_reference),
+            target_metadata=target,
+            write_side_reference=poisoned_reference,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "diagnostic"),
+    [
+        ("query_start_loc", "full query layout"),
+        ("actual_seq_lengths_q", "full query layout"),
+        ("positions", "full positions"),
+        ("attn_state", "attention state"),
+        ("num_actual_tokens", "actual token count"),
+        ("causal", "causal contract"),
+    ],
+)
+def test_carrier_rejects_write_or_query_contract_drift(
+    field: str,
+    diagnostic: str,
+) -> None:
+    runtime, _capability, _block_tables = _runtime_fixture()
+    owner = SimpleNamespace(_draft_window_runtime_state=runtime)
+    provider = install_draft_window_graph_binding_provider(owner)
+    capture = _register(provider)
+    inputs = _materialize(runtime, mapping_epoch=10)
+    target = _target_metadata()
+    write_side = _write_side_reference(runtime, capture)
+
+    def poisoned_builder(read_inputs: Any) -> dict[str, _Metadata]:
+        metadata = _metadata_builder(target, write_side=write_side)(read_inputs)
+        layer = metadata["draft.layers.0.self_attn"]
+        if field == "query_start_loc":
+            layer.query_start_loc = layer.query_start_loc.clone()
+        elif field == "actual_seq_lengths_q":
+            layer.actual_seq_lengths_q[-1] -= 1
+        elif field == "positions":
+            layer.positions = layer.positions.clone()
+        elif field == "attn_state":
+            layer.attn_state = object()
+        elif field == "num_actual_tokens":
+            layer.num_actual_tokens -= 1
+        elif field == "causal":
+            layer.causal = not layer.causal
+        else:  # pragma: no cover - parametrization is exhaustive
+            raise AssertionError(field)
+        return metadata
+
+    with pytest.raises(RuntimeError, match=diagnostic):
+        provider.bind_read_carrier(
+            capture_identity=capture,
+            inputs=inputs,
+            proposal_id=10,
+            metadata_builder=poisoned_builder,
+            target_metadata=target,
+            write_side_reference=write_side,
+        )
+
+
+def test_carrier_rejects_in_place_write_side_mutation_during_build() -> None:
+    runtime, _capability, _block_tables = _runtime_fixture()
+    owner = SimpleNamespace(_draft_window_runtime_state=runtime)
+    provider = install_draft_window_graph_binding_provider(owner)
+    capture = _register(provider)
+    inputs = _materialize(runtime, mapping_epoch=10)
+    target = _target_metadata()
+    write_side = _write_side_reference(runtime, capture)
+
+    def mutating_builder(read_inputs: Any) -> dict[str, _Metadata]:
+        metadata = _metadata_builder(target, write_side=write_side)(read_inputs)
+        write_side.positions.add_(1)
+        return metadata
+
+    with pytest.raises(RuntimeError, match="write/query state changed"):
+        provider.bind_read_carrier(
+            capture_identity=capture,
+            inputs=inputs,
+            proposal_id=10,
+            metadata_builder=mutating_builder,
+            target_metadata=target,
+            write_side_reference=write_side,
+        )
+
+
 def test_carrier_rejects_nested_target_aliases() -> None:
     runtime, _capability, _block_tables = _runtime_fixture()
     owner = SimpleNamespace(_draft_window_runtime_state=runtime)
@@ -485,12 +680,13 @@ def test_carrier_rejects_nested_target_aliases() -> None:
     target = _target_metadata()
 
     with pytest.raises(ValueError, match="aliases Target metadata"):
-        provider.bind_read_carrier(
-            capture_identity=capture,
-            inputs=inputs,
-            proposal_id=10,
-            metadata_builder=_metadata_builder(target, alias_target=True),
-            target_metadata=target,
+        _bind_read_carrier(
+            provider,
+            runtime,
+            capture,
+            inputs,
+            target,
+            alias_target=True,
         )
 
 
@@ -508,13 +704,7 @@ def test_backend_attribution_is_derived_from_actual_update_path() -> None:
     )
     target = _target_metadata()
     inputs = _materialize(runtime, mapping_epoch=10)
-    provider.bind_read_carrier(
-        capture_identity=capture,
-        inputs=inputs,
-        proposal_id=10,
-        metadata_builder=_metadata_builder(target),
-        target_metadata=target,
-    )
+    _bind_read_carrier(provider, runtime, capture, inputs, target)
     metadata = consume_draft_window_graph_metadata(
         owner,
         route=DraftWindowGraphRoute.DFLASH,
@@ -558,13 +748,7 @@ def test_actual_update_entry_resolves_backend_before_attribution(
     )
     target = _target_metadata()
     inputs = _materialize(runtime, mapping_epoch=10)
-    provider.bind_read_carrier(
-        capture_identity=capture,
-        inputs=inputs,
-        proposal_id=10,
-        metadata_builder=_metadata_builder(target),
-        target_metadata=target,
-    )
+    _bind_read_carrier(provider, runtime, capture, inputs, target)
     metadata = consume_draft_window_graph_metadata(
         owner,
         route=DraftWindowGraphRoute.DFLASH,
@@ -623,13 +807,7 @@ def test_replay_update_timeline_refuses_to_claim_same_or_next_generation() -> No
     )
     target = _target_metadata()
     inputs = _materialize(runtime, mapping_epoch=10)
-    provider.bind_read_carrier(
-        capture_identity=capture,
-        inputs=inputs,
-        proposal_id=10,
-        metadata_builder=_metadata_builder(target),
-        target_metadata=target,
-    )
+    _bind_read_carrier(provider, runtime, capture, inputs, target)
     metadata = consume_draft_window_graph_metadata(
         owner,
         route=DraftWindowGraphRoute.DFLASH,
@@ -682,13 +860,7 @@ def test_host_a_b_a_has_stable_backing_distinct_generations_and_no_stale_reuse()
     target = _target_metadata()
 
     inputs_a = _materialize(runtime, mapping_epoch=10, start=0)
-    carrier_a = provider.bind_read_carrier(
-        capture_identity=capture,
-        inputs=inputs_a,
-        proposal_id=10,
-        metadata_builder=_metadata_builder(target),
-        target_metadata=target,
-    )
+    carrier_a = _bind_read_carrier(provider, runtime, capture, inputs_a, target)
     address = carrier_a.capture_identity.backing_identity
     table_a = carrier_a.read_inputs.window_block_table.clone()
     provider.discard_bound_carriers()
@@ -703,24 +875,26 @@ def test_host_a_b_a_has_stable_backing_distinct_generations_and_no_stale_reuse()
         exact=(32, 48, 0, 0),
         upper=(64, 64, 0, 0),
     )
-    carrier_b = provider.bind_read_carrier(
-        capture_identity=capture,
-        inputs=inputs_b,
+    carrier_b = _bind_read_carrier(
+        provider,
+        runtime,
+        capture,
+        inputs_b,
+        target,
         proposal_id=11,
-        metadata_builder=_metadata_builder(target),
-        target_metadata=target,
     )
     table_b = carrier_b.read_inputs.window_block_table.clone()
     provider.discard_bound_carriers()
     runtime.retire_generation(inputs_b.identity)
 
     inputs_a2 = _materialize(runtime, mapping_epoch=12, start=0)
-    carrier_a2 = provider.bind_read_carrier(
-        capture_identity=capture,
-        inputs=inputs_a2,
+    carrier_a2 = _bind_read_carrier(
+        provider,
+        runtime,
+        capture,
+        inputs_a2,
+        target,
         proposal_id=12,
-        metadata_builder=_metadata_builder(target),
-        target_metadata=target,
     )
 
     assert carrier_b.capture_identity.backing_identity == address
@@ -785,13 +959,7 @@ def test_eagle3_k3_carriers_keep_distinct_step_sources_and_frozen_proposal() -> 
                 step=step,
                 execution_lane=0,
             )
-        provider.bind_read_carrier(
-            capture_identity=capture,
-            inputs=inputs,
-            proposal_id=10,
-            metadata_builder=_metadata_builder(target),
-            target_metadata=target,
-        )
+        _bind_read_carrier(provider, runtime, capture, inputs, target)
         previous = inputs.identity
         runtime.retire_generation(inputs.identity)
 
@@ -834,7 +1002,6 @@ def test_parallel_graph_manager_carries_explicit_metadata_to_actual_update_seam(
     target = _target_metadata()
     spy = _SourceSpy()
     speculator = SimpleNamespace(
-        _speculator_name=method,
         _draft_window_runtime_state=runtime,
         input_batch=SimpleNamespace(seq_lens_cpu_upper_bound=object()),
         attn_backends={"draft.layers.0.self_attn": AscendAttentionBackend},
@@ -853,13 +1020,7 @@ def test_parallel_graph_manager_carries_explicit_metadata_to_actual_update_seam(
         ),
     )
     inputs = _materialize(runtime, mapping_epoch=10)
-    provider.bind_read_carrier(
-        capture_identity=capture,
-        inputs=inputs,
-        proposal_id=10,
-        metadata_builder=_metadata_builder(target),
-        target_metadata=target,
-    )
+    _bind_read_carrier(provider, runtime, capture, inputs, target)
 
     def _build(*_args: Any) -> list[Mapping[str, Any]]:
         metadata = consume_draft_window_graph_metadata(
@@ -978,13 +1139,7 @@ def test_eagle3_graph_manager_carries_first_pass_and_ar_metadata_to_update(
         phase=phase,
         step=step,
     )
-    provider.bind_read_carrier(
-        capture_identity=capture,
-        inputs=inputs,
-        proposal_id=10,
-        metadata_builder=_metadata_builder(target),
-        target_metadata=target,
-    )
+    _bind_read_carrier(provider, runtime, capture, inputs, target)
 
     def _build(*_args: Any) -> list[Mapping[str, Any]]:
         metadata = consume_draft_window_graph_metadata(
