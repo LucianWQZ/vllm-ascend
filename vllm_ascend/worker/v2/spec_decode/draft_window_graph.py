@@ -3,9 +3,11 @@
 """Ascend-only graph binding contracts for the Draft Window read plane.
 
 P5 deliberately does not enable Draft Window graph execution.  It defines the
-instance-owned descriptor and observation seam that P6 can use to prove which
-stable P3 backing is seen by live execution, graph capture, replay, graph-task
-update, and the eventual attention consumer.
+instance-owned descriptor and observation seam that P6 can use to test the
+expected P3 backing at live, capture, replay, graph-task update, and consumer
+boundaries.  These Python observations are not evidence that captured graph
+metadata or an NPU attention operator consumed that backing; P6 must establish
+the explicit read-carrier path and verify it on NPU before enabling Graph.
 
 The provider never owns tensors.  P3's :class:`DraftWindowWorkspace` remains
 the sole mutable owner: addresses are stable, contents are generation-scoped,
@@ -49,7 +51,7 @@ class DraftWindowGraphStage(Enum):
 
 
 class DraftWindowGraphConsumerKind(Enum):
-    """How the eventual backend obtains the read carrier."""
+    """Expected future carrier path, not backend-derived consumption proof."""
 
     DIRECT_CAPTURED = "direct_captured"
     TASK_REBOUND = "task_rebound"
@@ -57,7 +59,7 @@ class DraftWindowGraphConsumerKind(Enum):
 
 
 class DraftWindowGraphMetadataOwner(Enum):
-    """Owner of metadata derived from the binding's read-only tensors."""
+    """Expected metadata owner; P5 does not attest the runtime backend owner."""
 
     DRAFT_METADATA_STORE = "draft_metadata_store"
     ATTENTION_BACKEND = "attention_backend"
@@ -138,7 +140,7 @@ class DraftWindowGraphBindingDescriptor:
 
 @dataclass(frozen=True, slots=True)
 class DraftWindowGraphSourceEvent:
-    """One opt-in observation; no event is retained without an observer."""
+    """One expected-binding observation, not an operator-consumption attestation."""
 
     sequence: int
     stage: DraftWindowGraphStage
@@ -297,6 +299,7 @@ class DraftWindowGraphBindingProvider:
         if workspace.bound_identity != generation:
             raise RuntimeError("graph binding workspace generation is stale")
         full_source = self._runtime_state.capability.full_source
+        full_source.validate_owner_bindings()
         canonical_tensors = (
             *full_source._input_block_tables,
             full_source._block_tables_owner.num_blocks.gpu,
@@ -374,6 +377,7 @@ class DraftWindowGraphBindingProvider:
             raise RuntimeError("graph binding generation no longer matches P3 inputs")
         if descriptor.identity.mapping_epoch != inputs.identity.mapping_epoch:
             raise RuntimeError("graph binding mapping_epoch no longer matches P3 inputs")
+        self._runtime_state.capability.full_source.validate_owner_bindings()
         current_backing = _workspace_backing_identity(self._runtime_state)
         if current_backing != descriptor.backing_identity:
             raise RuntimeError("graph backing address or geometry changed after binding")

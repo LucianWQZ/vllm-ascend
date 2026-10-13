@@ -458,6 +458,45 @@ def test_backing_address_is_stable_while_contents_and_generation_change() -> Non
     provider.observe(DraftWindowGraphStage.REPLAY, expected=descriptor_b.expectation)
 
 
+def test_observe_rejects_canonical_full_source_table_rebinding() -> None:
+    runtime, _capability, block_tables = _runtime_fixture()
+    inputs = _materialize(runtime)
+    provider, descriptor = _bind(
+        runtime,
+        inputs,
+        route=DraftWindowGraphRoute.EAGLE3_FIRST_PASS,
+    )
+    block_tables.input_block_tables[0] = torch.zeros_like(block_tables.input_block_tables[0])
+
+    with pytest.raises(
+        RuntimeError,
+        match="canonical input block table 0 was replaced",
+    ):
+        provider.observe(
+            DraftWindowGraphStage.REPLAY,
+            expected=descriptor.expectation,
+        )
+
+
+def test_bind_rejects_canonical_full_source_table_rebinding() -> None:
+    runtime, _capability, block_tables = _runtime_fixture()
+    inputs = _materialize(runtime)
+    block_tables.input_block_tables[0] = torch.zeros_like(block_tables.input_block_tables[0])
+    provider = DraftWindowGraphBindingProvider(runtime_state=runtime)
+
+    with pytest.raises(
+        RuntimeError,
+        match="canonical input block table 0 was replaced",
+    ):
+        provider.bind(
+            inputs,
+            proposal_id=inputs.identity.mapping_epoch,
+            route=DraftWindowGraphRoute.EAGLE3_FIRST_PASS,
+            consumer_kind=DraftWindowGraphConsumerKind.TASK_REBOUND,
+            metadata_owner=DraftWindowGraphMetadataOwner.DRAFT_METADATA_STORE,
+        )
+
+
 def test_active_generation_cannot_be_rebound_or_replaced() -> None:
     runtime, _capability, _block_tables = _runtime_fixture()
     inputs = _materialize(runtime)
