@@ -26,6 +26,7 @@ from vllm_ascend.worker.v2.spec_decode.draft_window import (
 from vllm_ascend.worker.v2.spec_decode.draft_window_async import (
     DraftWindowEagerAsyncPool,
     DraftWindowEagerAsyncState,
+    DraftWindowNPUEventCompletionToken,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_eager_capability import (
     P7EagerTopologyFingerprint,
@@ -161,6 +162,56 @@ def _acquire(pool: DraftWindowEagerAsyncPool, epoch: int, request_ids: tuple[str
     )
 
 
+def test_eagle_steps_can_share_one_mapping_epoch_but_not_change_requests() -> None:
+    pool, _ = _pool(capacity=3)
+    first = pool.acquire(
+        mapping_epoch=10,
+        ordered_request_ids=("A", "B"),
+        phase=DraftWindowExecutionPhase.PROPOSAL,
+        step=0,
+    )
+    second = pool.acquire(
+        mapping_epoch=10,
+        ordered_request_ids=("A", "B"),
+        phase=DraftWindowExecutionPhase.STEP,
+        step=1,
+        allow_same_mapping_epoch=True,
+    )
+    assert first.execution_lane != second.execution_lane
+    with pytest.raises(ValueError, match="same-epoch continuation"):
+        pool.acquire(
+            mapping_epoch=10,
+            ordered_request_ids=("B", "A"),
+            phase=DraftWindowExecutionPhase.STEP,
+            step=2,
+            allow_same_mapping_epoch=True,
+        )
+
+
+def test_event_completion_token_records_once_and_queries_real_event_contract() -> None:
+    class FakeEvent:
+        def __init__(self) -> None:
+            self.recorded_with: object | None = None
+            self.complete = False
+
+        def record(self, stream: object) -> None:
+            self.recorded_with = stream
+
+        def query(self) -> bool:
+            return self.complete
+
+    event = FakeEvent()
+    stream = object()
+    token = DraftWindowNPUEventCompletionToken(event=event)
+    token.record(stream)
+    assert event.recorded_with is stream
+    assert token.is_complete() is False
+    event.complete = True
+    assert token.is_complete() is True
+    with pytest.raises(RuntimeError, match="already recorded"):
+        token.record(stream)
+
+
 def _materialize(
     pool: DraftWindowEagerAsyncPool,
     handle: Any,
@@ -294,9 +345,12 @@ def test_abort_before_submit_releases_materialized_state_and_derived_buffers() -
         backend_derived_buffers=(torch.zeros(1),),
     )
 
+    assert handle.bound_metadata is not None
+
     pool.abort(handle)
 
     assert handle.state is DraftWindowEagerAsyncState.RETIRED
+    assert handle.bound_metadata is None
     assert handle.backend_derived_buffers == ()
     pool.release(handle)
     assert _acquire(pool, 2, ("B",)).execution_lane == 0
@@ -338,6 +392,13 @@ def test_abort_after_submit_waits_for_consumer_completion() -> None:
     event = _FakeCompletionToken()
     _bind_and_submit(pool, handle, event)
 
+    # ``submit`` retires the P3 metadata store immediately, but the async
+    # operation must keep the complete Draft-private metadata object (and all
+    # nested backend-derived tensors) alive until the device reader completes.
+    retained = handle.bound_metadata
+    assert retained is not None
+    assert retained["derived"] is handle.backend_derived_buffers[0]
+
     pool.abort(handle)
 
     assert handle.abort_requested is True
@@ -349,8 +410,10 @@ def test_abort_after_submit_waits_for_consumer_completion() -> None:
 
     event.complete = True
     assert pool.poll(handle)
+    assert handle.bound_metadata is retained
     pool.retire(handle)
     pool.release(handle)
+    assert handle.bound_metadata is None
     assert _acquire(pool, 2, ("B",)).execution_lane == 0
 
 
@@ -502,12 +565,11 @@ def test_async_pool_capacity_is_bounded_and_positive(capacity: int) -> None:
         )
 
 
-def test_async_pool_rejects_graph_prefix_and_non_async_fingerprints() -> None:
+def test_async_pool_rejects_graph_and_non_async_fingerprints() -> None:
     capability, _block_tables = _capability()
     topology = _topology()
     invalid = (
         replace_topology(topology, graph_mode="FULL"),
-        replace_topology(topology, prefix_caching=True),
         replace_topology(topology, async_scheduling=False),
     )
 
@@ -518,6 +580,21 @@ def test_async_pool_rejects_graph_prefix_and_non_async_fingerprints() -> None:
                 topology_template=value,
                 capacity=2,
             )
+
+
+def test_async_pool_accepts_prefix_residency_with_independent_lane_backing() -> None:
+    capability, _block_tables = _capability()
+    pool = DraftWindowEagerAsyncPool(
+        capability=capability,
+        topology_template=replace_topology(_topology(), prefix_caching=True),
+        capacity=2,
+    )
+
+    assert pool.capacity == 2
+    assert (
+        pool._runtimes[0].workspace.window_block_table.data_ptr()
+        != pool._runtimes[1].workspace.window_block_table.data_ptr()
+    )
 
 
 def replace_topology(

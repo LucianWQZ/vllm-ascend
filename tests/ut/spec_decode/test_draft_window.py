@@ -23,6 +23,9 @@ from vllm_ascend.attention.attention_v1 import (
     AscendAttentionBackend,
     AscendAttentionMetadataBuilder,
 )
+from vllm_ascend.attention.context_parallel.dsa_cp import (
+    AscendDSACPMetadataBuilder,
+)
 from vllm_ascend.attention.dsa_v1 import (
     AscendDSABackend,
     AscendDSAMetadataBuilder,
@@ -2084,7 +2087,7 @@ def test_compatibility_hardware_family_stops_before_full_source_allocation(
         forbidden_full_source,
     )
 
-    with pytest.raises(NotImplementedError, match="FAIL_CLOSED.*COMPATIBILITY"):
+    with pytest.raises(NotImplementedError, match="SOURCE_BLOCKED.*COMPATIBILITY"):
         build_draft_window_source_capability(
             policy=_p2_policy("eagle3"),
             runtime_route="eagle3",
@@ -2153,7 +2156,7 @@ def test_eagle3_provider_rejects_plan_offset_that_disagrees_with_configured_k() 
         )
 
 
-def test_async_source_capability_stops_before_full_source_allocation(
+def test_eagle3_async_source_capability_stops_before_full_source_allocation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     vllm_config = _p2_vllm_config(configured_k=3)
@@ -2167,7 +2170,7 @@ def test_async_source_capability_stops_before_full_source_allocation(
         forbidden_full_source,
     )
 
-    with pytest.raises(NotImplementedError, match="STATIC_READY.*NPU completion"):
+    with pytest.raises(NotImplementedError, match="REPORT1_RUNTIME_DEPENDENT.*multi-step async"):
         build_draft_window_source_capability(
             policy=_p2_policy("eagle3"),
             runtime_route="eagle3",
@@ -2175,4 +2178,80 @@ def test_async_source_capability_stops_before_full_source_allocation(
             block_tables=_block_tables(),
             causal=True,
             vllm_config=vllm_config,
+        )
+
+
+@pytest.mark.parametrize(
+    ("dsa_cp", "builder_class", "expected_semantics"),
+    [
+        (False, AscendDSAMetadataBuilder, "replicated"),
+        (True, AscendDSACPMetadataBuilder, "dsa_cp_derived"),
+    ],
+)
+def test_p7x_source_capability_binds_uncompressed_dsa_provider(
+    dsa_cp: bool,
+    builder_class: type[Any],
+    expected_semantics: str,
+) -> None:
+    builder = object.__new__(builder_class)
+    builder.compressor_ratio = 1
+    config = _p2_vllm_config(
+        configured_k=4,
+        additional_config={"enable_dsa_cp": dsa_cp},
+    )
+    if dsa_cp:
+        config.parallel_config.tensor_parallel_size = 2
+        config.parallel_config.tensor_parallel_rank = 1
+    capability = build_draft_window_source_capability(
+        policy=_p2_policy("dflash"),
+        runtime_route="dflash",
+        attn_groups=[
+            [
+                _attention_group(
+                    backend_class=AscendDSABackend,
+                    builder=builder,
+                )
+            ]
+        ],
+        block_tables=_block_tables(row_width=16),
+        causal=True,
+        vllm_config=config,
+    )
+
+    assert capability.inventory.groups[0].layout_category is DraftWindowLayoutCategory.DSA
+    assert capability.inventory.groups[0].drafting_compression_ratio == 1
+    assert capability.provider.source_group is capability.inventory.groups[0]
+    assert capability.provider.block_span_tokens == 64
+    assert capability.eager_topology_fingerprint is not None
+    assert capability.eager_topology_fingerprint.parallel_read_semantics == expected_semantics
+
+
+def test_p7x_compressed_dsa_stops_before_full_source_allocation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = object.__new__(AscendDSAMetadataBuilder)
+    builder.compressor_ratio = 4
+
+    def forbidden_full_source(**_kwargs: Any) -> Any:
+        raise AssertionError("compressed DSA must not create FullSource")
+
+    monkeypatch.setattr(
+        "vllm_ascend.worker.v2.spec_decode.draft_window.build_full_draft_kv_source",
+        forbidden_full_source,
+    )
+    with pytest.raises(NotImplementedError, match="SOURCE_BLOCKED.*compressed DSA"):
+        build_draft_window_source_capability(
+            policy=_p2_policy("dflash"),
+            runtime_route="dflash",
+            attn_groups=[
+                [
+                    _attention_group(
+                        backend_class=AscendDSABackend,
+                        builder=builder,
+                    )
+                ]
+            ],
+            block_tables=_block_tables(),
+            causal=True,
+            vllm_config=_p2_vllm_config(configured_k=4),
         )

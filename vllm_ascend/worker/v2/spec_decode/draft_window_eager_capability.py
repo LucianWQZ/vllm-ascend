@@ -58,6 +58,8 @@ class P7EagerTopologyFingerprint:
     prefix_caching: bool
     provider_version: int
     execution_lane: int
+    tensor_parallel_rank: int = 0
+    parallel_read_semantics: str = "replicated"
 
     def __post_init__(self) -> None:
         if not self.normalized_method or self.normalized_method != self.normalized_method.strip().lower():
@@ -90,6 +92,14 @@ class P7EagerTopologyFingerprint:
             raise ValueError("topology group fingerprints must have equal lengths")
         if any(gid < 0 for gid in self.global_group_ids):
             raise ValueError("topology global gids must be nonnegative")
+        if not 0 <= self.tensor_parallel_rank < self.tensor_parallel_size:
+            raise ValueError("topology TP rank must be within the TP world")
+        if self.parallel_read_semantics not in {
+            "replicated",
+            "dcp_interleaved",
+            "dsa_cp_derived",
+        }:
+            raise ValueError("topology parallel read semantics are not recognized")
 
     def for_execution_lane(
         self,
@@ -184,6 +194,14 @@ def _build_topology_fingerprint(
         prefix_caching=runtime_context.prefix_caching,
         provider_version=provider_version,
         execution_lane=execution_lane,
+        tensor_parallel_rank=runtime_context.tensor_parallel_rank,
+        parallel_read_semantics=(
+            "dsa_cp_derived"
+            if runtime_context.dsa_context_parallel
+            else "dcp_interleaved"
+            if runtime_context.decode_context_parallel_size > 1
+            else "replicated"
+        ),
     )
 
 

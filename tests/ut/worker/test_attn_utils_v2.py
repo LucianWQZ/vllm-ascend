@@ -20,6 +20,9 @@ from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_ascend.attention import dsa_v1
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
+from vllm_ascend.attention.context_parallel.dsa_cp import (
+    AscendDSACPMetadataBuilder,
+)
 from vllm_ascend.attention.dsa_v1 import (
     AscendDSAC4Backend,
     AscendDSAC4StateBackend,
@@ -589,6 +592,69 @@ class _RecordingDSAMetadataBuilder(AscendDSAMetadataBuilder):
         self.calls.append(call)
         call["common_ratio_to_sas_metadata"].setdefault("first_group", len(self.calls) == 1)
         return SimpleNamespace(common_attn_metadata=common_attn_metadata)
+
+
+class _RecordingDSACPMetadataBuilder(AscendDSACPMetadataBuilder):
+    def __init__(self, calls: list[dict[str, Any]]):
+        self.calls = calls
+
+    def build(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata,
+        fast_build: bool = False,
+        **kwargs,
+    ):
+        del common_prefix_len, fast_build
+        call = {
+            "common_attn_metadata": common_attn_metadata,
+            "common_ratio_to_sas_metadata": kwargs["common_ratio_to_sas_metadata"],
+            "num_actual_reqs": kwargs["num_actual_reqs"],
+        }
+        self.common_ratio_to_sas_metadata = call["common_ratio_to_sas_metadata"]
+        self.calls.append(call)
+        return SimpleNamespace(common_attn_metadata=common_attn_metadata)
+
+
+def test_build_attn_metadata_recognizes_dsa_cp_builder_as_dsa_consumer() -> None:
+    calls: list[dict[str, Any]] = []
+    layer_name = "draft.layers.0.self_attn"
+    spec = _make_dsv4_mla_spec(64, 1)
+    builder = _RecordingDSACPMetadataBuilder(calls)
+    group = AttentionGroup(
+        backend=AscendDSASWABackend,
+        layer_names=[layer_name],
+        kv_cache_spec=spec,
+        kv_cache_group_id=0,
+        metadata_builders=[builder],
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=8,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec(layer_names=[layer_name], kv_cache_spec=spec)],
+    )
+
+    metadata = attn_utils.build_attn_metadata(
+        attn_groups=[[group]],
+        num_reqs=2,
+        num_actual_reqs=2,
+        num_tokens=2,
+        query_start_loc_gpu=torch.tensor([0, 1, 2], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 1, 2], dtype=torch.int32),
+        max_query_len=1,
+        seq_lens=torch.tensor([32, 48], dtype=torch.int32),
+        seq_lens_cpu=torch.tensor([32, 48], dtype=torch.int32),
+        max_seq_len=48,
+        block_tables=[torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)],
+        slot_mappings=torch.tensor([[11, 12]], dtype=torch.int32),
+        kv_cache_config=kv_cache_config,
+        positions=torch.tensor([31, 47], dtype=torch.int64),
+    )
+
+    assert set(metadata) == {layer_name}
+    assert len(calls) == 1
+    assert calls[0]["num_actual_reqs"] == 2
+    assert calls[0]["common_ratio_to_sas_metadata"] is builder.common_ratio_to_sas_metadata
 
 
 def _make_dsa_metadata_groups():

@@ -112,6 +112,7 @@ def _eagle3_runtime_fixture(
             legacy_block_size=block_size,
             expected_future_offset=static_k,
         ),
+        workspace_capacity_columns=row_width,
     )
     return build_draft_window_runtime_state(capability), capability, block_tables
 
@@ -605,13 +606,18 @@ def test_scheduler_prefill_classification_does_not_bypass_decode_first_pass() ->
     harness, batch = _lifecycle_harness()
     prefill_batch = _eagle3_input_batch(has_prefill=True)
 
-    with harness._eagle3_draft_window_proposal_scope(
-        prefill_batch,
-        dummy_run=False,
-        is_profile=False,
+    with (
+        pytest.raises(RuntimeError, match="without consuming all Eagle3 steps"),
+        harness._eagle3_draft_window_proposal_scope(
+            prefill_batch,
+            dummy_run=False,
+            is_profile=False,
+        ),
     ):
-        assert harness._eagle3_window_bypass_active
-    assert harness._eagle3_window_epoch_source._next_epoch == 0
+        assert not harness._eagle3_window_bypass_active
+        assert harness._eagle3_window_proposal_context is not None
+        assert harness._eagle3_window_proposal_context.phase_plan.row_phase_fingerprint == ("prefill_terminal",)
+    assert harness._eagle3_window_epoch_source._next_epoch == 1
 
     with (
         pytest.raises(RuntimeError, match="without consuming all Eagle3 steps"),
@@ -623,7 +629,7 @@ def test_scheduler_prefill_classification_does_not_bypass_decode_first_pass() ->
     ):
         assert not harness._eagle3_window_bypass_active
         assert harness._eagle3_window_proposal_context is not None
-    assert harness._eagle3_window_epoch_source._next_epoch == 1
+    assert harness._eagle3_window_epoch_source._next_epoch == 2
 
 
 def test_continuing_pure_chunked_prefill_uses_baseline_without_window_state() -> None:

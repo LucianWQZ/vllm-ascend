@@ -9,7 +9,7 @@ untouched. The upstream vLLM checkout remains unmodified.
 """
 
 import copy
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, fields, is_dataclass
 from enum import Enum
@@ -31,11 +31,22 @@ from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftWindowSourceCapability,
     SingleGroupDirectPrefixProvider,
     compute_draft_window_scalar_plan,
-    gather_valid_num_blocks_cpu,
+)
+from vllm_ascend.worker.v2.spec_decode.draft_window_async import (
+    DraftWindowEagerAsyncHandle,
+    DraftWindowEagerAsyncPool,
+    DraftWindowEagerAsyncState,
+    DraftWindowNPUEventCompletionToken,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
     DraftWindowGraphStage,
     observe_draft_window_graph_source,
+)
+from vllm_ascend.worker.v2.spec_decode.draft_window_nongraph import (
+    DraftWindowBatchPhasePlan,
+    build_phase_aware_materialization_plan,
+    build_prefix_resident_snapshot,
+    classify_draft_window_batch_phase,
 )
 
 
@@ -84,6 +95,7 @@ class DraftWindowProposalContext:
     input_batch_id: int
     ordered_request_ids: tuple[str, ...]
     idx_mapping_fingerprint: tuple[int, ...]
+    phase_plan: DraftWindowBatchPhasePlan
 
 
 class DraftWindowProposalEpochSource:
@@ -97,11 +109,13 @@ class DraftWindowProposalEpochSource:
         if self._active is not None:
             raise RuntimeError("a draft-window proposal epoch is already active")
         request_ids, mapping = _proposal_fingerprint(input_batch)
+        phase_plan = classify_draft_window_batch_phase(input_batch)
         context = DraftWindowProposalContext(
             mapping_epoch=self._next_epoch,
             input_batch_id=id(input_batch),
             ordered_request_ids=request_ids,
             idx_mapping_fingerprint=mapping,
+            phase_plan=phase_plan,
         )
         self._next_epoch += 1
         self._active = context
@@ -121,6 +135,9 @@ class DraftWindowProposalEpochSource:
             raise RuntimeError("proposal request ordering changed within one epoch")
         if mapping != expected.idx_mapping_fingerprint:
             raise RuntimeError("proposal idx_mapping changed within one epoch")
+        phase_plan = classify_draft_window_batch_phase(input_batch)
+        if phase_plan != expected.phase_plan:
+            raise RuntimeError("proposal row phases changed within one epoch")
 
     def finish(self, expected: DraftWindowProposalContext) -> None:
         if self._active is not expected:
@@ -216,10 +233,14 @@ class DraftWindowEagerMixin:
     _draft_window_proposal_context: DraftWindowProposalContext | None
     _draft_window_live_inputs: DraftMetadataInputs | None
     _draft_window_bypass_active: bool
+    _draft_window_async_pool: DraftWindowEagerAsyncPool | None
+    _draft_window_async_handle: DraftWindowEagerAsyncHandle | None
+    _draft_window_completion_token_factory: Callable[[], Any]
     input_batch: InputBatch
     input_buffers: Any
     block_tables: Any
     model_state: Any
+    vllm_config: Any
     draft_attn_layer_names: set[str] | None
     arange: torch.Tensor
     attn_groups: Any
@@ -236,6 +257,22 @@ class DraftWindowEagerMixin:
         self._draft_window_proposal_context: DraftWindowProposalContext | None = None
         self._draft_window_live_inputs: DraftMetadataInputs | None = None
         self._draft_window_bypass_active = False
+        topology = getattr(
+            self._draft_window_source_capability,
+            "eager_topology_fingerprint",
+            None,
+        )
+        self._draft_window_async_pool = None
+        self._draft_window_async_handle = None
+        self._draft_window_completion_token_factory = DraftWindowNPUEventCompletionToken.record_current_stream
+        if topology is not None and topology.async_scheduling:
+            additional_config = getattr(self.vllm_config, "additional_config", None) or {}
+            capacity = int(additional_config.get("draft_window_async_lanes", 2))
+            self._draft_window_async_pool = DraftWindowEagerAsyncPool(
+                capability=self._draft_window_source_capability,
+                topology_template=topology,
+                capacity=capacity,
+            )
 
     @contextmanager
     def _draft_window_proposal_scope(
@@ -271,14 +308,46 @@ class DraftWindowEagerMixin:
             return
         context = epoch_source.begin(input_batch)
         self._draft_window_proposal_context = context
+        async_pool = self._draft_window_async_pool
         succeeded = False
         try:
+            if async_pool is not None:
+                async_pool.reclaim_completed()
+                self._draft_window_async_handle = async_pool.acquire(
+                    mapping_epoch=context.mapping_epoch,
+                    ordered_request_ids=context.ordered_request_ids,
+                    phase=DraftWindowExecutionPhase.PROPOSAL,
+                    step=0,
+                )
             yield
             succeeded = True
         finally:
             live_inputs = self._draft_window_live_inputs
             try:
-                if live_inputs is not None and live_inputs.lease.state is not DraftWindowLeaseState.RETIRED:
+                async_handle = self._draft_window_async_handle
+                if async_pool is not None:
+                    try:
+                        if async_handle is None:
+                            if succeeded:
+                                raise RuntimeError("eligible async proposal did not acquire a Draft Window lane")
+                        elif succeeded:
+                            if live_inputs is None:
+                                raise RuntimeError(
+                                    "eligible async proposal completed without consuming Draft Window inputs"
+                                )
+                            if async_handle.state is not DraftWindowEagerAsyncState.BOUND:
+                                raise RuntimeError(
+                                    "async Draft Window proposal did not bind metadata before submission"
+                                )
+                            completion = self._draft_window_completion_token_factory()
+                            async_pool.submit(async_handle, completion)
+                    except BaseException:
+                        if async_handle is not None:
+                            self._discard_unsubmitted_async_handle(async_pool, async_handle)
+                        raise
+                    if not succeeded and async_handle is not None:
+                        self._discard_unsubmitted_async_handle(async_pool, async_handle)
+                elif live_inputs is not None and live_inputs.lease.state is not DraftWindowLeaseState.RETIRED:
                     if succeeded:
                         self._draft_window_runtime_state.retire_generation(live_inputs.identity)
                     else:
@@ -287,8 +356,25 @@ class DraftWindowEagerMixin:
                     raise RuntimeError("eligible P4a proposal completed without consuming Draft Window inputs")
             finally:
                 self._draft_window_live_inputs = None
+                self._draft_window_async_handle = None
                 self._draft_window_proposal_context = None
                 epoch_source.finish(context)
+
+    @staticmethod
+    def _discard_unsubmitted_async_handle(
+        pool: DraftWindowEagerAsyncPool,
+        handle: DraftWindowEagerAsyncHandle,
+    ) -> None:
+        """Release host-owned failure state without touching submitted work."""
+        if handle.state in (
+            DraftWindowEagerAsyncState.SUBMITTED,
+            DraftWindowEagerAsyncState.FREE,
+        ):
+            return
+        if handle.state is not DraftWindowEagerAsyncState.RETIRED:
+            pool.abort(handle)
+        if handle.state is DraftWindowEagerAsyncState.RETIRED:
+            pool.release(handle)
 
     def _snapshot_prepared_draft_seq_lens(
         self,
@@ -328,23 +414,41 @@ class DraftWindowEagerMixin:
             )
             cpu_apply_time_full_upper[:num_reqs].clamp_(max=self.max_model_len)
         capability = self._draft_window_source_capability
-        cpu_valid_num_blocks = gather_valid_num_blocks_cpu(
-            capability.full_source,
+        resident_snapshot = build_prefix_resident_snapshot(
+            full_source=capability.full_source,
             global_group_id=capability.provider.global_group_id,
             idx_mapping_np=input_batch.idx_mapping_np,
+            ordered_request_ids=context.ordered_request_ids,
             num_reqs=num_reqs,
             num_reqs_padded=num_reqs_padded,
         )
-        plan = build_eager_window_materialization_plan(
+        plan = build_phase_aware_materialization_plan(
             provider=capability.provider,
+            phase_plan=context.phase_plan,
             cpu_full_exact=cpu_full_exact,
             cpu_apply_time_full_upper=cpu_apply_time_full_upper,
-            cpu_valid_num_blocks=cpu_valid_num_blocks,
+            cpu_valid_num_blocks=resident_snapshot.valid_num_blocks,
             actual_request_count=num_reqs,
             padded_request_count=num_reqs_padded,
         )
         # Recheck freshness after the controlled length snapshot and host plan.
         self._draft_window_epoch_source.validate(context, input_batch)
+        async_pool = self._draft_window_async_pool
+        if async_pool is not None:
+            handle = self._draft_window_async_handle
+            if handle is None:
+                raise RuntimeError("async proposal has no acquired Draft Window lane")
+            return async_pool.materialize(
+                handle,
+                idx_mapping=input_batch.idx_mapping,
+                read_descriptors=plan.read_descriptors,
+                device_window_exact=None,
+                cpu_window_exact=plan.cpu_window_exact,
+                cpu_window_upper=plan.cpu_window_upper,
+                cpu_valid_num_blocks=plan.cpu_valid_num_blocks,
+                num_reqs_padded=num_reqs_padded,
+                row_phase_fingerprint=plan.row_phase_fingerprint,
+            )
         return self._draft_window_runtime_state.materialize(
             mapping_epoch=context.mapping_epoch,
             ordered_request_ids=context.ordered_request_ids,
@@ -358,6 +462,7 @@ class DraftWindowEagerMixin:
             phase=DraftWindowExecutionPhase.PROPOSAL,
             step=0,
             execution_lane=0,
+            row_phase_fingerprint=plan.row_phase_fingerprint,
         )
 
     def _validated_draft_attention_read_inputs(
@@ -444,6 +549,17 @@ class DraftWindowEagerMixin:
             metadata,
             target_metadata,
         )
+        async_pool = self._draft_window_async_pool
+        if async_pool is not None:
+            handle = self._draft_window_async_handle
+            if handle is None or handle.inputs is not inputs:
+                raise RuntimeError("async metadata does not belong to the active Draft Window handle")
+            async_pool.bind(
+                handle,
+                metadata=metadata,
+                target_metadata=target_metadata,
+            )
+            return async_pool.read_bound_metadata(handle)
         runtime_state.publish_metadata(
             inputs,
             metadata,
@@ -557,27 +673,14 @@ def _proposal_fingerprint(
 def _requires_prefill_baseline_bypass(
     input_batch: InputBatch | Any,
 ) -> bool:
-    """Classify the pure-prefill phase that must use baseline full reads.
+    """Bypass only an all-continuing scheduler-prefill batch.
 
-    Upstream invokes the speculator after every target step, including every
-    chunk of a long prompt and the chunk that completes it. A batch containing
-    only prefill requests uses the baseline full-context metadata path and
-    allocates no Window generation. A mixed prefill/decode batch remains outside
-    the supported route and fails before epoch/workspace creation.
+    Terminal rows transition into speculative decode and mixed batches carry
+    an explicit row-wise full/window contract.  This helper remains for the
+    existing proposal-scope call sites; the immutable phase plan is bound to
+    the proposal epoch before any materialization.
     """
-    num_reqs = int(input_batch.num_reqs)
-    is_prefilling = np.asarray(input_batch.is_prefilling_np)[:num_reqs]
-    if is_prefilling.ndim != 1 or is_prefilling.shape[0] != num_reqs:
-        raise ValueError("prefill classification does not cover active requests")
-    has_prefill = bool(input_batch.has_prefill)
-    any_prefill = bool(np.any(is_prefilling))
-    if has_prefill != any_prefill:
-        raise RuntimeError("InputBatch has_prefill disagrees with is_prefilling_np")
-    if not any_prefill:
-        return False
-    if not bool(np.all(is_prefilling)):
-        raise NotImplementedError("MRV2 draft-window P4a does not support mixed prefill/decode proposals")
-    return True
+    return classify_draft_window_batch_phase(input_batch).bypass_entire_batch
 
 
 def _isolate_draft_metadata_from_target(

@@ -22,6 +22,7 @@ from vllm_ascend.attention.attention_v1 import (
     AscendAttentionBackend,
     AscendAttentionMetadataBuilder,
 )
+from vllm_ascend.device.hardware_profile import AttentionBackendFamily
 from vllm_ascend.worker.v2 import attn_utils as ascend_attn_utils
 from vllm_ascend.worker.v2.attn_utils import (
     build_attn_metadata_wrapper,
@@ -44,6 +45,9 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_eager import (
     _isolate_draft_metadata_from_target,
     build_eager_window_materialization_plan,
 )
+from vllm_ascend.worker.v2.spec_decode.draft_window_eager_capability import (
+    P7EagerTopologyFingerprint,
+)
 
 
 def _runtime_fixture(
@@ -51,6 +55,8 @@ def _runtime_fixture(
     window_size: int = 128,
     max_num_reqs: int = 8,
     row_width: int = 16,
+    async_scheduling: bool = False,
+    prefix_caching: bool = False,
 ) -> tuple[Any, DraftWindowSourceCapability, SimpleNamespace]:
     canonical_counts = torch.full(
         (1, max_num_reqs),
@@ -100,6 +106,29 @@ def _runtime_fixture(
         inventory=inventory,
         block_tables=block_tables,
     )
+    topology = P7EagerTopologyFingerprint(
+        normalized_method="dflash",
+        runtime_route="dflash",
+        attention_backend_family=AttentionBackendFamily.STANDARD,
+        backend_impls=(f"{AscendAttentionBackend.__module__}.{AscendAttentionBackend.__qualname__}",),
+        builder_impls=(f"{AscendAttentionMetadataBuilder.__module__}.{AscendAttentionMetadataBuilder.__qualname__}",),
+        global_group_ids=(0,),
+        layouts=("dense_gqa_direct_prefix",),
+        block_geometry=((0, 64, 64),),
+        tensor_parallel_size=1,
+        data_parallel_size=1,
+        pipeline_parallel_size=1,
+        prefill_context_parallel_size=1,
+        decode_context_parallel_size=1,
+        sequence_parallel=False,
+        dsa_context_parallel=False,
+        flashcomm=False,
+        graph_mode="NONE",
+        async_scheduling=async_scheduling,
+        prefix_caching=prefix_caching,
+        provider_version=1,
+        execution_lane=0,
+    )
     capability = DraftWindowSourceCapability(
         inventory=inventory,
         full_source=full_source,
@@ -109,6 +138,8 @@ def _runtime_fixture(
             legacy_block_size=64,
             expected_future_offset=0,
         ),
+        eager_topology_fingerprint=topology,
+        workspace_capacity_columns=row_width,
     )
     return build_draft_window_runtime_state(capability), capability, block_tables
 
@@ -319,8 +350,17 @@ def test_scope_without_eligible_policy_state_is_a_true_noop() -> None:
     assert not hasattr(harness, "_draft_window_live_inputs")
 
 
-def _harness(*, query_width: int = 4) -> tuple[_EagerHarness, SimpleNamespace]:
-    runtime, capability, block_tables = _runtime_fixture()
+def _harness(
+    *,
+    query_width: int = 4,
+    async_scheduling: bool = False,
+    prefix_caching: bool = False,
+    async_lanes: int = 2,
+) -> tuple[_EagerHarness, SimpleNamespace]:
+    runtime, capability, block_tables = _runtime_fixture(
+        async_scheduling=async_scheduling,
+        prefix_caching=prefix_caching,
+    )
     batch = _input_batch()
     block_tables.slot_mappings = torch.tensor(
         [[101, 102, 103, 104, 105, 106, 107, 108]],
@@ -329,6 +369,9 @@ def _harness(*, query_width: int = 4) -> tuple[_EagerHarness, SimpleNamespace]:
     harness = _EagerHarness()
     harness._draft_window_runtime_state = runtime
     harness._draft_window_source_capability = capability
+    harness.vllm_config = SimpleNamespace(
+        additional_config={"draft_window_async_lanes": async_lanes},
+    )
     harness._initialize_draft_window_eager_state()
     harness.draft_attn_layer_names = {"draft.layer"}
     harness.block_tables = block_tables
@@ -543,7 +586,7 @@ def test_apply_time_upper_uses_actual_dflash_or_dspark_query_width(
         assert harness.captured_read_inputs.seq_lens_cpu_upper_bound.tolist() == expected_upper
 
 
-def test_terminal_pure_prefill_uses_baseline_then_decode_uses_window() -> None:
+def test_terminal_pure_prefill_transitions_to_window_then_decode_uses_window() -> None:
     harness, batch = _harness()
     batch = _input_batch(has_prefill=True)
     harness.input_batch = batch
@@ -562,10 +605,10 @@ def test_terminal_pure_prefill_uses_baseline_then_decode_uses_window() -> None:
             causal=False,
         )
 
-    assert result == {"baseline": True}
-    assert harness.baseline_builder_calls == 1
-    assert harness.builder_events == []
-    assert harness._draft_window_epoch_source._next_epoch == 0
+    assert "draft.layer" in result
+    assert harness.baseline_builder_calls == 0
+    assert harness.builder_events == ["builder"]
+    assert harness._draft_window_epoch_source._next_epoch == 1
     assert harness._draft_window_proposal_context is None
     assert harness._draft_window_live_inputs is None
     assert harness._draft_window_runtime_state.workspace.bound_identity is None
@@ -588,26 +631,39 @@ def test_terminal_pure_prefill_uses_baseline_then_decode_uses_window() -> None:
         )
 
     assert "draft.layer" in metadata
-    assert harness.builder_events == ["builder"]
-    assert harness._draft_window_epoch_source._next_epoch == 1
+    assert harness.builder_events == ["builder", "builder"]
+    assert harness._draft_window_epoch_source._next_epoch == 2
     assert harness._draft_window_runtime_state.workspace.bound_identity is None
 
 
-def test_mixed_prefill_decode_fails_before_materialization() -> None:
+def test_mixed_prefill_decode_builds_row_specific_full_and_window_reads() -> None:
     harness, batch = _harness()
     batch.has_prefill = True
     batch.is_prefilling_np[:] = np.array([True, False])
     batch.num_computed_prefill_tokens_np[:] = np.array([0, 4])
 
-    with (
-        pytest.raises(NotImplementedError, match="mixed prefill/decode"),
-        harness._draft_window_proposal_scope(
-            batch,
-            dummy_run=False,
-            is_profile=False,
-        ),
+    with harness._draft_window_proposal_scope(
+        batch,
+        dummy_run=False,
+        is_profile=False,
     ):
-        pass
+        metadata = harness._build_draft_attn_metadata(
+            num_reqs=2,
+            num_reqs_padded=4,
+            num_tokens_padded=8,
+            seq_lens_cpu_upper_bound=batch.seq_lens_cpu_upper_bound,
+            step=4,
+            causal=False,
+        )
+        inputs = harness._draft_window_live_inputs
+        assert inputs is not None
+        assert inputs.identity.row_phase_fingerprint == (
+            "prefill_continuing",
+            "pure_decode",
+        )
+        assert inputs.active_table_columns == (16, 3)
+        assert inputs.cpu_window_exact.tolist() == [193, 129, 0, 0]
+        assert "draft.layer" in metadata
 
     assert harness._draft_window_runtime_state.workspace.bound_identity is None
 
@@ -616,8 +672,8 @@ def test_continuing_pure_chunked_prefill_uses_baseline_without_window_state() ->
     harness, batch = _harness()
     batch.has_prefill = True
     batch.is_prefilling_np.fill(True)
-    batch.prefill_len_np[:] = np.array([8, 4])
     batch.num_computed_prefill_tokens_np.fill(0)
+    batch.prefill_len_np[:] = np.array([8, 8])
     batch.num_scheduled_tokens[:] = np.array([4, 4])
 
     with harness._draft_window_proposal_scope(
@@ -642,6 +698,101 @@ def test_continuing_pure_chunked_prefill_uses_baseline_without_window_state() ->
     assert harness._draft_window_live_inputs is None
     assert harness._draft_window_runtime_state.workspace.bound_identity is None
     assert harness._draft_window_runtime_state.metadata_store._entry is None
+
+
+class _FakeAsyncCompletion:
+    def __init__(self) -> None:
+        self.complete = False
+
+    def is_complete(self) -> bool:
+        return self.complete
+
+
+def _run_async_proposal(
+    harness: _EagerHarness,
+    batch: SimpleNamespace,
+) -> None:
+    with harness._draft_window_proposal_scope(
+        batch,
+        dummy_run=False,
+        is_profile=False,
+    ):
+        metadata = harness._build_draft_attn_metadata(
+            num_reqs=batch.num_reqs,
+            num_reqs_padded=4,
+            num_tokens_padded=8,
+            seq_lens_cpu_upper_bound=batch.seq_lens_cpu_upper_bound,
+            step=4,
+            causal=False,
+        )
+        assert "draft.layer" in metadata
+
+
+def test_live_async_scope_owns_two_inflight_generations_and_reclaims_reverse_completion() -> None:
+    harness, batch = _harness(async_scheduling=True, prefix_caching=True)
+    completions: list[_FakeAsyncCompletion] = []
+
+    def new_completion() -> _FakeAsyncCompletion:
+        token = _FakeAsyncCompletion()
+        completions.append(token)
+        return token
+
+    harness._draft_window_completion_token_factory = new_completion
+    pool = harness._draft_window_async_pool
+    assert pool is not None
+
+    _run_async_proposal(harness, batch)
+    first = pool._active[0]
+    assert first is not None
+    first_ptr = pool._runtimes[0].workspace.window_block_table.data_ptr()
+
+    _run_async_proposal(harness, batch)
+    second = pool._active[1]
+    assert second is not None
+    assert first.operation_id != second.operation_id
+    assert first.mapping_epoch + 1 == second.mapping_epoch
+    assert (
+        pool._runtimes[0].workspace.window_block_table.data_ptr()
+        != pool._runtimes[1].workspace.window_block_table.data_ptr()
+    )
+
+    completions[1].complete = True
+    _run_async_proposal(harness, batch)
+    third = pool._active[1]
+    assert third is not None and third is not second
+    assert pool._runtimes[1].workspace.window_block_table.data_ptr() != first_ptr
+
+    completions[0].complete = True
+    completions[2].complete = True
+    assert pool.reclaim_completed() == (0, 1)
+    assert pool._active == [None, None]
+
+
+def test_live_async_pressure_and_builder_failure_cleanup_do_not_poison_epoch_owner() -> None:
+    harness, batch = _harness(async_scheduling=True, async_lanes=1)
+    completions: list[_FakeAsyncCompletion] = []
+
+    def new_completion() -> _FakeAsyncCompletion:
+        token = _FakeAsyncCompletion()
+        completions.append(token)
+        return token
+
+    harness._draft_window_completion_token_factory = new_completion
+    pool = harness._draft_window_async_pool
+    assert pool is not None
+    _run_async_proposal(harness, batch)
+
+    with pytest.raises(RuntimeError, match="pool pressure"):
+        _run_async_proposal(harness, batch)
+    assert harness._draft_window_epoch_source._active is None
+
+    completions[0].complete = True
+    assert pool.reclaim_completed() == (0,)
+    harness.raise_in_builder = True
+    with pytest.raises(RuntimeError, match="synthetic builder failure"):
+        _run_async_proposal(harness, batch)
+    assert pool._active == [None]
+    assert harness._draft_window_epoch_source._active is None
 
 
 def test_metadata_isolation_clones_nested_target_aliases_without_mutating_target() -> None:

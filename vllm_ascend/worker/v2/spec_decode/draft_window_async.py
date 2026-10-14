@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
-"""Bounded host lifecycle foundation for future eager async Draft Windows.
+"""Bounded lifecycle owner for eager asynchronous Draft Windows.
 
-The pool deliberately has no production installation point.  It proves lane,
-backing, generation, abort, and completion-token ownership on the host while
-the existing async capability gate remains closed pending a real NPU event and
-live consumer integration.
+P7-X installs the pool only for an eligible non-Graph DFlash/DSpark route.
+The pool owns one independent P3 runtime per lane and keeps Draft-private
+metadata alive until a completion token proves the device consumer is done.
+Host tests prove the state machine; real stream ordering remains an NPU gate.
 """
 
 from collections.abc import Iterator, Sequence
@@ -44,6 +44,37 @@ class DraftWindowEagerAsyncState(Enum):
     RETIRED = "retired"
 
 
+@dataclass(slots=True)
+class DraftWindowNPUEventCompletionToken:
+    """Minimal real-device event adapter used by the live eager owner.
+
+    Construction is dependency-injected in host tests. Production passes a
+    ``torch.npu.Event`` and records it on the Draft consumer stream exactly
+    once; querying never synchronizes the host.
+    """
+
+    event: Any
+    _recorded: bool = False
+
+    def record(self, stream: Any) -> None:
+        if self._recorded:
+            raise RuntimeError("Draft Window completion event is already recorded")
+        self.event.record(stream)
+        self._recorded = True
+
+    def is_complete(self) -> bool:
+        if not self._recorded:
+            raise RuntimeError("Draft Window completion event was not recorded")
+        return bool(self.event.query())
+
+    @classmethod
+    def record_current_stream(cls) -> "DraftWindowNPUEventCompletionToken":
+        event = torch.npu.Event()  # type: ignore[attr-defined]
+        token = cls(event=event)
+        token.record(torch.npu.current_stream())  # type: ignore[attr-defined]
+        return token
+
+
 @dataclass(slots=True, eq=False)
 class DraftWindowEagerAsyncHandle:
     """One non-reusable operation handle owned by a bounded pool."""
@@ -57,13 +88,19 @@ class DraftWindowEagerAsyncHandle:
     topology_fingerprint: P7EagerTopologyFingerprint
     state: DraftWindowEagerAsyncState = DraftWindowEagerAsyncState.ACQUIRED
     inputs: DraftMetadataInputs | None = field(default=None, repr=False)
+    # Retain the complete Draft-private metadata object until the device
+    # completion token proves that every late backend reader has finished.
+    # P3's store is generation-scoped and is intentionally discarded when the
+    # lease enters pending retirement, so it cannot be the async lifetime
+    # owner after submit.
+    bound_metadata: Any | None = field(default=None, repr=False)
     completion_token: DraftWindowCompletionToken | None = field(default=None, repr=False)
     backend_derived_buffers: tuple[torch.Tensor, ...] = field(default=(), repr=False)
     abort_requested: bool = False
 
 
 class DraftWindowEagerAsyncPool:
-    """Fixed-capacity, independent P3 lane pool for host contract testing."""
+    """Fixed-capacity pool of independent P3 lanes for eager execution."""
 
     def __init__(
         self,
@@ -78,8 +115,6 @@ class DraftWindowEagerAsyncPool:
             raise ValueError("async eager pool requires Graph mode NONE")
         if not topology_template.async_scheduling:
             raise ValueError("async eager pool requires an async topology fingerprint")
-        if topology_template.prefix_caching:
-            raise ValueError("async eager pool does not support prefix caching")
         if topology_template.normalized_method != capability.inventory.method:
             raise ValueError("async topology method does not match the source capability")
         if topology_template.runtime_route != capability.inventory.runtime_route:
@@ -100,6 +135,8 @@ class DraftWindowEagerAsyncPool:
         )
         self._active: list[DraftWindowEagerAsyncHandle | None] = [None] * capacity
         self._last_mapping_epoch = -1
+        self._last_epoch_fingerprint: tuple[str, ...] | None = None
+        self._last_epoch_step = -1
         self._next_operation_id = 0
 
     def acquire(
@@ -109,15 +146,18 @@ class DraftWindowEagerAsyncPool:
         ordered_request_ids: Sequence[str],
         phase: DraftWindowExecutionPhase,
         step: int,
+        allow_same_mapping_epoch: bool = False,
     ) -> DraftWindowEagerAsyncHandle:
         if not isinstance(mapping_epoch, int) or isinstance(mapping_epoch, bool) or mapping_epoch < 0:
             raise ValueError("mapping epoch must be a nonnegative integer")
-        if mapping_epoch <= self._last_mapping_epoch:
+        fingerprint = tuple(ordered_request_ids)
+        if mapping_epoch < self._last_mapping_epoch or (
+            mapping_epoch == self._last_mapping_epoch and not allow_same_mapping_epoch
+        ):
             raise ValueError(
                 "mapping epoch must strictly increase across async operations: "
                 f"current={mapping_epoch} previous={self._last_mapping_epoch}"
             )
-        fingerprint = tuple(ordered_request_ids)
         if not fingerprint or any(not isinstance(req_id, str) or not req_id for req_id in fingerprint):
             raise ValueError("async request fingerprint must contain non-empty stable request IDs")
         if len(set(fingerprint)) != len(fingerprint):
@@ -126,6 +166,9 @@ class DraftWindowEagerAsyncPool:
             raise TypeError("async phase must be a DraftWindowExecutionPhase")
         if not isinstance(step, int) or isinstance(step, bool) or step < 0:
             raise ValueError("async step must be a nonnegative integer")
+        if mapping_epoch == self._last_mapping_epoch:
+            if fingerprint != self._last_epoch_fingerprint or step != self._last_epoch_step + 1:
+                raise ValueError("same-epoch continuation must preserve request identity and advance one step")
         try:
             lane = self._active.index(None)
         except ValueError as error:
@@ -146,6 +189,8 @@ class DraftWindowEagerAsyncPool:
         )
         self._next_operation_id += 1
         self._last_mapping_epoch = mapping_epoch
+        self._last_epoch_fingerprint = fingerprint
+        self._last_epoch_step = step
         self._active[lane] = handle
         return handle
 
@@ -160,6 +205,7 @@ class DraftWindowEagerAsyncPool:
         cpu_window_upper: torch.Tensor,
         num_reqs_padded: int,
         cpu_valid_num_blocks: torch.Tensor | None = None,
+        row_phase_fingerprint: Sequence[str] = (),
     ) -> DraftMetadataInputs:
         self._require_state(handle, DraftWindowEagerAsyncState.ACQUIRED)
         runtime = self._runtimes[handle.execution_lane]
@@ -177,6 +223,7 @@ class DraftWindowEagerAsyncPool:
                 phase=handle.phase,
                 step=handle.step,
                 execution_lane=handle.execution_lane,
+                row_phase_fingerprint=row_phase_fingerprint,
             )
             if inputs.identity.topology_fingerprint != handle.topology_fingerprint:
                 runtime.abort_generation(inputs.identity)
@@ -187,6 +234,7 @@ class DraftWindowEagerAsyncPool:
         except BaseException:
             handle.state = DraftWindowEagerAsyncState.RETIRED
             handle.inputs = None
+            handle.bound_metadata = None
             raise
 
     def bind(
@@ -228,6 +276,7 @@ class DraftWindowEagerAsyncPool:
         except BaseException:
             runtime.abort_generation(inputs.identity)
             handle.inputs = None
+            handle.bound_metadata = None
             handle.state = DraftWindowEagerAsyncState.RETIRED
             raise
         try:
@@ -238,8 +287,10 @@ class DraftWindowEagerAsyncPool:
             )
         except BaseException:
             handle.inputs = None
+            handle.bound_metadata = None
             handle.state = DraftWindowEagerAsyncState.RETIRED
             raise
+        handle.bound_metadata = metadata
         handle.backend_derived_buffers = buffers
         handle.state = DraftWindowEagerAsyncState.BOUND
 
@@ -257,6 +308,7 @@ class DraftWindowEagerAsyncPool:
         except BaseException:
             runtime.abort_generation(inputs.identity)
             handle.inputs = None
+            handle.bound_metadata = None
             handle.backend_derived_buffers = ()
             handle.state = DraftWindowEagerAsyncState.RETIRED
             raise
@@ -279,6 +331,25 @@ class DraftWindowEagerAsyncPool:
             handle.state = DraftWindowEagerAsyncState.CONSUMER_COMPLETE
         return complete
 
+    def reclaim_completed(self) -> tuple[int, ...]:
+        """Poll, retire, and release completed lanes without blocking."""
+        reclaimed: list[int] = []
+        for handle in tuple(self._active):
+            if handle is None or handle.state is not DraftWindowEagerAsyncState.SUBMITTED:
+                continue
+            if self.poll(handle):
+                lane = handle.execution_lane
+                self.retire(handle)
+                self.release(handle)
+                reclaimed.append(lane)
+        return tuple(reclaimed)
+
+    def read_bound_metadata(self, handle: DraftWindowEagerAsyncHandle) -> Any:
+        self._require_state(handle, DraftWindowEagerAsyncState.BOUND)
+        if handle.bound_metadata is None:
+            raise RuntimeError("async handle has no bound Draft metadata")
+        return handle.bound_metadata
+
     def retire(self, handle: DraftWindowEagerAsyncHandle) -> None:
         self._require_active(handle)
         if handle.state is DraftWindowEagerAsyncState.SUBMITTED:
@@ -291,6 +362,7 @@ class DraftWindowEagerAsyncPool:
         self._require_state(handle, DraftWindowEagerAsyncState.RETIRED)
         lane = handle.execution_lane
         handle.inputs = None
+        handle.bound_metadata = None
         handle.completion_token = None
         handle.backend_derived_buffers = ()
         handle.state = DraftWindowEagerAsyncState.FREE
@@ -315,6 +387,7 @@ class DraftWindowEagerAsyncPool:
         elif handle.state is not DraftWindowEagerAsyncState.ACQUIRED:
             raise RuntimeError(f"cannot abort an async operation from state {handle.state.value}")
         handle.inputs = None
+        handle.bound_metadata = None
         handle.backend_derived_buffers = ()
         handle.abort_requested = True
         handle.state = DraftWindowEagerAsyncState.RETIRED

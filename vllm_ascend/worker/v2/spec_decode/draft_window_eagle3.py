@@ -26,7 +26,6 @@ from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftWindowSourceCapability,
     SingleGroupDirectPrefixProvider,
     compute_draft_window_scalar_plan,
-    gather_valid_num_blocks_cpu,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_eager import (
     AscendDraftAttentionReadInputs,
@@ -37,6 +36,11 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_eager import (
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
     DraftWindowGraphStage,
     observe_draft_window_graph_source,
+)
+from vllm_ascend.worker.v2.spec_decode.draft_window_nongraph import (
+    DraftWindowBatchPhasePlan,
+    DraftWindowRowPhase,
+    build_prefix_resident_snapshot,
 )
 
 
@@ -71,6 +75,7 @@ class Eagle3StepMaterializationPlan:
     cpu_window_upper: torch.Tensor
     cpu_valid_num_blocks: torch.Tensor
     window_starts: tuple[int, ...]
+    row_phase_fingerprint: tuple[str, ...]
 
 
 class Eagle3DraftWindowMixin:
@@ -243,6 +248,7 @@ class Eagle3DraftWindowMixin:
             cpu_apply_time_full_upper=cpu_upper,
             cpu_valid_num_blocks=cpu_valid_num_blocks,
             step=0,
+            phase_plan=context.phase_plan,
         )
         self._eagle3_window_epoch_source.validate(context, input_batch)
         inputs = self._draft_window_runtime_state.materialize(
@@ -258,6 +264,7 @@ class Eagle3DraftWindowMixin:
             phase=DraftWindowExecutionPhase.PROPOSAL,
             step=0,
             execution_lane=0,
+            row_phase_fingerprint=step_plan.row_phase_fingerprint,
         )
         self._eagle3_window_proposal_plan = proposal
         self._eagle3_window_live_inputs = inputs
@@ -350,6 +357,7 @@ class Eagle3DraftWindowMixin:
             cpu_apply_time_full_upper=cpu_upper,
             cpu_valid_num_blocks=cpu_valid_num_blocks,
             step=step,
+            phase_plan=context.phase_plan,
         )
         self._eagle3_window_epoch_source.validate(context, input_batch)
         inputs = self._draft_window_runtime_state.materialize_serialized_step(
@@ -442,13 +450,15 @@ class Eagle3DraftWindowMixin:
         num_reqs_padded: int,
     ) -> torch.Tensor:
         capability = self._draft_window_source_capability
-        return gather_valid_num_blocks_cpu(
-            capability.full_source,
+        context = self._require_eagle3_window_context()
+        return build_prefix_resident_snapshot(
+            full_source=capability.full_source,
             global_group_id=capability.provider.global_group_id,
             idx_mapping_np=self.input_batch.idx_mapping_np,
+            ordered_request_ids=context.ordered_request_ids,
             num_reqs=num_reqs,
             num_reqs_padded=num_reqs_padded,
-        )
+        ).valid_num_blocks
 
 
 def build_eagle3_frozen_proposal_plan(
@@ -498,6 +508,7 @@ def build_eagle3_step_materialization_plan(
     cpu_apply_time_full_upper: torch.Tensor,
     cpu_valid_num_blocks: torch.Tensor,
     step: int,
+    phase_plan: DraftWindowBatchPhasePlan | None = None,
 ) -> Eagle3StepMaterializationPlan:
     """Project one real ``E_s`` without recomputing the proposal anchor."""
     if not isinstance(step, int) or isinstance(step, bool):
@@ -522,6 +533,12 @@ def build_eagle3_step_materialization_plan(
     cpu_window_upper = torch.zeros(padded, dtype=torch.int32)
     descriptors: list[DraftWindowReadDescriptor] = []
     window_starts: list[int] = []
+    if phase_plan is None:
+        row_phases = (DraftWindowRowPhase.PURE_DECODE,) * proposal.actual_request_count
+    else:
+        if len(phase_plan.row_phases) != proposal.actual_request_count:
+            raise ValueError("Eagle3 row phase plan does not match active requests")
+        row_phases = phase_plan.row_phases
     for row, proposal_row in enumerate(proposal.row_plans):
         full_exact = int(cpu_full_exact[row].item())
         full_upper = int(cpu_apply_time_full_upper[row].item())
@@ -530,18 +547,39 @@ def build_eagle3_step_materialization_plan(
             raise ValueError("Eagle3 first-pass exact end must equal proposal-entry L0")
         if full_upper < full_exact:
             raise ValueError("apply-time full upper must be greater than or equal to exact")
-        descriptor = provider.describe_frozen_step(
-            proposal_row,
-            full_exact_end=full_exact,
-            valid_num_blocks=valid_num_blocks,
-        )
-        visible = full_exact - proposal_row.window_start
-        raw_upper = max(full_upper - proposal_row.window_start, visible)
-        window_upper = min(raw_upper, descriptor.safe_extent_tokens)
+        if row_phases[row] is DraftWindowRowPhase.PREFILL_CONTINUING:
+            source_width = provider.full_source.input_block_table_row_width(provider.global_group_id)
+            if valid_num_blocks < 0 or valid_num_blocks > source_width:
+                raise RuntimeError("Eagle3 resident extent is outside the canonical source row")
+            safe_extent = valid_num_blocks * provider.block_span_tokens
+            if safe_extent < full_exact:
+                raise RuntimeError("Eagle3 continuing-prefill full read exceeds resident source")
+            descriptor = DraftWindowReadDescriptor(
+                global_group_id=provider.global_group_id,
+                source_start_column=0,
+                first_token_offset=0,
+                required_columns=valid_num_blocks,
+                safe_extent_tokens=safe_extent,
+                valid_num_blocks=valid_num_blocks,
+                source_row_width=source_width,
+            )
+            visible = full_exact
+            window_start = 0
+            window_upper = min(max(full_upper, visible), safe_extent)
+        else:
+            descriptor = provider.describe_frozen_step(
+                proposal_row,
+                full_exact_end=full_exact,
+                valid_num_blocks=valid_num_blocks,
+            )
+            visible = full_exact - proposal_row.window_start
+            raw_upper = max(full_upper - proposal_row.window_start, visible)
+            window_upper = min(raw_upper, descriptor.safe_extent_tokens)
+            window_start = proposal_row.window_start
         if window_upper < visible:
             raise RuntimeError("Eagle3 Window upper is shorter than Window exact")
         descriptors.append(descriptor)
-        window_starts.append(proposal_row.window_start)
+        window_starts.append(window_start)
         cpu_window_exact[row] = visible
         cpu_window_upper[row] = window_upper
 
@@ -552,6 +590,7 @@ def build_eagle3_step_materialization_plan(
         cpu_window_upper=cpu_window_upper,
         cpu_valid_num_blocks=cpu_valid_num_blocks,
         window_starts=tuple(window_starts),
+        row_phase_fingerprint=tuple(phase.value for phase in row_phases),
     )
 
 

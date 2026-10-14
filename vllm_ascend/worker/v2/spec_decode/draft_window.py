@@ -121,6 +121,7 @@ class DraftWindowRuntimeContext:
     dsa_context_parallel: bool
     flashcomm: bool
     prefix_caching: bool
+    tensor_parallel_rank: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,6 +139,14 @@ class DraftWindowGroupInventory:
     causal: bool
     layout_category: DraftWindowLayoutCategory
     capability_failures: tuple[str, ...]
+    # Geometry facts are kept separate from phase-specific capability gates.
+    # P7-X may close a conservative P2 backend/runtime gate, but it must never
+    # erase a source-owner or block-geometry failure.
+    source_geometry_failures: tuple[str, ...] = ()
+    # DSA drafting supports only the uncompressed/native SWA cache contract.
+    # This value comes from the actual metadata-builder instance, not a model
+    # name or backend-class guess.
+    drafting_compression_ratio: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -355,11 +364,47 @@ class SingleGroupDirectPrefixProvider:
     full_source: FullDraftKVSource
     legacy_block_size: int
     expected_future_offset: int
+    # P2 uses the implicit failure-free dense group. P7-X can explicitly bind
+    # one source-safe backend group (currently uncompressed DSA/DSA-CP) while
+    # preserving the original inventory diagnostics and layout identity.
+    explicit_source_group: DraftWindowGroupInventory | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    source_block_span_tokens: int | None = None
     _group: DraftWindowGroupInventory = field(init=False, repr=False)
     _capacity_columns: int = field(init=False, repr=False)
+    _block_span_tokens: int = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
-        group = self.inventory.require_single_group_direct_prefix()
+        if self.explicit_source_group is None:
+            group = self.inventory.require_single_group_direct_prefix()
+            span = group.block_span_tokens
+            assert span is not None
+            if self.source_block_span_tokens is not None and self.source_block_span_tokens != span:
+                raise ValueError("explicit source block span disagrees with the P2 group")
+        else:
+            group = self.explicit_source_group
+            if len(self.inventory.groups) != 1 or self.inventory.groups[0] != group:
+                raise ValueError("explicit source group must be the sole inventory consumer")
+            if group.source_geometry_failures:
+                raise NotImplementedError(
+                    "explicit backend provider has unresolved source geometry: "
+                    + "; ".join(group.source_geometry_failures)
+                )
+            if group.layout_category not in (
+                DraftWindowLayoutCategory.DENSE_GQA_DIRECT_PREFIX,
+                DraftWindowLayoutCategory.DSA,
+            ):
+                raise NotImplementedError(
+                    f"layout {group.layout_category.value} has no explicit direct-prefix source contract"
+                )
+            span = self.source_block_span_tokens
+            if span is None:
+                raise ValueError("explicit backend provider requires a source block span")
+            if span != group.kernel_block_size:
+                raise ValueError("explicit source block span must equal the canonical kernel block size")
         if self.legacy_block_size <= 0:
             raise ValueError("legacy block size must be greater than 0")
         if not isinstance(self.expected_future_offset, int) or isinstance(
@@ -391,8 +436,6 @@ class SingleGroupDirectPrefixProvider:
             kernel_block_sizes=self.full_source.kernel_block_sizes,
             num_groups=self.full_source.num_groups,
         )
-        span = group.block_span_tokens
-        assert span is not None
         try:
             capacity_columns = compute_direct_prefix_capacity(
                 window_size=self.inventory.window_size,
@@ -409,6 +452,7 @@ class SingleGroupDirectPrefixProvider:
             ) from error
         object.__setattr__(self, "_group", group)
         object.__setattr__(self, "_capacity_columns", capacity_columns)
+        object.__setattr__(self, "_block_span_tokens", span)
 
     @property
     def global_group_id(self) -> int:
@@ -419,6 +463,16 @@ class SingleGroupDirectPrefixProvider:
     def capacity_columns(self) -> int:
         """Return the fixed narrow-table capacity proven by P2 geometry."""
         return self._capacity_columns
+
+    @property
+    def block_span_tokens(self) -> int:
+        """Return the source-token span represented by one table column."""
+        return self._block_span_tokens
+
+    @property
+    def source_group(self) -> DraftWindowGroupInventory:
+        """Return the exact inventory consumer bound by this provider."""
+        return self._group
 
     def describe(
         self,
@@ -550,8 +604,7 @@ class SingleGroupDirectPrefixProvider:
         valid_num_blocks: int,
     ) -> DraftWindowReadDescriptor:
         """Project a previously validated absolute interval onto FullSource."""
-        span = self._group.block_span_tokens
-        assert span is not None
+        span = self._block_span_tokens
         projection = project_direct_prefix(
             window_start=window_start,
             window_visible_length=window_visible_length,
@@ -606,6 +659,10 @@ class DraftWindowSourceCapability:
     full_source: FullDraftKVSource
     provider: SingleGroupDirectPrefixProvider
     eager_topology_fingerprint: "P7EagerTopologyFingerprint | None" = None
+    # P7-X mixed/prefix rows can require a full-resident row in the same
+    # stable backing that carries narrow decode rows.  Existing P3 fixtures
+    # omit this field and retain the original narrow capacity.
+    workspace_capacity_columns: int | None = None
 
 
 def _normalize_method(method: str) -> str:
@@ -974,7 +1031,8 @@ def build_draft_window_inventory(
         kernel_block_size = int(kernel_block_sizes[outer_global_group_id])
         for local_consumer_index, consumer in enumerate(consumers):
             backend_class = consumer.backend
-            builder_class = type(consumer.get_metadata_builder(0))
+            metadata_builder = consumer.get_metadata_builder(0)
+            builder_class = type(metadata_builder)
             actual_global_group_id = int(consumer.kv_cache_group_id)
             layout_category = _classify_layout(
                 backend_class,
@@ -982,22 +1040,24 @@ def build_draft_window_inventory(
                 consumer.kv_cache_spec,
             )
             group_failures: list[str] = []
+            source_geometry_failures: list[str] = []
             if actual_global_group_id != outer_global_group_id:
-                group_failures.append(
+                source_geometry_failures.append(
                     "AttentionGroup global gid does not match its outer source "
                     f"index ({actual_global_group_id} != {outer_global_group_id})"
                 )
             spec_block_size = int(consumer.kv_cache_spec.block_size)
             if spec_block_size != logical_block_size:
-                group_failures.append(
+                source_geometry_failures.append(
                     f"KV spec logical block size does not match BlockTables ({spec_block_size} != {logical_block_size})"
                 )
             if logical_block_size <= 0 or kernel_block_size <= 0:
-                group_failures.append("block sizes must be greater than zero")
+                source_geometry_failures.append("block sizes must be greater than zero")
             elif logical_block_size % kernel_block_size != 0:
-                group_failures.append(
+                source_geometry_failures.append(
                     f"kernel block size {kernel_block_size} does not divide logical block size {logical_block_size}"
                 )
+            group_failures.extend(source_geometry_failures)
             if layout_category is not DraftWindowLayoutCategory.DENSE_GQA_DIRECT_PREFIX:
                 group_failures.append(f"{layout_category.value} has no verified P2 direct-prefix provider")
             if not _is_subclass(backend_class, AscendAttentionBackend):
@@ -1009,6 +1069,11 @@ def build_draft_window_inventory(
             block_span_tokens = (
                 kernel_block_size if not group_failures and runtime_context.decode_context_parallel_size == 1 else None
             )
+            drafting_compression_ratio: int | None = None
+            if layout_category is DraftWindowLayoutCategory.DSA:
+                raw_ratio = getattr(metadata_builder, "compressor_ratio", None)
+                if isinstance(raw_ratio, int) and not isinstance(raw_ratio, bool):
+                    drafting_compression_ratio = raw_ratio
             group_causal = causal if isinstance(causal, bool) else bool(causal.get(outer_global_group_id, True))
             groups.append(
                 DraftWindowGroupInventory(
@@ -1023,6 +1088,8 @@ def build_draft_window_inventory(
                     causal=group_causal,
                     layout_category=layout_category,
                     capability_failures=tuple(group_failures),
+                    source_geometry_failures=tuple(source_geometry_failures),
+                    drafting_compression_ratio=drafting_compression_ratio,
                 )
             )
 
@@ -1073,9 +1140,19 @@ def build_full_draft_kv_source(
     inventory: DraftWindowInventory,
     block_tables: Any,
     idx_mapping: torch.Tensor | None = None,
+    source_group: DraftWindowGroupInventory | None = None,
 ) -> FullDraftKVSource:
     """Bind, but never copy or mutate, canonical full BlockTables tensors."""
-    group = inventory.require_single_group_direct_prefix()
+    if source_group is None:
+        group = inventory.require_single_group_direct_prefix()
+    else:
+        group = source_group
+        if len(inventory.groups) != 1 or inventory.groups[0] != group:
+            raise ValueError("explicit FullSource group must be the sole inventory consumer")
+        if group.source_geometry_failures:
+            raise NotImplementedError(
+                "explicit FullSource group has unresolved source geometry: " + "; ".join(group.source_geometry_failures)
+            )
     context = _group_diagnostic_context(inventory, group)
     input_block_tables = tuple(block_tables.input_block_tables)
     logical_block_sizes = tuple(int(size) for size in block_tables.block_sizes)
@@ -1321,7 +1398,33 @@ def build_draft_window_runtime_context(
         dsa_context_parallel=dsa_context_parallel,
         flashcomm=flashcomm,
         prefix_caching=bool(getattr(getattr(vllm_config, "cache_config", None), "enable_prefix_caching", False)),
+        tensor_parallel_rank=_get_tensor_parallel_rank(parallel_config),
     )
+
+
+def _get_tensor_parallel_rank(parallel_config: Any) -> int:
+    """Resolve process-local TP identity without inventing a rank.
+
+    Unit/config-only callers may provide an explicit rank.  A live TP route
+    must have an initialized vLLM TP group; failure to resolve it is a hard
+    source/configuration error rather than a rank-zero fallback.
+    """
+    world_size = int(parallel_config.tensor_parallel_size)
+    configured_rank = getattr(parallel_config, "tensor_parallel_rank", None)
+    if configured_rank is not None:
+        rank = int(configured_rank)
+    elif world_size == 1:
+        rank = 0
+    else:
+        try:
+            from vllm.distributed import get_tp_group
+
+            rank = int(get_tp_group().rank_in_group)
+        except (AssertionError, AttributeError, RuntimeError) as error:
+            raise RuntimeError("TP Draft Window route requires an initialized TP group rank") from error
+    if rank < 0 or rank >= world_size:
+        raise ValueError(f"TP rank {rank} is outside [0, {world_size})")
+    return rank
 
 
 def build_draft_window_source_capability(
@@ -1347,11 +1450,11 @@ def build_draft_window_source_capability(
         runtime_context=runtime_context,
     )
     uses_dynamic_k = bool(vllm_config.speculative_config.uses_dynamic_speculative_decoding())
-    from vllm_ascend.worker.v2.spec_decode.draft_window_eager_capability import (
-        evaluate_draft_window_eager_capability,
+    from vllm_ascend.worker.v2.spec_decode.draft_window_nongraph import (
+        evaluate_p7x_nongraph_capability,
     )
 
-    eager_decision = evaluate_draft_window_eager_capability(
+    eager_decision = evaluate_p7x_nongraph_capability(
         policy=policy,
         inventory=inventory,
         runtime_context=runtime_context,
@@ -1359,11 +1462,23 @@ def build_draft_window_source_capability(
         provider_version=DraftWindowRuntimeState.PROVIDER_VERSION,
         execution_lane=0,
     )
-    eager_topology_fingerprint = eager_decision.require_live_materialization()
-    group = inventory.require_single_group_direct_prefix()
+    eager_topology_fingerprint = eager_decision.require_local_materialization()
+    if len(inventory.groups) != 1:
+        raise NotImplementedError("P7-X live source currently requires one executable group")
+    group = inventory.groups[0]
+    if (
+        group.layout_category
+        not in (
+            DraftWindowLayoutCategory.DENSE_GQA_DIRECT_PREFIX,
+            DraftWindowLayoutCategory.DSA,
+        )
+        or group.source_geometry_failures
+    ):
+        raise NotImplementedError("P7-X live source requires one source-safe dense or uncompressed DSA prefix provider")
     full_source = build_full_draft_kv_source(
         inventory=inventory,
         block_tables=block_tables,
+        source_group=group,
     )
     provider = SingleGroupDirectPrefixProvider(
         inventory=inventory,
@@ -1376,12 +1491,20 @@ def build_draft_window_source_capability(
             configured_k=int(vllm_config.speculative_config.num_speculative_tokens),
             uses_dynamic_k=uses_dynamic_k,
         ),
+        explicit_source_group=group,
+        source_block_span_tokens=group.kernel_block_size,
     )
     return DraftWindowSourceCapability(
         inventory=inventory,
         full_source=full_source,
         provider=provider,
         eager_topology_fingerprint=eager_topology_fingerprint,
+        # Mixed/chunked rows may carry a canonical full-resident read beside
+        # windowed decode rows. Reserve one stable full-width backing once;
+        # active rows still copy only their descriptor columns.
+        workspace_capacity_columns=full_source.input_block_table_row_width(
+            group.global_group_id,
+        ),
     )
 
 
@@ -1416,6 +1539,7 @@ class DraftWindowGenerationIdentity:
     phase: DraftWindowExecutionPhase
     step: int
     topology_fingerprint: "P7EagerTopologyFingerprint | None" = None
+    row_phase_fingerprint: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         _require_nonnegative_python_int(self.generation_id, "generation id")
@@ -1445,6 +1569,8 @@ class DraftWindowGenerationIdentity:
             raise ValueError("normalized method must be a non-empty canonical method name")
         if not isinstance(self.phase, DraftWindowExecutionPhase):
             raise TypeError("phase must be a DraftWindowExecutionPhase")
+        if self.row_phase_fingerprint and len(self.row_phase_fingerprint) != self.actual_request_count:
+            raise ValueError("row phase fingerprint must match the actual request count")
 
 
 class DraftWindowCompletionToken(Protocol):
@@ -2031,6 +2157,7 @@ class DraftWindowRuntimeState:
         phase: DraftWindowExecutionPhase,
         step: int,
         execution_lane: int,
+        row_phase_fingerprint: Sequence[str] = (),
     ) -> DraftMetadataInputs:
         """Acquire, bind, and materialize one generation or cleanly fail.
 
@@ -2064,6 +2191,7 @@ class DraftWindowRuntimeState:
             phase=phase,
             step=step,
             topology_fingerprint=self.topology_fingerprint,
+            row_phase_fingerprint=tuple(row_phase_fingerprint),
         )
         self._last_retired_identity = None
         return self._materialize_identity(
@@ -2148,6 +2276,7 @@ class DraftWindowRuntimeState:
             phase=DraftWindowExecutionPhase.STEP,
             step=step,
             topology_fingerprint=previous_identity.topology_fingerprint,
+            row_phase_fingerprint=previous_identity.row_phase_fingerprint,
         )
         self._last_retired_identity = None
         return self._materialize_identity(
@@ -2340,19 +2469,30 @@ def build_draft_window_runtime_state(
     topology_fingerprint: "P7EagerTopologyFingerprint | None" = None,
 ) -> DraftWindowRuntimeState:
     """Allocate P3 state only after P2 has closed all capability gates."""
-    group = capability.inventory.require_single_group_direct_prefix()
+    group = capability.provider.source_group
+    if len(capability.inventory.groups) != 1 or capability.inventory.groups[0] != group:
+        raise RuntimeError("provider source group does not match the capability inventory")
     if group.global_group_id != capability.provider.global_group_id:
         raise RuntimeError("provider gid does not match the inventory candidate")
     capability.full_source.validate_owner_bindings()
     source_table = capability.full_source._input_block_tables[group.global_group_id]
     persistent_counts = capability.full_source._block_tables_owner.num_blocks.gpu[group.global_group_id]
     if source_table.dtype != torch.int32 or persistent_counts.dtype != torch.int32:
-        raise TypeError("P3 dense direct-prefix tables and valid counts must use int32")
+        raise TypeError("P3 direct-prefix source tables and valid counts must use int32")
     if source_table.device != persistent_counts.device:
         raise ValueError("P3 source table and valid counts must share a device")
+    table_capacity_columns = (
+        capability.provider.capacity_columns
+        if capability.workspace_capacity_columns is None
+        else capability.workspace_capacity_columns
+    )
+    if table_capacity_columns < capability.provider.capacity_columns:
+        raise ValueError("configured workspace capacity is smaller than the provider capacity")
+    if table_capacity_columns > source_table.shape[1]:
+        raise ValueError("configured workspace capacity exceeds the canonical source row width")
     workspace = DraftWindowWorkspace(
         max_num_reqs=source_table.shape[0],
-        table_capacity_columns=capability.provider.capacity_columns,
+        table_capacity_columns=table_capacity_columns,
         table_template=source_table,
         valid_count_template=persistent_counts,
     )
