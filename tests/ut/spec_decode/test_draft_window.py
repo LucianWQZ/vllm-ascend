@@ -35,6 +35,7 @@ from vllm_ascend.attention.sfa_v1 import (
     AscendSFABackend,
     AscendSFAMetadataBuilder,
 )
+from vllm_ascend.device.hardware_profile import AttentionBackendFamily
 from vllm_ascend.worker.v2 import block_table as ascend_block_table
 from vllm_ascend.worker.v2.block_table import AscendBlockTables
 from vllm_ascend.worker.v2.spec_decode.autoregressive.speculator import (
@@ -897,6 +898,7 @@ def _p2_policy(method: str = "eagle3") -> DraftWindowPolicyDecision:
 
 def _p2_runtime_context(**changes: Any) -> DraftWindowRuntimeContext:
     context = DraftWindowRuntimeContext(
+        attention_backend_family=AttentionBackendFamily.STANDARD,
         graph_mode="NONE",
         async_scheduling=False,
         tensor_parallel_size=1,
@@ -2062,6 +2064,35 @@ def test_runtime_context_uses_actual_eager_and_topology_configuration() -> None:
     )
 
     assert context == _p2_runtime_context()
+
+
+def test_compatibility_hardware_family_stops_before_full_source_allocation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "vllm_ascend.worker.v2.spec_decode.draft_window.get_current_hardware_profile",
+        lambda: SimpleNamespace(
+            attention_backend_family=AttentionBackendFamily.COMPATIBILITY,
+        ),
+    )
+
+    def forbidden_full_source(**_kwargs: Any) -> Any:
+        raise AssertionError("compatibility hardware must not create FullSource")
+
+    monkeypatch.setattr(
+        "vllm_ascend.worker.v2.spec_decode.draft_window.build_full_draft_kv_source",
+        forbidden_full_source,
+    )
+
+    with pytest.raises(NotImplementedError, match="FAIL_CLOSED.*COMPATIBILITY"):
+        build_draft_window_source_capability(
+            policy=_p2_policy("eagle3"),
+            runtime_route="eagle3",
+            attn_groups=[[_attention_group()]],
+            block_tables=_block_tables(),
+            causal=True,
+            vllm_config=_p2_vllm_config(configured_k=3),
+        )
 
 
 def test_runtime_context_flashcomm_env_fails_closed(

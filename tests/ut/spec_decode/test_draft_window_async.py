@@ -12,6 +12,7 @@ from vllm_ascend.attention.attention_v1 import (
     AscendAttentionBackend,
     AscendAttentionMetadataBuilder,
 )
+from vllm_ascend.device.hardware_profile import AttentionBackendFamily
 from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftWindowExecutionPhase,
     DraftWindowGroupInventory,
@@ -105,6 +106,7 @@ def _topology() -> P7EagerTopologyFingerprint:
     return P7EagerTopologyFingerprint(
         normalized_method="eagle3",
         runtime_route="eagle3",
+        attention_backend_family=AttentionBackendFamily.STANDARD,
         backend_impls=("vllm_ascend.attention.attention_v1.AscendAttentionBackend",),
         builder_impls=("vllm_ascend.attention.attention_v1.AscendAttentionMetadataBuilder",),
         global_group_ids=(0,),
@@ -300,6 +302,36 @@ def test_abort_before_submit_releases_materialized_state_and_derived_buffers() -
     assert _acquire(pool, 2, ("B",)).execution_lane == 0
 
 
+@pytest.mark.parametrize(
+    "alias_owner",
+    ["window", "canonical", "target"],
+)
+def test_backend_derived_buffers_reject_read_plane_and_target_aliases(
+    alias_owner: str,
+) -> None:
+    pool, block_tables = _pool(capacity=1)
+    handle = _acquire(pool, 1, ("A",))
+    inputs = _materialize(pool, handle)
+    target_tensor = torch.ones(4, dtype=torch.int32)
+    aliases = {
+        "window": inputs.window_block_table[:, :1],
+        "canonical": block_tables.input_block_tables[0][:1, :1],
+        "target": target_tensor[:1],
+    }
+
+    with pytest.raises(ValueError, match="backend derived buffers.*alias"):
+        pool.bind(
+            handle,
+            metadata={"draft": torch.zeros(1)},
+            target_metadata={"target": target_tensor},
+            backend_derived_buffers=(aliases[alias_owner],),
+        )
+
+    assert handle.state is DraftWindowEagerAsyncState.RETIRED
+    assert handle.inputs is None
+    pool.release(handle)
+
+
 def test_abort_after_submit_waits_for_consumer_completion() -> None:
     pool, _block_tables = _pool(capacity=1)
     handle = _acquire(pool, 1, ("A",))
@@ -410,6 +442,37 @@ def test_wrong_topology_generation_and_lane_are_rejected() -> None:
     )
     with pytest.raises(RuntimeError, match="topology fingerprint"):
         pool.validate_topology(handle, forged)
+
+
+def test_serialized_runtime_rejects_topology_drift_before_workspace_write() -> None:
+    pool, _block_tables = _pool(capacity=1)
+    handle = _acquire(pool, 1, ("A",))
+    idx_mapping = torch.tensor([0], dtype=torch.int32)
+    first = _materialize(pool, handle, idx_mapping=idx_mapping)
+    runtime = pool._runtimes[handle.execution_lane]
+    runtime.retire_generation(first.identity)
+    runtime.topology_fingerprint = replace_topology(
+        handle.topology_fingerprint,
+        runtime_route="dflash",
+    )
+    exact = torch.tensor([97, 0], dtype=torch.int32)
+    upper = torch.tensor([128, 0], dtype=torch.int32)
+
+    with pytest.raises(RuntimeError, match="runtime topology fingerprint"):
+        runtime.materialize_serialized_step(
+            previous_identity=first.identity,
+            ordered_request_ids=("A",),
+            idx_mapping=idx_mapping,
+            read_descriptors=(_descriptor(),),
+            device_window_exact=exact,
+            cpu_window_exact=exact,
+            cpu_window_upper=upper,
+            num_reqs_padded=2,
+            step=1,
+            execution_lane=0,
+        )
+
+    assert runtime.workspace.bound_identity is None
 
 
 def test_preempt_resume_uses_new_generation_and_preserves_backing_address() -> None:

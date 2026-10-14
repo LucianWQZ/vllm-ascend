@@ -12,6 +12,7 @@ must remain fail closed until its device/lifetime evidence is available.
 from dataclasses import dataclass, replace
 from enum import Enum
 
+from vllm_ascend.device.hardware_profile import AttentionBackendFamily
 from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftWindowInventory,
     DraftWindowLayoutCategory,
@@ -38,6 +39,7 @@ class P7EagerTopologyFingerprint:
 
     normalized_method: str
     runtime_route: str
+    attention_backend_family: AttentionBackendFamily
     backend_impls: tuple[str, ...]
     builder_impls: tuple[str, ...]
     global_group_ids: tuple[int, ...]
@@ -62,6 +64,8 @@ class P7EagerTopologyFingerprint:
             raise ValueError("topology method must be a non-empty normalized name")
         if not self.runtime_route or self.runtime_route != self.runtime_route.strip().lower():
             raise ValueError("topology runtime route must be a non-empty normalized name")
+        if not isinstance(self.attention_backend_family, AttentionBackendFamily):
+            raise TypeError("topology attention backend family must be typed")
         if self.provider_version <= 0:
             raise ValueError("topology provider version must be greater than zero")
         if self.execution_lane < 0:
@@ -154,6 +158,7 @@ def _build_topology_fingerprint(
     return P7EagerTopologyFingerprint(
         normalized_method=inventory.method,
         runtime_route=inventory.runtime_route,
+        attention_backend_family=runtime_context.attention_backend_family,
         backend_impls=tuple(_qualified_type_name(group.backend_class) for group in groups),
         builder_impls=tuple(_qualified_type_name(group.builder_class) for group in groups),
         global_group_ids=tuple(group.global_group_id for group in groups),
@@ -235,6 +240,14 @@ def evaluate_draft_window_eager_capability(
         provider_version=provider_version,
         execution_lane=execution_lane,
     )
+    if runtime_context.attention_backend_family is not AttentionBackendFamily.STANDARD:
+        return _decision(
+            P7EagerCapabilityStatus.FAIL_CLOSED,
+            "attention backend family "
+            f"{runtime_context.attention_backend_family.name} has no verified "
+            "P7-E Draft Window contract",
+            fingerprint,
+        )
     if uses_dynamic_k:
         return _decision(
             P7EagerCapabilityStatus.OWNER_BLOCKED,

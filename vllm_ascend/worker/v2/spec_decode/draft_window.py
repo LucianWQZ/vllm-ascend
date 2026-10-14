@@ -37,6 +37,10 @@ from vllm_ascend.attention.dsa_v1 import AscendDSABackend
 from vllm_ascend.attention.indexer import AscendSFAIndexerBackend
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
 from vllm_ascend.attention.sfa_v1 import AscendSFABackend
+from vllm_ascend.device.hardware_profile import (
+    AttentionBackendFamily,
+    get_current_hardware_profile,
+)
 
 if TYPE_CHECKING:
     from vllm_ascend.worker.v2.spec_decode.draft_window_eager_capability import (
@@ -105,6 +109,7 @@ class DraftWindowLayoutCategory(Enum):
 class DraftWindowRuntimeContext:
     """Runtime modes that must be proven before a P2 candidate is usable."""
 
+    attention_backend_family: AttentionBackendFamily
     graph_mode: str
     async_scheduling: bool
     tensor_parallel_size: int
@@ -264,6 +269,15 @@ class FullDraftKVSource:
     def references_same_idx_mapping_tensor(self, tensor: torch.Tensor) -> bool:
         """Return whether ``tensor`` is the same object, not whether it is fresh."""
         return self._idx_mapping is tensor
+
+    def shares_canonical_storage(self, tensor: torch.Tensor) -> bool:
+        """Return whether a tensor aliases any canonical FullSource backing."""
+        self.validate_owner_bindings()
+        canonical_tensors = self._input_block_tables + (
+            self._persistent_num_blocks_cpu,
+            self._block_tables_owner.num_blocks.gpu,
+        )
+        return any(draft_window_tensors_share_storage(tensor, canonical) for canonical in canonical_tensors)
 
     def bind_batch(self, idx_mapping: torch.Tensor) -> "FullDraftKVSource":
         """Return a view bound to the exact mapping used for this batch.
@@ -1230,6 +1244,14 @@ def _shares_storage(left: torch.Tensor, right: torch.Tensor) -> bool:
         return left.data_ptr() == right.data_ptr()
 
 
+def draft_window_tensors_share_storage(
+    left: torch.Tensor,
+    right: torch.Tensor,
+) -> bool:
+    """Expose the conservative storage-alias oracle to sibling read-plane owners."""
+    return _shares_storage(left, right)
+
+
 def _validate_source_geometry(
     *,
     inventory: DraftWindowInventory,
@@ -1284,6 +1306,7 @@ def build_draft_window_runtime_context(
     )
     flashcomm = flashcomm_explicitly_enabled or dsa_context_parallel
     return DraftWindowRuntimeContext(
+        attention_backend_family=get_current_hardware_profile().attention_backend_family,
         graph_mode=mode_name,
         async_scheduling=bool(getattr(scheduler_config, "async_scheduling", False)),
         tensor_parallel_size=int(parallel_config.tensor_parallel_size),
@@ -2077,6 +2100,7 @@ class DraftWindowRuntimeState:
         This models several Eagle3 forwards within one proposal without lying
         that the batch mapping changed between those forwards.
         """
+        self._validate_topology_fingerprint(previous_identity)
         self._reclaim_completed_reader()
         if self._active_inputs is not None:
             raise RuntimeError("cannot refresh a Draft Window while the previous reader is active")
@@ -2148,6 +2172,7 @@ class DraftWindowRuntimeState:
         cpu_valid_num_blocks: torch.Tensor | None,
     ) -> DraftMetadataInputs:
         """Acquire and populate the one serialized backing for an identity."""
+        self._validate_topology_fingerprint(identity)
         self._reclaim_completed_reader()
         lease = self._lease_pool.acquire(owner=self, identity=identity)
         self._last_mapping_epoch = max(self._last_mapping_epoch, identity.mapping_epoch)
@@ -2297,7 +2322,15 @@ class DraftWindowRuntimeState:
     def _require_active_inputs(self, inputs: DraftMetadataInputs) -> None:
         if self._active_inputs is not inputs:
             raise RuntimeError("typed inputs are not the active runtime generation")
+        self._validate_topology_fingerprint(inputs.identity)
         inputs.validate_for(inputs.identity)
+
+    def _validate_topology_fingerprint(
+        self,
+        identity: DraftWindowGenerationIdentity,
+    ) -> None:
+        if identity.topology_fingerprint != self.topology_fingerprint:
+            raise RuntimeError("generation topology fingerprint does not match the runtime topology fingerprint")
 
 
 def build_draft_window_runtime_state(
@@ -2359,6 +2392,7 @@ def validate_draft_metadata_isolation(
     metadata: Any,
     *,
     target_metadata: Any,
+    subject: str = "Draft metadata",
 ) -> None:
     """Reject any mutable object or storage shared with Target metadata.
 
@@ -2371,7 +2405,7 @@ def validate_draft_metadata_isolation(
         raise ValueError("Target metadata is required for Draft isolation validation")
     shared = _mutable_reference_keys(metadata) & _mutable_reference_keys(target_metadata)
     if shared:
-        raise ValueError("Draft metadata mutable storage aliases Target metadata")
+        raise ValueError(f"{subject} mutable storage aliases Target metadata")
 
 
 def _mutable_reference_keys(value: Any) -> set[tuple[str, Any]]:

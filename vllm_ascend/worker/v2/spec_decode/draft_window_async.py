@@ -24,6 +24,8 @@ from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftWindowRuntimeState,
     DraftWindowSourceCapability,
     build_draft_window_runtime_state,
+    draft_window_tensors_share_storage,
+    validate_draft_metadata_isolation,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_eager_capability import (
     P7EagerTopologyFingerprint,
@@ -199,13 +201,37 @@ class DraftWindowEagerAsyncPool:
         inputs = handle.inputs
         assert inputs is not None
         buffers = tuple(backend_derived_buffers)
-        if any(not isinstance(buffer, torch.Tensor) for buffer in buffers):
-            self._runtimes[handle.execution_lane].abort_generation(inputs.identity)
+        runtime = self._runtimes[handle.execution_lane]
+        try:
+            if any(not isinstance(buffer, torch.Tensor) for buffer in buffers):
+                raise TypeError("backend derived buffers must be tensors")
+            workspace_tensors = (
+                inputs.window_block_table,
+                inputs.valid_num_blocks,
+                inputs.device_window_exact,
+                inputs.cpu_window_exact,
+                inputs.cpu_window_upper,
+            )
+            if any(
+                draft_window_tensors_share_storage(buffer, backing)
+                for buffer in buffers
+                for backing in workspace_tensors
+            ):
+                raise ValueError("backend derived buffers must not alias Draft Window backing")
+            if any(runtime.capability.full_source.shares_canonical_storage(buffer) for buffer in buffers):
+                raise ValueError("backend derived buffers must not alias canonical FullSource")
+            validate_draft_metadata_isolation(
+                buffers,
+                target_metadata=target_metadata,
+                subject="backend derived buffers",
+            )
+        except BaseException:
+            runtime.abort_generation(inputs.identity)
             handle.inputs = None
             handle.state = DraftWindowEagerAsyncState.RETIRED
-            raise TypeError("backend derived buffers must be tensors")
+            raise
         try:
-            self._runtimes[handle.execution_lane].publish_metadata(
+            runtime.publish_metadata(
                 inputs,
                 metadata,
                 target_metadata=target_metadata,

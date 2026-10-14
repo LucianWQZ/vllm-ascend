@@ -11,6 +11,7 @@ from vllm_ascend.attention.attention_v1 import (
     AscendAttentionBackend,
     AscendAttentionMetadataBuilder,
 )
+from vllm_ascend.device.hardware_profile import AttentionBackendFamily
 from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftWindowGroupInventory,
     DraftWindowInventory,
@@ -38,6 +39,7 @@ def _policy(method: str = "eagle3") -> DraftWindowPolicyDecision:
 
 def _context(**changes: object) -> DraftWindowRuntimeContext:
     value = DraftWindowRuntimeContext(
+        attention_backend_family=AttentionBackendFamily.STANDARD,
         graph_mode="NONE",
         async_scheduling=False,
         tensor_parallel_size=1,
@@ -144,6 +146,7 @@ def test_dense_single_group_eager_route_is_ready_for_npu_not_supported() -> None
     assert decision.topology_fingerprint == P7EagerTopologyFingerprint(
         normalized_method="eagle3",
         runtime_route="eagle3",
+        attention_backend_family=AttentionBackendFamily.STANDARD,
         backend_impls=("vllm_ascend.attention.attention_v1.AscendAttentionBackend",),
         builder_impls=("vllm_ascend.attention.attention_v1.AscendAttentionMetadataBuilder",),
         global_group_ids=(0,),
@@ -164,6 +167,35 @@ def test_dense_single_group_eager_route_is_ready_for_npu_not_supported() -> None
         execution_lane=0,
     )
     decision.require_live_materialization()
+
+
+def test_compatibility_attention_backend_family_fails_closed() -> None:
+    """A subclass-compatible backend must not erase its hardware contract."""
+
+    class _CompatibilityBackend(AscendAttentionBackend):
+        pass
+
+    class _CompatibilityBuilder(AscendAttentionMetadataBuilder):
+        pass
+
+    decision = _evaluate(
+        inventory=_inventory(
+            groups=(
+                _group(
+                    backend=_CompatibilityBackend,
+                    builder=_CompatibilityBuilder,
+                ),
+            ),
+        ),
+        context=_context(
+            attention_backend_family=AttentionBackendFamily.COMPATIBILITY,
+        ),
+    )
+
+    assert decision.status is P7EagerCapabilityStatus.FAIL_CLOSED
+    assert "COMPATIBILITY" in decision.reason
+    with pytest.raises(NotImplementedError, match="FAIL_CLOSED.*COMPATIBILITY"):
+        decision.require_live_materialization()
 
 
 @pytest.mark.parametrize("graph_mode", ["FULL", "FULL_DECODE_ONLY", "PIECEWISE"])
