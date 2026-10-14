@@ -2103,6 +2103,10 @@ def test_eagle3_provider_rejects_plan_offset_that_disagrees_with_configured_k() 
         causal=True,
         vllm_config=_p2_vllm_config(configured_k=64),
     )
+    assert capability.eager_topology_fingerprint is not None
+    assert capability.eager_topology_fingerprint.graph_mode == "NONE"
+    assert capability.eager_topology_fingerprint.async_scheduling is False
+    assert capability.eager_topology_fingerprint.global_group_ids == (0,)
     mismatched_plan = DraftWindowScalarPlan(
         full_exact_end=257,
         full_horizon_end=257,
@@ -2115,4 +2119,29 @@ def test_eagle3_provider_rejects_plan_offset_that_disagrees_with_configured_k() 
         capability.provider.describe(
             mismatched_plan,
             valid_num_blocks=5,
+        )
+
+
+def test_async_source_capability_stops_before_full_source_allocation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vllm_config = _p2_vllm_config(configured_k=3)
+    vllm_config.scheduler_config.async_scheduling = True
+
+    def forbidden_full_source(**_kwargs: Any) -> Any:
+        raise AssertionError("STATIC_READY async must not create FullSource")
+
+    monkeypatch.setattr(
+        "vllm_ascend.worker.v2.spec_decode.draft_window.build_full_draft_kv_source",
+        forbidden_full_source,
+    )
+
+    with pytest.raises(NotImplementedError, match="STATIC_READY.*NPU completion"):
+        build_draft_window_source_capability(
+            policy=_p2_policy("eagle3"),
+            runtime_route="eagle3",
+            attn_groups=[[_attention_group()]],
+            block_tables=_block_tables(),
+            causal=True,
+            vllm_config=vllm_config,
         )

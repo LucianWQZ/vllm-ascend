@@ -14,7 +14,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields, is_dataclass
 from enum import Enum
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 import numpy as np
 import torch
@@ -37,6 +37,11 @@ from vllm_ascend.attention.dsa_v1 import AscendDSABackend
 from vllm_ascend.attention.indexer import AscendSFAIndexerBackend
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
 from vllm_ascend.attention.sfa_v1 import AscendSFABackend
+
+if TYPE_CHECKING:
+    from vllm_ascend.worker.v2.spec_decode.draft_window_eager_capability import (
+        P7EagerTopologyFingerprint,
+    )
 
 
 class DraftWindowPolicyState(Enum):
@@ -586,6 +591,7 @@ class DraftWindowSourceCapability:
     inventory: DraftWindowInventory
     full_source: FullDraftKVSource
     provider: SingleGroupDirectPrefixProvider
+    eager_topology_fingerprint: "P7EagerTopologyFingerprint | None" = None
 
 
 def _normalize_method(method: str) -> str:
@@ -1305,17 +1311,32 @@ def build_draft_window_source_capability(
     vllm_config: Any,
 ) -> DraftWindowSourceCapability:
     """Build P2 state after ``set_attn`` and before any Window allocation."""
+    runtime_context = build_draft_window_runtime_context(
+        vllm_config,
+        block_tables,
+    )
     inventory = build_draft_window_inventory(
         policy=policy,
         runtime_route=runtime_route,
         attn_groups=attn_groups,
         block_tables=block_tables,
         causal=causal,
-        runtime_context=build_draft_window_runtime_context(
-            vllm_config,
-            block_tables,
-        ),
+        runtime_context=runtime_context,
     )
+    uses_dynamic_k = bool(vllm_config.speculative_config.uses_dynamic_speculative_decoding())
+    from vllm_ascend.worker.v2.spec_decode.draft_window_eager_capability import (
+        evaluate_draft_window_eager_capability,
+    )
+
+    eager_decision = evaluate_draft_window_eager_capability(
+        policy=policy,
+        inventory=inventory,
+        runtime_context=runtime_context,
+        uses_dynamic_k=uses_dynamic_k,
+        provider_version=DraftWindowRuntimeState.PROVIDER_VERSION,
+        execution_lane=0,
+    )
+    eager_topology_fingerprint = eager_decision.require_live_materialization()
     group = inventory.require_single_group_direct_prefix()
     full_source = build_full_draft_kv_source(
         inventory=inventory,
@@ -1330,13 +1351,14 @@ def build_draft_window_source_capability(
         expected_future_offset=resolve_static_future_offset(
             normalized_method=policy.normalized_method,
             configured_k=int(vllm_config.speculative_config.num_speculative_tokens),
-            uses_dynamic_k=bool(vllm_config.speculative_config.uses_dynamic_speculative_decoding()),
+            uses_dynamic_k=uses_dynamic_k,
         ),
     )
     return DraftWindowSourceCapability(
         inventory=inventory,
         full_source=full_source,
         provider=provider,
+        eager_topology_fingerprint=eager_topology_fingerprint,
     )
 
 
@@ -1370,6 +1392,7 @@ class DraftWindowGenerationIdentity:
     execution_lane: int
     phase: DraftWindowExecutionPhase
     step: int
+    topology_fingerprint: "P7EagerTopologyFingerprint | None" = None
 
     def __post_init__(self) -> None:
         _require_nonnegative_python_int(self.generation_id, "generation id")
@@ -1701,10 +1724,11 @@ class DraftWindowLease:
 
 
 class _DraftWindowLeasePool:
-    """One-lane pool; serialized eager is explicit and Async remains gated."""
+    """One stable lane; a P7 pool may own several independent instances."""
 
-    def __init__(self, workspace: DraftWindowWorkspace) -> None:
+    def __init__(self, workspace: DraftWindowWorkspace, execution_lane: int) -> None:
         self._workspace = workspace
+        self._execution_lane = execution_lane
         self._current: DraftWindowLease | None = None
 
     def acquire(
@@ -1713,11 +1737,13 @@ class _DraftWindowLeasePool:
         owner: "DraftWindowRuntimeState",
         identity: DraftWindowGenerationIdentity,
     ) -> DraftWindowLease:
-        self._reclaim_completed_reader()
         if self._current is not None:
-            raise RuntimeError("draft-window execution lane 0 is still in use")
-        if identity.execution_lane != 0:
-            raise NotImplementedError("P3 supports only serialized execution lane 0")
+            raise RuntimeError(f"draft-window execution lane {self._execution_lane} is still in use")
+        if identity.execution_lane != self._execution_lane:
+            raise RuntimeError(
+                "draft-window generation lane does not match its workspace: "
+                f"generation={identity.execution_lane} workspace={self._execution_lane}"
+            )
         lease = DraftWindowLease(
             owner=owner,
             identity=identity,
@@ -1768,14 +1794,23 @@ class _DraftWindowLeasePool:
             return
         raise RuntimeError("cannot retire an already retired lease")
 
-    def _reclaim_completed_reader(self) -> None:
+    def reclaim_completed_reader(
+        self,
+        expected_identity: DraftWindowGenerationIdentity,
+    ) -> DraftWindowGenerationIdentity | None:
         lease = self._current
-        if lease is None or lease._state is not DraftWindowLeaseState.RETIRED_PENDING:
-            return
+        if lease is None:
+            raise RuntimeError("draft-window lane has no pending reader")
+        if lease.identity != expected_identity:
+            raise RuntimeError("pending reader belongs to a different generation")
+        if lease._state is not DraftWindowLeaseState.RETIRED_PENDING:
+            raise RuntimeError("draft-window reader is not pending retirement")
         token = lease._completion_token
         assert token is not None
         if bool(token.is_complete()):
             self._finish_retirement(lease)
+            return expected_identity
+        return None
 
     def _finish_retirement(self, lease: DraftWindowLease) -> None:
         self._workspace.reset(lease.identity)
@@ -1939,15 +1974,24 @@ class DraftWindowRuntimeState:
         *,
         capability: DraftWindowSourceCapability,
         workspace: DraftWindowWorkspace,
+        execution_lane: int = 0,
+        topology_fingerprint: "P7EagerTopologyFingerprint | None" = None,
     ) -> None:
+        if execution_lane < 0:
+            raise ValueError("execution lane must be nonnegative")
         self.capability = capability
         self.workspace = workspace
+        self.execution_lane = execution_lane
+        self.topology_fingerprint = (
+            capability.eager_topology_fingerprint if topology_fingerprint is None else topology_fingerprint
+        )
         self.metadata_store = DraftMetadataStore()
-        self._lease_pool = _DraftWindowLeasePool(workspace)
+        self._lease_pool = _DraftWindowLeasePool(workspace, execution_lane)
         self._active_inputs: DraftMetadataInputs | None = None
         self._last_mapping_epoch = -1
         self._next_generation_id = 0
         self._last_retired_identity: DraftWindowGenerationIdentity | None = None
+        self._pending_retirement_identity: DraftWindowGenerationIdentity | None = None
 
     def materialize(
         self,
@@ -1996,6 +2040,7 @@ class DraftWindowRuntimeState:
             execution_lane=execution_lane,
             phase=phase,
             step=step,
+            topology_fingerprint=self.topology_fingerprint,
         )
         self._last_retired_identity = None
         return self._materialize_identity(
@@ -2032,6 +2077,7 @@ class DraftWindowRuntimeState:
         This models several Eagle3 forwards within one proposal without lying
         that the batch mapping changed between those forwards.
         """
+        self._reclaim_completed_reader()
         if self._active_inputs is not None:
             raise RuntimeError("cannot refresh a Draft Window while the previous reader is active")
         if self._last_retired_identity != previous_identity:
@@ -2077,6 +2123,7 @@ class DraftWindowRuntimeState:
             execution_lane=execution_lane,
             phase=DraftWindowExecutionPhase.STEP,
             step=step,
+            topology_fingerprint=previous_identity.topology_fingerprint,
         )
         self._last_retired_identity = None
         return self._materialize_identity(
@@ -2101,6 +2148,7 @@ class DraftWindowRuntimeState:
         cpu_valid_num_blocks: torch.Tensor | None,
     ) -> DraftMetadataInputs:
         """Acquire and populate the one serialized backing for an identity."""
+        self._reclaim_completed_reader()
         lease = self._lease_pool.acquire(owner=self, identity=identity)
         self._last_mapping_epoch = max(self._last_mapping_epoch, identity.mapping_epoch)
         self._next_generation_id += 1
@@ -2172,6 +2220,32 @@ class DraftWindowRuntimeState:
             raise RuntimeError("cannot use a retired lease")
         self._retire_lease(inputs.lease, expected_identity)
 
+    def poll_reader_completion(
+        self,
+        expected_identity: DraftWindowGenerationIdentity,
+    ) -> bool:
+        """Poll an explicitly retired reader without allowing early reuse."""
+        if self._last_retired_identity == expected_identity:
+            return True
+        inputs = self._active_inputs
+        if inputs is not None:
+            inputs.validate_for(expected_identity)
+            if inputs.lease.state is not DraftWindowLeaseState.READER_PENDING:
+                raise RuntimeError("active Draft Window reader has not been submitted")
+            self._retire_lease(inputs.lease, expected_identity)
+            if self._last_retired_identity == expected_identity:
+                return True
+            if self._pending_retirement_identity == expected_identity:
+                return False
+        if self._pending_retirement_identity != expected_identity:
+            raise RuntimeError("pending reader belongs to a different generation")
+        retired = self._lease_pool.reclaim_completed_reader(expected_identity)
+        if retired is None:
+            return False
+        self._pending_retirement_identity = None
+        self._last_retired_identity = retired
+        return True
+
     def abort_generation(self, expected_identity: DraftWindowGenerationIdentity) -> None:
         inputs = self._active_inputs
         if inputs is None:
@@ -2191,7 +2265,12 @@ class DraftWindowRuntimeState:
         self.metadata_store.discard(expected_identity)
         self._lease_pool.retire(lease, expected_identity)
         self._active_inputs = None
-        self._last_retired_identity = expected_identity if lease.state is DraftWindowLeaseState.RETIRED else None
+        if lease.state is DraftWindowLeaseState.RETIRED:
+            self._last_retired_identity = expected_identity
+            self._pending_retirement_identity = None
+        else:
+            self._last_retired_identity = None
+            self._pending_retirement_identity = expected_identity
 
     def _abort_active(self, identity: DraftWindowGenerationIdentity) -> None:
         inputs = self._active_inputs
@@ -2202,6 +2281,18 @@ class DraftWindowRuntimeState:
         self._lease_pool.retire(inputs.lease, identity)
         self._active_inputs = None
         self._last_retired_identity = None
+        self._pending_retirement_identity = (
+            identity if inputs.lease.state is DraftWindowLeaseState.RETIRED_PENDING else None
+        )
+
+    def _reclaim_completed_reader(self) -> None:
+        pending = self._pending_retirement_identity
+        if pending is None:
+            return
+        retired = self._lease_pool.reclaim_completed_reader(pending)
+        if retired is not None:
+            self._pending_retirement_identity = None
+            self._last_retired_identity = retired
 
     def _require_active_inputs(self, inputs: DraftMetadataInputs) -> None:
         if self._active_inputs is not inputs:
@@ -2211,6 +2302,9 @@ class DraftWindowRuntimeState:
 
 def build_draft_window_runtime_state(
     capability: DraftWindowSourceCapability,
+    *,
+    execution_lane: int = 0,
+    topology_fingerprint: "P7EagerTopologyFingerprint | None" = None,
 ) -> DraftWindowRuntimeState:
     """Allocate P3 state only after P2 has closed all capability gates."""
     group = capability.inventory.require_single_group_direct_prefix()
@@ -2232,6 +2326,8 @@ def build_draft_window_runtime_state(
     return DraftWindowRuntimeState(
         capability=capability,
         workspace=workspace,
+        execution_lane=execution_lane,
+        topology_fingerprint=topology_fingerprint,
     )
 
 
