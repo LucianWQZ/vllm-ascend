@@ -218,7 +218,7 @@ def build_prefix_resident_snapshot(
         idx_mapping_np=mapping,
         num_reqs=num_reqs,
         num_reqs_padded=num_reqs_padded,
-    ).clone()
+    )
     return DraftWindowResidentSetSnapshot(
         global_group_id=global_group_id,
         ordered_request_fingerprint=request_ids,

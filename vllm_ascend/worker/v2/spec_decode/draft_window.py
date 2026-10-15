@@ -1734,7 +1734,6 @@ class DraftWindowWorkspace:
         if source_table.dtype != self.window_block_table.dtype:
             raise TypeError("canonical source table and Window workspace must share a dtype")
 
-        self._zero_all()
         try:
             if cpu_valid_num_blocks is None:
                 gather_valid_num_blocks(

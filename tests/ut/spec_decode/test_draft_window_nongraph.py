@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 import torch
 
+import vllm_ascend.worker.v2.spec_decode.draft_window_nongraph as draft_window_nongraph
 from vllm_ascend.attention.attention_v1 import (
     AscendAttentionBackend,
     AscendAttentionMetadataBuilder,
@@ -240,6 +241,32 @@ def test_prefix_resident_snapshot_tracks_mapping_and_detects_eviction() -> None:
     assert second.source_identity == first.source_identity
     assert second.mapping_fingerprint == first.mapping_fingerprint
     assert not torch.equal(second.valid_num_blocks, first.valid_num_blocks)
+
+
+def test_prefix_resident_snapshot_takes_ownership_of_fresh_gather(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capability, _block_tables = _capability(prefix=True)
+    gathered = torch.tensor([7, 6], dtype=torch.int32)
+
+    def fake_gather(*_args: object, **_kwargs: object) -> torch.Tensor:
+        return gathered
+
+    monkeypatch.setattr(
+        draft_window_nongraph,
+        "gather_valid_num_blocks_cpu",
+        fake_gather,
+    )
+    snapshot = build_prefix_resident_snapshot(
+        full_source=capability.full_source,
+        global_group_id=0,
+        idx_mapping_np=np.asarray([3, 5], dtype=np.intp),
+        ordered_request_ids=("A", "B"),
+        num_reqs=2,
+        num_reqs_padded=2,
+    )
+
+    assert snapshot.valid_num_blocks is gathered
 
 
 @pytest.mark.parametrize("tp_size", [2, 4, 16])

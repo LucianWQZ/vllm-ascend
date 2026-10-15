@@ -257,6 +257,43 @@ def test_workspace_reuse_clears_shrunk_rows_and_tails() -> None:
     assert second.cpu_window_exact.tolist() == [32, 0]
 
 
+def test_workspace_success_path_avoids_redundant_preclear(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, _capability, _block_tables = _runtime_fixture(
+        max_num_reqs=16,
+        row_width=32,
+    )
+    workspace = runtime.workspace
+    full_clear_calls = 0
+    original_zero_all = workspace._zero_all
+
+    def counted_zero_all() -> None:
+        nonlocal full_clear_calls
+        full_clear_calls += 1
+        original_zero_all()
+
+    monkeypatch.setattr(workspace, "_zero_all", counted_zero_all)
+    inputs = _materialize(
+        runtime,
+        mapping_epoch=1,
+        idx_mapping=torch.tensor([3, 5], dtype=torch.int32),
+        descriptors=(
+            replace(_descriptor(required=2, valid=32), source_row_width=32),
+            replace(_descriptor(required=1, valid=32), source_row_width=32),
+        ),
+    )
+    runtime.retire_generation(inputs.identity)
+
+    assert full_clear_calls == 1
+    assert workspace.bound_identity is None
+    assert workspace.window_block_table.count_nonzero().item() == 0
+    assert workspace.valid_num_blocks.count_nonzero().item() == 0
+    assert workspace.device_window_exact.count_nonzero().item() == 0
+    assert workspace.cpu_window_exact.count_nonzero().item() == 0
+    assert workspace.cpu_window_upper.count_nonzero().item() == 0
+
+
 def test_workspace_materializes_an_empty_batch_without_stale_state() -> None:
     runtime, _capability, _block_tables = _runtime_fixture()
 

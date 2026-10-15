@@ -211,13 +211,12 @@ class DraftWindowEagerAsyncPool:
     ) -> DraftWindowEagerAsyncHandle:
         """Acquire safely, waiting only when every bounded lane is owned.
 
-        Normal execution remains nonblocking: completed readers are queried and
-        reclaimed first.  If all lanes are still submitted, pressure is applied
-        to the oldest operation by synchronizing its real completion event.  No
-        backing is overwritten and no polling loop or global stream sync is
-        introduced.
+        Normal execution remains nonblocking: a free lane is acquired without
+        querying unrelated readers.  Only actual pool pressure polls completed
+        readers; if all lanes are still submitted, pressure is applied to the
+        oldest operation by synchronizing its real completion event.  No backing
+        is overwritten and no polling loop or global stream sync is introduced.
         """
-        self.reclaim_completed()
         try:
             return self.acquire(
                 mapping_epoch=mapping_epoch,
@@ -226,7 +225,18 @@ class DraftWindowEagerAsyncPool:
                 step=step,
                 allow_same_mapping_epoch=allow_same_mapping_epoch,
             )
-        except RuntimeError as pressure_error:
+        except RuntimeError:
+            self.reclaim_completed()
+            try:
+                return self.acquire(
+                    mapping_epoch=mapping_epoch,
+                    ordered_request_ids=ordered_request_ids,
+                    phase=phase,
+                    step=step,
+                    allow_same_mapping_epoch=allow_same_mapping_epoch,
+                )
+            except RuntimeError as retry_error:
+                pressure_error = retry_error
             if any(handle is None for handle in self._active):
                 raise
             submitted = tuple(

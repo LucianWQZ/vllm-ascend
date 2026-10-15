@@ -43,10 +43,12 @@ class _FakeCompletionToken:
     ) -> None:
         self.complete = complete
         self.wait_error = wait_error
+        self.query_calls = 0
         self.wait_calls = 0
         self.on_wait: Callable[[], None] | None = None
 
     def is_complete(self) -> bool:
+        self.query_calls += 1
         return self.complete
 
     def wait(self) -> None:
@@ -335,6 +337,25 @@ def test_pressure_waits_oldest_submitted_lane_without_overwrite() -> None:
     assert third.execution_lane == first.execution_lane
     assert pool._active[second.execution_lane] is second
     assert second.bound_metadata is retained_b
+
+
+def test_backpressure_acquire_does_not_poll_when_a_lane_is_free() -> None:
+    pool, _block_tables = _pool(capacity=2)
+    first = _acquire(pool, 10, ("A",))
+    event = _FakeCompletionToken()
+    _bind_and_submit(pool, first, event)
+    queries_before_acquire = event.query_calls
+
+    second = pool.acquire_with_backpressure(
+        mapping_epoch=11,
+        ordered_request_ids=("B",),
+        phase=DraftWindowExecutionPhase.PROPOSAL,
+        step=0,
+    )
+
+    assert second.execution_lane != first.execution_lane
+    assert event.query_calls == queries_before_acquire
+    assert event.wait_calls == 0
 
 
 def test_pressure_reclaims_reverse_completed_lane_without_wait() -> None:
