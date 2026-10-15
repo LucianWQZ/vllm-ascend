@@ -67,6 +67,12 @@ class DraftWindowNPUEventCompletionToken:
             raise RuntimeError("Draft Window completion event was not recorded")
         return bool(self.event.query())
 
+    def wait(self) -> None:
+        """Block for this event only when bounded-pool pressure requires it."""
+        if not self._recorded:
+            raise RuntimeError("Draft Window completion event was not recorded")
+        self.event.synchronize()
+
     @classmethod
     def record_current_stream(cls) -> "DraftWindowNPUEventCompletionToken":
         event = torch.npu.Event()  # type: ignore[attr-defined]
@@ -193,6 +199,64 @@ class DraftWindowEagerAsyncPool:
         self._last_epoch_step = step
         self._active[lane] = handle
         return handle
+
+    def acquire_with_backpressure(
+        self,
+        *,
+        mapping_epoch: int,
+        ordered_request_ids: Sequence[str],
+        phase: DraftWindowExecutionPhase,
+        step: int,
+        allow_same_mapping_epoch: bool = False,
+    ) -> DraftWindowEagerAsyncHandle:
+        """Acquire safely, waiting only when every bounded lane is owned.
+
+        Normal execution remains nonblocking: completed readers are queried and
+        reclaimed first.  If all lanes are still submitted, pressure is applied
+        to the oldest operation by synchronizing its real completion event.  No
+        backing is overwritten and no polling loop or global stream sync is
+        introduced.
+        """
+        self.reclaim_completed()
+        try:
+            return self.acquire(
+                mapping_epoch=mapping_epoch,
+                ordered_request_ids=ordered_request_ids,
+                phase=phase,
+                step=step,
+                allow_same_mapping_epoch=allow_same_mapping_epoch,
+            )
+        except RuntimeError as pressure_error:
+            if any(handle is None for handle in self._active):
+                raise
+            submitted = tuple(
+                handle
+                for handle in self._active
+                if handle is not None and handle.state is DraftWindowEagerAsyncState.SUBMITTED
+            )
+            if len(submitted) != self.capacity:
+                raise RuntimeError(
+                    "draft-window async pool pressure cannot wait because an owned lane has not reached SUBMITTED"
+                ) from pressure_error
+            oldest = min(submitted, key=lambda handle: handle.operation_id)
+            completion = oldest.completion_token
+            wait = getattr(completion, "wait", None)
+            if completion is None or not callable(wait):
+                raise RuntimeError(
+                    "draft-window async pool pressure requires a waitable completion token"
+                ) from pressure_error
+            wait()
+            if not self.poll(oldest):
+                raise RuntimeError("draft-window completion wait returned before the oldest reader completed")
+            self.retire(oldest)
+            self.release(oldest)
+            return self.acquire(
+                mapping_epoch=mapping_epoch,
+                ordered_request_ids=ordered_request_ids,
+                phase=phase,
+                step=step,
+                allow_same_mapping_epoch=allow_same_mapping_epoch,
+            )
 
     def materialize(
         self,

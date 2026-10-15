@@ -237,8 +237,9 @@ def test_prefix_resident_snapshot_tracks_mapping_and_detects_eviction() -> None:
         num_reqs_padded=2,
     )
     assert second.valid_num_blocks.tolist() == [4, 6]
-    with pytest.raises(RuntimeError, match="resident-set snapshot"):
-        second.validate_expected(first)
+    assert second.source_identity == first.source_identity
+    assert second.mapping_fingerprint == first.mapping_fingerprint
+    assert not torch.equal(second.valid_num_blocks, first.valid_num_blocks)
 
 
 @pytest.mark.parametrize("tp_size", [2, 4, 16])

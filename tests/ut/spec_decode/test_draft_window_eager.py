@@ -355,7 +355,7 @@ def _harness(
     query_width: int = 4,
     async_scheduling: bool = False,
     prefix_caching: bool = False,
-    async_lanes: int = 2,
+    async_lanes: int | None = 2,
 ) -> tuple[_EagerHarness, SimpleNamespace]:
     runtime, capability, block_tables = _runtime_fixture(
         async_scheduling=async_scheduling,
@@ -369,8 +369,12 @@ def _harness(
     harness = _EagerHarness()
     harness._draft_window_runtime_state = runtime
     harness._draft_window_source_capability = capability
+    additional_config = {}
+    if async_lanes is not None:
+        additional_config["draft_window_async_lanes"] = async_lanes
     harness.vllm_config = SimpleNamespace(
-        additional_config={"draft_window_async_lanes": async_lanes},
+        additional_config=additional_config,
+        max_concurrent_batches=2,
     )
     harness._initialize_draft_window_eager_state()
     harness.draft_attn_layer_names = {"draft.layer"}
@@ -703,9 +707,14 @@ def test_continuing_pure_chunked_prefill_uses_baseline_without_window_state() ->
 class _FakeAsyncCompletion:
     def __init__(self) -> None:
         self.complete = False
+        self.wait_calls = 0
 
     def is_complete(self) -> bool:
         return self.complete
+
+    def wait(self) -> None:
+        self.wait_calls += 1
+        self.complete = True
 
 
 def _run_async_proposal(
@@ -768,8 +777,8 @@ def test_live_async_scope_owns_two_inflight_generations_and_reclaims_reverse_com
     assert pool._active == [None, None]
 
 
-def test_live_async_pressure_and_builder_failure_cleanup_do_not_poison_epoch_owner() -> None:
-    harness, batch = _harness(async_scheduling=True, async_lanes=1)
+def test_live_async_pressure_backpressures_and_builder_failure_does_not_poison_epoch_owner() -> None:
+    harness, batch = _harness(async_scheduling=True, async_lanes=2)
     completions: list[_FakeAsyncCompletion] = []
 
     def new_completion() -> _FakeAsyncCompletion:
@@ -781,18 +790,34 @@ def test_live_async_pressure_and_builder_failure_cleanup_do_not_poison_epoch_own
     pool = harness._draft_window_async_pool
     assert pool is not None
     _run_async_proposal(harness, batch)
+    _run_async_proposal(harness, batch)
 
-    with pytest.raises(RuntimeError, match="pool pressure"):
-        _run_async_proposal(harness, batch)
+    _run_async_proposal(harness, batch)
+    assert completions[0].wait_calls == 1
+    assert completions[1].wait_calls == 0
     assert harness._draft_window_epoch_source._active is None
 
-    completions[0].complete = True
-    assert pool.reclaim_completed() == (0,)
+    completions[1].complete = True
+    completions[2].complete = True
+    assert pool.reclaim_completed() == (0, 1)
     harness.raise_in_builder = True
     with pytest.raises(RuntimeError, match="synthetic builder failure"):
         _run_async_proposal(harness, batch)
-    assert pool._active == [None]
+    assert pool._active == [None, None]
     assert harness._draft_window_epoch_source._active is None
+
+
+def test_live_async_capacity_below_host_batch_depth_rejects_at_initialization() -> None:
+    with pytest.raises(ValueError, match="max_concurrent_batches"):
+        _harness(async_scheduling=True, async_lanes=1)
+
+
+def test_live_async_default_capacity_uses_host_batch_depth() -> None:
+    harness, _batch = _harness(async_scheduling=True, async_lanes=None)
+    pool = harness._draft_window_async_pool
+
+    assert pool is not None
+    assert pool.capacity == harness.vllm_config.max_concurrent_batches == 2
 
 
 def test_metadata_isolation_clones_nested_target_aliases_without_mutating_target() -> None:

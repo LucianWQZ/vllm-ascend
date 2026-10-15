@@ -19,6 +19,7 @@ from vllm.v1.worker.gpu import block_table as upstream_block_table
 from vllm.v1.worker.utils import AttentionGroup
 
 import vllm_ascend.worker.v2.spec_decode as spec_decode_factory
+import vllm_ascend.worker.v2.spec_decode.draft_window as draft_window_module
 from vllm_ascend.attention.attention_v1 import (
     AscendAttentionBackend,
     AscendAttentionMetadataBuilder,
@@ -2069,6 +2070,26 @@ def test_runtime_context_uses_actual_eager_and_topology_configuration() -> None:
     assert context == _p2_runtime_context()
 
 
+def test_runtime_context_uses_effective_dsa_cp_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _p2_vllm_config(additional_config={"enable_dsa_cp": True})
+    config.parallel_config.use_sequence_parallel_moe = True
+    monkeypatch.setattr(
+        draft_window_module,
+        "_effective_dsa_context_parallel",
+        lambda: False,
+    )
+
+    context = build_draft_window_runtime_context(
+        config,
+        SimpleNamespace(cp_size=1),
+    )
+
+    assert context.dsa_context_parallel is False
+    assert context.flashcomm is False
+
+
 def test_compatibility_hardware_family_stops_before_full_source_allocation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2192,6 +2213,7 @@ def test_p7x_source_capability_binds_uncompressed_dsa_provider(
     dsa_cp: bool,
     builder_class: type[Any],
     expected_semantics: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     builder = object.__new__(builder_class)
     builder.compressor_ratio = 1
@@ -2200,6 +2222,11 @@ def test_p7x_source_capability_binds_uncompressed_dsa_provider(
         additional_config={"enable_dsa_cp": dsa_cp},
     )
     if dsa_cp:
+        monkeypatch.setattr(
+            draft_window_module,
+            "_effective_dsa_context_parallel",
+            lambda: True,
+        )
         config.parallel_config.tensor_parallel_size = 2
         config.parallel_config.tensor_parallel_rank = 1
     capability = build_draft_window_source_capability(
@@ -2224,6 +2251,43 @@ def test_p7x_source_capability_binds_uncompressed_dsa_provider(
     assert capability.provider.block_span_tokens == 64
     assert capability.eager_topology_fingerprint is not None
     assert capability.eager_topology_fingerprint.parallel_read_semantics == expected_semantics
+
+
+def test_p7x_source_capability_does_not_claim_dsa_cp_when_effective_authority_is_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = object.__new__(AscendDSAMetadataBuilder)
+    builder.compressor_ratio = 1
+    config = _p2_vllm_config(
+        configured_k=4,
+        additional_config={"enable_dsa_cp": True},
+    )
+    monkeypatch.setattr(
+        draft_window_module,
+        "_effective_dsa_context_parallel",
+        lambda: False,
+    )
+
+    capability = build_draft_window_source_capability(
+        policy=_p2_policy("dflash"),
+        runtime_route="dflash",
+        attn_groups=[
+            [
+                _attention_group(
+                    backend_class=AscendDSABackend,
+                    builder=builder,
+                )
+            ]
+        ],
+        block_tables=_block_tables(row_width=16),
+        causal=True,
+        vllm_config=config,
+    )
+
+    topology = capability.eager_topology_fingerprint
+    assert topology is not None
+    assert topology.dsa_context_parallel is False
+    assert topology.parallel_read_semantics == "replicated"
 
 
 def test_p7x_compressed_dsa_stops_before_full_source_allocation(

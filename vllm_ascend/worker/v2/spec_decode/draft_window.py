@@ -1370,10 +1370,11 @@ def build_draft_window_runtime_context(
         mode_name = "NONE"
     additional_config = getattr(vllm_config, "additional_config", None) or {}
     sequence_parallel = bool(getattr(parallel_config, "use_sequence_parallel_moe", False))
-    dsa_context_parallel = validate_additional_config_bool(
+    dsa_context_parallel_requested = validate_additional_config_bool(
         additional_config.get("enable_dsa_cp", False),
         "additional_config.enable_dsa_cp",
     )
+    dsa_context_parallel = dsa_context_parallel_requested and _effective_dsa_context_parallel()
     flashcomm_explicitly_enabled = validate_additional_config_bool(
         additional_config.get("enable_flashcomm1", False),
         "additional_config.enable_flashcomm1",
@@ -1400,6 +1401,13 @@ def build_draft_window_runtime_context(
         prefix_caching=bool(getattr(getattr(vllm_config, "cache_config", None), "enable_prefix_caching", False)),
         tensor_parallel_rank=_get_tensor_parallel_rank(parallel_config),
     )
+
+
+def _effective_dsa_context_parallel() -> bool:
+    """Read the same validated DSA-CP authority used by backend selection."""
+    from vllm_ascend.utils import enable_dsa_cp
+
+    return bool(enable_dsa_cp())
 
 
 def _get_tensor_parallel_rank(parallel_config: Any) -> int:

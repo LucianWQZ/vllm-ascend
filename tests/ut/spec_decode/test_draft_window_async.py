@@ -2,6 +2,7 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 """CPU-only P7-E bounded async lifecycle contracts."""
 
+from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Any
 
@@ -34,11 +35,27 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_eager_capability import (
 
 
 class _FakeCompletionToken:
-    def __init__(self, *, complete: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        complete: bool = False,
+        wait_error: BaseException | None = None,
+    ) -> None:
         self.complete = complete
+        self.wait_error = wait_error
+        self.wait_calls = 0
+        self.on_wait: Callable[[], None] | None = None
 
     def is_complete(self) -> bool:
         return self.complete
+
+    def wait(self) -> None:
+        self.wait_calls += 1
+        if self.on_wait is not None:
+            self.on_wait()
+        if self.wait_error is not None:
+            raise self.wait_error
+        self.complete = True
 
 
 class _RaisingCompletionToken(_FakeCompletionToken):
@@ -193,6 +210,7 @@ def test_event_completion_token_records_once_and_queries_real_event_contract() -
         def __init__(self) -> None:
             self.recorded_with: object | None = None
             self.complete = False
+            self.synchronize_calls = 0
 
         def record(self, stream: object) -> None:
             self.recorded_with = stream
@@ -200,12 +218,19 @@ def test_event_completion_token_records_once_and_queries_real_event_contract() -
         def query(self) -> bool:
             return self.complete
 
+        def synchronize(self) -> None:
+            self.synchronize_calls += 1
+            self.complete = True
+
     event = FakeEvent()
     stream = object()
     token = DraftWindowNPUEventCompletionToken(event=event)
     token.record(stream)
     assert event.recorded_with is stream
     assert token.is_complete() is False
+    token.wait()
+    assert event.synchronize_calls == 1
+    assert token.is_complete() is True
     event.complete = True
     assert token.is_complete() is True
     with pytest.raises(RuntimeError, match="already recorded"):
@@ -280,6 +305,160 @@ def test_two_inflight_generations_complete_in_reverse_without_early_reuse() -> N
     assert pool.poll(first) is False
     with pytest.raises(RuntimeError, match="not the active operation"):
         pool.poll(second)
+
+
+def test_pressure_waits_oldest_submitted_lane_without_overwrite() -> None:
+    pool, _block_tables = _pool(capacity=2)
+    first = _acquire(pool, 10, ("A",))
+    second = _acquire(pool, 11, ("B",))
+    event_a = _FakeCompletionToken()
+    event_b = _FakeCompletionToken()
+    _bind_and_submit(pool, first, event_a)
+    _bind_and_submit(pool, second, event_b)
+    retained_b = second.bound_metadata
+
+    def assert_oldest_is_still_owned() -> None:
+        assert first.bound_metadata is not None
+        assert second.bound_metadata is retained_b
+        assert pool._active == [first, second]
+
+    event_a.on_wait = assert_oldest_is_still_owned
+    third = pool.acquire_with_backpressure(
+        mapping_epoch=12,
+        ordered_request_ids=("C",),
+        phase=DraftWindowExecutionPhase.PROPOSAL,
+        step=0,
+    )
+
+    assert event_a.wait_calls == 1
+    assert event_b.wait_calls == 0
+    assert third.execution_lane == first.execution_lane
+    assert pool._active[second.execution_lane] is second
+    assert second.bound_metadata is retained_b
+
+
+def test_pressure_reclaims_reverse_completed_lane_without_wait() -> None:
+    pool, _block_tables = _pool(capacity=2)
+    first = _acquire(pool, 10, ("A",))
+    second = _acquire(pool, 11, ("B",))
+    event_a = _FakeCompletionToken()
+    event_b = _FakeCompletionToken(complete=True)
+    _bind_and_submit(pool, first, event_a)
+    _bind_and_submit(pool, second, event_b)
+
+    third = pool.acquire_with_backpressure(
+        mapping_epoch=12,
+        ordered_request_ids=("C",),
+        phase=DraftWindowExecutionPhase.PROPOSAL,
+        step=0,
+    )
+
+    assert event_a.wait_calls == 0
+    assert event_b.wait_calls == 0
+    assert third.execution_lane == second.execution_lane
+    assert pool._active[first.execution_lane] is first
+
+
+def test_pressure_wait_failure_keeps_all_lanes_owned() -> None:
+    pool, _block_tables = _pool(capacity=1)
+    handle = _acquire(pool, 1, ("A",))
+    event = _FakeCompletionToken(wait_error=RuntimeError("event wait failed"))
+    _bind_and_submit(pool, handle, event)
+
+    with pytest.raises(RuntimeError, match="event wait failed"):
+        pool.acquire_with_backpressure(
+            mapping_epoch=2,
+            ordered_request_ids=("B",),
+            phase=DraftWindowExecutionPhase.PROPOSAL,
+            step=0,
+        )
+
+    assert event.wait_calls == 1
+    assert handle.state is DraftWindowEagerAsyncState.SUBMITTED
+    assert pool._active == [handle]
+    assert handle.bound_metadata is not None
+
+
+def test_pressure_after_abort_submit_waits_before_reusing_lane() -> None:
+    pool, _block_tables = _pool(capacity=1)
+    handle = _acquire(pool, 1, ("A",))
+    event = _FakeCompletionToken()
+    _bind_and_submit(pool, handle, event)
+    retained = handle.bound_metadata
+
+    pool.abort(handle)
+    assert handle.abort_requested is True
+    assert handle.state is DraftWindowEagerAsyncState.SUBMITTED
+
+    replacement = pool.acquire_with_backpressure(
+        mapping_epoch=2,
+        ordered_request_ids=("B",),
+        phase=DraftWindowExecutionPhase.PROPOSAL,
+        step=0,
+    )
+
+    assert event.wait_calls == 1
+    assert handle.state is DraftWindowEagerAsyncState.FREE
+    assert handle.bound_metadata is None
+    assert retained is not None
+    assert replacement.execution_lane == handle.execution_lane
+    assert replacement.operation_id > handle.operation_id
+
+
+def test_pressure_completion_query_error_keeps_lane_and_metadata_owned() -> None:
+    pool, _block_tables = _pool(capacity=1)
+    handle = _acquire(pool, 1, ("A",))
+    _materialize(pool, handle)
+    pool.bind(handle, metadata={"draft": 1}, target_metadata={"target": 1})
+    event = _RaisingCompletionToken()
+
+    with pytest.raises(RuntimeError, match="completion query failed"):
+        pool.submit(handle, event)
+    retained = handle.bound_metadata
+
+    with pytest.raises(RuntimeError, match="completion query failed"):
+        pool.acquire_with_backpressure(
+            mapping_epoch=2,
+            ordered_request_ids=("B",),
+            phase=DraftWindowExecutionPhase.PROPOSAL,
+            step=0,
+        )
+
+    assert handle.state is DraftWindowEagerAsyncState.SUBMITTED
+    assert handle.bound_metadata is retained
+    assert pool._active == [handle]
+    assert event.wait_calls == 0
+
+
+def test_pressure_preserves_prefix_and_tp_topology_identity() -> None:
+    capability, _block_tables = _capability()
+    topology = replace_topology(
+        _topology(),
+        prefix_caching=True,
+        tensor_parallel_size=16,
+        tensor_parallel_rank=7,
+        parallel_read_semantics="replicated",
+    )
+    pool = DraftWindowEagerAsyncPool(
+        capability=capability,
+        topology_template=topology,
+        capacity=1,
+    )
+    first = _acquire(pool, 1, ("A",))
+    event = _FakeCompletionToken()
+    _bind_and_submit(pool, first, event)
+
+    second = pool.acquire_with_backpressure(
+        mapping_epoch=2,
+        ordered_request_ids=("B",),
+        phase=DraftWindowExecutionPhase.PROPOSAL,
+        step=0,
+    )
+
+    assert second.topology_fingerprint.prefix_caching is True
+    assert second.topology_fingerprint.tensor_parallel_size == 16
+    assert second.topology_fingerprint.tensor_parallel_rank == 7
+    assert second.topology_fingerprint.parallel_read_semantics == "replicated"
 
 
 def test_stable_lane_backing_survives_a_b_a_without_stale_generation() -> None:

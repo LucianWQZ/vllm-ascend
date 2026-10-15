@@ -125,18 +125,6 @@ class DraftWindowResidentSetSnapshot:
     source_identity: Any
     valid_num_blocks: torch.Tensor
 
-    def validate_expected(self, expected: "DraftWindowResidentSetSnapshot") -> None:
-        if not isinstance(expected, DraftWindowResidentSetSnapshot):
-            raise TypeError("expected resident-set snapshot must be typed")
-        if (
-            self.global_group_id != expected.global_group_id
-            or self.ordered_request_fingerprint != expected.ordered_request_fingerprint
-            or self.mapping_fingerprint != expected.mapping_fingerprint
-            or self.source_identity != expected.source_identity
-            or not torch.equal(self.valid_num_blocks, expected.valid_num_blocks)
-        ):
-            raise RuntimeError("resident-set snapshot does not match the expected generation")
-
 
 @dataclass(frozen=True, slots=True)
 class P7XCapabilityDecision:

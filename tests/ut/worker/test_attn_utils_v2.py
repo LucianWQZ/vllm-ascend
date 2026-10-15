@@ -48,6 +48,10 @@ from vllm_ascend.patch.platform.patch_kv_cache_utils import (
 from vllm_ascend.utils import vllm_version_is
 from vllm_ascend.worker.v2 import attn_utils
 from vllm_ascend.worker.v2.model_states.default import AscendModelState
+from vllm_ascend.worker.v2.spec_decode.draft_window import (
+    DraftWindowPolicyState,
+    resolve_draft_window_policy,
+)
 
 
 def _make_kv_cache_tensor(size: int, layer_names: list[str], page_size: int = 0) -> KVCacheTensor:
@@ -616,7 +620,13 @@ class _RecordingDSACPMetadataBuilder(AscendDSACPMetadataBuilder):
         return SimpleNamespace(common_attn_metadata=common_attn_metadata)
 
 
-def test_build_attn_metadata_recognizes_dsa_cp_builder_as_dsa_consumer() -> None:
+def test_window_off_build_attn_metadata_recognizes_dsa_cp_builder_as_dsa_consumer() -> None:
+    policy = resolve_draft_window_policy(
+        requested_window_size=None,
+        method="dflash",
+        target_model_type="qwen3",
+    )
+    assert policy.state is DraftWindowPolicyState.CONFIG_OFF
     calls: list[dict[str, Any]] = []
     layer_name = "draft.layers.0.self_attn"
     spec = _make_dsv4_mla_spec(64, 1)

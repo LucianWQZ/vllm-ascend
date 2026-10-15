@@ -267,7 +267,15 @@ class DraftWindowEagerMixin:
         self._draft_window_completion_token_factory = DraftWindowNPUEventCompletionToken.record_current_stream
         if topology is not None and topology.async_scheduling:
             additional_config = getattr(self.vllm_config, "additional_config", None) or {}
-            capacity = int(additional_config.get("draft_window_async_lanes", 2))
+            host_batch_depth = int(self.vllm_config.max_concurrent_batches)
+            if host_batch_depth <= 0:
+                raise ValueError("max_concurrent_batches must be greater than zero")
+            capacity = int(additional_config.get("draft_window_async_lanes", host_batch_depth))
+            if capacity < host_batch_depth:
+                raise ValueError(
+                    "draft_window_async_lanes must be at least max_concurrent_batches "
+                    f"({host_batch_depth}), got {capacity}"
+                )
             self._draft_window_async_pool = DraftWindowEagerAsyncPool(
                 capability=self._draft_window_source_capability,
                 topology_template=topology,
@@ -312,8 +320,7 @@ class DraftWindowEagerMixin:
         succeeded = False
         try:
             if async_pool is not None:
-                async_pool.reclaim_completed()
-                self._draft_window_async_handle = async_pool.acquire(
+                self._draft_window_async_handle = async_pool.acquire_with_backpressure(
                     mapping_epoch=context.mapping_epoch,
                     ordered_request_ids=context.ordered_request_ids,
                     phase=DraftWindowExecutionPhase.PROPOSAL,
