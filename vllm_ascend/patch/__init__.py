@@ -1178,6 +1178,29 @@
 #    Future Plan:
 #       Remove this patch once upstream exposes a backend-dispatchable spec-decode
 #       graph manager abstraction.
+#   2. `vllm.v1.worker.gpu.spec_decode.dflash.cudagraph.build_attn_metadata`
+#    Why:
+#       DFlash startup capture must build backend-native Ascend attention metadata.
+#    How:
+#       Reuse the vLLM-Ascend metadata builder through the existing worker patch.
+#    Related PR (if no, explain why):
+#       No, vllm-ascend v2 spec-decode ACL graph integration.
+#    Future Plan:
+#       Remove this patch once upstream dispatches capture metadata construction
+#       through the selected attention backend.
+#   3. `vllm.v1.worker.gpu.spec_decode.dflash.cudagraph._prepare_dflash_inputs_to_capture`
+#    Why:
+#       The local Draft Window graph spike needs an instance-owned startup carrier
+#       while pinned vLLM exposes no capture read-input hook.
+#    How:
+#       Install a same-signature Ascend adapter. The OFF path delegates to the
+#       saved upstream helper; the experimental path reads only an explicit typed
+#       context attached to the Draft-private `InputBuffers` instance.
+#    Related PR (if no, explain why):
+#       No, this is a local source spike and does not enable product Graph Window.
+#    Future Plan:
+#       Remove this private helper patch when upstream provides an explicit
+#       vendor-neutral capture read-input provider.
 #
 # ** 25. File: worker/patch_v2/patch_eagle_speculator.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

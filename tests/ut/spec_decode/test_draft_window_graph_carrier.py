@@ -13,7 +13,10 @@ from typing import Any
 import numpy as np
 import pytest
 import torch
+import vllm.v1.worker.gpu.spec_decode.dflash.cudagraph as upstream_dflash_cudagraph
 from vllm.config.compilation import CUDAGraphMode
+from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
+from vllm.v1.worker.gpu.input_batch import InputBuffers
 from vllm.v1.worker.gpu.spec_decode.autoregressive.cudagraph_utils import (
     SpeculatorCudaGraphManager,
 )
@@ -23,6 +26,7 @@ from vllm.v1.worker.gpu.spec_decode.dflash.cudagraph import (
 
 import vllm_ascend.worker.v2.spec_decode.autoregressive.aclgraph as ar_aclgraph_module
 import vllm_ascend.worker.v2.spec_decode.dflash.aclgraph as dflash_aclgraph_module
+import vllm_ascend.worker.v2.spec_decode.dflash.capture as dflash_capture_module
 from vllm_ascend.attention.attention_v1 import (
     AscendAttentionBackend,
     AscendAttentionBackendImpl,
@@ -37,6 +41,11 @@ from vllm_ascend.worker.v2.spec_decode.autoregressive.speculator import (
 )
 from vllm_ascend.worker.v2.spec_decode.dflash.aclgraph import (
     DFlashAclGraphManager,
+)
+from vllm_ascend.worker.v2.spec_decode.dflash.capture import (
+    ascend_prepare_dflash_inputs_to_capture,
+    draft_window_dflash_capture_scope,
+    format_dflash_capture_descriptor,
 )
 from vllm_ascend.worker.v2.spec_decode.dflash.speculator import (
     AscendDFlashSpeculator,
@@ -1196,3 +1205,435 @@ def test_eagle3_graph_manager_carries_first_pass_and_ar_metadata_to_update(
         DraftWindowGraphStage.CONSUMER,
         DraftWindowGraphStage.UPDATE,
     ]
+
+
+def _parallel_capture_descriptor(
+    *,
+    mode: CUDAGraphMode = CUDAGraphMode.FULL,
+    num_reqs: int | None = 4,
+    num_tokens: int = 8,
+    query_width: int | None = 2,
+) -> BatchExecutionDescriptor:
+    return BatchExecutionDescriptor(
+        cg_mode=mode,
+        num_tokens=num_tokens,
+        num_reqs=num_reqs,
+        uniform_token_count=query_width,
+    )
+
+
+def _parallel_capture_fixture(
+    *,
+    method: str = "dflash",
+    route: DraftWindowGraphRoute = DraftWindowGraphRoute.DFLASH,
+    descriptor: BatchExecutionDescriptor | None = None,
+    descriptor_text: str | None = None,
+) -> tuple[Any, Any, Any, InputBuffers, BatchExecutionDescriptor]:
+    runtime, _capability, block_tables = _runtime_fixture(method=method)
+    owner = SimpleNamespace(_draft_window_runtime_state=runtime)
+    provider = install_draft_window_graph_binding_provider(owner)
+    descriptor = descriptor or _parallel_capture_descriptor()
+    num_reqs = descriptor.num_reqs or min(descriptor.num_tokens, 8)
+    query_width = descriptor.uniform_token_count or descriptor.num_tokens // num_reqs
+    bootstrap_query_width = descriptor.num_tokens // 4
+    fingerprint = _fingerprint(
+        method=method,
+        route=route,
+        query_width=bootstrap_query_width,
+        padded_tokens=descriptor.num_tokens,
+    )
+    fingerprint = replace(
+        fingerprint,
+        graph_mode=descriptor.cg_mode.name,
+        capture_bucket=(num_reqs, descriptor.num_tokens),
+        padded_request_count=num_reqs,
+        query_width=query_width,
+        static_k=max(1, query_width - 1),
+        capture_descriptor=(
+            descriptor_text
+            if descriptor_text is not None
+            else format_dflash_capture_descriptor(descriptor, max_num_reqs=8)
+        ),
+    )
+    capture = provider.register_capture_identity(
+        fingerprint=fingerprint,
+        execution_lane=0,
+        consumer_ordinal=0,
+    )
+    input_buffers = InputBuffers(
+        max_num_reqs=8,
+        max_num_tokens=64,
+        device=torch.device("cpu"),
+    )
+    owner.input_buffers = input_buffers
+    owner.target_input_buffers = InputBuffers(
+        max_num_reqs=8,
+        max_num_tokens=64,
+        device=torch.device("cpu"),
+    )
+    block_tables.cp_size = 1
+    block_tables.cp_rank = 0
+    block_tables.cp_interleave = 1
+    # Keep source contents observable in these ownership tests. The real
+    # upstream helper zeroes its persistent dummy rows as baseline capture
+    # setup; the Window adapter must not add another source mutation.
+    block_tables.get_dummy_block_tables = lambda count: tuple(
+        table[:count] for table in block_tables.input_block_tables
+    )
+    block_tables.get_dummy_slot_mappings = lambda count: block_tables.slot_mappings[:, :count].fill_(-1)
+    return owner, provider, capture, input_buffers, descriptor
+
+
+def _call_capture_helper(
+    input_buffers: InputBuffers,
+    block_tables: Any,
+    *,
+    num_reqs: int = 4,
+    num_tokens: int = 8,
+    skip_attn: bool = False,
+) -> Any:
+    return ascend_prepare_dflash_inputs_to_capture(
+        num_reqs,
+        num_tokens,
+        input_buffers,
+        block_tables,
+        [[SimpleNamespace()]],
+        SimpleNamespace(),
+        512,
+        skip_attn,
+        True,
+    )
+
+
+def test_dflash_capture_helper_patch_symbol_is_installed() -> None:
+    import vllm_ascend.patch.worker.patch_v2.patch_dflash_speculator  # noqa: F401
+
+    assert upstream_dflash_cudagraph._prepare_dflash_inputs_to_capture is ascend_prepare_dflash_inputs_to_capture
+
+
+def test_dflash_capture_helper_off_delegates_to_exact_original(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sentinel = object()
+    received: tuple[Any, ...] | None = None
+
+    def original(*args: Any) -> Any:
+        nonlocal received
+        received = args
+        return sentinel
+
+    monkeypatch.setattr(
+        dflash_capture_module,
+        "_ORIGINAL_PREPARE_DFLASH_INPUTS_TO_CAPTURE",
+        original,
+    )
+    input_buffers = object()
+    args = (
+        2,
+        4,
+        input_buffers,
+        object(),
+        [[object()]],
+        object(),
+        128,
+        False,
+        True,
+    )
+
+    assert ascend_prepare_dflash_inputs_to_capture(*args) is sentinel
+    assert received == args
+
+
+@pytest.mark.parametrize(
+    ("method", "route"),
+    [
+        ("dflash", DraftWindowGraphRoute.DFLASH),
+        ("dspark", DraftWindowGraphRoute.DSPARK),
+    ],
+)
+def test_parallel_capture_helper_window_read_uses_persistent_carrier_and_full_write(
+    monkeypatch: pytest.MonkeyPatch,
+    method: str,
+    route: DraftWindowGraphRoute,
+) -> None:
+    owner, provider, capture, input_buffers, descriptor = _parallel_capture_fixture(
+        method=method,
+        route=route,
+    )
+    block_tables = owner._draft_window_runtime_state.capability.full_source._block_tables_owner
+    canonical_table = block_tables.input_block_tables[0]
+    canonical_table_before = canonical_table.clone()
+    canonical_slot = block_tables.slot_mappings[:, : descriptor.num_tokens]
+    positions_ptr = input_buffers.positions.data_ptr()
+    builder_calls: list[dict[str, Any]] = []
+
+    monkeypatch.setattr(
+        dflash_capture_module,
+        "build_slot_mappings_by_layer",
+        lambda slots, _config: {"draft": slots},
+    )
+    monkeypatch.setattr(
+        dflash_capture_module,
+        "maybe_prepare_dcp_local_seq_lens",
+        lambda _out, seq_lens, *_args, **_kwargs: seq_lens,
+    )
+
+    def builder(**kwargs: Any) -> dict[str, object]:
+        builder_calls.append(kwargs)
+        return {"draft": object()}
+
+    monkeypatch.setattr(dflash_capture_module, "build_attn_metadata", builder)
+
+    with draft_window_dflash_capture_scope(
+        owner,
+        input_buffers,
+        {CUDAGraphMode.FULL: [descriptor]},
+        max_num_reqs=8,
+    ) as context:
+        assert context is not None
+        state_a = _call_capture_helper(input_buffers, block_tables)
+        state_b = _call_capture_helper(input_buffers, block_tables)
+        read_inputs = provider.startup_capture_read_inputs(capture)
+
+        assert state_a.slot_mappings["draft"].data_ptr() == canonical_slot.data_ptr()
+        assert state_b.slot_mappings["draft"].data_ptr() == canonical_slot.data_ptr()
+        assert builder_calls[0]["block_tables"][0] is read_inputs.window_block_table
+        assert builder_calls[0]["seq_lens"] is read_inputs.device_window_exact
+        assert builder_calls[0]["seq_lens_cpu"] is read_inputs.cpu_window_exact
+        assert builder_calls[0]["seq_lens_cpu_upper_bound"] is read_inputs.cpu_window_upper
+        assert builder_calls[0]["slot_mappings"].data_ptr() == canonical_slot.data_ptr()
+        assert (
+            builder_calls[0]["query_start_loc_gpu"].untyped_storage().data_ptr()
+            == input_buffers.query_start_loc.untyped_storage().data_ptr()
+        )
+        assert input_buffers.positions.data_ptr() == positions_ptr
+        assert (
+            read_inputs.window_block_table.untyped_storage().data_ptr() != canonical_table.untyped_storage().data_ptr()
+        )
+        assert builder_calls[0]["block_tables"][0].data_ptr() == builder_calls[1]["block_tables"][0].data_ptr()
+        assert builder_calls[0]["seq_lens"].data_ptr() == builder_calls[1]["seq_lens"].data_ptr()
+        assert torch.equal(canonical_table, canonical_table_before)
+    assert not hasattr(input_buffers, "_ascend_draft_window_capture_context")
+
+
+def test_dflash_capture_context_is_instance_owned_and_does_not_cross_talk() -> None:
+    owner_a, provider_a, capture_a, buffers_a, descriptor_a = _parallel_capture_fixture()
+    owner_b, provider_b, capture_b, buffers_b, descriptor_b = _parallel_capture_fixture()
+
+    with (
+        draft_window_dflash_capture_scope(
+            owner_a,
+            buffers_a,
+            {CUDAGraphMode.FULL: [descriptor_a]},
+            max_num_reqs=8,
+        ) as context_a,
+        draft_window_dflash_capture_scope(
+            owner_b,
+            buffers_b,
+            {CUDAGraphMode.FULL: [descriptor_b]},
+            max_num_reqs=8,
+        ) as context_b,
+    ):
+        assert context_a is not None and context_b is not None
+        assert context_a is not context_b
+        assert context_a.provider is provider_a
+        assert context_b.provider is provider_b
+        assert context_a.resolve(4, 8, False)[0] == capture_a
+        assert context_b.resolve(4, 8, False)[0] == capture_b
+        assert (
+            context_a.resolve(4, 8, False)[1].window_block_table.data_ptr()
+            != context_b.resolve(4, 8, False)[1].window_block_table.data_ptr()
+        )
+
+
+def test_dflash_capture_context_rejects_target_or_foreign_input_owner() -> None:
+    owner, _provider, _capture, _input_buffers, descriptor = _parallel_capture_fixture()
+
+    with (
+        pytest.raises(RuntimeError, match="speculator-owned Draft input buffers"),
+        draft_window_dflash_capture_scope(
+            owner,
+            InputBuffers(8, 64, torch.device("cpu")),
+            {CUDAGraphMode.FULL: [descriptor]},
+            max_num_reqs=8,
+        ),
+    ):
+        pass
+    owner.input_buffers = owner.target_input_buffers
+    with (
+        pytest.raises(RuntimeError, match="Target input buffers"),
+        draft_window_dflash_capture_scope(
+            owner,
+            owner.target_input_buffers,
+            {CUDAGraphMode.FULL: [descriptor]},
+            max_num_reqs=8,
+        ),
+    ):
+        pass
+
+
+def test_dflash_capture_context_rejects_use_after_cleanup() -> None:
+    owner, _provider, _capture, input_buffers, descriptor = _parallel_capture_fixture()
+
+    with draft_window_dflash_capture_scope(
+        owner,
+        input_buffers,
+        {CUDAGraphMode.FULL: [descriptor]},
+        max_num_reqs=8,
+    ) as context:
+        assert context is not None
+    with pytest.raises(RuntimeError, match="no longer active"):
+        context.resolve(4, 8, False)
+
+
+def test_dflash_capture_context_rejects_stale_descriptor() -> None:
+    owner, _provider, _capture, input_buffers, descriptor = _parallel_capture_fixture(
+        descriptor_text="stale-descriptor"
+    )
+
+    with (
+        pytest.raises(RuntimeError, match="capture descriptor"),
+        draft_window_dflash_capture_scope(
+            owner,
+            input_buffers,
+            {CUDAGraphMode.FULL: [descriptor]},
+            max_num_reqs=8,
+        ),
+    ):
+        pass
+
+
+def test_dflash_capture_context_rejects_wrong_bucket() -> None:
+    owner, _provider, _capture, input_buffers, descriptor = _parallel_capture_fixture()
+
+    with (
+        draft_window_dflash_capture_scope(
+            owner,
+            input_buffers,
+            {CUDAGraphMode.FULL: [descriptor]},
+            max_num_reqs=8,
+        ),
+        pytest.raises(RuntimeError, match="capture bucket"),
+    ):
+        _call_capture_helper(
+            input_buffers,
+            owner._draft_window_runtime_state.capability.full_source._block_tables_owner,
+            num_reqs=2,
+            num_tokens=4,
+        )
+
+
+def test_dflash_capture_context_rejects_runtime_generation() -> None:
+    owner, provider, capture, input_buffers, descriptor = _parallel_capture_fixture()
+    runtime = owner._draft_window_runtime_state
+    inputs = _materialize(runtime, mapping_epoch=10)
+    _bind_read_carrier(provider, runtime, capture, inputs, _target_metadata())
+
+    with (
+        pytest.raises(RuntimeError, match="runtime generation"),
+        draft_window_dflash_capture_scope(
+            owner,
+            input_buffers,
+            {CUDAGraphMode.FULL: [descriptor]},
+            max_num_reqs=8,
+        ),
+    ):
+        pass
+
+
+@pytest.mark.parametrize("raise_during_capture", [False, True])
+def test_dflash_manager_capture_context_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+    raise_during_capture: bool,
+) -> None:
+    owner, _provider, _capture, input_buffers, descriptor = _parallel_capture_fixture()
+    manager = DFlashAclGraphManager.__new__(DFlashAclGraphManager)
+    manager.speculator = owner
+    manager.max_num_reqs = 8
+    manager._capture_descs = {CUDAGraphMode.FULL: [descriptor]}
+
+    @contextmanager
+    def no_op_context(*_args: Any, **_kwargs: Any):
+        yield
+
+    def capture(_self: Any, *_args: Any, **_kwargs: Any) -> None:
+        assert hasattr(input_buffers, "_ascend_draft_window_capture_context")
+        if raise_during_capture:
+            raise RuntimeError("capture failed")
+
+    monkeypatch.setattr(dflash_aclgraph_module, "communicator_switch", no_op_context)
+    monkeypatch.setattr(dflash_aclgraph_module, "model_capture_wrapper", no_op_context)
+    monkeypatch.setattr(DFlashCudaGraphManager, "capture", capture)
+
+    args = (
+        object(),
+        input_buffers,
+        owner._draft_window_runtime_state.capability.full_source._block_tables_owner,
+        [[object()]],
+        object(),
+        512,
+    )
+    if raise_during_capture:
+        with pytest.raises(RuntimeError, match="capture failed"):
+            manager.capture(*args)
+    else:
+        manager.capture(*args)
+    assert not hasattr(input_buffers, "_ascend_draft_window_capture_context")
+
+
+def test_dflash_capture_helper_piecewise_skip_preserves_full_slots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    descriptor = _parallel_capture_descriptor(
+        mode=CUDAGraphMode.PIECEWISE,
+        num_reqs=None,
+        num_tokens=16,
+        query_width=None,
+    )
+    owner, _provider, _capture, input_buffers, descriptor = _parallel_capture_fixture(
+        descriptor=descriptor,
+    )
+    block_tables = owner._draft_window_runtime_state.capability.full_source._block_tables_owner
+    canonical_slot = block_tables.slot_mappings[:, : descriptor.num_tokens]
+    monkeypatch.setattr(
+        dflash_capture_module,
+        "build_slot_mappings_by_layer",
+        lambda slots, _config: {"draft": slots},
+    )
+    monkeypatch.setattr(
+        dflash_capture_module,
+        "build_attn_metadata",
+        lambda **_kwargs: pytest.fail("skip_attn must not build metadata"),
+    )
+
+    with draft_window_dflash_capture_scope(
+        owner,
+        input_buffers,
+        {CUDAGraphMode.PIECEWISE: [descriptor]},
+        max_num_reqs=8,
+    ):
+        state = _call_capture_helper(
+            input_buffers,
+            block_tables,
+            num_reqs=8,
+            num_tokens=16,
+            skip_attn=True,
+        )
+    assert state.attn_metadata is None
+    assert state.slot_mappings["draft"].data_ptr() == canonical_slot.data_ptr()
+
+
+def test_config_off_creates_no_capture_context_or_provider() -> None:
+    owner = SimpleNamespace()
+    input_buffers = InputBuffers(4, 16, torch.device("cpu"))
+    descriptor = _parallel_capture_descriptor(num_reqs=2, num_tokens=4)
+
+    with draft_window_dflash_capture_scope(
+        owner,
+        input_buffers,
+        {CUDAGraphMode.FULL: [descriptor]},
+        max_num_reqs=4,
+    ) as context:
+        assert context is None
+    assert not hasattr(owner, "_draft_window_graph_binding_provider")
+    assert not hasattr(input_buffers, "_ascend_draft_window_capture_context")

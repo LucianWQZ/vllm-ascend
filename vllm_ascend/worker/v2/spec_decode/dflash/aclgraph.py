@@ -20,6 +20,9 @@ from vllm_ascend.compilation.acl_graph import (
     update_full_graph_params,
 )
 from vllm_ascend.worker.v2.aclgraph_utils import collect_sorted_captured_token_sizes, model_capture_wrapper
+from vllm_ascend.worker.v2.spec_decode.dflash.capture import (
+    draft_window_dflash_capture_scope,
+)
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
     DraftWindowGraphStage,
     assert_draft_window_graph_metadata_batch,
@@ -74,22 +77,27 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
         progress_bar_desc: str = "Capturing CUDA graphs",
     ) -> None:
         """Capture ACL graphs for DFlash."""
-        observe_draft_window_graph_capture(self.speculator)
-        with communicator_switch(), model_capture_wrapper(self.speculator, False):
-            super().capture(
-                forward_fn,
-                input_buffers,
-                block_tables,
-                attn_groups,
-                kv_cache_config,
-                max_model_len,
-                causal,
-                progress_bar_desc,
-            )
-        observe_draft_window_graph_source(
+        with draft_window_dflash_capture_scope(
             self.speculator,
-            DraftWindowGraphStage.CONSUMER,
-        )
+            input_buffers,
+            getattr(self, "_capture_descs", {}),
+            max_num_reqs=getattr(self, "max_num_reqs", 0),
+        ) as capture_context:
+            observe_draft_window_graph_capture(
+                self.speculator,
+                capture_context=capture_context,
+            )
+            with communicator_switch(), model_capture_wrapper(self.speculator, False):
+                super().capture(
+                    forward_fn,
+                    input_buffers,
+                    block_tables,
+                    attn_groups,
+                    kv_cache_config,
+                    max_model_len,
+                    causal,
+                    progress_bar_desc,
+                )
 
     def run_fullgraph(self, desc: BatchExecutionDescriptor) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         """Override run_fullgraph to update full graph params in run_fullgraph."""

@@ -5,9 +5,9 @@
 P5 introduced the instance-owned descriptor and source-observation seam. P6
 adds a separate startup-capture identity namespace, persistent per-consumer
 read carriers, Draft-private metadata validation, and attribution at the real
-backend update entrance. The pinned upstream startup capture still has no safe
-Ascend-only carrier injection point, so capture and the user-visible Graph
-Window route remain fail closed.
+backend update entrance. The P7-X source spike adds an Ascend-owned adapter for
+the pinned DFlash startup helper, but does not install the provider in the
+product path or relax the user-visible Graph Window gate.
 
 The provider owns only its explicitly registered persistent graph-carrier
 buffers. P3's :class:`DraftWindowWorkspace` remains the runtime materialization
@@ -579,6 +579,69 @@ class DraftWindowGraphBindingProvider:
     def submitted_carriers(self) -> tuple[DraftWindowGraphReadCarrier, ...]:
         return self._submitted_carriers
 
+    def registered_capture_identities(
+        self,
+        *,
+        route: DraftWindowGraphRoute,
+    ) -> tuple[DraftWindowGraphCaptureIdentity, ...]:
+        """Return immutable startup identities for one explicitly typed route."""
+        if not isinstance(route, DraftWindowGraphRoute):
+            raise TypeError("capture identity lookup requires a graph route")
+        return tuple(
+            sorted(
+                (
+                    carrier.capture_identity
+                    for carrier in self._carriers.values()
+                    if carrier.capture_identity.fingerprint.route is route
+                ),
+                key=lambda identity: (
+                    identity.consumer_ordinal,
+                    identity.fingerprint.capture_bucket,
+                ),
+            )
+        )
+
+    def startup_capture_read_inputs(
+        self,
+        capture_identity: DraftWindowGraphCaptureIdentity,
+    ) -> DraftWindowGraphReadInputs:
+        """Resolve stable startup backing without manufacturing a generation."""
+        if not isinstance(capture_identity, DraftWindowGraphCaptureIdentity):
+            raise TypeError("startup capture requires a capture identity")
+        carrier = self._require_registered_capture(capture_identity)
+        if (
+            carrier.state is not DraftWindowGraphCarrierState.EMPTY
+            or carrier.runtime_identity is not None
+            or carrier.metadata is not None
+        ):
+            raise RuntimeError("startup capture carrier is already bound to a runtime generation")
+        read_inputs = carrier.read_inputs
+        actual_backing = capture_identity.backing_identity
+        tensor_identities = (
+            (_tensor_identity(read_inputs.window_block_table), actual_backing.window_block_table),
+            (_tensor_identity(read_inputs.valid_num_blocks), actual_backing.valid_num_blocks),
+            (_tensor_identity(read_inputs.device_window_exact), actual_backing.device_window_exact),
+            (_tensor_identity(read_inputs.cpu_window_exact), actual_backing.cpu_window_exact),
+            (_tensor_identity(read_inputs.cpu_window_upper), actual_backing.cpu_window_upper),
+        )
+        if any(actual != expected for actual, expected in tensor_identities):
+            raise RuntimeError("startup capture carrier backing identity changed")
+        if read_inputs.padded_request_count != capture_identity.fingerprint.padded_request_count:
+            raise RuntimeError("startup capture carrier request geometry changed")
+        if read_inputs.actual_request_count == read_inputs.padded_request_count:
+            return read_inputs
+        capture_view = DraftWindowGraphReadInputs(
+            window_block_table=read_inputs.window_block_table,
+            valid_num_blocks=read_inputs.valid_num_blocks,
+            device_window_exact=read_inputs.device_window_exact,
+            cpu_window_exact=read_inputs.cpu_window_exact,
+            cpu_window_upper=read_inputs.cpu_window_upper,
+            actual_request_count=read_inputs.padded_request_count,
+            padded_request_count=read_inputs.padded_request_count,
+        )
+        carrier.read_inputs = capture_view
+        return capture_view
+
     @property
     def inventory_method(self) -> str:
         """Return the P2-normalized method owned by this provider."""
@@ -600,10 +663,10 @@ class DraftWindowGraphBindingProvider:
     ) -> DraftWindowGraphCaptureIdentity:
         """Allocate one stable per-consumer backing without a fake request.
 
-        Registration defines the address contract needed by a future safe
-        capture seam.  It does *not* attest that upstream startup capture used
-        this address; :func:`observe_draft_window_graph_capture` continues to
-        reject that claim under the current repository boundary.
+        Registration defines the address contract consumed by the optional
+        P7-X startup adapter. It does *not* attest that an ACL Graph or NPU
+        operator captured this address; that remains a device-side evidence
+        gate.
         """
         if not isinstance(fingerprint, DraftWindowGraphRouteFingerprint):
             raise TypeError("capture identity requires a graph route fingerprint")
@@ -1509,22 +1572,26 @@ def observe_draft_window_graph_source(
     return provider.observe(stage, expected=descriptor.expectation)
 
 
-def observe_draft_window_graph_capture(owner: Any) -> None:
-    """Fail closed when P6 state is present at the unhooked startup capture.
-
-    The pinned upstream capture path builds private dummy metadata internally.
-    Ascend can observe around that call but cannot supply the persistent P6
-    carrier without modifying vLLM, mutating shared owners, or duplicating the
-    capture builder.  All are forbidden by R-REPO-01/Frozen invariants.
-    """
+def observe_draft_window_graph_capture(
+    owner: Any,
+    *,
+    capture_context: Any = None,
+) -> None:
+    """Require an explicit instance-owned startup carrier when P6 is present."""
     provider = getattr(owner, "_draft_window_graph_binding_provider", None)
     if provider is None:
         return
     if not isinstance(provider, DraftWindowGraphBindingProvider):
         raise TypeError("invalid instance-owned Draft Window graph binding provider")
-    raise RuntimeError(
-        "P6 has no safe Ascend-only capture carrier seam in the pinned vLLM; Graph Window capture remains fail closed"
-    )
+    if capture_context is None:
+        raise RuntimeError(
+            "P6 has no safe Ascend-only capture carrier seam in the pinned vLLM; "
+            "Graph Window capture remains fail closed"
+        )
+    validate = getattr(capture_context, "validate_for_provider", None)
+    if not callable(validate):
+        raise TypeError("invalid Draft Window startup capture context")
+    validate(provider)
 
 
 def consume_draft_window_graph_metadata(
