@@ -31,6 +31,9 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
     observe_draft_window_graph_source,
     resolve_parallel_draft_window_graph_route,
 )
+from vllm_ascend.worker.v2.spec_decode.draft_window_graph_characterization import (
+    prepare_parallel_draft_window_graph_characterization,
+)
 from vllm_ascend.worker.v2.utils import communicator_switch
 
 
@@ -103,6 +106,10 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
         """Override run_fullgraph to update full graph params in run_fullgraph."""
         num_tokens = desc.num_tokens
 
+        prepare_parallel_draft_window_graph_characterization(
+            self.speculator,
+            desc,
+        )
         draft_attn_metadatas = self.speculator.build_draft_attn_metadatas(
             desc.num_reqs,
             self.speculator.input_batch.seq_lens_cpu_upper_bound,

@@ -48,6 +48,11 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
     DraftWindowGraphRoute,
     consume_draft_window_graph_metadata,
 )
+from vllm_ascend.worker.v2.spec_decode.draft_window_graph_characterization import (
+    build_parallel_draft_window_graph_characterization_source,
+    experimental_draft_window_graph_characterization_enabled,
+    install_parallel_draft_window_graph_characterization,
+)
 from vllm_ascend.worker.v2.spec_decode.pcp_utils import prepare_replicated_pcp_config
 
 
@@ -72,18 +77,42 @@ class AscendDSparkSpeculator(DraftWindowEagerMixin, DSparkSpeculator):
             "_draft_window_runtime_state",
         ):
             raise RuntimeError("draft-window runtime ownership is already initialized")
-        capability = build_draft_window_source_capability(
-            policy=policy,
-            runtime_route=self._speculator_name.lower(),
-            attn_groups=self.attn_groups,
-            block_tables=self.block_tables,
-            causal=self._group_causal,
-            vllm_config=self.vllm_config,
-        )
+        graph_context = None
+        if experimental_draft_window_graph_characterization_enabled():
+            from vllm_ascend.worker.v2.spec_decode.draft_window import (
+                build_draft_window_runtime_context,
+            )
+
+            runtime_context = build_draft_window_runtime_context(
+                self.vllm_config,
+                self.block_tables,
+            )
+        else:
+            runtime_context = None
+        if runtime_context is not None and runtime_context.graph_mode != "NONE":
+            capability, graph_context = build_parallel_draft_window_graph_characterization_source(
+                policy=policy,
+                runtime_route=self._speculator_name.lower(),
+                attn_groups=self.attn_groups,
+                block_tables=self.block_tables,
+                causal=self._group_causal,
+                vllm_config=self.vllm_config,
+            )
+        else:
+            capability = build_draft_window_source_capability(
+                policy=policy,
+                runtime_route=self._speculator_name.lower(),
+                attn_groups=self.attn_groups,
+                block_tables=self.block_tables,
+                causal=self._group_causal,
+                vllm_config=self.vllm_config,
+            )
         runtime_state = build_draft_window_runtime_state(capability)
         self._draft_window_source_capability = capability
         self._draft_window_runtime_state = runtime_state
         self._initialize_draft_window_eager_state()
+        if graph_context is not None:
+            self._draft_window_graph_characterization_context = graph_context
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         vllm_config, self.replicated_pcp = prepare_replicated_pcp_config(vllm_config)
@@ -118,6 +147,18 @@ class AscendDSparkSpeculator(DraftWindowEagerMixin, DSparkSpeculator):
         # It needs this speculator to update full-graph params, so set it here.
         self.query_cudagraph_manager.speculator = self
         self.query_cudagraph_manager.update_stream = self.update_stream
+        graph_context = getattr(
+            self,
+            "_draft_window_graph_characterization_context",
+            None,
+        )
+        if graph_context is not None:
+            if not experimental_draft_window_graph_characterization_enabled():
+                raise RuntimeError("Graph characterization flag changed during initialization")
+            install_parallel_draft_window_graph_characterization(
+                self,
+                runtime_context=graph_context,
+            )
 
     def set_attn(
         self,

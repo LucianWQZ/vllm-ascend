@@ -358,4 +358,18 @@ def ascend_prepare_dflash_inputs_to_capture(
         for_cudagraph_capture=True,
         causal=causal,
     )
+    # Optional, bounded G1/G3/G4 evidence.  The recorder exists only when the
+    # strict characterization flag installed an instance-owned provider.
+    from vllm_ascend.worker.v2.spec_decode.draft_window_graph_characterization import (
+        record_parallel_graph_capture,
+    )
+
+    record_parallel_graph_capture(
+        context.provider,
+        identity=identity,
+        read_inputs=read_inputs,
+        slot_mapping=slot_mappings,
+        positions=input_batch.positions,
+        query_start_loc=input_batch.query_start_loc,
+    )
     return AttentionState(attn_metadata, slot_mappings_by_layer)

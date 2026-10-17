@@ -82,6 +82,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Emit per-layer KVPool ranged transfer audit events. Default: 0 (disabled).
     # Valid values: 0 or 1. This configuration is not sensitive.
     "VLLM_ASCEND_KVPOOL_RANGE_DEBUG": lambda: _strict_binary_env("VLLM_ASCEND_KVPOOL_RANGE_DEBUG"),
+    # Internal-only MRV2 Draft Window ACL Graph characterization switch.
+    # This does not enable the public Graph Window capability gate. It exists
+    # solely for controlled NPU operand/read-set/timeline experiments and is
+    # deliberately strict and default-off.
+    "VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH": lambda: _strict_binary_env(
+        "VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH"
+    ),
     # Override the Unified Buffer (UB) size in KB for Triton kernel tile sizing.
     # 0 (default): auto-detect from device properties, falling back to 192 KB
     # (safe for Ascend 910B/A3). Set to a positive value to override when

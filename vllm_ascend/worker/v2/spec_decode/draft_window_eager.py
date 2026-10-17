@@ -479,7 +479,22 @@ class DraftWindowEagerMixin:
     ) -> AscendDraftAttentionReadInputs:
         """The single formal P4a validation and transport-narrowing boundary."""
         inputs.validate_for(expected_identity)
-        observe_draft_window_graph_source(self, DraftWindowGraphStage.LIVE)
+        characterization = getattr(
+            self,
+            "_draft_window_graph_characterization",
+            None,
+        )
+        if characterization is not None:
+            observe_materialized = getattr(
+                characterization,
+                "observe_materialized",
+                None,
+            )
+            if not callable(observe_materialized):
+                raise TypeError("invalid Draft Window graph characterization session")
+            observe_materialized(inputs)
+        else:
+            observe_draft_window_graph_source(self, DraftWindowGraphStage.LIVE)
         global_group_id = expected_identity.global_group_id
         block_tables = tuple(
             (inputs.window_block_table if gid == global_group_id else full_table[: inputs.padded_request_count])

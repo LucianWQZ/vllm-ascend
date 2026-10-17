@@ -1449,6 +1449,36 @@ def build_draft_window_source_capability(
         vllm_config,
         block_tables,
     )
+    return _build_draft_window_source_capability_for_context(
+        policy=policy,
+        runtime_route=runtime_route,
+        attn_groups=attn_groups,
+        block_tables=block_tables,
+        causal=causal,
+        vllm_config=vllm_config,
+        runtime_context=runtime_context,
+    )
+
+
+def _build_draft_window_source_capability_for_context(
+    *,
+    policy: DraftWindowPolicyDecision,
+    runtime_route: str,
+    attn_groups: Sequence[Sequence[AttentionGroup]],
+    block_tables: Any,
+    causal: bool | Mapping[int, bool],
+    vllm_config: Any,
+    runtime_context: DraftWindowRuntimeContext,
+) -> DraftWindowSourceCapability:
+    """Build the source plane from an already-validated runtime context.
+
+    The normal production entry above always supplies the exact configured
+    context.  The internal Graph characterization route is the sole sibling
+    caller: it validates the real Graph context first, then supplies a copy
+    with only ``graph_mode`` set to ``NONE`` so the existing P2/P7-X source
+    inventory can be reused without weakening the public Graph fail-closed
+    decision.
+    """
     inventory = build_draft_window_inventory(
         policy=policy,
         runtime_route=runtime_route,
