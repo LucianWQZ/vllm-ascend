@@ -66,6 +66,7 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
     DraftWindowGraphBackendAttribution,
     DraftWindowGraphCaptureIdentity,
     DraftWindowGraphConsumerKind,
+    DraftWindowGraphMetadataBuild,
     DraftWindowGraphRoute,
     DraftWindowGraphRouteFingerprint,
     DraftWindowGraphStage,
@@ -551,6 +552,34 @@ def test_explicit_carrier_builds_draft_private_metadata_and_preserves_target() -
     torch.testing.assert_close(target_layer.nested["tensor"], target_snapshot["nested_tensor"])
     np.testing.assert_array_equal(target_layer.nested["array"], target_snapshot["nested_array"])
     torch.testing.assert_close(block_tables.input_block_tables[0], canonical_before)
+
+
+def test_draft_private_fields_still_reject_target_storage_alias() -> None:
+    runtime, _capability, _block_tables = _runtime_fixture()
+    owner = SimpleNamespace(_draft_window_runtime_state=runtime)
+    provider = install_draft_window_graph_binding_provider(owner)
+    capture = _register(provider)
+    inputs = _materialize(runtime, mapping_epoch=10)
+    target = _target_metadata()
+    write_side = _write_side_reference(runtime, capture)
+
+    def alias_private_view(read_inputs: Any) -> DraftWindowGraphMetadataBuild:
+        final_metadata = _metadata_builder(target, write_side=write_side)(read_inputs)
+        # A distinct mapping cannot hide a Target-owned layer/storage alias.
+        return DraftWindowGraphMetadataBuild(
+            metadata=final_metadata,
+            private_isolation_view=dict(target),
+        )
+
+    with pytest.raises(ValueError, match="mutable storage aliases Target metadata"):
+        provider.bind_read_carrier(
+            capture_identity=capture,
+            inputs=inputs,
+            proposal_id=10,
+            metadata_builder=alias_private_view,
+            target_metadata=target,
+            write_side_reference=write_side,
+        )
 
 
 def test_carrier_rejects_window_table_as_write_side_slot_mapping() -> None:

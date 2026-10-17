@@ -336,13 +336,22 @@ def update_full_graph_params(
                 draft_attn_metadatas=draft_attn_metadatas,
                 update_function_path=(f"{update_full_graph_params.__module__}.{update_full_graph_params.__qualname__}"),
             )
+        update_kwargs = {
+            "draft_attn_metadatas": draft_attn_metadatas,
+        }
+        if draft_window_graph_update_binding is not None:
+            # Only the exact Ascend FIA implementation can pass the backend
+            # attribution check above.  Thread the typed binding to that real
+            # operator-update boundary for characterization; ordinary callers
+            # see the byte-for-byte-equivalent call shape used before P7-X.
+            update_kwargs["draft_window_graph_update_binding"] = draft_window_graph_update_binding
         impl_cls.update_graph_params(
             update_stream,
             forward_context,
             num_tokens,
             vllm_config,
             speculative_config,
-            draft_attn_metadatas=draft_attn_metadatas,
+            **update_kwargs,
         )
 
 

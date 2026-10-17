@@ -361,6 +361,7 @@ def ascend_prepare_dflash_inputs_to_capture(
     # Optional, bounded G1/G3/G4 evidence.  The recorder exists only when the
     # strict characterization flag installed an instance-owned provider.
     from vllm_ascend.worker.v2.spec_decode.draft_window_graph_characterization import (
+        attach_parallel_graph_capture_operand_observer,
         record_parallel_graph_capture,
     )
 
@@ -371,5 +372,10 @@ def ascend_prepare_dflash_inputs_to_capture(
         slot_mapping=slot_mappings,
         positions=input_batch.positions,
         query_start_loc=input_batch.query_start_loc,
+    )
+    attach_parallel_graph_capture_operand_observer(
+        context.provider,
+        identity=identity,
+        metadata=attn_metadata,
     )
     return AttentionState(attn_metadata, slot_mappings_by_layer)

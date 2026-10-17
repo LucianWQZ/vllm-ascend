@@ -89,6 +89,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH": lambda: _strict_binary_env(
         "VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH"
     ),
+    # Optional machine-readable artifact for the internal MRV2 Graph
+    # characterization campaign.  It is consulted only when the strict
+    # experimental switch above installs the instance-owned recorder.
+    "VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH_ARTIFACT": lambda: os.getenv(
+        "VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH_ARTIFACT"
+    ),
     # Override the Unified Buffer (UB) size in KB for Triton kernel tile sizing.
     # 0 (default): auto-detect from device properties, falling back to 192 KB
     # (safe for Ascend 910B/A3). Set to a positive value to override when

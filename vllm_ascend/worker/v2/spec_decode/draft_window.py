@@ -2120,12 +2120,21 @@ class DraftMetadataStore:
         metadata: Any,
         *,
         target_metadata: Any,
+        isolation_view: Any | None = None,
     ) -> None:
+        """Publish Draft metadata after validating its Draft-private view.
+
+        Normal eager callers omit ``isolation_view`` and retain P3's original
+        all-fields isolation contract.  The experimental Graph route supplies
+        a separate, immutable validation view captured *before* canonical
+        full write/query references are restored.  This keeps Draft read state
+        isolated without misclassifying intentionally shared full owners.
+        """
         inputs.validate_for(inputs.identity)
         if self._entry is not None:
             raise RuntimeError("cannot overwrite active draft metadata")
         validate_draft_metadata_isolation(
-            metadata,
+            metadata if isolation_view is None else isolation_view,
             target_metadata=target_metadata,
         )
         self._entry = _DraftMetadataStoreEntry(inputs=inputs, metadata=metadata)
@@ -2367,6 +2376,7 @@ class DraftWindowRuntimeState:
         metadata: Any,
         *,
         target_metadata: Any,
+        isolation_view: Any | None = None,
     ) -> None:
         try:
             self._require_active_inputs(inputs)
@@ -2374,6 +2384,7 @@ class DraftWindowRuntimeState:
                 inputs,
                 metadata,
                 target_metadata=target_metadata,
+                isolation_view=isolation_view,
             )
         except BaseException:
             if self._active_inputs is inputs:

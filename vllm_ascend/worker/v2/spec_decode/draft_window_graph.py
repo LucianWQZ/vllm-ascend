@@ -394,6 +394,29 @@ class DraftWindowGraphReadCarrier:
 
 
 @dataclass(frozen=True, slots=True)
+class DraftWindowGraphMetadataBuild:
+    """Final metadata plus the pre-restore Draft-private validation view.
+
+    Graph metadata legitimately reuses canonical full write/query owners.
+    ``private_isolation_view`` is retained separately so Target isolation and
+    canonical write identity remain two independent, non-contradictory
+    invariants.  Ordinary P6 callers can still return a Mapping and receive the
+    original all-fields isolation behavior.
+    """
+
+    metadata: Mapping[str, Any]
+    private_isolation_view: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        if not self.metadata or not self.private_isolation_view:
+            raise ValueError("graph metadata build requires non-empty metadata views")
+        if self.metadata is self.private_isolation_view:
+            raise ValueError("graph final metadata and private isolation view must be distinct mappings")
+        if tuple(self.metadata) != tuple(self.private_isolation_view):
+            raise ValueError("graph metadata views must contain the same ordered layer keys")
+
+
+@dataclass(frozen=True, slots=True)
 class DraftWindowGraphUpdateBinding:
     """Exact submitted carrier set passed to the real backend update seam."""
 
@@ -750,7 +773,10 @@ class DraftWindowGraphBindingProvider:
         capture_identity: DraftWindowGraphCaptureIdentity,
         inputs: DraftMetadataInputs,
         proposal_id: int,
-        metadata_builder: Callable[[DraftWindowGraphReadInputs], Mapping[str, Any]],
+        metadata_builder: Callable[
+            [DraftWindowGraphReadInputs],
+            Mapping[str, Any] | DraftWindowGraphMetadataBuild,
+        ],
         target_metadata: Any,
         write_side_reference: DraftWindowGraphWriteSideReference | None = None,
     ) -> DraftWindowGraphReadCarrier:
@@ -812,12 +838,26 @@ class DraftWindowGraphBindingProvider:
             proposal_id=proposal_id,
             route=capture_identity.fingerprint.route,
         )
-        metadata = metadata_builder(carrier.read_inputs)
+        build_result = metadata_builder(carrier.read_inputs)
+        if isinstance(build_result, DraftWindowGraphMetadataBuild):
+            metadata = build_result.metadata
+            isolation_view = build_result.private_isolation_view
+        else:
+            metadata = build_result
+            isolation_view = metadata
         if not isinstance(metadata, Mapping) or not metadata:
             raise RuntimeError("explicit Draft Window graph carrier produced no Draft metadata")
+        if not isinstance(isolation_view, Mapping) or not isolation_view:
+            raise RuntimeError("explicit Draft Window graph carrier produced no private isolation view")
+        if tuple(metadata) != tuple(isolation_view):
+            raise RuntimeError("Draft graph metadata and private isolation view layer keys differ")
         validate_draft_metadata_isolation(
-            metadata,
+            isolation_view,
             target_metadata=target_metadata,
+        )
+        self._validate_metadata_uses_read_carrier(
+            isolation_view,
+            carrier.read_inputs,
         )
         self._validate_metadata_uses_carrier(
             metadata,
@@ -829,6 +869,7 @@ class DraftWindowGraphBindingProvider:
             inputs,
             metadata,
             target_metadata=target_metadata,
+            isolation_view=isolation_view,
         )
         metadata = self._runtime_state.read_metadata(generation)
 
@@ -1228,38 +1269,17 @@ class DraftWindowGraphBindingProvider:
         write_side_reference: DraftWindowGraphWriteSideReference,
         write_side_snapshot: _DraftWindowGraphWriteSideSnapshot,
     ) -> None:
+        cls._validate_metadata_uses_read_carrier(metadata, read_inputs)
         cls._validate_write_side_unchanged(
             write_side_reference,
             write_side_snapshot,
         )
-        expected_table_storage = _tensor_identity(read_inputs.window_block_table).storage_data_ptr
-        expected_device_storage = _tensor_identity(read_inputs.device_window_exact).storage_data_ptr
-        expected_cpu_storage = _tensor_identity(read_inputs.cpu_window_exact).storage_data_ptr
-        expected_lengths = read_inputs.cpu_window_exact.tolist()
         expected_slot = _tensor_identity(write_side_reference.slot_mapping)
         expected_query = _tensor_identity(write_side_reference.query_start_loc)
         expected_positions = _tensor_identity(write_side_reference.positions)
         for layer_name, layer_metadata in metadata.items():
             if layer_metadata is None:
                 continue
-            block_tables = getattr(layer_metadata, "block_tables", None)
-            seq_lens = getattr(layer_metadata, "seq_lens", None)
-            seq_lens_cpu = getattr(layer_metadata, "seq_lens_cpu", None)
-            seq_lens_list = getattr(layer_metadata, "seq_lens_list", None)
-            if not isinstance(block_tables, torch.Tensor) or (
-                _tensor_identity(block_tables).storage_data_ptr != expected_table_storage
-            ):
-                raise RuntimeError(f"Draft graph metadata {layer_name!r} does not use carrier block tables")
-            if not isinstance(seq_lens, torch.Tensor) or (
-                _tensor_identity(seq_lens).storage_data_ptr != expected_device_storage
-            ):
-                raise RuntimeError(f"Draft graph metadata {layer_name!r} does not use carrier device lengths")
-            if not isinstance(seq_lens_cpu, torch.Tensor) or (
-                _tensor_identity(seq_lens_cpu).storage_data_ptr != expected_cpu_storage
-            ):
-                raise RuntimeError(f"Draft graph metadata {layer_name!r} does not use carrier CPU lengths")
-            if not isinstance(seq_lens_list, list) or seq_lens_list[: len(expected_lengths)] != expected_lengths:
-                raise RuntimeError(f"Draft graph metadata {layer_name!r} does not use carrier exact length values")
             slot_mapping = getattr(layer_metadata, "slot_mapping", None)
             if not isinstance(slot_mapping, torch.Tensor) or _tensor_identity(slot_mapping) != expected_slot:
                 raise RuntimeError(f"Draft graph metadata {layer_name!r} does not preserve the full slot mapping")
@@ -1281,6 +1301,38 @@ class DraftWindowGraphBindingProvider:
                 or _tensor_identity(metadata_positions) != expected_positions
             ):
                 raise RuntimeError(f"Draft graph metadata {layer_name!r} does not preserve full positions")
+
+    @staticmethod
+    def _validate_metadata_uses_read_carrier(
+        metadata: Mapping[str, Any],
+        read_inputs: DraftWindowGraphReadInputs,
+    ) -> None:
+        """Validate only Draft-private read carriers, never full write state."""
+        expected_table_storage = _tensor_identity(read_inputs.window_block_table).storage_data_ptr
+        expected_device_storage = _tensor_identity(read_inputs.device_window_exact).storage_data_ptr
+        expected_cpu_storage = _tensor_identity(read_inputs.cpu_window_exact).storage_data_ptr
+        expected_lengths = read_inputs.cpu_window_exact.tolist()
+        for layer_name, layer_metadata in metadata.items():
+            if layer_metadata is None:
+                continue
+            block_tables = getattr(layer_metadata, "block_tables", None)
+            seq_lens = getattr(layer_metadata, "seq_lens", None)
+            seq_lens_cpu = getattr(layer_metadata, "seq_lens_cpu", None)
+            seq_lens_list = getattr(layer_metadata, "seq_lens_list", None)
+            if not isinstance(block_tables, torch.Tensor) or (
+                _tensor_identity(block_tables).storage_data_ptr != expected_table_storage
+            ):
+                raise RuntimeError(f"Draft graph metadata {layer_name!r} does not use carrier block tables")
+            if not isinstance(seq_lens, torch.Tensor) or (
+                _tensor_identity(seq_lens).storage_data_ptr != expected_device_storage
+            ):
+                raise RuntimeError(f"Draft graph metadata {layer_name!r} does not use carrier device lengths")
+            if not isinstance(seq_lens_cpu, torch.Tensor) or (
+                _tensor_identity(seq_lens_cpu).storage_data_ptr != expected_cpu_storage
+            ):
+                raise RuntimeError(f"Draft graph metadata {layer_name!r} does not use carrier CPU lengths")
+            if not isinstance(seq_lens_list, list) or seq_lens_list[: len(expected_lengths)] != expected_lengths:
+                raise RuntimeError(f"Draft graph metadata {layer_name!r} does not use carrier exact length values")
 
     def _require_submitted_route(
         self,

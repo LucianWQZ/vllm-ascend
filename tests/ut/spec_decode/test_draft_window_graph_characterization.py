@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import copy
+import json
 from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any
@@ -18,6 +19,7 @@ from vllm.v1.worker.gpu.spec_decode.dflash.cudagraph import (
     DFlashCudaGraphManager,
 )
 
+import vllm_ascend.attention.attention_v1 as attention_v1_module
 import vllm_ascend.worker.v2.spec_decode.dflash.aclgraph as dflash_aclgraph_module
 import vllm_ascend.worker.v2.spec_decode.dflash.capture as dflash_capture_module
 import vllm_ascend.worker.v2.spec_decode.dflash.speculator as dflash_speculator_module
@@ -29,7 +31,10 @@ from tests.ut.spec_decode.test_draft_window_graph_carrier import (
     _runtime_fixture,
     _target_metadata,
 )
-from vllm_ascend.attention.attention_v1 import AscendAttentionBackend
+from vllm_ascend.attention.attention_v1 import (
+    AscendAttentionBackend,
+    AscendAttentionBackendImpl,
+)
 from vllm_ascend.device.hardware_profile import AttentionBackendFamily
 from vllm_ascend.worker.v2.spec_decode.dflash.aclgraph import (
     DFlashAclGraphManager,
@@ -46,16 +51,42 @@ from vllm_ascend.worker.v2.spec_decode.draft_window import (
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
     DraftWindowGraphRoute,
+    build_draft_window_graph_update_binding,
     consume_draft_window_graph_metadata,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph_characterization import (
+    DraftWindowGraphCaptureOperandContext,
     DraftWindowGraphCharacterizationStage,
+    DraftWindowGraphLifecycleStage,
+    DraftWindowGraphOperandStage,
+    audit_characterization_snapshot,
     experimental_draft_window_graph_characterization_enabled,
     install_parallel_draft_window_graph_characterization,
     maybe_install_parallel_draft_window_graph_characterization,
     prepare_parallel_draft_window_graph_characterization,
+    record_parallel_graph_capture_operator_operand,
+    record_parallel_graph_output,
+    record_parallel_graph_replay_submission,
+    record_parallel_graph_update_operator_operand,
     validate_base_graph_characterization_context,
 )
+
+
+class _FakeExternalEvent:
+    def __init__(self) -> None:
+        self.recorded_stream: Any | None = None
+
+    def wait(self, _stream: Any) -> None:
+        return None
+
+    def reset(self, _stream: Any) -> None:
+        return None
+
+    def record(self, stream: Any) -> None:
+        self.recorded_stream = stream
+
+    def query(self) -> bool:
+        return False
 
 
 def _runtime_context(**overrides: Any) -> DraftWindowRuntimeContext:
@@ -342,6 +373,45 @@ def test_runtime_candidate_reuses_real_p3_generation_and_builds_private_metadata
     assert DraftWindowGraphCharacterizationStage.BOUND in stages
 
 
+def test_real_target_metadata_sharing_is_allowed_for_full_write_carriers() -> None:
+    """Mirror the real engine's canonical Target/write owner relationship."""
+    owner, descriptor = _characterization_owner()
+    session = install_parallel_draft_window_graph_characterization(
+        owner,
+        runtime_context=_runtime_context(),
+    )
+    runtime = owner._draft_window_runtime_state
+    inputs = _materialize(runtime, mapping_epoch=10)
+
+    target = owner.model_state.attn_metadata
+    target_layer = target["draft.layers.0.self_attn"]
+    canonical_slot = owner.block_tables.slot_mappings[0, :8]
+    canonical_positions = owner.input_buffers.positions[:8]
+    canonical_query_start = owner.input_buffers.query_start_loc[:5]
+    target_layer.slot_mapping = canonical_slot
+    target_layer.positions = canonical_positions
+    target_layer.query_start_loc = canonical_query_start
+
+    _publish_eager_generation(owner, inputs)
+    _install_metadata_builder(owner)
+    carrier = prepare_parallel_draft_window_graph_characterization(owner, descriptor)
+
+    assert carrier is not None and carrier.metadata is not None
+    graph_layer = carrier.metadata["draft.layers.0.self_attn"]
+    assert graph_layer.slot_mapping.untyped_storage().data_ptr() == canonical_slot.untyped_storage().data_ptr()
+    assert graph_layer.positions.untyped_storage().data_ptr() == canonical_positions.untyped_storage().data_ptr()
+    assert (
+        graph_layer.query_start_loc.untyped_storage().data_ptr() == canonical_query_start.untyped_storage().data_ptr()
+    )
+    assert graph_layer.block_tables is carrier.read_inputs.window_block_table
+    assert graph_layer.seq_lens is carrier.read_inputs.device_window_exact
+    assert (
+        graph_layer.block_tables.untyped_storage().data_ptr() != target_layer.block_tables.untyped_storage().data_ptr()
+    )
+    assert graph_layer.seq_lens.untyped_storage().data_ptr() != target_layer.seq_lens.untyped_storage().data_ptr()
+    assert session.recorder.events[-1].stage is DraftWindowGraphCharacterizationStage.BOUND
+
+
 def test_capture_helper_records_real_persistent_operand_and_full_write(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -376,7 +446,7 @@ def test_capture_helper_records_real_persistent_operand_and_full_write(
     monkeypatch.setattr(
         dflash_capture_module,
         "build_attn_metadata",
-        lambda **_kwargs: {"draft": object()},
+        lambda **_kwargs: {"draft": SimpleNamespace()},
     )
 
     with draft_window_dflash_capture_scope(
@@ -397,6 +467,393 @@ def test_capture_helper_records_real_persistent_operand_and_full_write(
     assert event.slot_mapping_values == (-1,) * 8
     assert event.position_values == (0,) * 8
     assert event.query_layout_values == (0, 2, 4, 6, 8)
+
+    capture_metadata = state.attn_metadata["draft"]
+    read_inputs = session.provider.startup_capture_read_inputs(identity)
+    fake_event = SimpleNamespace(query=lambda: False)
+    fake_handle = object()
+    fake_stream = object()
+    record_parallel_graph_capture_operator_operand(
+        capture_metadata,
+        block_table=read_inputs.window_block_table,
+        seq_lengths=read_inputs.cpu_window_exact.tolist(),
+        layer_name="draft.layers.0.self_attn",
+        num_tokens=8,
+        handle=fake_handle,
+        event=fake_event,
+        stream=fake_stream,
+        backend_impl=type("Backend", (), {}),
+    )
+    operand = session.recorder.operand_events[-1]
+    assert operand.stage is DraftWindowGraphOperandStage.CAPTURE_OPERATOR
+    assert operand.evidence_level == "HOST_OPERATOR_BOUNDARY_FACT"
+    assert operand.actual_table_address == identity.backing_identity.window_block_table.data_ptr
+    assert operand.length_values == tuple(read_inputs.cpu_window_exact.tolist())
+
+
+def test_runtime_update_operand_and_g4_records_are_machine_readable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    artifact = tmp_path / "g1-g5.json"
+    monkeypatch.setenv("VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH_ARTIFACT", str(artifact))
+    owner, descriptor = _characterization_owner()
+    session = install_parallel_draft_window_graph_characterization(
+        owner,
+        runtime_context=_runtime_context(),
+    )
+    runtime = owner._draft_window_runtime_state
+    inputs = _materialize(runtime, mapping_epoch=10)
+    target = owner.model_state.attn_metadata
+    _publish_eager_generation(owner, inputs)
+    _install_metadata_builder(owner)
+    carrier = prepare_parallel_draft_window_graph_characterization(owner, descriptor)
+    assert carrier is not None and carrier.metadata is not None
+    batch = consume_draft_window_graph_metadata(
+        owner,
+        route=DraftWindowGraphRoute.DFLASH,
+        expected_consumer_count=1,
+    )
+    assert batch is not None
+    binding = build_draft_window_graph_update_binding(
+        owner,
+        route=DraftWindowGraphRoute.DFLASH,
+        draft_attn_metadatas=list(batch),
+    )
+    assert binding is not None
+    record_parallel_graph_output(owner, torch.tensor([1.0, 2.0]))
+    layer_name = "draft.layers.0.self_attn"
+    layer = carrier.metadata[layer_name]
+    fake_event = SimpleNamespace(query=lambda: False)
+    record_parallel_graph_update_operator_operand(
+        binding,
+        draft_metadata=carrier.metadata,
+        layer_name=layer_name,
+        captured_block_table=carrier.read_inputs.window_block_table,
+        actual_block_table=layer.block_tables,
+        seq_lengths=layer.seq_lens_list,
+        num_tokens=8,
+        handle=object(),
+        event=fake_event,
+        stream=object(),
+        backend_impl=type("Backend", (), {}),
+    )
+
+    assert session.recorder.g4_records[-1].target_metadata_identity == id(target)
+    assert session.recorder.g4_records[-1].draft_output_hash is not None
+    assert session.recorder.g4_records[-1].target_output_hash is None
+    assert session.recorder.operand_events[-1].stage is DraftWindowGraphOperandStage.UPDATE_OPERATOR
+    assert session.recorder.lifecycle_events[-1].stage is DraftWindowGraphLifecycleStage.UPDATE_EVENT_RECORDED
+    payload = json.loads(artifact.read_text(encoding="utf-8"))
+    assert payload["schema"] == "mrv2-draft-window-graph-characterization-v2"
+    assert payload["evidence_boundary"]["physical_memory_transaction"] == ("NOT_PROVEN_REQUIRES_DEVICE_TOOL")
+    assert payload["operand_events"][-1]["actual_table_address"] == (carrier.read_inputs.window_block_table.data_ptr())
+
+
+def test_real_fia_capture_call_records_actual_operator_operand(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owner, _descriptor_value = _characterization_owner()
+    session = install_parallel_draft_window_graph_characterization(
+        owner,
+        runtime_context=_runtime_context(),
+    )
+    identity = session.provider.registered_capture_identities(
+        route=DraftWindowGraphRoute.DFLASH,
+    )[0]
+    read_inputs = session.provider.startup_capture_read_inputs(identity)
+    read_inputs.window_block_table.copy_(
+        owner.block_tables.input_block_tables[0][
+            : read_inputs.padded_request_count,
+            : read_inputs.window_block_table.shape[1],
+        ]
+    )
+    read_inputs.cpu_window_exact.fill_(12)
+    read_inputs.device_window_exact.fill_(12)
+    metadata = SimpleNamespace(
+        actual_seq_lengths_q=[8],
+        attn_mask=None,
+        causal=True,
+    )
+    metadata._draft_window_graph_capture_operand_context = DraftWindowGraphCaptureOperandContext(
+        recorder=session.recorder,
+        identity=identity,
+    )
+
+    impl = AscendAttentionBackendImpl.__new__(AscendAttentionBackendImpl)
+    impl.num_heads = 1
+    impl.head_size = 4
+    impl.num_kv_heads = 1
+    impl.scale = 1.0
+    impl.sliding_window = None
+    impl.enable_c8_quant = False
+    impl._use_max_workspace_for_fia_graph = False
+    impl._use_layer_aware_fia_graph_replay = False
+    impl.kv_sharing_target_layer_name = None
+    impl._layer_name = None
+    impl._get_fia_params = lambda key, value, _metadata: (
+        key,
+        value,
+        16,
+        read_inputs.window_block_table,
+        read_inputs.cpu_window_exact.tolist(),
+    )
+
+    graph_params = SimpleNamespace(
+        workspaces={8: torch.zeros(1)},
+        events={8: []},
+        handles={8: []},
+        attn_params={8: []},
+    )
+    fake_stream = object()
+    monkeypatch.setattr(attention_v1_module, "get_draft_graph_params", lambda: graph_params)
+    monkeypatch.setattr(attention_v1_module, "weak_ref_tensors", lambda value: value)
+    monkeypatch.setattr(attention_v1_module.torch_npu.npu, "current_stream", lambda: fake_stream)
+    monkeypatch.setattr(torch.npu, "ExternalEvent", _FakeExternalEvent)
+    monkeypatch.setattr(torch.npu, "graph_task_group_begin", lambda _stream: None)
+    monkeypatch.setattr(torch.npu, "graph_task_group_end", lambda _stream: object())
+    monkeypatch.setattr(
+        attention_v1_module.torch_npu,
+        "npu_fused_infer_attention_score",
+        SimpleNamespace(out=lambda **_kwargs: None),
+    )
+    monkeypatch.setattr(
+        attention_v1_module,
+        "_EXTRA_CTX",
+        SimpleNamespace(is_draft_model=True, is_draft_model_prefill=False),
+    )
+
+    query = torch.zeros((8, 1, 4))
+    key = torch.zeros((8, 1, 4))
+    value = torch.zeros((8, 1, 4))
+    output = torch.zeros((8, 1, 4))
+    result, num_tokens = impl.full_graph_fia(
+        query,
+        key,
+        value,
+        metadata,
+        output,
+    )
+
+    assert result.shape == (8, 1, 4)
+    assert num_tokens == 8
+    operand = session.recorder.operand_events[-1]
+    assert operand.stage is DraftWindowGraphOperandStage.CAPTURE_OPERATOR
+    assert operand.actual_table_address == read_inputs.window_block_table.data_ptr()
+    assert operand.length_values == (12, 12, 12, 12)
+
+
+def test_real_fia_update_call_records_rebound_operator_operand(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owner, descriptor = _characterization_owner()
+    session = install_parallel_draft_window_graph_characterization(
+        owner,
+        runtime_context=_runtime_context(),
+    )
+    runtime = owner._draft_window_runtime_state
+    inputs = _materialize(runtime, mapping_epoch=10)
+    _publish_eager_generation(owner, inputs)
+    _install_metadata_builder(owner)
+    carrier = prepare_parallel_draft_window_graph_characterization(owner, descriptor)
+    assert carrier is not None and carrier.metadata is not None
+    batch = consume_draft_window_graph_metadata(
+        owner,
+        route=DraftWindowGraphRoute.DFLASH,
+        expected_consumer_count=1,
+    )
+    assert batch is not None
+    binding = build_draft_window_graph_update_binding(
+        owner,
+        route=DraftWindowGraphRoute.DFLASH,
+        draft_attn_metadatas=list(batch),
+    )
+    assert binding is not None
+
+    layer_name = "draft.layers.0.self_attn"
+    query = torch.zeros((8, 1, 4))
+    key = torch.zeros((8, 1, 4))
+    value = torch.zeros((8, 1, 4))
+    output = torch.zeros((8, 1, 4))
+    softmax_lse = torch.zeros(1)
+    captured_table = carrier.read_inputs.window_block_table
+    event = _FakeExternalEvent()
+    handle = object()
+    graph_params = SimpleNamespace(
+        workspaces={8: torch.zeros(1)},
+        events={8: [event]},
+        handles={8: [handle]},
+        attn_params={
+            8: [
+                (
+                    query,
+                    key,
+                    value,
+                    captured_table,
+                    None,
+                    16,
+                    [999],
+                    None,
+                    1,
+                    1,
+                    1.0,
+                    output,
+                    softmax_lse,
+                    3,
+                    2**31 - 1,
+                    2**31 - 1,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            ]
+        },
+    )
+    operator_calls: list[dict[str, Any]] = []
+
+    @contextmanager
+    def stream_context(_stream: Any):
+        yield
+
+    monkeypatch.setattr(attention_v1_module, "needs_layer_aware_fia_graph_replay", lambda: False)
+    monkeypatch.setattr(attention_v1_module, "using_paged_attention", lambda *_args: False)
+    monkeypatch.setattr(attention_v1_module, "get_draft_graph_params", lambda: graph_params)
+    monkeypatch.setattr(torch.npu, "stream", stream_context)
+    monkeypatch.setattr(torch.npu, "graph_task_update_begin", lambda *_args: None)
+    monkeypatch.setattr(torch.npu, "graph_task_update_end", lambda *_args: None)
+    monkeypatch.setattr(
+        attention_v1_module.torch_npu,
+        "npu_fused_infer_attention_score",
+        SimpleNamespace(out=lambda **kwargs: operator_calls.append(kwargs)),
+    )
+    monkeypatch.setattr(
+        attention_v1_module,
+        "_EXTRA_CTX",
+        SimpleNamespace(
+            is_draft_model=True,
+            is_draft_model_prefill=False,
+            sinks=False,
+        ),
+    )
+
+    update_stream = object()
+    AscendAttentionBackendImpl.update_graph_params(
+        update_stream,
+        SimpleNamespace(attn_metadata={}),
+        8,
+        object(),
+        object(),
+        draft_attn_metadatas=[carrier.metadata],
+        draft_window_graph_update_binding=binding,
+    )
+
+    assert len(operator_calls) == 1
+    assert operator_calls[0]["block_table"] is captured_table
+    assert operator_calls[0]["actual_seq_lengths_kv"] == (carrier.metadata[layer_name].seq_lens_list)
+    operand = session.recorder.operand_events[-1]
+    assert operand.stage is DraftWindowGraphOperandStage.UPDATE_OPERATOR
+    assert operand.generation_id == inputs.identity.generation_id
+    assert operand.actual_table_address == captured_table.data_ptr()
+    assert event.recorded_stream is update_stream
+
+
+def test_replay_submission_records_real_event_without_synchronizing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owner, descriptor = _characterization_owner()
+    session = install_parallel_draft_window_graph_characterization(
+        owner,
+        runtime_context=_runtime_context(),
+    )
+    runtime = owner._draft_window_runtime_state
+    inputs = _materialize(runtime, mapping_epoch=10)
+    _publish_eager_generation(owner, inputs)
+    _install_metadata_builder(owner)
+    prepare_parallel_draft_window_graph_characterization(owner, descriptor)
+    consume_draft_window_graph_metadata(
+        owner,
+        route=DraftWindowGraphRoute.DFLASH,
+        expected_consumer_count=1,
+    )
+
+    event = SimpleNamespace(query=lambda: False)
+    token = SimpleNamespace(event=event)
+    stream = object()
+    from vllm_ascend.worker.v2.spec_decode import draft_window_async
+
+    monkeypatch.setattr(
+        draft_window_async.DraftWindowNPUEventCompletionToken,
+        "record_current_stream",
+        classmethod(lambda _cls: token),
+    )
+    monkeypatch.setattr(torch.npu, "current_stream", lambda: stream)
+    record_parallel_graph_replay_submission(owner)
+
+    lifecycle = session.recorder.lifecycle_events[-1]
+    assert lifecycle.stage is DraftWindowGraphLifecycleStage.REPLAY_SUBMITTED
+    assert lifecycle.stream_identity == id(stream)
+    assert lifecycle.event_identity == id(event)
+    assert lifecycle.event_complete is False
+
+
+def test_campaign_auditor_requires_all_evidence_layers_and_detects_host_a_b_a() -> None:
+    stages = (
+        "capture",
+        "materialized",
+        "bound",
+        "live",
+        "replay",
+        "consumer",
+        "update",
+    )
+    events = [{"stage": stage} for stage in stages]
+    events.extend(
+        [
+            {
+                "stage": "bound",
+                "backing_table_address": 123,
+                "table_values": [[1, 2]],
+                "generation_id": 10,
+            },
+            {
+                "stage": "bound",
+                "backing_table_address": 123,
+                "table_values": [[9, 8]],
+                "generation_id": 11,
+            },
+            {
+                "stage": "bound",
+                "backing_table_address": 123,
+                "table_values": [[1, 2]],
+                "generation_id": 12,
+            },
+        ]
+    )
+    result = audit_characterization_snapshot(
+        {
+            "schema": "mrv2-draft-window-graph-characterization-v2",
+            "events": events,
+            "operand_events": [
+                {"stage": "capture_operator"},
+                {"stage": "update_operator"},
+            ],
+            "g4_records": [{}],
+            "lifecycle_events": [
+                {"stage": "replay_submitted"},
+                {"stage": "update_event_recorded"},
+                {"stage": "proposal_retired"},
+            ],
+        }
+    )
+    assert result["G1_HOST_OPERATOR_BOUNDARY"] == "PASS"
+    assert result["G2_HOST_A_B_A"] == "PASS"
+    assert result["G3_PHYSICAL_MEMORY_TRANSACTION"] == "DEVICE_TOOL_REQUIRED"
+    assert result["G4_WRITE_TARGET_ORACLE"] == "PASS"
+    assert result["G5_UPDATE_EFFECTIVE_GENERATION"] == "NPU_TASK_TRACE_REQUIRED"
+    assert result["ready_for_device_campaign"] is True
 
 
 def test_runtime_candidate_rejects_wrong_mapping_epoch_before_binding() -> None:
@@ -560,9 +1017,27 @@ def test_manager_prepares_candidate_before_consuming_graph_metadata(
     )
     monkeypatch.setattr(dflash_aclgraph_module, "set_forward_context", no_op_context)
     monkeypatch.setattr(dflash_aclgraph_module, "get_forward_context", lambda: object())
-    monkeypatch.setattr(dflash_aclgraph_module, "update_full_graph_params", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        dflash_aclgraph_module,
+        "record_parallel_graph_replay_submission",
+        lambda _owner: calls.append("replay_event"),
+    )
+    monkeypatch.setattr(
+        dflash_aclgraph_module,
+        "record_parallel_graph_output",
+        lambda _owner, _output: calls.append("output_hash"),
+    )
+    monkeypatch.setattr(
+        dflash_aclgraph_module,
+        "update_full_graph_params",
+        lambda *_args, **_kwargs: calls.append("update"),
+    )
     monkeypatch.setattr(torch.npu, "current_stream", lambda: object())
-    monkeypatch.setattr(DFlashCudaGraphManager, "run_fullgraph", lambda self, desc: "replayed")
+    monkeypatch.setattr(
+        DFlashCudaGraphManager,
+        "run_fullgraph",
+        lambda self, desc: calls.append("replay") or "replayed",
+    )
     monkeypatch.setattr(
         dflash_aclgraph_module,
         "_EXTRA_CTX",
@@ -570,4 +1045,11 @@ def test_manager_prepares_candidate_before_consuming_graph_metadata(
     )
 
     assert manager.run_fullgraph(_descriptor()) == "replayed"
-    assert calls[:2] == ["prepare", "build"]
+    assert calls == [
+        "prepare",
+        "build",
+        "replay",
+        "replay_event",
+        "output_hash",
+        "update",
+    ]

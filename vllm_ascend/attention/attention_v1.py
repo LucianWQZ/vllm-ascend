@@ -541,8 +541,15 @@ class AscendAttentionBackendImpl(AttentionImpl):
         vllm_config,
         speculative_config=None,
         draft_attn_metadatas=None,
+        draft_window_graph_update_binding=None,
     ):
         use_layer_aware_replay = needs_layer_aware_fia_graph_replay()
+        if draft_window_graph_update_binding is not None and (
+            using_paged_attention(num_tokens, vllm_config) or _EXTRA_CTX.sinks
+        ):
+            raise RuntimeError(
+                "base Draft Window Graph characterization supports only the non-sinks FIA task-update path"
+            )
         if using_paged_attention(num_tokens, vllm_config):
             # Paged Attention update logic
             if _EXTRA_CTX.is_draft_model:
@@ -874,10 +881,13 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         c8_v_aq_offset,
                         layer_name,
                     ) = param
+                    captured_block_tables = block_tables
+                    draft_step_metadata = None
 
                     if _EXTRA_CTX.is_draft_model:
                         draft_step, key = draft_attn_key_steps[attn_count]
-                        metadata = attn_metadata[draft_step][key]
+                        draft_step_metadata = attn_metadata[draft_step]
+                        metadata = draft_step_metadata[key]
                         seq_lens = metadata.seq_lens_list
                         actual_seq_lengths_q = metadata.actual_seq_lengths_q
                         block_tables = metadata.block_tables
@@ -936,6 +946,26 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     torch.npu.graph_task_update_end(update_stream)
 
                     event.record(update_stream)
+                    if draft_window_graph_update_binding is not None:
+                        if draft_step_metadata is None:
+                            raise RuntimeError("Draft Window graph update binding reached a non-Draft FIA task")
+                        from vllm_ascend.worker.v2.spec_decode.draft_window_graph_characterization import (
+                            record_parallel_graph_update_operator_operand,
+                        )
+
+                        record_parallel_graph_update_operator_operand(
+                            draft_window_graph_update_binding,
+                            draft_metadata=draft_step_metadata,
+                            layer_name=str(key),
+                            captured_block_table=captured_block_tables,
+                            actual_block_table=block_tables,
+                            seq_lengths=seq_lens,
+                            num_tokens=num_tokens,
+                            handle=handle,
+                            event=event,
+                            stream=update_stream,
+                            backend_impl=AscendAttentionBackendImpl,
+                        )
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         super().process_weights_after_loading(act_dtype)
@@ -1110,6 +1140,22 @@ class AscendAttentionBackendImpl(AttentionImpl):
 
         handle = torch.npu.graph_task_group_end(stream)
         graph_params.handles[num_tokens].append(handle)
+        if _EXTRA_CTX.is_draft_model:
+            from vllm_ascend.worker.v2.spec_decode.draft_window_graph_characterization import (
+                record_parallel_graph_capture_operator_operand,
+            )
+
+            record_parallel_graph_capture_operator_operand(
+                attn_metadata,
+                block_table=block_table,
+                seq_lengths=actual_seq_lengths_kv,
+                layer_name=self._graph_metadata_layer_name(layer),
+                num_tokens=num_tokens,
+                handle=handle,
+                event=event,
+                stream=stream,
+                backend_impl=AscendAttentionBackendImpl,
+            )
         return output, num_tokens
 
     def full_graph_fia_v2(

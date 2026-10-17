@@ -33,6 +33,8 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph_characterization import (
     prepare_parallel_draft_window_graph_characterization,
+    record_parallel_graph_output,
+    record_parallel_graph_replay_submission,
 )
 from vllm_ascend.worker.v2.utils import communicator_switch
 
@@ -133,6 +135,8 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
             DraftWindowGraphStage.REPLAY,
         )
         ret = super().run_fullgraph(desc)
+        record_parallel_graph_replay_submission(self.speculator)
+        record_parallel_graph_output(self.speculator, ret)
         observe_draft_window_graph_source(
             self.speculator,
             DraftWindowGraphStage.CONSUMER,

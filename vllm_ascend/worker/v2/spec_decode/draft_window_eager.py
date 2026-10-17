@@ -357,6 +357,12 @@ class DraftWindowEagerMixin:
                 elif live_inputs is not None and live_inputs.lease.state is not DraftWindowLeaseState.RETIRED:
                     if succeeded:
                         self._draft_window_runtime_state.retire_generation(live_inputs.identity)
+                        if hasattr(self, "_draft_window_graph_characterization"):
+                            from vllm_ascend.worker.v2.spec_decode.draft_window_graph_characterization import (
+                                record_parallel_graph_retirement,
+                            )
+
+                            record_parallel_graph_retirement(self, live_inputs)
                     else:
                         self._draft_window_runtime_state.abort_generation(live_inputs.identity)
                 elif succeeded:
