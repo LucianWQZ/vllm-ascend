@@ -136,7 +136,6 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
         )
         ret = super().run_fullgraph(desc)
         record_parallel_graph_replay_submission(self.speculator)
-        record_parallel_graph_output(self.speculator, ret)
         observe_draft_window_graph_source(
             self.speculator,
             DraftWindowGraphStage.CONSUMER,
@@ -178,4 +177,8 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
                 draft_attn_metadatas=draft_attn_metadatas,
                 draft_window_graph_update_binding=graph_update_binding,
             )
+        # Evidence-only D2H must not block submission of the backend UPDATE
+        # that records the ExternalEvent awaited by the captured FIA task.
+        # This does not reorder replay/consumer/update or prove its device timing.
+        record_parallel_graph_output(self.speculator, ret)
         return ret

@@ -95,6 +95,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH_ARTIFACT": lambda: os.getenv(
         "VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH_ARTIFACT"
     ),
+    # Internal characterization observer only, not a Graph capability switch.
+    # Default 1, strict 0/1, non-sensitive. 0 keeps the experimental carrier
+    # and all its validation but disables evidence copies/events/artifact I/O.
+    # Ignored unless EXPERIMENTAL_DRAFT_WINDOW_GRAPH is enabled.
+    "VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH_OBSERVE": lambda: _strict_binary_env(
+        "VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH_OBSERVE", "1"
+    ),
     # Override the Unified Buffer (UB) size in KB for Triton kernel tile sizing.
     # 0 (default): auto-detect from device properties, falling back to 192 KB
     # (safe for Ascend 910B/A3). Set to a positive value to override when

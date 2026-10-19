@@ -14,9 +14,12 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
+import time
+import uuid
 from collections.abc import Mapping, Sequence
 from contextlib import ExitStack
-from dataclasses import asdict, dataclass, is_dataclass, replace
+from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from enum import Enum
 from pathlib import Path
 from typing import Any, cast
@@ -107,6 +110,8 @@ class DraftWindowGraphCharacterizationEvent:
     position_values: tuple[int, ...]
     query_layout_address: int | None
     query_layout_values: tuple[int, ...]
+    values_sampled_at_sequence: int | None = None
+    layer_metadata_ids: tuple[tuple[str, int], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,9 +141,20 @@ class DraftWindowGraphOperandEvent:
     length_kind: str
     length_address: int | None
     length_values: tuple[int, ...]
-    handle_identity: int
-    event_identity: int
-    stream_identity: int
+    handle_identity: int | None
+    event_identity: int | None
+    stream_identity: int | None
+    provider_identity: int
+    global_group_id: int
+    table_shape: tuple[int, ...]
+    table_dtype: str
+    table_device: str
+    cpu_exact: tuple[int, ...]
+    cpu_upper: tuple[int, ...]
+    host_monotonic_ns: int
+    # No device-to-host copy or guessed task internals inside graph capture.
+    actual_task_table_address: int | None = None
+    actual_memory_read_set: tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,6 +180,7 @@ class DraftWindowGraphG4OracleRecord:
     target_length_values: tuple[tuple[str, tuple[int, ...]], ...]
     draft_output_hash: str | None
     target_output_hash: str | None
+    runtime_oracle_inputs: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,6 +194,7 @@ class DraftWindowGraphLifecycleEvent:
     event_complete: bool | None
     lease_state: str | None
     note: str
+    host_monotonic_ns: int = field(default_factory=time.monotonic_ns)
 
 
 @dataclass(frozen=True, slots=True)
@@ -194,12 +212,16 @@ class DraftWindowGraphCharacterizationRecorder:
     def __init__(
         self,
         *,
-        max_events: int = 512,
+        max_events: int = 16384,
         artifact_path: str | None = None,
+        enabled: bool = True,
     ) -> None:
         if max_events <= 0:
             raise ValueError("characterization recorder capacity must be positive")
         self._max_events = max_events
+        self.enabled = enabled
+        self.recorder_id = uuid.uuid4().hex
+        self.artifact_errors: list[str] = []
         self._events: list[DraftWindowGraphCharacterizationEvent] = []
         self._operand_events: list[DraftWindowGraphOperandEvent] = []
         self._g4_records: list[DraftWindowGraphG4OracleRecord] = []
@@ -207,6 +229,7 @@ class DraftWindowGraphCharacterizationRecorder:
         self._completion_tokens: dict[int, Any] = {}
         self._provider: DraftWindowGraphBindingProvider | None = None
         self._sequence = 0
+        self._host_observation_times: dict[int, int] = {}
         self._artifact_path = None if artifact_path is None else Path(artifact_path).expanduser().resolve()
         if self._artifact_path is not None and not self._artifact_path.parent.is_dir():
             raise ValueError("characterization artifact parent directory does not exist")
@@ -234,6 +257,8 @@ class DraftWindowGraphCharacterizationRecorder:
 
     def record(self, event: DraftWindowGraphSourceEvent) -> None:
         """Implement the P6 observer protocol and snapshot the submitted carrier."""
+        if not self.enabled:
+            return
         provider = self._require_provider()
         carriers = tuple(
             carrier
@@ -243,16 +268,25 @@ class DraftWindowGraphCharacterizationRecorder:
         )
         if len(carriers) != 1:
             raise RuntimeError("characterization source event does not resolve one submitted carrier")
-        carrier = carriers[0]
-        reference = carrier.write_side_reference
+        bound = tuple(
+            record
+            for record in self._events
+            if record.stage is DraftWindowGraphCharacterizationStage.BOUND
+            and record.generation_id == event.identity.generation_id
+            and record.mapping_epoch == event.identity.mapping_epoch
+        )
+        if len(bound) != 1:
+            raise RuntimeError("source observation has no unique pre-replay bound snapshot")
+        # Replay may be waiting for the backend ExternalEvent, recorded by
+        # UPDATE. No D2H or output access may wait for that replay here. This
+        # record denotes Python submission order with explicitly cached values,
+        # not a new read of device contents or proof of completion.
         self._append(
-            self._event_from_read_inputs(
+            replace(
+                bound[0],
+                sequence=self._next_sequence(),
                 stage=DraftWindowGraphCharacterizationStage(event.stage.value),
-                identity=carrier.capture_identity,
-                read_inputs=carrier.read_inputs,
-                generation_id=event.identity.generation_id,
-                mapping_epoch=event.identity.mapping_epoch,
-                write_side_reference=reference,
+                values_sampled_at_sequence=bound[0].sequence,
             )
         )
 
@@ -264,19 +298,27 @@ class DraftWindowGraphCharacterizationRecorder:
         slot_mapping: torch.Tensor,
         positions: torch.Tensor,
         query_start_loc: torch.Tensor,
+        metadata: Mapping[str, Any] | None = None,
     ) -> None:
         """Record G1/G3/G4 after the actual patched capture helper builds metadata."""
+        if not self.enabled:
+            return
         self._append(
-            self._event_from_read_inputs(
-                stage=DraftWindowGraphCharacterizationStage.CAPTURE,
-                identity=identity,
-                read_inputs=read_inputs,
-                generation_id=None,
-                mapping_epoch=None,
-                write_side_reference=None,
-                slot_mapping=slot_mapping,
-                positions=positions,
-                query_start_loc=query_start_loc,
+            replace(
+                self._event_from_read_inputs(
+                    stage=DraftWindowGraphCharacterizationStage.CAPTURE,
+                    identity=identity,
+                    read_inputs=read_inputs,
+                    generation_id=None,
+                    mapping_epoch=None,
+                    write_side_reference=None,
+                    slot_mapping=slot_mapping,
+                    positions=positions,
+                    query_start_loc=query_start_loc,
+                ),
+                layer_metadata_ids=tuple(
+                    (str(key), id(value)) for key, value in (metadata or {}).items() if value is not None
+                ),
             )
         )
 
@@ -316,6 +358,8 @@ class DraftWindowGraphCharacterizationRecorder:
         )
 
     def record_bound(self, carrier: DraftWindowGraphReadCarrier) -> None:
+        if not self.enabled:
+            return
         runtime_identity = carrier.runtime_identity
         if runtime_identity is None:
             raise RuntimeError("bound characterization carrier has no runtime identity")
@@ -343,11 +387,16 @@ class DraftWindowGraphCharacterizationRecorder:
         stream: Any,
         backend_impl: type[Any],
     ) -> None:
+        if not self.enabled:
+            return
+        read_inputs = self._require_provider().startup_capture_read_inputs(identity)
         expected_address = identity.backing_identity.window_block_table.data_ptr
         actual_address = _tensor_data_address(block_table)
         if actual_address != expected_address:
             raise RuntimeError("captured FIA block-table operand does not use the registered Window backing")
         length_kind, length_address, length_values = _length_operand_snapshot(seq_lengths)
+        if length_address is not None and length_address != read_inputs.device_window_exact.data_ptr():
+            raise RuntimeError("captured FIA tensor length operand is not the registered Window backing")
         expected_lengths = tuple(
             self._require_provider().startup_capture_read_inputs(identity).cpu_window_exact.tolist()
         )
@@ -372,9 +421,17 @@ class DraftWindowGraphCharacterizationRecorder:
                 length_kind=length_kind,
                 length_address=length_address,
                 length_values=length_values,
-                handle_identity=id(handle),
-                event_identity=id(event),
-                stream_identity=id(stream),
+                handle_identity=None if handle is None else id(handle),
+                event_identity=None if event is None else id(event),
+                stream_identity=None if stream is None else id(stream),
+                provider_identity=id(self._require_provider()),
+                global_group_id=identity.fingerprint.global_group_id,
+                table_shape=tuple(block_table.shape),
+                table_dtype=str(block_table.dtype),
+                table_device=str(block_table.device),
+                cpu_exact=tuple(read_inputs.cpu_window_exact.tolist()),
+                cpu_upper=tuple(read_inputs.cpu_window_upper.tolist()),
+                host_monotonic_ns=time.monotonic_ns(),
             )
         )
 
@@ -393,6 +450,8 @@ class DraftWindowGraphCharacterizationRecorder:
         stream: Any,
         backend_impl: type[Any],
     ) -> None:
+        if not self.enabled:
+            return
         carriers = tuple(carrier for carrier in binding.carriers if carrier.metadata is draft_metadata)
         if len(carriers) != 1:
             raise RuntimeError("operator update metadata does not resolve one submitted Window carrier")
@@ -406,6 +465,8 @@ class DraftWindowGraphCharacterizationRecorder:
         if captured_address != expected_address or actual_address != expected_address:
             raise RuntimeError("updated FIA block-table operand does not use persistent Window backing")
         length_kind, length_address, length_values = _length_operand_snapshot(seq_lengths)
+        if length_address is not None and length_address != carrier.read_inputs.device_window_exact.data_ptr():
+            raise RuntimeError("updated FIA tensor length operand is not the runtime Window backing")
         expected_lengths = tuple(carrier.read_inputs.cpu_window_exact.tolist())
         if length_values and length_values[: len(expected_lengths)] != expected_lengths:
             raise RuntimeError("updated FIA length operand does not use runtime Window lengths")
@@ -428,9 +489,17 @@ class DraftWindowGraphCharacterizationRecorder:
                 length_kind=length_kind,
                 length_address=length_address,
                 length_values=length_values,
-                handle_identity=id(handle),
-                event_identity=id(event),
-                stream_identity=id(stream),
+                handle_identity=None if handle is None else id(handle),
+                event_identity=None if event is None else id(event),
+                stream_identity=None if stream is None else id(stream),
+                provider_identity=id(self._require_provider()),
+                global_group_id=carrier.capture_identity.fingerprint.global_group_id,
+                table_shape=tuple(actual_block_table.shape),
+                table_dtype=str(actual_block_table.dtype),
+                table_device=str(actual_block_table.device),
+                cpu_exact=tuple(carrier.read_inputs.cpu_window_exact.tolist()),
+                cpu_upper=tuple(carrier.read_inputs.cpu_window_upper.tolist()),
+                host_monotonic_ns=time.monotonic_ns(),
             )
         )
         self.record_lifecycle(
@@ -450,6 +519,8 @@ class DraftWindowGraphCharacterizationRecorder:
         carrier: DraftWindowGraphReadCarrier,
         target_metadata: Mapping[Any, Any],
     ) -> None:
+        if not self.enabled:
+            return
         runtime_identity = carrier.runtime_identity
         reference = carrier.write_side_reference
         if runtime_identity is None or reference is None:
@@ -499,6 +570,7 @@ class DraftWindowGraphCharacterizationRecorder:
                 target_length_values=tuple(target_length_values),
                 draft_output_hash=None,
                 target_output_hash=None,
+                runtime_oracle_inputs=_runtime_oracle_inputs(owner, carrier),
             )
         )
 
@@ -509,6 +581,8 @@ class DraftWindowGraphCharacterizationRecorder:
         draft_output: Any,
         target_output: Any | None = None,
     ) -> None:
+        if not self.enabled:
+            return
         matches = [index for index, record in enumerate(self._g4_records) if record.generation_id == generation_id]
         if len(matches) != 1:
             raise RuntimeError("Graph output does not resolve one G4 generation record")
@@ -531,6 +605,8 @@ class DraftWindowGraphCharacterizationRecorder:
         lease_state: str | None,
         note: str,
     ) -> None:
+        if not self.enabled:
+            return
         event_identity = None if event is None else id(event)
         if event_identity is not None:
             self._completion_tokens[event_identity] = event
@@ -550,32 +626,59 @@ class DraftWindowGraphCharacterizationRecorder:
 
     def snapshot(self) -> dict[str, Any]:
         """Return a JSON-safe, evidence-level-labelled campaign artifact."""
+        scope = {
+            "recorder_id": self.recorder_id,
+            "process_id": os.getpid(),
+            "provider_identity": None if self._provider is None else id(self._provider),
+        }
+
+        def scoped(value: dict[str, Any]) -> dict[str, Any]:
+            return dict(value, record_scope=dict(scope))
+
         return {
             "schema": "mrv2-draft-window-graph-characterization-v2",
+            "recorder_revision": "repair2",
+            "recorder_id": self.recorder_id,
+            "process_id": os.getpid(),
+            "provider_identity": None if self._provider is None else id(self._provider),
+            "observer_enabled": self.enabled,
+            "artifact_errors": list(self.artifact_errors),
+            "max_events": self._max_events,
+            "host_observation_times_ns": dict(self._host_observation_times),
+            "clock_domain": "process_monotonic_ns_NOT_DEVICE_TIME",
             "evidence_boundary": {
                 "operand_events": "HOST_OPERATOR_BOUNDARY_FACT",
                 "physical_memory_transaction": "NOT_PROVEN_REQUIRES_DEVICE_TOOL",
                 "update_effective_generation": "NOT_PROVEN_REQUIRES_NPU_TIMELINE",
             },
-            "events": [_json_safe(event) for event in self._events],
-            "operand_events": [_json_safe(event) for event in self._operand_events],
-            "g4_records": [_json_safe(record) for record in self._g4_records],
-            "lifecycle_events": [self._lifecycle_snapshot(event) for event in self._lifecycle_events],
+            "events": [scoped(_json_safe(event)) for event in self._events],
+            "operand_events": [scoped(_json_safe(event)) for event in self._operand_events],
+            "g4_records": [scoped(_json_safe(record)) for record in self._g4_records],
+            "lifecycle_events": [scoped(self._lifecycle_snapshot(event)) for event in self._lifecycle_events],
         }
 
     def write_artifact(self) -> None:
-        if self._artifact_path is None:
+        if self._artifact_path is None or not self.enabled:
             return
-        self._artifact_path.write_text(
-            json.dumps(self.snapshot(), indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
+        try:
+            payload = json.dumps(self.snapshot(), indent=2, sort_keys=True) + "\n"
+            temporary = self._artifact_path.with_suffix(f".{self.recorder_id}.tmp")
+            temporary.write_text(payload, encoding="utf-8")
+            temporary.replace(self._artifact_path)
+        except (OSError, TypeError, ValueError) as error:
+            # Evidence I/O must not replace a model failure from a finally path.
+            # The driver/checker treats this diagnostic as INVALID_EVIDENCE.
+            if len(self.artifact_errors) < 8:
+                self.artifact_errors.append(f"{type(error).__name__}: {error}")
 
     def _lifecycle_snapshot(self, event: DraftWindowGraphLifecycleEvent) -> dict[str, Any]:
         result = _json_safe(event)
         event_identity = event.event_identity
         token = None if event_identity is None else self._completion_tokens.get(event_identity)
         result["event_complete"] = _query_event_without_sync(token)
+        result["query_host_monotonic_ns"] = time.monotonic_ns()
+        result["clock_domain"] = "process_monotonic_ns_NOT_DEVICE_TIME"
+        result["completion_source"] = None if token is None else _class_path(type(token))
         return result
 
     def _event_from_read_inputs(
@@ -617,12 +720,18 @@ class DraftWindowGraphCharacterizationRecorder:
     def _append(self, event: DraftWindowGraphCharacterizationEvent) -> None:
         self._require_capacity()
         self._events.append(event)
-        self.write_artifact()
+        if event.stage not in (
+            DraftWindowGraphCharacterizationStage.REPLAY,
+            DraftWindowGraphCharacterizationStage.CONSUMER,
+            DraftWindowGraphCharacterizationStage.UPDATE,
+        ):
+            self.write_artifact()
 
     def _append_operand(self, event: DraftWindowGraphOperandEvent) -> None:
         self._require_capacity()
         self._operand_events.append(event)
-        self.write_artifact()
+        # Capture callback: no serialization, completion polling or D2H here.
+        # Flush outside capture (manager finally), or from the external driver.
 
     def _append_g4(self, record: DraftWindowGraphG4OracleRecord) -> None:
         self._require_capacity()
@@ -642,6 +751,9 @@ class DraftWindowGraphCharacterizationRecorder:
     def _next_sequence(self) -> int:
         sequence = self._sequence
         self._sequence += 1
+        # Bounded like the event buffers; never grows on exhausted recording.
+        if len(self._host_observation_times) < self._max_events:
+            self._host_observation_times[sequence] = time.monotonic_ns()
         return sequence
 
     def _require_provider(self) -> DraftWindowGraphBindingProvider:
@@ -688,7 +800,8 @@ class DraftWindowGraphCharacterizationSession:
         return matches[0]
 
     def observe_materialized(self, inputs: DraftMetadataInputs) -> None:
-        self.recorder.record_materialized(route=self.route, inputs=inputs)
+        if self.recorder.enabled:
+            self.recorder.record_materialized(route=self.route, inputs=inputs)
 
 
 def experimental_draft_window_graph_characterization_enabled() -> bool:
@@ -809,8 +922,9 @@ def install_parallel_draft_window_graph_characterization(
 
     recorder = DraftWindowGraphCharacterizationRecorder(
         artifact_path=envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH_ARTIFACT,
+        enabled=envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH_OBSERVE,
     )
-    provider = install_draft_window_graph_binding_provider(owner, observer=recorder)
+    provider = install_draft_window_graph_binding_provider(owner, observer=recorder if recorder.enabled else None)
     recorder.attach_provider(provider)
     route = resolve_parallel_draft_window_graph_route(owner)
     if route not in (DraftWindowGraphRoute.DFLASH, DraftWindowGraphRoute.DSPARK):
@@ -972,6 +1086,7 @@ def record_parallel_graph_capture(
     slot_mapping: torch.Tensor,
     positions: torch.Tensor,
     query_start_loc: torch.Tensor,
+    metadata: Mapping[str, Any] | None = None,
 ) -> None:
     recorder = provider.observer
     if isinstance(recorder, DraftWindowGraphCharacterizationRecorder):
@@ -981,6 +1096,7 @@ def record_parallel_graph_capture(
             slot_mapping=slot_mapping,
             positions=positions,
             query_start_loc=query_start_loc,
+            metadata=metadata,
         )
 
 
@@ -989,25 +1105,54 @@ def attach_parallel_graph_capture_operand_observer(
     *,
     identity: DraftWindowGraphCaptureIdentity,
     metadata: Mapping[str, Any],
+    target_metadata: Mapping[str, Any] | None = None,
 ) -> None:
-    """Attach a capture-scoped observer only to explicit Draft metadata."""
+    """Atomically attach to unique Draft objects, not layer mapping entries.
+
+    The real builder shares one metadata object across a group's layers. The
+    immutable context lives with that object and its forward closure, not the
+    input-preparation context manager. It is never rebound to another capture
+    identity: old closures must keep observing their original operands.
+    """
     recorder = provider.observer
     if not isinstance(recorder, DraftWindowGraphCharacterizationRecorder):
         return
+    if recorder._require_provider() is not provider:
+        raise RuntimeError("capture operand observer provider mismatch")
+    provider.startup_capture_read_inputs(identity)  # Validate identity/backing before mutation.
     context = DraftWindowGraphCaptureOperandContext(
         recorder=recorder,
         identity=identity,
     )
-    attached = 0
+    unique: dict[int, Any] = {}
     for layer_metadata in metadata.values():
         if layer_metadata is None:
             continue
-        if hasattr(layer_metadata, _CAPTURE_OPERAND_CONTEXT_ATTRIBUTE):
-            raise RuntimeError("capture operand observer is already attached")
-        setattr(layer_metadata, _CAPTURE_OPERAND_CONTEXT_ATTRIBUTE, context)
-        attached += 1
-    if attached == 0:
+        unique[id(layer_metadata)] = layer_metadata
+    if not unique:
         raise RuntimeError("capture operand observer found no Draft attention metadata")
+    pending = []
+    for layer_metadata in unique.values():
+        if target_metadata is not None and any(layer_metadata is value for value in target_metadata.values()):
+            raise RuntimeError("capture operand observer cannot attach to Target metadata")
+        if hasattr(layer_metadata, _CAPTURE_OPERAND_CONTEXT_ATTRIBUTE):
+            previous = getattr(layer_metadata, _CAPTURE_OPERAND_CONTEXT_ATTRIBUTE)
+            if not isinstance(previous, DraftWindowGraphCaptureOperandContext) or (
+                previous.recorder is not recorder or previous.identity != identity
+            ):
+                raise RuntimeError("capture operand observer is already attached to a conflicting owner/identity")
+            continue  # Explicit same-owner/same-identity idempotence, no overwrite.
+        pending.append(layer_metadata)
+    attempted = []
+    try:
+        for layer_metadata in pending:
+            attempted.append(layer_metadata)
+            setattr(layer_metadata, _CAPTURE_OPERAND_CONTEXT_ATTRIBUTE, context)
+    except BaseException:
+        for layer_metadata in reversed(attempted):
+            if getattr(layer_metadata, _CAPTURE_OPERAND_CONTEXT_ATTRIBUTE, None) is context:
+                delattr(layer_metadata, _CAPTURE_OPERAND_CONTEXT_ATTRIBUTE)
+        raise
 
 
 def record_parallel_graph_capture_operator_operand(
@@ -1081,6 +1226,8 @@ def record_parallel_graph_replay_submission(owner: Any) -> None:
         return
     if not isinstance(session, DraftWindowGraphCharacterizationSession):
         raise TypeError("invalid Graph characterization session")
+    if not session.recorder.enabled:
+        return
     carriers = session.provider.submitted_carriers
     if not carriers:
         raise RuntimeError("Graph replay submission has no submitted Window carrier")
@@ -1272,6 +1419,45 @@ def _tensor_values(tensor: torch.Tensor) -> tuple[int, ...]:
     # host snapshot intentionally synchronizes device tensors to establish a
     # CPU oracle; it is never present in the default product path.
     return tuple(int(value) for value in tensor.detach().to(device="cpu").reshape(-1).tolist())
+
+
+def _runtime_oracle_inputs(owner: Any, carrier: DraftWindowGraphReadCarrier) -> dict[str, Any] | None:
+    """Snapshot raw full producers outside capture; never derive E from V+S.
+
+    This opt-in D2H is NOT performance representative. Missing harness/runtime
+    fields stay null; they must not be reconstructed from the Window planner.
+    """
+    live_inputs = getattr(owner, "_draft_window_live_inputs", None)
+    if live_inputs is None:
+        return None
+    identity = live_inputs.identity
+    batch = owner.input_batch
+    count = identity.actual_request_count
+    mapping = getattr(batch, "idx_mapping_np", None)
+    upper = getattr(batch, "seq_lens_cpu_upper_bound", None)
+    full_exact = getattr(owner.input_buffers, "seq_lens", None)
+    counts = getattr(owner.block_tables.num_blocks, "cpu", None)
+    max_model_len = getattr(owner, "max_model_len", None)
+    fingerprint = carrier.capture_identity.fingerprint
+    return {
+        "source_identity": _json_safe(identity.source_identity),
+        "request_ids": list(identity.ordered_request_fingerprint),
+        "row_phases": list(identity.row_phase_fingerprint),
+        "mapping": None if mapping is None else [int(v) for v in mapping[:count]],
+        "full_exact": None if full_exact is None else list(_tensor_values(full_exact[:count])),
+        "full_upper": None
+        if upper is None or max_model_len is None
+        else [min(int(v) + fingerprint.query_width, max_model_len) for v in upper[:count]],
+        "valid_counts": None
+        if mapping is None or counts is None
+        else [int(counts[fingerprint.global_group_id, int(row)]) for row in mapping[:count]],
+        "horizon_rule": "H=full_exact; parallel future_offset=0",
+        "window_size": fingerprint.window_size,
+        "legacy_block_size": fingerprint.logical_block_size,
+        "block_span_tokens": fingerprint.block_span_tokens,
+        "query_width": fingerprint.query_width,
+        "missing_policy": "null is not an oracle PASS",
+    }
 
 
 def _tensor_rows(tensor: torch.Tensor) -> tuple[tuple[int, ...], ...]:

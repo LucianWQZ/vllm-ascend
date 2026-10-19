@@ -1050,6 +1050,7 @@ def test_manager_prepares_candidate_before_consuming_graph_metadata(
         "build",
         "replay",
         "replay_event",
-        "output_hash",
         "update",
+        # D2H cannot wait on a graph whose ExternalEvent update is unsubmitted.
+        "output_hash",
     ]
