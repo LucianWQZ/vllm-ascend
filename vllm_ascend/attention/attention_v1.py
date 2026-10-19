@@ -526,6 +526,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
         # attn_metadata during graph replay. Record the captured layer name only
         # for that path.
         self._layer_name: str | None = None
+        # Observation identity is the executing Attention layer, not a KV-sharing
+        # metadata key. It does not enable layer-aware task replay.
+        self._capture_observer_layer_name: str | None = None
 
     def _graph_metadata_layer_name(self, layer: AttentionLayer | None = None) -> str | None:
         layer_name = layer.layer_name if layer is not None else self._layer_name
@@ -1149,7 +1152,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 attn_metadata,
                 block_table=block_table,
                 seq_lengths=actual_seq_lengths_kv,
-                layer_name=self._graph_metadata_layer_name(layer),
+                layer_name=(
+                    layer.layer_name if layer is not None else getattr(self, "_capture_observer_layer_name", None)
+                ),
                 num_tokens=num_tokens,
                 handle=handle,
                 event=event,
@@ -1818,6 +1823,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
             shape = [num_tokens, num_heads * head_size]
         """
         assert output is not None, "Output tensor must be provided."
+        if getattr(attn_metadata, "_draft_window_graph_capture_operand_context", None) is not None:
+            self._capture_observer_layer_name = layer.layer_name
         if self._use_layer_aware_fia_graph_replay:
             self._layer_name = layer.layer_name
 

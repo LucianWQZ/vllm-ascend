@@ -43,6 +43,45 @@ def _real_builder(monkeypatch):
     return builder
 
 
+def _forward_capture_layer(monkeypatch, metadata, layer_name, tokens):
+    """Keep forward -> forward_impl -> FIA -> observer; stub only NPU/timer services."""
+    import vllm_ascend.attention.attention_v1 as backend
+    from tests.ut.spec_decode.test_draft_window_graph_characterization import _FakeExternalEvent
+
+    params = SimpleNamespace(
+        workspaces={tokens: torch.zeros(1)}, events={tokens: []}, handles={tokens: []}, attn_params={tokens: []}
+    )
+    monkeypatch.setattr(backend, "get_draft_graph_params", lambda: params)
+    monkeypatch.setattr(backend, "weak_ref_tensors", lambda v: v)
+    monkeypatch.setattr(backend.torch_npu.npu, "current_stream", lambda: "host-stream")
+    monkeypatch.setattr(torch.npu, "ExternalEvent", _FakeExternalEvent)
+    monkeypatch.setattr(torch.npu, "graph_task_group_begin", lambda _: None)
+    monkeypatch.setattr(torch.npu, "graph_task_group_end", lambda _: object())
+    monkeypatch.setattr(backend.torch_npu, "npu_fused_infer_attention_score", SimpleNamespace(out=lambda **kw: None))
+    monkeypatch.setattr(
+        backend, "_EXTRA_CTX", SimpleNamespace(capturing=True, is_draft_model=True, is_draft_model_prefill=False)
+    )
+    monkeypatch.setattr(backend, "record_attention_compute_start", lambda: None)
+    monkeypatch.setattr(backend, "using_paged_attention", lambda *a: False)
+    impl = AscendAttentionBackendImpl.__new__(AscendAttentionBackendImpl)
+    impl.num_heads, impl.num_kv_heads, impl.head_size, impl.scale = 1, 1, 4, 1.0
+    impl.sliding_window = impl.sinks = impl._layer_name = impl.kv_sharing_target_layer_name = None
+    impl.enable_c8_quant = impl._use_max_workspace_for_fia_graph = impl._use_layer_aware_fia_graph_replay = False
+    impl.key_cache, impl.vllm_config = torch.zeros(1), SimpleNamespace()
+    impl._get_fia_params = lambda k, v, m: (k, v, 64, m.block_tables, m.seq_lens_list)
+    q, out = torch.zeros((tokens, 1, 4)), torch.zeros((tokens, 1, 4))
+    impl.forward(
+        SimpleNamespace(layer_name=layer_name, _k_scale_float=1, _v_scale_float=1),
+        q,
+        None,
+        None,
+        None,
+        metadata,
+        output=out,
+    )
+    return params  # Retain fake task handles for closure-lifetime assertions.
+
+
 def _capture_fixture(monkeypatch, *, separate=False):
     owner, descriptor = _characterization_owner()
     builder = _real_builder(monkeypatch)
@@ -170,12 +209,12 @@ def test_real_upstream_factory_warmup_capture_inventory_and_closures(monkeypatch
     owner.speculative_config.num_speculative_tokens = 7
     session = install_parallel_draft_window_graph_characterization(owner, runtime_context=_runtime_context())
     builder = _real_builder(monkeypatch)
-    layers = ["draft.layer.0", "draft.layer.1"]
+    layers = [f"draft.layer.{i}" for i in range(5)]
     groups = [[SimpleNamespace(layer_names=layers, get_metadata_builder=lambda _: builder)]]
     config = SimpleNamespace(kv_cache_groups=[SimpleNamespace(layer_names=layers)])
     manager = upstream_dflash.DFlashCudaGraphManager.__new__(upstream_dflash.DFlashCudaGraphManager)
     manager.max_num_reqs, manager.dp_size = 8, 1
-    closures, objects, observed = [], [], []
+    closures, objects, observed, handles = [], [], [], []
 
     def capture_loop(_manager, create_forward_fn, _progress):
         # Substitute only the hardware graph scope, keep upstream closure factory.
@@ -192,17 +231,7 @@ def test_real_upstream_factory_warmup_capture_inventory_and_closures(monkeypatch
         context = getattr(obj, ATTRIBUTE)
         assert context.identity.fingerprint.capture_bucket == (n, tokens)
         for layer in layers:
-            record_parallel_graph_capture_operator_operand(
-                obj,
-                block_table=obj.block_tables,
-                seq_lengths=obj.seq_lens_list,
-                layer_name=layer,
-                num_tokens=tokens,
-                handle=object(),
-                event=object(),
-                stream=object(),
-                backend_impl=AscendAttentionBackendImpl,
-            )
+            handles.append(_forward_capture_layer(monkeypatch, obj, layer, tokens))
             observed.append((n, tokens, layer))
 
     monkeypatch.setattr(CudaGraphManager, "capture", capture_loop)
@@ -212,10 +241,11 @@ def test_real_upstream_factory_warmup_capture_inventory_and_closures(monkeypatch
     ):
         manager.capture(forward, owner.input_buffers, owner.block_tables, groups, config, 512, True)
     assert len({id(obj) for obj in objects}) == 6
-    assert len(observed) == 12
+    assert len(observed) == 6 * len(layers)
+    assert [e.layer_name for e in session.recorder.operand_events] == [layer for _, _, layer in observed]
     # A retained old closure still uses its old bucket after subsequent attaches.
     closures[0](CUDAGraphMode.NONE)
-    assert observed[-2:] == [(4, 28, layer) for layer in layers]
+    assert observed[-len(layers) :] == [(4, 28, layer) for layer in layers]
     old_context = getattr(objects[0], ATTRIBUTE)
     other_identity = session.provider.registered_capture_identities(route=session.route)[0]
     assert other_identity != old_context.identity
@@ -326,7 +356,8 @@ def test_artifact_io_failure_is_reported_without_masking_model_error(monkeypatch
     assert "FileNotFoundError" in session.recorder.snapshot()["artifact_errors"][0]
 
 
-def test_real_builder_to_shared_metadata_to_real_fia_call_per_layer(monkeypatch):
+@pytest.mark.parametrize("kv_owner", [None, "kv.shared.owner"])
+def test_real_builder_to_shared_metadata_to_real_fia_call_per_layer(monkeypatch, kv_owner):
     import vllm_ascend.attention.attention_v1 as backend
     from tests.ut.spec_decode.test_draft_window_graph_characterization import _FakeExternalEvent
 
@@ -344,24 +375,74 @@ def test_real_builder_to_shared_metadata_to_real_fia_call_per_layer(monkeypatch)
     monkeypatch.setattr(
         backend.torch_npu, "npu_fused_infer_attention_score", SimpleNamespace(out=lambda **kw: calls.append(kw))
     )
-    monkeypatch.setattr(backend, "_EXTRA_CTX", SimpleNamespace(is_draft_model=True, is_draft_model_prefill=False))
+    monkeypatch.setattr(
+        backend, "_EXTRA_CTX", SimpleNamespace(is_draft_model=True, is_draft_model_prefill=False, capturing=True)
+    )
+    monkeypatch.setattr(backend, "record_attention_compute_start", lambda: None)
+    monkeypatch.setattr(backend, "using_paged_attention", lambda *a: False)
     for layer_name, obj in metadata.items():
         impl = AscendAttentionBackendImpl.__new__(AscendAttentionBackendImpl)
         impl.num_heads, impl.num_kv_heads, impl.head_size, impl.scale = 1, 1, 4, 1.0
         impl.sliding_window, impl.enable_c8_quant = None, False
         impl._use_max_workspace_for_fia_graph = False
         impl._use_layer_aware_fia_graph_replay = False
-        impl.kv_sharing_target_layer_name = None
-        impl._layer_name = layer_name
+        impl.kv_sharing_target_layer_name = kv_owner
+        impl._layer_name = None  # Real non-layer-aware initialization; never seed the answer.
+        impl.sinks = None
+        impl.key_cache = torch.zeros(1)
+        impl.vllm_config = SimpleNamespace()
         impl._get_fia_params = lambda key, value, m: (key, value, 64, m.block_tables, m.seq_lens_list)
         tensors = [torch.zeros((8, 1, 4)) for _ in range(4)]
-        impl.full_graph_fia(tensors[0], tensors[1], tensors[2], obj, tensors[3])
+        layer = SimpleNamespace(layer_name=layer_name, _k_scale_float=1.0, _v_scale_float=1.0)
+        impl.forward(layer, tensors[0], None, None, None, obj, output=tensors[3])
+        assert impl._layer_name is None  # Do not enable layer-aware execution policy.
     assert len(calls) == 2
     assert [e.layer_name for e in session.recorder.operand_events] == list(metadata)
     for call, event in zip(calls, session.recorder.operand_events):
         assert call["block_table"].data_ptr() == event.actual_table_address
         assert tuple(call["actual_seq_lengths_kv"]) == event.length_values
     assert not any(hasattr(obj, ATTRIBUTE) for obj in owner.model_state.attn_metadata.values())
+
+
+def test_lifecycle_and_export_never_query_or_retain_backend_event(tmp_path):
+    import gc
+    import weakref
+
+    from vllm_ascend.worker.v2.spec_decode.draft_window_graph_characterization import (
+        DraftWindowGraphCharacterizationRecorder,
+        DraftWindowGraphLifecycleStage,
+    )
+
+    class ForbiddenEvent:
+        calls = 0
+
+        def query(self):
+            self.calls += 1
+            raise AssertionError("backend event query forbidden")
+
+        synchronize = wait = query
+
+    recorder = DraftWindowGraphCharacterizationRecorder(artifact_path=str(tmp_path / "partial.json"))
+    event = ForbiddenEvent()
+    ref = weakref.ref(event)
+    recorder.record_lifecycle(
+        stage=DraftWindowGraphLifecycleStage.UPDATE_EVENT_RECORDED,
+        generation_id=1,
+        mapping_epoch=1,
+        stream=None,
+        event=event,
+        lease_state=None,
+        note="backend ExternalEvent recorded",
+    )
+    before = recorder.snapshot()
+    for _ in range(3):
+        recorder.write_artifact()
+        assert recorder.snapshot() == before
+    assert event.calls == 0
+    assert before["lifecycle_events"][0]["event_complete"] is None
+    del event
+    gc.collect()
+    assert ref() is None
 
 
 def test_no_blocking_observation_between_replay_and_update(monkeypatch):

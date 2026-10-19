@@ -779,15 +779,13 @@ def test_replay_submission_records_real_event_without_synchronizing(
         expected_consumer_count=1,
     )
 
-    event = SimpleNamespace(query=lambda: False)
-    token = SimpleNamespace(event=event)
     stream = object()
     from vllm_ascend.worker.v2.spec_decode import draft_window_async
 
     monkeypatch.setattr(
         draft_window_async.DraftWindowNPUEventCompletionToken,
         "record_current_stream",
-        classmethod(lambda _cls: token),
+        classmethod(lambda _cls: pytest.fail("passive recorder must not create a device event")),
     )
     monkeypatch.setattr(torch.npu, "current_stream", lambda: stream)
     record_parallel_graph_replay_submission(owner)
@@ -795,8 +793,8 @@ def test_replay_submission_records_real_event_without_synchronizing(
     lifecycle = session.recorder.lifecycle_events[-1]
     assert lifecycle.stage is DraftWindowGraphLifecycleStage.REPLAY_SUBMITTED
     assert lifecycle.stream_identity == id(stream)
-    assert lifecycle.event_identity == id(event)
-    assert lifecycle.event_complete is False
+    assert lifecycle.event_identity is None
+    assert lifecycle.event_complete is None  # Passive observation is not completion polling.
 
 
 def test_campaign_auditor_requires_all_evidence_layers_and_detects_host_a_b_a() -> None:

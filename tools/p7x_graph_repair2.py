@@ -17,6 +17,7 @@ import json
 import math
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -269,6 +270,20 @@ def _audit_campaign(document: dict[str, Any]) -> dict[str, Any]:
     expected_layers = document.get("draft_layer_names", [])
     if not expected_layers:
         missing.append("actual Draft layer inventory absent")
+    invocation_keys = set()
+    for event in operands:
+        if expected_layers and event.get("layer_name") not in expected_layers:
+            errors.append("operator layer not in actual Draft inventory")
+        if event.get("handle_identity") is not None:
+            invocation_key = (
+                event.get("stage"),
+                *_generation(event),
+                event.get("layer_name"),
+                event["handle_identity"],
+            )
+            if invocation_key in invocation_keys:
+                errors.append("duplicate operator task/layer association")
+            invocation_keys.add(invocation_key)
     for key in complete:
         seen = {e.get("layer_name") for e in operands if _generation(e) == key and e.get("stage") == "update_operator"}
         if not expected_layers or set(expected_layers) != seen:
@@ -369,6 +384,7 @@ def _audit_campaign(document: dict[str, Any]) -> dict[str, Any]:
                     {
                         "generation": key,
                         "row": row,
+                        "H": exact,  # Base parallel route has future_offset=0.
                         "S": expected.window_start,
                         "E": exact,
                         "V": expected.visible_length,
@@ -490,6 +506,224 @@ def compare_target_numeric(left, right):
         for x, y in zip(a, b)
     )
     return {"status": "PASS" if okay else "FAIL", "max_abs_error": max(abs(x - y) for x, y in zip(a, b))}
+
+
+def analyze_campaign(document):
+    """Derived analysis only: retain the official check, scan the entire sequence."""
+    audit = audit_campaign(document)
+    rows = audit.get("independent_oracle_rows", [])
+    boundaries = {
+        "S_eq_0": any(r["S"] == 0 for r in rows),
+        "S_gt_0": any(r["S"] > 0 for r in rows),
+        "non_block_end": any(r["E"] % 128 for r in rows),
+    }
+    for end in (32, 1024, 1025, 1151, 1152, 1153, 2049):
+        boundaries[f"runtime_E_{end}"] = any(r["E"] == end for r in rows)
+    candidates = []
+    if audit["EVIDENCE_INTEGRITY"] == "PASS":
+        snap = document["snapshot"]
+        bound = sorted((r for r in snap["events"] if r.get("stage") == "bound"), key=lambda r: r["sequence"])
+        groups = {}
+        for record in bound:
+            key = (record["capture_descriptor"], record["backing_table_address"])
+            groups.setdefault(key, []).append(record)
+        # Bounded diagnostic scan: report incomplete search, never infer absence
+        # from a budget-exhausted prefix. Each candidate includes raw sequence IDs.
+        examined, exhausted = 0, False
+        for records in groups.values():
+            for i, a in enumerate(records):
+                for j in range(i + 2, len(records)):
+                    examined += 1
+                    if examined > 100000:
+                        exhausted = True
+                        break
+                    last = records[j]
+                    if any(a[k] != last[k] for k in ("table_values", "exact_lengths", "upper_lengths")):
+                        continue
+                    b = next((r for r in records[i + 1 : j] if r["table_values"] != a["table_values"]), None)
+                    if b and check_aba([a, b, last], snap["g4_records"]) == "PASS":
+                        candidates.append(
+                            {
+                                "sequences": [a["sequence"], b["sequence"], last["sequence"]],
+                                "descriptor": a["capture_descriptor"],
+                                "backing": a["backing_table_address"],
+                                "generations": [_generation(r) for r in (a, b, last)],
+                            }
+                        )
+                if exhausted:
+                    break
+            if exhausted:
+                break
+    else:
+        exhausted = False
+    return {
+        "official_check": audit,
+        "requested": document.get("outputs", []),
+        "observed_runtime_rows": rows,
+        "boundaries": {k: "COVERED_HOST_ORACLE" if v else "NOT_REACHED" for k, v in boundaries.items()},
+        "aba_scan": {
+            "status": "HOST_CANDIDATE" if candidates else "OPEN",
+            "candidates": candidates,
+            "scan_complete": not exhausted,
+            "device_refresh": "OPEN",
+        },
+    }
+
+
+def compare_probe_sets(left, right, left_dir, right_dir):
+    """Strict whole-collection comparison, never a FULL_TARGET equivalence claim.
+
+    Raw paths resolve beside each delivered JSON (not arbitrary server paths).
+    Repeated hashes remain distinct ordered samples; missing/extra samples fail.
+    """
+    result = {
+        "write_semantics": "OPEN",
+        "head_only_numeric": "OPEN",
+        "full_target_numeric": "OPEN",
+        "pairs": [],
+        "errors": [],
+        "tolerance": {"atol": 0, "rtol": 0, "reason": "identical head input, exact diagnostic comparison"},
+    }
+    if left.get("errors") or right.get("errors"):
+        result["errors"].append("probe collection errors")
+        return result
+
+    def tensor(value):
+        _require(isinstance(value, dict), "missing tensor snapshot")
+        _require(all(value.get(k) is not None for k in ("shape", "dtype", "values")), "missing tensor fields")
+        _require(
+            isinstance(value["shape"], list) and all(type(n) is int and n >= 0 for n in value["shape"]),
+            "invalid tensor shape",
+        )
+
+        def validate(data, shape):
+            if shape:
+                _require(isinstance(data, list) and len(data) == shape[0], "shape/value mismatch")
+                for child in data:
+                    validate(child, shape[1:])
+            else:
+                _require(isinstance(data, (int, float)) and math.isfinite(data), "nonfinite/nonnumeric value")
+
+        validate(value["values"], value["shape"])
+        return {k: value[k] for k in ("shape", "dtype", "values")}
+
+    def state(value):
+        _require(isinstance(value, dict), "missing phase snapshot")
+        layers = value.get("target_layers")
+        _require(isinstance(layers, dict) and bool(layers), "missing Target layers")
+        _require(bool(value.get("canonical_tables")), "missing canonical tables")
+        return {
+            "canonical_tables": [tensor(t) for t in value["canonical_tables"]],
+            **{k: tensor(value.get(k)) for k in ("slots", "positions", "query")},
+            "target_layers": {k: {f: tensor(v.get(f)) for f in ("table", "exact")} for k, v in layers.items()},
+        }
+
+    for kind, status in (("full_write_target", "write_semantics"), ("target_logits_head", "head_only_numeric")):
+        a = [r for r in left.get("records", []) if r.get("kind") == kind]
+        b = [r for r in right.get("records", []) if r.get("kind") == kind]
+        result[kind + "_counts"] = [len(a), len(b)]
+        if not a or not b:
+            continue
+        if len(a) != len(b):
+            result[status] = "FAIL"
+            result["errors"].append(f"{kind} sample cardinality differs")
+            continue
+        try:
+            for index in range(len(a)):
+                x, y = a[index], b[index]
+                if kind == "full_write_target":
+                    for phase in ("before", "after"):
+                        _require(
+                            state(x.get(phase)) == state(y.get(phase)), f"sample {index} {phase} semantic mismatch"
+                        )
+                else:
+                    import torch
+
+                    tensors = []
+                    pair = {"index": index, "files": []}
+                    for item, root in ((x, left_dir), (y, right_dir)):
+                        path = Path(root) / Path(item["path"]).name
+                        _require(path.is_file(), f"RAW_NOT_DELIVERED: {path.name}")
+                        data = torch.load(path, map_location="cpu", weights_only=True)
+                        for name, shape in (("hidden_states", "input_shape"), ("logits", "output_shape")):
+                            t = data[name]
+                            _require(isinstance(t, torch.Tensor) and t.numel() > 0, "empty/non-tensor raw input")
+                            _require(
+                                list(t.shape) == item[shape] and bool(torch.isfinite(t).all()),
+                                "shape/nonfinite raw tensor",
+                            )
+                        _require(str(data["logits"].dtype) == item["dtype"], "dtype mismatch")
+                        digest = hashlib.sha256(
+                            data["hidden_states"].contiguous().view(torch.uint8).numpy().tobytes()
+                        ).hexdigest()
+                        _require(digest == item["input_sha256"], "input hash mismatch")
+                        pair["files"].append(
+                            {
+                                "path": str(path),
+                                "file_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                                "input_sha256": digest,
+                                "output_sha256": hashlib.sha256(
+                                    data["logits"].contiguous().view(torch.uint8).numpy().tobytes()
+                                ).hexdigest(),
+                            }
+                        )
+                        tensors.append(data)
+                    for key in ("hidden_states", "logits"):
+                        p, q = tensors[0][key], tensors[1][key]
+                        _require(
+                            p.dtype == q.dtype and p.shape == q.shape and torch.equal(p, q), f"{key} differs at {index}"
+                        )
+                    result["pairs"].append(pair)
+            result[status] = "PASS"
+        except (ValueError, KeyError, TypeError, OSError, RuntimeError) as error:
+            result[status] = "OPEN" if "RAW_NOT_DELIVERED" in str(error) else "FAIL"
+            result["errors"].append(str(error))
+    return result
+
+
+def launch_case(args):
+    """External supervisor: no model imports, no fabricated campaign on SIGSEGV."""
+    args.output.mkdir(parents=True, exist_ok=False)
+    argv = args.argv[1:] if args.argv and args.argv[0] == "--" else args.argv
+    _require(bool(argv), "launcher requires a child argv")
+    record = {
+        "run_id": args.run_id,
+        "case_id": args.case_id,
+        "driver_mode": args.mode,
+        "source_sha": _git(ROOT, "rev-parse", "HEAD"),
+        "source_tree": _git(ROOT, "rev-parse", "HEAD^{tree}"),
+        "attempt_id": args.attempt,
+        "argv": argv,
+        "status": "STARTING",
+        "returncode": None,
+        "signal": None,
+        "timeout": False,
+        "host_start_ns": time.monotonic_ns(),
+    }
+    path = args.output / "launcher.json"
+    _write(path, record)
+    with (args.output / "stdout.log").open("wb") as stdout, (args.output / "stderr.log").open("wb") as stderr:
+        try:
+            child = subprocess.Popen(argv, stdout=stdout, stderr=stderr, start_new_session=True)
+        except OSError as error:
+            record.update(status="NOT_STARTED", error=str(error), returncode=127)
+            _write(path, record)
+            return 127
+        record.update(pid=child.pid, status="RUNNING")
+        _write(path, record)
+        try:
+            code = child.wait(timeout=args.timeout)
+        except subprocess.TimeoutExpired:
+            record["timeout"] = True
+            os.killpg(child.pid, signal.SIGTERM)
+            try:
+                code = child.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                os.killpg(child.pid, signal.SIGKILL)
+                code = child.wait()
+    record.update(returncode=code, signal=-code if code < 0 else None, status="EXITED", host_end_ns=time.monotonic_ns())
+    _write(path, record)
+    return 124 if record["timeout"] else code if code >= 0 else 128 - code
 
 
 def _write(path, value):
@@ -657,7 +891,8 @@ def run_case(args):
     output.mkdir(parents=True, exist_ok=False)
     identity = {
         "run_id": args.run_id,
-        "case_id": args.case,
+        "case_id": getattr(args, "case_id", None) or args.case,
+        "driver_mode": args.case,
         "attempt_id": args.attempt,
         "source_sha": _git(ROOT, "rev-parse", "HEAD"),
         "source_tree": _git(ROOT, "rev-parse", "HEAD^{tree}"),
@@ -731,6 +966,7 @@ def run_case(args):
         compilation_config={"cudagraph_mode": "FULL_DECODE_ONLY", "cudagraph_capture_sizes": [7, 14, 28]},
     )
     record["llm_kwargs"] = config
+    _write(output / "progress.json", {"identity": identity, "phase": "BEFORE_STARTUP"})
     try:
         llm = LLM(**config)
         core = llm.llm_engine.engine_core.engine_core
@@ -749,6 +985,15 @@ def run_case(args):
         record["draft_graph_keys"] = [[d["num_reqs"], d["num_tokens"]] for d in record["draft_inventory"]["graphs"]]
         record["draft_layer_names"] = list(spec.draft_attn_layer_names)
         record["startup_complete"] = True
+        _write(
+            output / "progress.json",
+            {
+                "identity": identity,
+                "phase": "STARTUP_COMPLETE",
+                "draft_inventory": record["draft_inventory"],
+                "draft_layer_names": record["draft_layer_names"],
+            },
+        )
         session = getattr(spec, "_draft_window_graph_characterization", None)
         record["provider_installed"] = hasattr(spec, "_draft_window_graph_binding_provider")
         if args.case == "A0" and (session is not None or record["provider_installed"]):
@@ -774,6 +1019,10 @@ def run_case(args):
             else [{"label": f"smoke-{n}", "prompts": ["Hello, my name is"] * n, "max_tokens": 16} for n in (1, 2, 4)]
         )
         for request in requests:
+            _write(
+                output / "progress.json",
+                {"identity": identity, "phase": "BEFORE_GENERATE", "request": request["label"]},
+            )
             start = time.monotonic_ns()
             results = llm.generate(
                 request["prompts"],
@@ -788,6 +1037,9 @@ def run_case(args):
                     "prompt_token_ids": [r.prompt_token_ids for r in results],
                     "token_ids": [r.outputs[0].token_ids for r in results],
                 }
+            )
+            _write(
+                output / "progress.json", {"identity": identity, "phase": "AFTER_GENERATE", "request": request["label"]}
             )
         record["status"] = "OK"
     except BaseException as error:
@@ -866,6 +1118,19 @@ def trace_probe(output):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
+    analyze = sub.add_parser("analyze")
+    analyze.add_argument("artifact", type=Path)
+    analyze.add_argument("--output", required=True, type=Path)
+    probes = sub.add_parser("compare-probes")
+    probes.add_argument("left", type=Path)
+    probes.add_argument("right", type=Path)
+    probes.add_argument("--output", required=True, type=Path)
+    launch = sub.add_parser("launch")
+    launch.add_argument("--output", type=Path, required=True)
+    for name in ("run-id", "case-id", "attempt", "mode"):
+        launch.add_argument(f"--{name}", required=True)
+    launch.add_argument("--timeout", type=int, default=1800)
+    launch.add_argument("argv", nargs=argparse.REMAINDER)
     check = sub.add_parser("check")
     check.add_argument("artifact", type=Path)
     check.add_argument("--output", required=True, type=Path)
@@ -882,8 +1147,10 @@ def main():
     fixtures = sub.add_parser("make-requests")
     fixtures.add_argument("--target-model", required=True)
     fixtures.add_argument("--output", required=True, type=Path)
+    fixtures.add_argument("--profile", choices=("smoke", "boundaries", "combined"), default="combined")
     run = sub.add_parser("run")
     run.add_argument("--case", required=True, choices=("A0", "A1", "B", "B-observer-off"))
+    run.add_argument("--case-id", help="actual experiment ID; --case remains the driver mode")
     for name in ("run-id", "attempt", "expected-sha", "target-model", "draft-model"):
         run.add_argument(f"--{name}", required=True)
     for name in ("vllm-repo", "fixture-manifest", "output"):
@@ -891,6 +1158,18 @@ def main():
     run.add_argument("--requests", type=Path)
     run.add_argument("--target-probe", action="store_true", help="extra D2H after capture; not for timing")
     args = parser.parse_args()
+    if args.command == "launch":
+        return launch_case(args)
+    if args.command == "compare-probes":
+        result = compare_probe_sets(
+            json.loads(args.left.read_text()), json.loads(args.right.read_text()), args.left.parent, args.right.parent
+        )
+        _write(args.output, result)
+        return 0 if result["write_semantics"] == result["head_only_numeric"] == "PASS" else 2
+    if args.command == "analyze":
+        result = analyze_campaign(json.loads(args.artifact.read_text()))
+        _write(args.output, result)
+        return 0 if result["official_check"]["EVIDENCE_INTEGRITY"] == "PASS" else 2
     if args.command == "make-requests":
         from transformers import AutoTokenizer
 
@@ -898,8 +1177,12 @@ def main():
         unit = tokenizer.encode("Hello world. ", add_special_tokens=False)
         if not unit:
             raise RuntimeError("empty tokenizer fixture")
-        requests = []
-        for length in (32, 1024, 1025, 1151, 1152, 1153, 2049, 32):
+        requests = (
+            []
+            if args.profile == "boundaries"
+            else [{"label": f"smoke-{n}", "prompts": ["Hello, my name is"] * n, "max_tokens": 16} for n in (1, 2, 4)]
+        )
+        for length in () if args.profile == "smoke" else (32, 1024, 1025, 1151, 1152, 1153, 2049, 32):
             tokens = (unit * ((length + len(unit) - 1) // len(unit)))[:length]
             requests.append(
                 {

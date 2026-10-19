@@ -194,6 +194,7 @@ class DraftWindowGraphLifecycleEvent:
     event_complete: bool | None
     lease_state: str | None
     note: str
+    event_type: str | None = None
     host_monotonic_ns: int = field(default_factory=time.monotonic_ns)
 
 
@@ -226,7 +227,6 @@ class DraftWindowGraphCharacterizationRecorder:
         self._operand_events: list[DraftWindowGraphOperandEvent] = []
         self._g4_records: list[DraftWindowGraphG4OracleRecord] = []
         self._lifecycle_events: list[DraftWindowGraphLifecycleEvent] = []
-        self._completion_tokens: dict[int, Any] = {}
         self._provider: DraftWindowGraphBindingProvider | None = None
         self._sequence = 0
         self._host_observation_times: dict[int, int] = {}
@@ -608,8 +608,6 @@ class DraftWindowGraphCharacterizationRecorder:
         if not self.enabled:
             return
         event_identity = None if event is None else id(event)
-        if event_identity is not None:
-            self._completion_tokens[event_identity] = event
         self._append_lifecycle(
             DraftWindowGraphLifecycleEvent(
                 sequence=self._next_sequence(),
@@ -618,7 +616,8 @@ class DraftWindowGraphCharacterizationRecorder:
                 mapping_epoch=mapping_epoch,
                 stream_identity=None if stream is None else id(stream),
                 event_identity=event_identity,
-                event_complete=_query_event_without_sync(event),
+                event_complete=None,
+                event_type=None if event is None else _class_path(type(event)),
                 lease_state=lease_state,
                 note=note,
             )
@@ -637,7 +636,7 @@ class DraftWindowGraphCharacterizationRecorder:
 
         return {
             "schema": "mrv2-draft-window-graph-characterization-v2",
-            "recorder_revision": "repair2",
+            "recorder_revision": "repair3-passive",
             "recorder_id": self.recorder_id,
             "process_id": os.getpid(),
             "provider_identity": None if self._provider is None else id(self._provider),
@@ -673,12 +672,10 @@ class DraftWindowGraphCharacterizationRecorder:
 
     def _lifecycle_snapshot(self, event: DraftWindowGraphLifecycleEvent) -> dict[str, Any]:
         result = _json_safe(event)
-        event_identity = event.event_identity
-        token = None if event_identity is None else self._completion_tokens.get(event_identity)
-        result["event_complete"] = _query_event_without_sync(token)
-        result["query_host_monotonic_ns"] = time.monotonic_ns()
+        result["query_host_monotonic_ns"] = None
         result["clock_domain"] = "process_monotonic_ns_NOT_DEVICE_TIME"
-        result["completion_source"] = None if token is None else _class_path(type(token))
+        result["completion_source"] = None
+        result["completion_status"] = "UNPROVEN"
         return result
 
     def _event_from_read_inputs(
@@ -1231,11 +1228,6 @@ def record_parallel_graph_replay_submission(owner: Any) -> None:
     carriers = session.provider.submitted_carriers
     if not carriers:
         raise RuntimeError("Graph replay submission has no submitted Window carrier")
-    from vllm_ascend.worker.v2.spec_decode.draft_window_async import (
-        DraftWindowNPUEventCompletionToken,
-    )
-
-    token = DraftWindowNPUEventCompletionToken.record_current_stream()
     stream = torch.npu.current_stream()
     for carrier in carriers:
         identity = carrier.runtime_identity
@@ -1246,9 +1238,9 @@ def record_parallel_graph_replay_submission(owner: Any) -> None:
             generation_id=identity.generation_id,
             mapping_epoch=identity.mapping_epoch,
             stream=stream,
-            event=token.event,
+            event=None,
             lease_state=None,
-            note="torch.npu.Event recorded after ACL Graph replay; no host synchronization",
+            note="host replay submission only; no completion event created or sampled",
         )
 
 
@@ -1484,21 +1476,6 @@ def _length_operand_snapshot(value: Any) -> tuple[str, int | None, tuple[int, ..
             raise TypeError("host length operand must contain integers")
         return ("host_sequence", None, tuple(int(item) for item in value))
     raise TypeError(f"unsupported graph length operand type: {type(value).__name__}")
-
-
-def _query_event_without_sync(event: Any | None) -> bool | None:
-    if event is None:
-        return None
-    query = getattr(event, "query", None)
-    if not callable(query):
-        return None
-    try:
-        return bool(query())
-    except RuntimeError:
-        # A backend ExternalEvent may not be queryable on every CANN release.
-        # The event identity is still useful, but completion remains an NPU
-        # trace question rather than a fabricated False result.
-        return None
 
 
 def _hash_tensor_tree(value: Any) -> str:

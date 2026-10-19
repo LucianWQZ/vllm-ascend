@@ -50,6 +50,157 @@ def _empty():
     }
 
 
+def test_repair3_boundary_report_requires_runtime_not_prompt():
+    result = _tool().analyze_campaign(_empty())
+    assert result["boundaries"]["S_gt_0"] == "NOT_REACHED"
+    assert result["aba_scan"]["status"] == "OPEN"
+
+
+def test_repair3_probe_set_missing_never_equals_missing(tmp_path):
+    result = _tool().compare_probe_sets({"records": []}, {"records": []}, tmp_path, tmp_path)
+    assert result["write_semantics"] == "OPEN"
+    assert result["head_only_numeric"] == "OPEN"
+    assert result["full_target_numeric"] == "OPEN"
+
+
+def test_repair3_launcher_preserves_failure_and_identity(tmp_path):
+    args = SimpleNamespace(
+        output=tmp_path / "launch",
+        run_id="r",
+        case_id="B0",
+        attempt="2",
+        mode="B",
+        timeout=10,
+        argv=[sys.executable, "-c", "raise SystemExit(3)"],
+    )
+    assert _tool().launch_case(args) == 3
+    record = json.loads((args.output / "launcher.json").read_text())
+    assert record["returncode"] == 3
+    assert record["case_id"] == "B0" and record["driver_mode"] == "B"
+    assert not (args.output / "campaign.json").exists()
+
+
+def test_repair3_launcher_records_signal_without_fabricating_campaign(tmp_path, monkeypatch):
+    tool = _tool()
+    monkeypatch.setattr(tool, "_git", lambda *a: "a" * 40)
+    monkeypatch.setattr(tool.subprocess, "Popen", lambda *a, **kw: SimpleNamespace(pid=123, wait=lambda **kw: -11))
+    args = SimpleNamespace(
+        output=tmp_path / "launch",
+        run_id="r",
+        case_id="B0",
+        attempt="1",
+        mode="B",
+        timeout=10,
+        argv=["stub-native-crash"],
+    )
+    assert tool.launch_case(args) == 139
+    record = json.loads((args.output / "launcher.json").read_text())
+    assert record["returncode"] == -11 and record["signal"] == 11
+    assert not (args.output / "campaign.json").exists()
+
+
+@pytest.mark.parametrize(
+    "mutation", ["none", "missing_layer", "count", "nan", "shape", "dtype", "duplicate_hash", "missing_raw"]
+)
+def test_repair3_probe_collection_strictness(tmp_path, mutation):
+    import hashlib
+
+    tensor = {"shape": [1], "dtype": "torch.float32", "values": [1]}
+    state = dict(
+        canonical_tables=[tensor],
+        slots=tensor,
+        positions=tensor,
+        query=tensor,
+        target_layers={"l": {"table": tensor, "exact": tensor}},
+    )
+    x = torch.tensor([1.0])
+    digest = hashlib.sha256(x.view(torch.uint8).numpy().tobytes()).hexdigest()
+    left, right = tmp_path / "a", tmp_path / "b"
+    left.mkdir()
+    right.mkdir()
+    a = {
+        "records": [
+            {"kind": "full_write_target", "before": state, "after": state},
+            {
+                "kind": "target_logits_head",
+                "path": "head.pt",
+                "input_sha256": digest,
+                "input_shape": [1],
+                "output_shape": [1],
+                "dtype": "torch.float32",
+            },
+        ]
+    }
+    b = deepcopy(a)
+    torch.save({"hidden_states": x, "logits": x}, left / "head.pt")
+    torch.save({"hidden_states": x, "logits": x}, right / "head.pt")
+    if mutation == "missing_layer":
+        b["records"][0]["after"]["target_layers"] = {}
+    elif mutation == "count":
+        b["records"].append(deepcopy(b["records"][0]))
+    elif mutation == "nan":
+        torch.save({"hidden_states": x, "logits": torch.tensor([float("nan")])}, right / "head.pt")
+    elif mutation == "shape":
+        b["records"][1]["input_shape"] = [2]
+    elif mutation == "dtype":
+        b["records"][1]["dtype"] = "torch.bfloat16"
+    elif mutation == "duplicate_hash":
+        # Legitimate repeats are distinct samples, NOT dictionary overwritten.
+        a["records"].append(deepcopy(a["records"][1]))
+        b["records"].append(deepcopy(b["records"][1]))
+    elif mutation == "missing_raw":
+        b["records"][1]["path"] = "missing.pt"
+    result = _tool().compare_probe_sets(a, b, left, right)
+    if mutation in ("none", "duplicate_hash"):
+        assert result["head_only_numeric"] == result["write_semantics"] == "PASS"
+        assert len(result["pairs"]) == (2 if mutation == "duplicate_hash" else 1)
+    else:
+        assert "PASS" not in (result["write_semantics"], result["head_only_numeric"]) or not (
+            result["write_semantics"] == result["head_only_numeric"] == "PASS"
+        )
+    assert result["full_target_numeric"] == "OPEN"
+
+
+@pytest.mark.parametrize("mutation", ["missing", "wrong", "duplicate"])
+def test_repair3_per_layer_association_rejected(mutation):
+    doc = _complete_host_fixture()
+    records = doc["snapshot"]["operand_events"]
+    if mutation == "missing":
+        records[:] = [r for r in records if r["layer_name"] != "layer.1"]
+    elif mutation == "wrong":
+        records[0]["layer_name"] = "not.a.draft.layer"
+    else:
+        records[0]["handle_identity"] = 123
+        records.append(dict(deepcopy(records[0]), sequence=999))
+    result = _tool().audit_campaign(doc)
+    assert result["HOST_CONTRACTS"] != "PASS"
+
+
+def test_repair3_full_sequence_scan_finds_earlier_aba(monkeypatch):
+    tool = _tool()
+    bound = [
+        dict(
+            sequence=n,
+            generation_id=n,
+            mapping_epoch=n,
+            capture_descriptor="d",
+            backing_table_address=100,
+            table_values=[[v]],
+            exact_lengths=[1],
+            upper_lengths=[1],
+            stage="bound",
+            record_scope={"recorder_id": "r", "process_id": 1, "provider_identity": 9},
+        )
+        for n, v in enumerate((1, 2, 1, 3, 4))
+    ]
+    raw = dict(source_identity={"table": 50}, full_exact=[1], full_upper=[1], valid_counts=[1], mapping=[0])
+    doc = {"snapshot": {"events": bound, "g4_records": [dict(r, runtime_oracle_inputs=raw) for r in bound]}}
+    # This isolates the scan algorithm; the unmodified audit runs first in CLI.
+    monkeypatch.setattr(tool, "audit_campaign", lambda _: {"EVIDENCE_INTEGRITY": "PASS"})
+    assert tool.check_aba(bound, doc["snapshot"]["g4_records"]) == "OPEN"
+    assert tool.analyze_campaign(doc)["aba_scan"]["candidates"][0]["sequences"] == [0, 1, 2]
+
+
 def test_empty_artifact_never_passes_device_or_host_contracts():
     result = _tool().audit_campaign(_empty())
     assert result["EVIDENCE_INTEGRITY"] == "PASS"
