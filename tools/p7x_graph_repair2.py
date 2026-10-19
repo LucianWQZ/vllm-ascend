@@ -49,17 +49,73 @@ def _generation(record):
     return (record.get("generation_id"), record.get("mapping_epoch"), record.get("capture_descriptor"))
 
 
+def _require(condition, message):
+    # Evidence checks must have the same semantics under python -O.
+    if not condition:
+        raise ValueError(message)
+
+
+def _invalid_evidence(message):
+    return {
+        "EVIDENCE_INTEGRITY": "INVALID_EVIDENCE",
+        "HOST_CONTRACTS": "FAIL",
+        "DEVICE_FUNCTIONAL_GATES": {
+            "fixed_inventory_replay": "NOT_RUN",
+            "G2_A_B_A": "OPEN",
+            "G4_controlled_target_numeric": "OPEN",
+        },
+        "DEVICE_EVIDENCE_LEVELS": dict.fromkeys(
+            ("operator_boundary", "task_internal", "physical_read", "completion_and_effective_generation"), "OPEN"
+        ),
+        "errors": [message],
+        "missing": [],
+    }
+
+
+def _unique_generations(records, label, errors):
+    grouped = {}
+    for record in records:
+        grouped.setdefault(_generation(record), []).append(record)
+    unique = {}
+    for key, matches in grouped.items():
+        if len(matches) != 1:
+            errors.append(f"duplicate {label} generation {key}")
+        else:
+            unique[key] = matches[0]
+    return unique
+
+
+def _strict_runtime_order(records):
+    """Parallel Base proposals within ONE recorder/provider; gaps are legal.
+
+    This is not the Eagle3 per-step (shared epoch) protocol or a device clock.
+    """
+    for field in ("sequence", "generation_id", "mapping_epoch"):
+        values = [r.get(field) for r in records]
+        if any(type(v) is not int or v < 0 for v in values) or any(a >= b for a, b in zip(values, values[1:])):
+            return False
+    return True
+
+
 def audit_campaign(document: dict[str, Any]) -> dict[str, Any]:
+    """Malformed evidence still produces a machine-readable, non-PASS report."""
+    try:
+        return _audit_campaign(document)
+    except (KeyError, TypeError, ValueError, IndexError, AttributeError) as error:
+        return _invalid_evidence(f"malformed evidence: {type(error).__name__}: {error}")
+
+
+def _audit_campaign(document: dict[str, Any]) -> dict[str, Any]:
     """Check integrity, then associations and independent math; never infer L3/L5/L6.
 
     The four result namespaces are deliberately separate. A failed-run archive
     can have valid integrity, while every functional gate remains NOT_RUN.
     """
-    if not __debug__:
-        raise RuntimeError("evidence checker must not run with Python -O (assertions disabled)")
     errors: list[str] = []
     missing: list[str] = []
+    _require(isinstance(document, dict), "campaign root must be an object")
     identity, snap = document.get("identity", {}), document.get("snapshot", {})
+    _require(isinstance(identity, dict) and isinstance(snap, dict), "identity/snapshot must be objects")
     if document.get("schema") != "p7x-repair2-campaign-v1":
         errors.append("unsupported campaign schema")
     if any(identity.get(key) is None or identity.get(key) == "" for key in IDENTITY_KEYS):
@@ -143,10 +199,52 @@ def audit_campaign(document: dict[str, Any]) -> dict[str, Any]:
     if errors:
         return result
     events, operands = sections["events"], sections["operand_events"]
-    bound = [e for e in events if e.get("stage") == "bound"]
-    by_generation = {_generation(e): e for e in bound}
-    if len(by_generation) != len(bound):
-        errors.append("duplicate bound generation")
+    bound = sorted((e for e in events if e.get("stage") == "bound"), key=lambda r: r["sequence"])
+    by_generation = _unique_generations(bound, "bound", errors)
+    g4_by_generation = _unique_generations(sections["g4_records"], "G4", errors)
+    if not _strict_runtime_order(bound):
+        errors.append("bound generation/mapping_epoch must strictly increase in recorder sequence order")
+    for key in by_generation.keys() - g4_by_generation.keys():
+        missing.append(f"unique G4 record missing for bound {key}")
+    for key in g4_by_generation.keys() - by_generation.keys():
+        errors.append(f"orphan G4 record {key}")
+    captures = [e for e in events if e.get("stage") == "capture"]
+    capture_backings: dict[str, tuple[Any, Any]] = {}
+    for capture in captures:
+        descriptor = capture.get("capture_descriptor")
+        _require(isinstance(descriptor, str) and bool(descriptor), "capture descriptor must be a nonempty string")
+        backing = (capture.get("route"), capture.get("backing_table_address"))
+        if descriptor in capture_backings and capture_backings[descriptor] != backing:
+            errors.append("capture descriptor changed backing/route within one provider scope")
+        capture_backings[descriptor] = backing
+
+    def capture_for(record):
+        # Warmup and capture can legitimately repeat a descriptor. Resolve the
+        # most recent preceding helper snapshot, not an arbitrary dict overwrite.
+        matching = [
+            e
+            for e in captures
+            if e.get("capture_descriptor") == record.get("capture_descriptor") and e["sequence"] < record["sequence"]
+        ]
+        return max(matching, key=lambda e: e["sequence"]) if matching else None
+
+    def same_backing(record, address, label):
+        if (
+            type(address) is not int
+            or address <= 0
+            or type(record.get("backing_table_address")) is not int
+            or record.get("backing_table_address") != address
+        ):
+            errors.append(f"{label} backing association mismatch")
+
+    for record in bound:
+        capture = capture_for(record)
+        if capture is None:
+            missing.append(f"capture backing snapshot missing {_generation(record)}")
+        else:
+            same_backing(capture, record.get("backing_table_address"), "bound/capture")
+            if capture.get("route") != record.get("route"):
+                errors.append("bound/capture route mismatch")
     required_stages = ("bound", "replay", "consumer", "update")
     complete = set()
     for key, record in by_generation.items():
@@ -161,6 +259,13 @@ def audit_campaign(document: dict[str, Any]) -> dict[str, Any]:
             errors.append(f"source timeline order mismatch {key}")
         else:
             complete.add(key)
+        for event in matching:
+            if event.get("stage") in ("live", "replay", "consumer", "update"):
+                if event.get("values_sampled_at_sequence") != record["sequence"]:
+                    errors.append("cached source values have wrong BOUND sample reference")
+                for field in ("route", "backing_table_address", "table_values", "exact_lengths", "upper_lengths"):
+                    if event.get(field) != record.get(field):
+                        errors.append(f"cached source/BOUND {field} mismatch")
     expected_layers = document.get("draft_layer_names", [])
     if not expected_layers:
         missing.append("actual Draft layer inventory absent")
@@ -176,16 +281,35 @@ def audit_campaign(document: dict[str, Any]) -> dict[str, Any]:
         if set(expected_layers) != captured:
             missing.append(f"incomplete per-layer capture {key[2]}")
     for event in operands:
+        capture = capture_for(event)
+        if capture is None:
+            missing.append(f"operator has no preceding capture backing {event.get('capture_descriptor')}")
+        else:
+            for field in ("expected_table_address", "actual_table_address", "captured_table_address"):
+                same_backing(capture, event.get(field), f"operator/capture {field}")
+            if capture.get("route") != event.get("route"):
+                errors.append("operator/capture route mismatch")
+        if event.get("stage") == "capture_operator":
+            if event.get("generation_id") is not None or event.get("mapping_epoch") is not None:
+                errors.append("startup capture must not claim a runtime generation")
+            if capture and event.get("cpu_exact") != capture.get("exact_lengths"):
+                errors.append("capture operator/helper exact mismatch")
+        elif event.get("stage") != "update_operator":
+            errors.append("unknown operator stage")
         if event.get("stage") == "update_operator" and _generation(event) not in by_generation:
             errors.append("orphan update operator")
         elif event.get("stage") == "update_operator":
             bound_record = by_generation[_generation(event)]
+            for field in ("expected_table_address", "actual_table_address", "captured_table_address"):
+                same_backing(bound_record, event.get(field), f"operator/bound {field}")
+            if event["sequence"] <= bound_record["sequence"] or event.get("route") != bound_record.get("route"):
+                errors.append("operator/bound sequence or route mismatch")
             if event.get("cpu_exact") != bound_record.get("exact_lengths"):
                 errors.append("operator exact/generation lag")
             if event.get("length_kind") == "host_sequence" and event.get("length_values") != event.get("cpu_exact"):
                 errors.append("actual operator length differs from typed exact")
     oracle_results = []
-    for record in sections["g4_records"]:
+    for record in g4_by_generation.values():
         key = _generation(record)
         if key not in by_generation:
             errors.append("orphan G4 record")
@@ -198,10 +322,27 @@ def audit_campaign(document: dict[str, Any]) -> dict[str, Any]:
             continue
         try:
             count = len(raw["full_exact"])
-            assert count > 0 and all(
-                len(raw[k]) == count for k in ("full_upper", "valid_counts", "mapping", "request_ids")
+            _require(
+                count > 0
+                and all(len(raw[k]) == count for k in ("full_upper", "valid_counts", "mapping", "request_ids")),
+                "raw active row counts disagree",
             )
-            assert raw["source_identity"]["input_block_table_ptrs"][0] == record["canonical_table_address"]
+            _require(
+                raw["source_identity"]["input_block_table_ptrs"][0] == record["canonical_table_address"],
+                "canonical source identity mismatch",
+            )
+            source_event = by_generation[key]
+            same_backing(source_event, record.get("window_table_address"), "G4/bound")
+            _require(record["sequence"] > source_event["sequence"], "G4 must follow BOUND")
+            _require(record.get("route") == source_event.get("route"), "G4/bound route mismatch")
+            tables = (source_event["table_values"], record["window_table_values"])
+            for table in tables:
+                _require(isinstance(table, list) and len(table) >= count, "missing active table rows")
+                _require(all(isinstance(row, list) and row for row in table), "invalid table rows")
+                _require(all(v == 0 for row in table[count:] for v in row), "nonzero padded table row")
+            for field in ("exact_lengths", "upper_lengths"):
+                _require(len(source_event[field]) >= count, "missing active length rows")
+                _require(all(v == 0 for v in source_event[field][count:]), "nonzero padded length row")
             for row, exact in enumerate(raw["full_exact"]):
                 expected = oracle(
                     full_table=record["canonical_table_values"][row],
@@ -214,12 +355,16 @@ def audit_campaign(document: dict[str, Any]) -> dict[str, Any]:
                     query_width=raw["query_width"],
                     valid_block_count=raw["valid_counts"][row],
                 )
-                actual = record["window_table_values"][row]
-                assert actual[: expected.required_columns] == list(expected.expected_block_ids)
-                assert all(v == 0 for v in actual[expected.required_columns :])
-                source_event = by_generation[key]
-                assert source_event["exact_lengths"][row] == expected.visible_length
-                assert source_event["upper_lengths"][row] == expected.window_upper
+                # Active required columns must independently match BOTH samples.
+                # Extra zero capacity/padded rows may differ in snapshot shape.
+                for table in tables:
+                    _require(
+                        table[row][: expected.required_columns] == list(expected.expected_block_ids),
+                        "BOUND/G4 active table differs from canonical oracle",
+                    )
+                    _require(all(v == 0 for v in table[row][expected.required_columns :]), "nonzero active table tail")
+                _require(source_event["exact_lengths"][row] == expected.visible_length, "exact length mismatch")
+                _require(source_event["upper_lengths"][row] == expected.window_upper, "upper length mismatch")
                 oracle_results.append(
                     {
                         "generation": key,
@@ -230,7 +375,7 @@ def audit_campaign(document: dict[str, Any]) -> dict[str, Any]:
                         "columns": expected.expected_columns,
                     }
                 )
-        except (AssertionError, KeyError, TypeError, IndexError, ValueError, RuntimeError) as error:
+        except (KeyError, TypeError, IndexError, ValueError, RuntimeError) as error:
             errors.append(f"independent runtime oracle mismatch {key}: {error}")
     if bound and len(sections["g4_records"]) != len(bound):
         missing.append("G4/bound cardinality mismatch")
@@ -242,6 +387,9 @@ def audit_campaign(document: dict[str, Any]) -> dict[str, Any]:
         if any(f"reqs={n};tokens={tokens};" in str(key[2]) for key in complete):
             covered.add((n, tokens))
     result["actual_replay_buckets"] = sorted(covered)
+    result["required_replay_buckets"] = sorted(required_buckets)
+    result["missing_replay_buckets"] = sorted(required_buckets - covered)
+    result["missing_inventory_buckets"] = sorted(required_buckets - inventory)
     result["independent_oracle_rows"] = oracle_results
     result["HOST_A_B_A_CONTENT"] = check_aba(bound, sections["g4_records"])
     if not bound or not operands or not oracle_results:
@@ -266,16 +414,29 @@ def check_aba(bound, full_records):
     """
     if len(bound) < 3:
         return "OPEN"
-    a, b, last = bound[-3:]
-    source = {_generation(r): r.get("runtime_oracle_inputs") for r in full_records}
-    raw = [source.get(_generation(r)) for r in (a, b, last)]
-    if any(not r for r in raw):
+    if any(type(r.get("sequence")) is not int for r in bound):
+        return "FAIL"
+    ordered = sorted(bound, key=lambda r: r["sequence"])
+    if not _strict_runtime_order(ordered):
+        return "FAIL"
+    a, b, last = ordered[-3:]
+    errors = []
+    source = _unique_generations(full_records, "G4", errors)
+    if errors:
+        return "FAIL"
+    selected = [source.get(_generation(r)) for r in (a, b, last)]
+    if any(r is None for r in selected):
         return "OPEN"
-    if (
-        len({r.get("generation_id") for r in (a, b, last)}) != 3
-        or len({r.get("mapping_epoch") for r in (a, b, last)}) != 3
+    scope = a.get("record_scope")
+    if not isinstance(scope, dict) or any(
+        scope.get(k) is None for k in ("recorder_id", "process_id", "provider_identity")
     ):
         return "FAIL"
+    if any(r.get("record_scope") != scope for r in (a, b, last, *selected)):
+        return "FAIL"
+    raw = [r.get("runtime_oracle_inputs") for r in selected]
+    if any(not r for r in raw):
+        return "OPEN"
     for key in ("capture_descriptor", "backing_table_address"):
         if not a.get(key) or not (a[key] == b.get(key) == last.get(key)):
             return "OPEN"
@@ -759,7 +920,10 @@ def main():
         result = compare_fn(json.loads(args.left.read_text()), json.loads(args.right.read_text()))
         _write(args.output, result)
         return 0 if result["status"] == "PASS" else 2
-    result = audit_campaign(json.loads(args.artifact.read_text()))
+    try:
+        result = audit_campaign(json.loads(args.artifact.read_text()))
+    except (OSError, ValueError) as error:
+        result = _invalid_evidence(f"cannot decode artifact: {error}")
     _write(args.output, result)
     return 0 if result["DEVICE_FUNCTIONAL_GATES"]["fixed_inventory_replay"] == "PASS" else 2
 

@@ -2,6 +2,10 @@
 """No empty/vacuous evidence PASS; test-only records never become NPU proof."""
 
 import importlib.util
+import json
+import subprocess
+import sys
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -133,11 +137,49 @@ def _complete_host_fixture():
     sequence = 0
     for n in (1, 2, 4):
         desc = f"mode=FULL;reqs={n};tokens={n * 7};uniform=7"
+        snap["events"].append(
+            dict(
+                sequence=sequence,
+                stage="capture",
+                route="dflash",
+                capture_descriptor=desc,
+                generation_id=None,
+                mapping_epoch=None,
+                backing_table_address=200,
+                exact_lengths=[1] * n,
+            )
+        )
+        sequence += 1
+        for layer in doc["draft_layer_names"]:
+            snap["operand_events"].append(
+                dict(
+                    sequence=sequence,
+                    stage="capture_operator",
+                    route="dflash",
+                    capture_descriptor=desc,
+                    generation_id=None,
+                    mapping_epoch=None,
+                    provider_identity=9,
+                    backend_impl="FIA",
+                    consumer="FIA.out",
+                    layer_name=layer,
+                    actual_table_address=200,
+                    expected_table_address=200,
+                    captured_table_address=200,
+                    table_shape=[n, 9],
+                    table_dtype="int32",
+                    cpu_exact=[1] * n,
+                    evidence_level="HOST_OPERATOR_BOUNDARY_FACT",
+                )
+            )
+            sequence += 1
+        bound_sequence = sequence
         for stage in ("bound", "replay", "consumer", "update"):
             snap["events"].append(
                 dict(
                     sequence=sequence,
                     stage=stage,
+                    route="dflash",
                     capture_descriptor=desc,
                     generation_id=n,
                     mapping_epoch=n,
@@ -145,6 +187,7 @@ def _complete_host_fixture():
                     table_values=[[101, 102, 103, 104, 105, 106, 107, 108, 0]] * n,
                     exact_lengths=[1024] * n,
                     upper_lengths=[1024] * n,
+                    values_sampled_at_sequence=None if stage == "bound" else bound_sequence,
                 )
             )
             sequence += 1
@@ -153,6 +196,7 @@ def _complete_host_fixture():
                 dict(
                     sequence=sequence,
                     stage="update_operator",
+                    route="dflash",
                     capture_descriptor=desc,
                     generation_id=n,
                     mapping_epoch=n,
@@ -162,6 +206,7 @@ def _complete_host_fixture():
                     layer_name=layer,
                     actual_table_address=200,
                     expected_table_address=200,
+                    captured_table_address=200,
                     table_shape=[n, 9],
                     table_dtype="int32",
                     cpu_exact=[1024] * n,
@@ -169,24 +214,16 @@ def _complete_host_fixture():
                 )
             )
             sequence += 1
-            snap["operand_events"].append(
-                dict(
-                    snap["operand_events"][-1],
-                    sequence=sequence,
-                    stage="capture_operator",
-                    generation_id=None,
-                    mapping_epoch=None,
-                )
-            )
-            sequence += 1
         snap["g4_records"].append(
             dict(
                 sequence=sequence,
+                route="dflash",
                 generation_id=n,
                 mapping_epoch=n,
                 capture_descriptor=desc,
                 canonical_table_address=100,
                 canonical_table_values=[list(range(100, 120))] * n,
+                window_table_address=200,
                 window_table_values=[[101, 102, 103, 104, 105, 106, 107, 108, 0]] * n,
                 runtime_oracle_inputs=dict(
                     full_exact=[1152] * n,
@@ -222,11 +259,11 @@ def test_host_fixture_does_not_prove_task_physical_or_completion():
 def test_checker_rejects_lag_and_incomplete_actual_coverage(mutation):
     doc = _complete_host_fixture()
     if mutation == "lag":
-        doc["snapshot"]["operand_events"][0]["generation_id"] = 99
+        next(e for e in doc["snapshot"]["operand_events"] if e["stage"] == "update_operator")["generation_id"] = 99
     elif mutation == "table":
         doc["snapshot"]["g4_records"][0]["window_table_values"][0][0] = 100
     elif mutation == "length":
-        doc["snapshot"]["events"][0]["exact_lengths"] = [1023]
+        next(e for e in doc["snapshot"]["events"] if e["stage"] == "bound")["exact_lengths"] = [1023]
     elif mutation == "layer":
         doc["draft_layer_names"].append("layer.2")
     elif mutation == "source":
@@ -294,6 +331,7 @@ def test_aba_requires_distinct_epoch_and_semantic_source_lineage():
     tool = _tool()
     bound = [
         dict(
+            sequence=n * 10,
             generation_id=n,
             mapping_epoch=n,
             capture_descriptor="same",
@@ -301,6 +339,7 @@ def test_aba_requires_distinct_epoch_and_semantic_source_lineage():
             table_values=[[v]],
             exact_lengths=[1],
             upper_lengths=[1],
+            record_scope={"recorder_id": "r", "process_id": 1, "provider_identity": 9},
         )
         for n, v in [(10, 1), (11, 2), (12, 1)]
     ]
@@ -310,3 +349,304 @@ def test_aba_requires_distinct_epoch_and_semantic_source_lineage():
     bound[2]["mapping_epoch"] = 10
     records[2]["mapping_epoch"] = 10
     assert tool.check_aba(bound, records) == "FAIL"
+
+
+@pytest.mark.parametrize("stage", ["capture_operator", "update_operator"])
+@pytest.mark.parametrize("also_forge_captured_pointer", [False, True])
+def test_review_f1_matching_wrong_operand_addresses_cannot_authorize_backing(stage, also_forge_captured_pointer):
+    doc = _complete_host_fixture()
+    for event in doc["snapshot"]["operand_events"]:
+        if event["stage"] == stage:
+            event["actual_table_address"] = event["expected_table_address"] = 999
+            if also_forge_captured_pointer:
+                event["captured_table_address"] = 999
+    result = _tool().audit_campaign(doc)
+    assert result["EVIDENCE_INTEGRITY"] == "INVALID_EVIDENCE"
+
+
+def test_review_f2_bound_table_must_match_g4_and_independent_oracle():
+    doc = _complete_host_fixture()
+    bound = next(e for e in doc["snapshot"]["events"] if e["stage"] == "bound")
+    bound["table_values"] = deepcopy(bound["table_values"])
+    bound["table_values"][0][0] = 999
+    assert _tool().audit_campaign(doc)["EVIDENCE_INTEGRITY"] == "INVALID_EVIDENCE"
+
+
+def test_review_f3_duplicate_g4_does_not_cover_missing_generations():
+    doc = _complete_host_fixture()
+    records = doc["snapshot"]["g4_records"]
+    doc["snapshot"]["g4_records"] = [dict(deepcopy(records[0]), sequence=r["sequence"]) for r in records]
+    assert _tool().audit_campaign(doc)["EVIDENCE_INTEGRITY"] == "INVALID_EVIDENCE"
+
+
+def test_review_f4_aba_epochs_must_increase_not_merely_differ():
+    bound = [
+        dict(
+            sequence=i * 10,
+            generation_id=i + 10,
+            mapping_epoch=epoch,
+            capture_descriptor="same",
+            backing_table_address=100,
+            table_values=[[value]],
+            exact_lengths=[1],
+            upper_lengths=[1],
+            record_scope={"recorder_id": "r", "process_id": 1, "provider_identity": 9},
+        )
+        for i, (epoch, value) in enumerate([(30, 1), (20, 2), (10, 1)])
+    ]
+    raw = dict(source_identity={"table": 50}, full_exact=[1], full_upper=[1], valid_counts=[1], mapping=[0])
+    records = [dict(r, sequence=r["sequence"] + 1, runtime_oracle_inputs=raw) for r in bound]
+    assert _tool().check_aba(bound, records) == "FAIL"
+
+
+@pytest.mark.parametrize("field", ["window_table_address", "route"])
+def test_review_g4_must_resolve_bound_backing_and_route(field):
+    doc = _complete_host_fixture()
+    doc["snapshot"]["g4_records"][0][field] = 999
+    assert _tool().audit_campaign(doc)["EVIDENCE_INTEGRITY"] == "INVALID_EVIDENCE"
+
+
+@pytest.mark.parametrize("mutation", ["active", "tail", "padded_row", "padded_length", "missing_row"])
+def test_bound_oracle_validates_active_content_and_padding_even_if_cached_events_agree(mutation):
+    doc = _complete_host_fixture()
+    events = [e for e in doc["snapshot"]["events"] if e.get("generation_id") == 1]
+    for event in events:
+        event["table_values"] = deepcopy(event["table_values"])
+        if mutation == "active":
+            event["table_values"][0][0] = 999
+        elif mutation == "tail":
+            event["table_values"][0][-1] = 999
+        elif mutation == "padded_row":
+            event["table_values"].append([999] * 9)
+        elif mutation == "padded_length":
+            event["upper_lengths"] = [1024, 99]
+        else:
+            event["table_values"] = []
+    result = _tool().audit_campaign(doc)
+    assert result["EVIDENCE_INTEGRITY"] == "INVALID_EVIDENCE"
+    assert any("oracle mismatch" in error for error in result["errors"])
+
+
+def test_zero_extra_capacity_and_padded_rows_need_not_have_identical_shapes():
+    doc = _complete_host_fixture()
+    for record in doc["snapshot"]["g4_records"]:
+        record["window_table_values"] = [row + [0, 0] for row in record["window_table_values"]]
+        record["window_table_values"].append([0] * 11)
+    assert _tool().audit_campaign(doc)["HOST_CONTRACTS"] == "PASS"
+
+
+def test_single_boundary_bucket_is_valid_host_evidence_but_not_complete_smoke():
+    doc = _complete_host_fixture()
+    descriptor = "mode=FULL;reqs=1;tokens=7;uniform=7"
+    for section in ("events", "operand_events", "g4_records"):
+        doc["snapshot"][section] = [r for r in doc["snapshot"][section] if r["capture_descriptor"] == descriptor]
+    doc["draft_graph_keys"] = [[1, 7]]
+    result = _tool().audit_campaign(doc)
+    assert result["HOST_CONTRACTS"] == "PASS"
+    assert result["DEVICE_FUNCTIONAL_GATES"]["fixed_inventory_replay"] == "OPEN"
+    assert result["missing_replay_buckets"] == result["missing_inventory_buckets"] == [(2, 14), (4, 28)]
+
+
+@pytest.mark.parametrize("kind", ["duplicate_bound", "missing_g4", "orphan_g4", "cached_sample", "no_capture"])
+def test_generation_associations_never_pass_incomplete_evidence(kind):
+    doc = _complete_host_fixture()
+    snap = doc["snapshot"]
+    if kind == "duplicate_bound":
+        snap["events"].append(dict(next(e for e in snap["events"] if e["stage"] == "bound"), sequence=1000))
+    elif kind == "missing_g4":
+        snap["g4_records"].pop()
+    elif kind == "orphan_g4":
+        snap["g4_records"][0]["generation_id"] = 999
+    elif kind == "cached_sample":
+        next(e for e in snap["events"] if e["stage"] == "replay")["values_sampled_at_sequence"] = 999
+    else:
+        snap["events"] = [e for e in snap["events"] if e["stage"] != "capture"]
+    result = _tool().audit_campaign(doc)
+    assert result["HOST_CONTRACTS"] != "PASS"
+    assert result["DEVICE_FUNCTIONAL_GATES"]["fixed_inventory_replay"] != "PASS"
+
+
+def test_repeated_capture_helper_uses_preceding_sample_not_last_dictionary_entry():
+    doc = _complete_host_fixture()
+    # A later legal capture of the first descriptor must not authorize an
+    # earlier operand. Its startup lengths may have changed in between.
+    sample = next(e for e in doc["snapshot"]["events"] if e["stage"] == "capture")
+    doc["snapshot"]["events"].append(dict(sample, sequence=1000, exact_lengths=[2]))
+    assert _tool().audit_campaign(doc)["HOST_CONTRACTS"] == "PASS"
+    doc["snapshot"]["events"][-1]["backing_table_address"] = 999
+    assert _tool().audit_campaign(doc)["EVIDENCE_INTEGRITY"] == "INVALID_EVIDENCE"
+
+
+@pytest.mark.parametrize("field", ["generation_id", "mapping_epoch"])
+def test_runtime_order_is_strict_and_uses_sequence_not_json_array_order(field):
+    doc = _complete_host_fixture()
+    for section in ("events", "operand_events", "g4_records"):
+        for record in doc["snapshot"][section]:
+            if record.get("generation_id") is not None:
+                record[field] = 10 - record[field]
+    assert _tool().audit_campaign(doc)["EVIDENCE_INTEGRITY"] == "INVALID_EVIDENCE"
+    valid = _complete_host_fixture()
+    valid["snapshot"]["events"].reverse()
+    assert _tool().audit_campaign(valid)["HOST_CONTRACTS"] == "PASS"
+
+
+@pytest.mark.parametrize("field", ["record_scope", "capture_descriptor", "backing_table_address"])
+def test_aba_cannot_splice_different_owners_or_backings(field):
+    bound = [
+        dict(
+            sequence=n * 10,
+            generation_id=n,
+            mapping_epoch=n + 100,
+            capture_descriptor="same",
+            backing_table_address=100,
+            table_values=[[v]],
+            exact_lengths=[1],
+            upper_lengths=[1],
+            record_scope={"recorder_id": "r", "process_id": 1, "provider_identity": 9},
+        )
+        for n, v in ((1, 1), (3, 2), (8, 1))
+    ]
+    raw = dict(source_identity={"table": 50}, full_exact=[1], full_upper=[1], valid_counts=[1], mapping=[0])
+    records = [dict(r, sequence=r["sequence"] + 1, runtime_oracle_inputs=raw) for r in bound]
+    assert _tool().check_aba(bound, records) == "PASS"  # monotonic gaps permitted
+    bound[1][field] = {"provider_identity": 99} if field == "record_scope" else "other"
+    records[1][field] = bound[1][field]
+    assert _tool().check_aba(bound, records) != "PASS"
+
+
+@pytest.mark.parametrize("optimized", [False, True])
+@pytest.mark.parametrize("kind", ["valid", "wrong_address", "wrong_table", "truncated_json", "bad_shape", "null_root"])
+def test_check_cli_writes_explicit_report_even_under_optimization(tmp_path, optimized, kind):
+    doc = _complete_host_fixture()
+    if kind == "wrong_address":
+        doc["snapshot"]["operand_events"][0].update(actual_table_address=999, expected_table_address=999)
+    elif kind == "wrong_table":
+        doc["snapshot"]["g4_records"][0]["window_table_values"][0][0] = 999
+    elif kind == "bad_shape":
+        doc["snapshot"]["events"][0]["sequence"] = []
+    payload = "{" if kind == "truncated_json" else json.dumps(None if kind == "null_root" else doc)
+    artifact, output = tmp_path / "input.json", tmp_path / "result.json"
+    artifact.write_text(payload)
+    command = [
+        sys.executable,
+        *(["-O"] if optimized else []),
+        str(Path(_tool().__file__)),
+        "check",
+        str(artifact),
+        "--output",
+        str(output),
+    ]
+    result = subprocess.run(command, capture_output=True, text=True)
+    assert result.returncode == (0 if kind == "valid" else 2), result.stderr
+    report = json.loads(output.read_text())
+    assert report["EVIDENCE_INTEGRITY"] == ("PASS" if kind == "valid" else "INVALID_EVIDENCE")
+    assert report["DEVICE_EVIDENCE_LEVELS"]["physical_read"] == "OPEN"
+
+
+def test_real_recorder_snapshot_to_checker_preserves_generation_and_padding_contract():
+    import numpy as np
+
+    from tests.ut.spec_decode.test_draft_window_graph_carrier import _materialize
+    from tests.ut.spec_decode.test_draft_window_graph_characterization import (
+        _characterization_owner,
+        _install_metadata_builder,
+        _publish_eager_generation,
+        _runtime_context,
+    )
+    from vllm_ascend.attention.attention_v1 import (
+        AscendAttentionBackend,
+        AscendAttentionBackendImpl,
+        AscendAttentionMetadataBuilder,
+    )
+    from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
+        DraftWindowGraphRoute,
+        DraftWindowGraphStage,
+        build_draft_window_graph_update_binding,
+        consume_draft_window_graph_metadata,
+        observe_draft_window_graph_source,
+        validate_draft_window_graph_backend_update,
+    )
+    from vllm_ascend.worker.v2.spec_decode.draft_window_graph_characterization import (
+        install_parallel_draft_window_graph_characterization,
+        prepare_parallel_draft_window_graph_characterization,
+        record_parallel_graph_update_operator_operand,
+    )
+
+    owner, descriptor = _characterization_owner()
+    owner.input_batch.idx_mapping_np = np.array([1, 3])
+    owner.input_batch.seq_lens_cpu_upper_bound = np.array([96, 96])
+    owner.input_buffers.seq_lens[:2] = 96
+    owner.max_model_len = 512
+    session = install_parallel_draft_window_graph_characterization(owner, runtime_context=_runtime_context())
+    identity = session.provider.registered_capture_identities(route=DraftWindowGraphRoute.DFLASH)[0]
+    read = session.provider.startup_capture_read_inputs(identity)
+    session.recorder.record_capture(
+        identity=identity,
+        read_inputs=read,
+        slot_mapping=owner.block_tables.slot_mappings[0, :8],
+        positions=owner.input_buffers.positions[:8],
+        query_start_loc=owner.input_buffers.query_start_loc[:5],
+    )
+    layer_name = "draft.layers.0.self_attn"
+    session.recorder.record_capture_operand(
+        identity=identity,
+        block_table=read.window_block_table,
+        seq_lengths=read.cpu_window_exact.tolist(),
+        layer_name=layer_name,
+        num_tokens=8,
+        handle=None,
+        event=None,
+        stream=None,
+        backend_impl=AscendAttentionBackendImpl,
+    )
+    inputs = _materialize(
+        owner._draft_window_runtime_state, mapping_epoch=10, exact=(96, 96, 0, 0), upper=(98, 98, 0, 0)
+    )
+    _publish_eager_generation(owner, inputs)
+    _install_metadata_builder(owner)
+    carrier = prepare_parallel_draft_window_graph_characterization(owner, descriptor)
+    batch = consume_draft_window_graph_metadata(owner, route=DraftWindowGraphRoute.DFLASH, expected_consumer_count=1)
+    observe_draft_window_graph_source(owner, DraftWindowGraphStage.REPLAY)
+    observe_draft_window_graph_source(owner, DraftWindowGraphStage.CONSUMER)
+    binding = build_draft_window_graph_update_binding(
+        owner, route=DraftWindowGraphRoute.DFLASH, draft_attn_metadatas=list(batch)
+    )
+    validate_draft_window_graph_backend_update(
+        binding,
+        attn_backend=AscendAttentionBackend,
+        impl_cls=AscendAttentionBackendImpl,
+        builder_cls=AscendAttentionMetadataBuilder,
+        draft_attn_metadatas=list(batch),
+        update_function_path="vllm_ascend.compilation.acl_graph.update_full_graph_params",
+    )
+    layer = carrier.metadata[layer_name]
+    record_parallel_graph_update_operator_operand(
+        binding,
+        draft_metadata=carrier.metadata,
+        layer_name=layer_name,
+        captured_block_table=read.window_block_table,
+        actual_block_table=layer.block_tables,
+        seq_lengths=layer.seq_lens_list,
+        num_tokens=8,
+        handle=None,
+        event=None,
+        stream=None,
+        backend_impl=AscendAttentionBackendImpl,
+    )
+    doc = _empty()
+    doc["snapshot"] = session.recorder.snapshot()
+    doc["identity"]["process_id"] = doc["snapshot"]["process_id"]
+    doc.update(startup_complete=True, status="OK", draft_layer_names=[layer_name], draft_graph_keys=[[4, 8]])
+    result = _tool().audit_campaign(doc)
+    assert result["HOST_CONTRACTS"] == "PASS", json.dumps(result, indent=2)
+    # This real recorder CPU fixture is not the fixed server smoke inventory.
+    assert result["DEVICE_FUNCTIONAL_GATES"]["fixed_inventory_replay"] == "OPEN"
+    assert result["missing_replay_buckets"] == [(1, 7), (2, 14), (4, 28)]
+    assert result["DEVICE_EVIDENCE_LEVELS"]["completion_and_effective_generation"] == "OPEN"
+    update = next(e for e in doc["snapshot"]["events"] if e["stage"] == "update")
+    bound = next(e for e in doc["snapshot"]["events"] if e["stage"] == "bound")
+    assert update["values_sampled_at_sequence"] == bound["sequence"]
+    assert len(bound["table_values"]) == 4  # two active + two actual zero-padded rows
+    broken = deepcopy(doc)
+    broken["snapshot"]["operand_events"][-1].update(actual_table_address=999, expected_table_address=999)
+    assert _tool().audit_campaign(broken)["EVIDENCE_INTEGRITY"] == "INVALID_EVIDENCE"
