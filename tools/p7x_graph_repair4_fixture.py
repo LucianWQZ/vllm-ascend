@@ -40,6 +40,7 @@ import json
 import math
 import os
 import signal
+import struct
 import subprocess
 import sys
 import uuid
@@ -54,8 +55,8 @@ if TYPE_CHECKING:
     from torch import Tensor
 
 ROOT = Path(__file__).resolve().parents[1]
-SCHEMA = "p7x-repair4-fia-fixture-v1"
-MANIFEST_SCHEMA = "p7x-repair4-fia-manifest-v1"
+SCHEMA = "p7x-repair5-fia-fixture-v2"
+MANIFEST_SCHEMA = "p7x-repair5-fia-manifest-v2"
 BLOCK_SIZE = 128
 NUM_BLOCKS = 32
 HEAD_SIZE = 64
@@ -84,9 +85,7 @@ SOURCE_FILES = (
 API_REFERENCES = {
     "graphs_branch_only": "https://github.com/Ascend/pytorch/blob/v2.10.0/torch_npu/npu/graphs.py",
     "events_branch_only": "https://github.com/Ascend/pytorch/blob/v2.10.0/torch_npu/npu/streams.py",
-    "cann_version": (
-        "https://gitee.com/ascend/pytorch/blob/2b4108588b7bdf5b1c1c30d9b81004ba637605d1/torch_npu/npu/utils.py"
-    ),
+    "cann_version": "installed torch_npu.utils.get_cann_version; see runtime_evidence.api_sources",
 }
 BLOCKERS = {
     "G4F": "BLOCKED: no target model/head/logits or controlled target execution",
@@ -171,7 +170,16 @@ def cases() -> list[dict[str, Any]]:
     return [
         dict(control, label=label, generation=index + 1, epoch=index + 1)
         for index, (label, control) in enumerate(
-            (("A", a), ("B", b), ("A_prime", a), ("short", short), ("nonaligned", nonaligned))
+            (
+                ("A", a),
+                ("B", b),
+                ("A_prime", a),
+                ("short", short),
+                ("nonaligned", nonaligned),
+                ("outside_only", dict(a, v_perturbation={"page": 1, "delta": 8})),
+                ("inside_only", dict(a, v_perturbation={"page": 2, "delta": 2})),
+                ("A_restore", a),
+            )
         )
     ]
 
@@ -179,6 +187,23 @@ def cases() -> list[dict[str, Any]]:
 def value_at(page: int, offset: int, channel: int) -> float:
     # High tail sentinel makes a single stale-length token observable in FP16.
     return (512 if page == 31 else page) + offset / 256 + channel / 256
+
+
+def case_value(case: dict, page: int, offset: int, channel: int) -> float:
+    perturbation = case.get("v_perturbation", {})
+    return value_at(page, offset, channel) + (perturbation.get("delta", 0) if perturbation.get("page") == page else 0)
+
+
+def expected_value_hash(case: dict) -> str:
+    # Match actual FP16 values, not an ideal real-number hash.
+    values = [
+        [
+            [[struct.unpack("<e", struct.pack("<e", case_value(case, p, o, c)))[0] for c in range(HEAD_SIZE)]]
+            for o in range(BLOCK_SIZE)
+        ]
+        for p in range(NUM_BLOCKS)
+    ]
+    return digest(values)
 
 
 def full_table_oracle(case: dict[str, Any]) -> dict[str, Any]:
@@ -202,7 +227,7 @@ def full_table_oracle(case: dict[str, Any]) -> dict[str, Any]:
     tokens = [(table[pos // BLOCK_SIZE], pos % BLOCK_SIZE) for pos in range(start, exact)]
     columns = list(range(start // BLOCK_SIZE, (exact + BLOCK_SIZE - 1) // BLOCK_SIZE))
     require(len(columns) <= TABLE_WIDTH, "window exceeds fixture table capacity")
-    row = [sum(value_at(page, offset, d) for page, offset in tokens) / len(tokens) for d in range(HEAD_SIZE)]
+    row = [sum(case_value(case, page, offset, d) for page, offset in tokens) / len(tokens) for d in range(HEAD_SIZE)]
     return {
         "start": start,
         "length": len(tokens),
@@ -238,7 +263,7 @@ def scope() -> dict[str, Any]:
             "dtype": "float16",
             "reason": "predeclared input/output quantization budget; native FIA accuracy must pass on device",
         },
-        "outside_window_only_perturbation": "NOT_IMPLEMENTED",
+        "outside_window_only_perturbation": "IMPLEMENTED_PRIVATE_FIA_NUMERIC_ONLY",
         "blockers": dict(BLOCKERS),
         "ready": False,
         "api_references": dict(API_REFERENCES),
@@ -380,25 +405,33 @@ def tensor_spec(tensor: Any) -> dict[str, Any]:
 
 
 def api_source(function: Any) -> dict[str, Any]:
-    source_file = inspect.getsourcefile(function)
-    if source_file is None:
-        raise ValueError("API source file unavailable; exact source evidence is required")
-    lines, line = inspect.getsourcelines(function)
-    path = Path(source_file).resolve()
-    return {
-        "path": str(path),
-        "line": line,
-        "file_sha256": file_digest(path),
-        "source": "".join(lines),
-        "signature": str(inspect.signature(function)),
-    }
+    result: dict[str, Any] = {"signature": None, "source": None, "status": "PROVENANCE_LIMITED"}
+    try:
+        result["signature"] = str(inspect.signature(function))
+    except (TypeError, ValueError) as error:
+        result["signature_error"] = f"{type(error).__name__}: {error}"
+    try:
+        source_file = inspect.getsourcefile(function)
+        if source_file is None:
+            return result
+        lines, line = inspect.getsourcelines(function)
+        path = Path(source_file).resolve()
+        result.update(
+            path=str(path), line=line, file_sha256=file_digest(path), source="".join(lines), status="SOURCE_AVAILABLE"
+        )
+    except (TypeError, OSError) as error:
+        result["source_error"] = f"{type(error).__name__}: {error}"
+    return result
 
 
 def runtime_evidence(torch: Any, torch_npu: Any) -> dict[str, Any]:
     require(torch_npu.__version__.split("+")[0] == TORCH_NPU_VERSION, "requires torch_npu 2.10.0.post4")
     require(torch.__version__.split("+")[0] == "2.10.0", "requires torch 2.10.0")
     require(torch.npu.is_available() is True, "NPU unavailable; CPU fallback is forbidden")
-    cann = torch_npu.npu.get_cann_version()
+    version_api = getattr(getattr(torch_npu, "utils", None), "get_cann_version", None)
+    if not callable(version_api):
+        raise ValueError("CORE_CAPABILITY_MISSING: torch_npu.utils.get_cann_version")
+    cann = version_api()
     require(isinstance(cann, str) and re.match(r"^9\.1(?:\.|$)", cann) is not None, "requires reported CANN 9.1")
     functions = {
         "graph_task_group_begin": torch.npu.graph_task_group_begin,
@@ -412,7 +445,7 @@ def runtime_evidence(torch: Any, torch_npu: Any) -> dict[str, Any]:
         "ExternalEvent.wait": torch.npu.ExternalEvent.wait,
         "ExternalEvent.reset": torch.npu.ExternalEvent.reset,
         "ExternalEvent.record": torch.npu.ExternalEvent.record,
-        "get_cann_version": torch_npu.npu.get_cann_version,
+        "get_cann_version": version_api,
     }
     schema = str(torch.ops.npu.npu_fused_infer_attention_score.out._schema)
     require(
@@ -423,6 +456,9 @@ def runtime_evidence(torch: Any, torch_npu: Any) -> dict[str, Any]:
         "torch": torch.__version__,
         "torch_npu": torch_npu.__version__,
         "cann": cann,
+        "soc_version": torch_npu.npu.get_soc_version()
+        if callable(getattr(torch_npu.npu, "get_soc_version", None))
+        else None,
         "api_sources": {name: api_source(fn) for name, fn in functions.items()},
         "native_extension_sha256": file_digest(Path(torch_npu._C.__file__)),
         "fia_schema": schema,
@@ -664,6 +700,7 @@ class NPUFixture:
             dtype=torch.float16,
             device=self.device,
         )
+        self.baseline_v = self.v.clone()
         self.output = torch.empty_like(self.q)
         self.full_table = torch.empty((1, FULL_TABLE_WIDTH), dtype=torch.int32, device=self.device)
         self.slots = torch.arange(QUERY_WIDTH, dtype=torch.int64, device=self.device)
@@ -702,6 +739,9 @@ class NPUFixture:
     def stage(self, case: dict[str, Any]) -> None:
         torch = self.torch
         with torch.npu.stream(self.replay_stream):
+            self.v.copy_(self.baseline_v)
+            if perturbation := case.get("v_perturbation"):
+                self.v[perturbation["page"]].add_(perturbation["delta"])
             self.full_table.copy_(torch.tensor([case["full_table"]], dtype=torch.int32, device=self.device))
             self.binding.bind(case)
             self.output.fill_(float("nan"))  # a replay that does no work cannot pass
@@ -986,7 +1026,14 @@ def check_artifact(document: dict[str, Any], manifest: dict[str, Any]) -> dict[s
             and set(runtime["production_sources"]) == {"capture", "backend_update", "helper"},
             "missing exact API sources",
         )
-        for evidence in list(runtime["api_sources"].values()) + list(runtime["production_sources"].values()):
+        limited = []
+        for name, evidence in runtime["api_sources"].items():
+            if evidence.get("status") == "PROVENANCE_LIMITED":
+                require(evidence.get("source") is None, "fabricated native source")
+                limited.append(name)
+        result["api_provenance_limited"] = limited
+        evidence_to_check = [v for n, v in runtime["api_sources"].items() if n not in limited]
+        for evidence in evidence_to_check + list(runtime["production_sources"].values()):
             require(
                 isinstance(evidence["source"], str)
                 and bool(evidence["source"])
@@ -1114,7 +1161,12 @@ def check_artifact(document: dict[str, Any], manifest: dict[str, Any]) -> dict[s
                 all(abs(a - b) <= ABS_TOL for a, b in zip(actual, expected)),
                 f"{case['label']} measured output mismatches full-table oracle",
             )
-            require(record["controls"] == records[0]["controls"], "read-only fixture controls changed")
+            require(
+                {k: v for k, v in record["controls"].items() if k != "v"}
+                == {k: v for k, v in records[0]["controls"].items() if k != "v"},
+                "read-only fixture controls changed",
+            )
+            require(record["controls"]["v"] == expected_value_hash(case), "actual V differs from complete control")
             require(
                 all(
                     isinstance(record["controls"][name], str)
@@ -1132,6 +1184,9 @@ def check_artifact(document: dict[str, Any], manifest: dict[str, Any]) -> dict[s
             outputs.append(actual)
         require(any(abs(a - b) > 10 * ABS_TOL for a, b in zip(outputs[0], outputs[1])), "A/B not distinguishable")
         require(all(abs(a - b) <= ABS_TOL for a, b in zip(outputs[0], outputs[2])), "A_prime did not restore A")
+        require(all(abs(a - b) <= ABS_TOL for a, b in zip(outputs[0], outputs[5])), "outside-only numeric interference")
+        require(any(abs(a - b) > 10 * ABS_TOL for a, b in zip(outputs[0], outputs[6])), "inside perturbation invisible")
+        require(all(abs(a - b) <= ABS_TOL for a, b in zip(outputs[0], outputs[7])), "final A restore failed")
         result.update(
             fixture="PASS",
             effective_inputs="A/B/A_prime measured by independent numerical oracle",

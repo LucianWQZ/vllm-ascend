@@ -30,7 +30,7 @@ def test_tolerance_is_frozen_in_manifest_and_outside_only_control_not_claimed():
     scope = manifest()["scope"]
     assert scope["numerical_acceptance"]["atol"] == fixture.ABS_TOL
     assert scope["numerical_acceptance"]["rtol"] == 0
-    assert scope["outside_window_only_perturbation"] == "NOT_IMPLEMENTED"
+    assert scope["outside_window_only_perturbation"] == "IMPLEMENTED_PRIVATE_FIA_NUMERIC_ONLY"
 
 
 def test_fp16_input_and_output_rounding_fit_predeclared_tolerance():
@@ -39,7 +39,9 @@ def test_fp16_input_and_output_rounding_fit_predeclared_tolerance():
     for case in fixture.cases():
         oracle = fixture.full_table_oracle(case)
         points = [(case["full_table"][pos // 128], pos % 128) for pos in range(oracle["start"], case["exact"])]
-        values = torch.tensor([[fixture.value_at(p, o, c) for c in range(64)] for p, o in points], dtype=torch.float64)
+        values = torch.tensor(
+            [[fixture.case_value(case, p, o, c) for c in range(64)] for p, o in points], dtype=torch.float64
+        )
         quantized = values.half().double()
         # This quantization bound does not prove native FIA accumulation accuracy.
         rounded_output = quantized.mean(dim=0).half().double()
@@ -174,7 +176,7 @@ def synthetic_document(expected):
                     "query_locs": [0, 7],
                     "q": "a" * 64,
                     "k": "b" * 64,
-                    "v": "c" * 64,
+                    "v": fixture.expected_value_hash(case),
                 },
             }
         )
@@ -184,7 +186,9 @@ def synthetic_document(expected):
 def test_primary_base7_geometry_and_independent_full_table_oracle():
     assert (fixture.QUERY_WIDTH, fixture.WINDOW_SIZE, fixture.BLOCK_SIZE) == (7, 1024, 128)
     assert (fixture.CAPACITY_TOKENS, fixture.TABLE_WIDTH) == (1151, 9)
-    a, b, again, short, nonaligned = [fixture.full_table_oracle(c) for c in fixture.cases()]
+    a, b, again, short, nonaligned, outside, inside, restored = [fixture.full_table_oracle(c) for c in fixture.cases()]
+    assert outside["output"] == a["output"] == restored["output"]
+    assert abs(inside["output"][0][0][0] - a["output"][0][0][0]) > 10 * fixture.ABS_TOL
     assert (a["start"], a["length"], b["start"], b["length"]) == (128, 1024, 256, 1024)
     assert a["output"] == again["output"] != b["output"]
     assert a["output"][0][0][0] == 5.5 + 127 / 512
@@ -369,7 +373,7 @@ def test_replay_update_last_consumer_completion_order():
     assert document["status"] == "COMPLETE"
     assert (
         adapter.calls
-        == ["stage", "replay_then_consumer_event", "update_then_update_event", "complete_both", "snapshot"] * 5
+        == ["stage", "replay_then_consumer_event", "update_then_update_event", "complete_both", "snapshot"] * 8
     )
 
 
@@ -425,7 +429,7 @@ def test_cli_help_and_dry_run_are_standalone_host_only():
     assert payload["status"] == "DRY_RUN_NOT_DEVICE_EVIDENCE"
     assert payload["scope"]["geometry"]["q"] == [7, 2, 64]
     assert payload["scope"]["ready"] is False
-    assert len(payload["cases"]) == 5
+    assert len(payload["cases"]) == 8
 
 
 def test_npu_run_rejects_cpu_before_launch(tmp_path):

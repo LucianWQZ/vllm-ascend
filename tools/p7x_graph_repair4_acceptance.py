@@ -685,7 +685,7 @@ def audit_joint(document, launcher, request_bytes, expected):
             _require(
                 isinstance(request.get("prompts"), list)
                 and request["prompts"]
-                and all(isinstance(p, str) and p for p in request["prompts"]),
+                and all(valid_prompt(p) for p in request["prompts"]),
                 "invalid prompts",
             )
             labels.append(request["label"])
@@ -742,6 +742,9 @@ def audit_joint(document, launcher, request_bytes, expected):
                     all(isinstance(p, list) and p and all(type(t) is int and t >= 0 for t in p) for p in prompts),
                     "missing prompt tokens",
                 )
+                for submitted, used in zip(request["prompts"], prompts):
+                    if isinstance(submitted, dict):
+                        _require(submitted["prompt_token_ids"] == used, "submitted/used token IDs differ")
                 _require(
                     all(
                         isinstance(t, list) and len(t) == 16 and all(type(x) is int and x >= 0 for x in t)
@@ -759,6 +762,19 @@ def audit_joint(document, launcher, request_bytes, expected):
     except (KeyError, TypeError, ValueError, IndexError) as error:
         result["errors"].append(str(error))
     return result
+
+
+def valid_prompt(prompt):
+    """Pinned vLLM TokensPrompt subset: no ambiguous/multimodal inputs here."""
+    if isinstance(prompt, str):
+        return bool(prompt.strip())
+    return (
+        isinstance(prompt, dict)
+        and set(prompt) == {"prompt_token_ids"}
+        and isinstance(prompt["prompt_token_ids"], list)
+        and bool(prompt["prompt_token_ids"])
+        and all(type(token) is int and token >= 0 for token in prompt["prompt_token_ids"])
+    )
 
 
 def audit_abort(document, manifest):

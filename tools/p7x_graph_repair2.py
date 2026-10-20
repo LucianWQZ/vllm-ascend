@@ -957,7 +957,7 @@ def run_case(args):
         "task_trace": None,
         "physical_read_trace": None,
     }
-    llm = session = target_probe = full_target_probe = None
+    llm = session = target_probe = full_target_probe = lifecycle_probe = None
     additional = {} if args.case == "A0" else {"draft_window_size": 1024}
     config = dict(
         model=args.target_model,
@@ -982,6 +982,19 @@ def run_case(args):
     record["llm_kwargs"] = config
     _write(output / "progress.json", {"identity": identity, "phase": "BEFORE_STARTUP"})
     try:
+        if getattr(args, "repair5_controlled_target", False) or getattr(args, "repair5_lifecycle", False):
+            tool_spec = importlib.util.spec_from_file_location("_repair5", ROOT / "tools/p7x_graph_repair5.py")
+            if tool_spec is None or tool_spec.loader is None:
+                raise RuntimeError("Repair5 capability tool missing")
+            repair5 = importlib.util.module_from_spec(tool_spec)
+            tool_spec.loader.exec_module(repair5)
+            import torch
+            import torch_npu
+
+            capability = repair5.capability(torch, torch_npu)
+            _write(output / "capability.json", capability)
+            if capability["status"] != "EXECUTION_APIS_AVAILABLE":
+                raise RuntimeError("CORE_CAPABILITY_MISSING before model load")
         llm = LLM(**config)
         core = llm.llm_engine.engine_core.engine_core
         runner = core.model_executor.driver_worker.worker.model_runner
@@ -1026,6 +1039,29 @@ def run_case(args):
         if args.target_probe:
             target_probe = TargetBoundaryProbe(runner, output)
             target_probe.install()
+        if getattr(args, "repair5_lifecycle", False):
+            lifecycle = repair5.load_tool("p7x_graph_repair5_lifecycle")
+            lifecycle_probe = lifecycle.MRV2LifecycleProbe(
+                spec, output / "mrv2-lifecycle.json", identity, abort_at=args.repair5_abort_at
+            )
+            lifecycle_probe.__enter__()
+        if getattr(args, "repair5_controlled_target", False):
+            controlled = repair5.load_tool("p7x_graph_repair5_target")
+            fixture = controlled.ControlledTarget(
+                runner,
+                fixture_id=hashlib.sha256(args.fixture_manifest.read_bytes()).hexdigest(),
+                arm="OFF" if args.case == "A0" else "ON",
+                scheduler=core.scheduler,
+                identity=identity,
+            )
+            fixture.execute(output / "controlled-target.pt", include_draft=args.repair5_controlled_mrv2)
+            record["controlled_target_numeric"] = {
+                "artifact": "controlled-target.pt",
+                "kind": "FULL_TARGET_CONTROLLED_SYNTHETIC_KV",
+                "status": "EXECUTED_SCOPED_NOT_GATE_CLOSURE",
+            }
+            # A disposable engine is never returned to serving after diagnostic KV staging.
+            requests = []
         if getattr(args, "full_target_probe", False):
             adapter_spec = importlib.util.spec_from_file_location(
                 "_repair4_full_target", ROOT / "tools/p7x_graph_repair4_target.py"
@@ -1082,6 +1118,11 @@ def run_case(args):
         )
         # Preserve original exception. Cleanup/artifact errors are separate fields.
     finally:
+        if lifecycle_probe is not None:
+            try:
+                lifecycle_probe.__exit__(None, None, None)
+            except Exception as error:
+                record["lifecycle_probe_error"] = repr(error)
         if full_target_probe is not None:
             try:
                 full_target_probe.__exit__(None, None, None)
@@ -1114,6 +1155,12 @@ def run_case(args):
         except Exception as error:
             record["artifact_collection_error"] = repr(error)
         _write(output / "campaign.json", record)
+        if lifecycle_probe is not None and lifecycle_probe.poisoned:
+            # Diagnostic child only: uncertain submission is never reused or
+            # fed to normal engine teardown. External launch/watchdog owns it.
+            record["diagnostic_quarantine"] = "PROCESS_EXIT_74_NO_REUSE"
+            _write(output / "campaign.json", record)
+            os._exit(74)
         if llm is not None:
             try:
                 llm.llm_engine.engine_core.shutdown()
@@ -1208,6 +1255,26 @@ def main():
     run.add_argument("--requests", type=Path)
     run.add_argument("--target-probe", action="store_true", help="extra D2H after capture; not for timing")
     run.add_argument(
+        "--repair5-controlled-target",
+        action="store_true",
+        help="exclusive no-request engine; deterministic actual Target Graph/KV fixture",
+    )
+    run.add_argument(
+        "--repair5-controlled-mrv2",
+        action="store_true",
+        help="also invoke actual speculator.propose from each controlled Target state",
+    )
+    run.add_argument(
+        "--repair5-lifecycle",
+        action="store_true",
+        help="ordinary-event serialized diagnostic on real MRV2 path; observer ON required",
+    )
+    run.add_argument(
+        "--repair5-abort-at",
+        default="none",
+        choices=("none", "before_replay", "after_replay", "after_update", "after_completion"),
+    )
+    run.add_argument(
         "--full-target-probe", action="store_true", help="actual target FULL forward/KV checkpoints after capture"
     )
     run.add_argument("--full-target-max-bytes", type=int, default=536870912, help="hard per-record CPU payload budget")
@@ -1215,6 +1282,13 @@ def main():
         "--full-target-max-records", type=int, default=4, help="hard retained-record bound; omissions reported"
     )
     args = parser.parse_args()
+    if args.command == "run":
+        if args.repair5_controlled_mrv2 and not (
+            args.repair5_controlled_target and (args.case == "A0" or args.repair5_lifecycle)
+        ):
+            parser.error("controlled MRV2 requires controlled Target; Window ON also requires lifecycle")
+        if args.repair5_abort_at != "none" and not args.repair5_lifecycle:
+            parser.error("abort requires lifecycle in disposable child supervised by launch")
     if args.command == "launch":
         return launch_case(args)
     if args.command == "compare-probes":

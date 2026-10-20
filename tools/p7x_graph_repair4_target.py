@@ -506,10 +506,8 @@ class LiveTargetAdapter(FullForwardCheckpointer):
                 _view(getattr(batch, name)) == _view(getattr(r.input_buffers, name)[:n]),
                 f"{name} is not the captured input buffer view",
             )
-        names = sorted({name for groups in r.attn_groups for group in groups for name in group.layer_names})
-        configured = {name for group in r.kv_cache_config.kv_cache_groups for name in group.layer_names}
-        draft_names = set(getattr(r.speculator, "draft_attn_layer_names", ()))
-        _require(set(names) == configured - draft_names and bool(names), "target layer inventory incomplete")
+        inventory = target_inventory(r)
+        names = inventory["target_layers"]
         context = r.compilation_config.static_forward_context
         metadata = r.model_state.attn_metadata
         _require(set(names) <= metadata.keys(), "missing target attention metadata")
@@ -637,6 +635,7 @@ class LiveTargetAdapter(FullForwardCheckpointer):
             "selected_block_ids": block_ids,
             "target_layer_names": names,
             "pinned_vllm_contract": PINNED_VLLM,
+            "inventory": inventory,
         }
         return inputs, kv_access, slots, block_ids, declared_reads
 
@@ -706,6 +705,34 @@ class LiveTargetAdapter(FullForwardCheckpointer):
                 delattr(owner, name)
         self._saved.clear()
         self._batch = None
+
+
+def target_inventory(runner: Any) -> dict:
+    """Derive execution ownership from model objects, not the shared registry size.
+
+    Qwen3ForCausalLM owns its Attention modules. The registry and AttentionGroups
+    also contain the independently constructed draft model. Captured K/V tasks
+    are checked separately by _boundary; module membership alone is not capture.
+    """
+    context = runner.compilation_config.static_forward_context
+    configured_list = [n for g in runner.kv_cache_config.kv_cache_groups for n in g.layer_names]
+    grouped = {n for groups in runner.attn_groups for g in groups for n in g.layer_names}
+    _require(len(configured_list) == len(set(configured_list)), "duplicate configured layer")
+    configured = set(configured_list)
+    _require(grouped == configured and configured <= context.keys(), "registry/config/group mismatch")
+    modules = {id(module) for module in runner.model.modules()}
+    names = {name for name in configured if id(context[name]) in modules}
+    draft = set(getattr(runner.speculator, "draft_attn_layer_names", ()))
+    _require(bool(names) and not names & draft, "empty target or draft bound to target model")
+    _require(names | draft == configured, "unowned configured layer or missing target module")
+    _require(len({id(context[name]) for name in names}) == len(names), "aliased target layer registration")
+    return {
+        "registered_layers": sorted(context),
+        "configured_layers": sorted(configured),
+        "draft_layers": sorted(draft),
+        "target_layers": sorted(names),
+        "ownership_basis": "actual_target_model_module_identity",
+    }
 
 
 def main() -> int:

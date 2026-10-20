@@ -347,6 +347,7 @@ def live_fixture(monkeypatch):
     impl._use_max_workspace_for_fia_graph = False
     impl._use_layer_aware_fia_graph_replay = False
     layer = SimpleNamespace(kv_cache=(k, v), impl=impl)
+    runner.model = SimpleNamespace(modules=lambda: iter([layer]))
     runner.block_tables = SimpleNamespace(slot_mappings=torch.tensor([[0, 1]]))
     metadata = SimpleNamespace(
         causal=True,
