@@ -245,6 +245,9 @@ def scope() -> dict[str, Any]:
         "update": "update_full_graph_params -> AscendAttentionBackendImpl.update_graph_params",
         "binding": "FullDraftKVSource -> P3.materialize -> P6.bind/consume -> build_draft_window_graph_update_binding",
         "geometry": {
+            "method": "dspark",
+            "static_k": QUERY_WIDTH,
+            "sample_from_anchor": True,
             "q": [QUERY_WIDTH, NUM_HEADS, HEAD_SIZE],
             "kv": [NUM_BLOCKS, BLOCK_SIZE, 1, HEAD_SIZE],
             "table": [1, TABLE_WIDTH],
@@ -530,7 +533,8 @@ class ProductionBinding:
             query_width=QUERY_WIDTH,
             padded_request_count=1,
             padded_token_count=QUERY_WIDTH,
-            static_k=QUERY_WIDTH - 1,
+            # Base DSpark uses sample_from_anchor=True: actual queries == K.
+            static_k=QUERY_WIDTH,
             window_size=WINDOW_SIZE,
             logical_block_size=BLOCK_SIZE,
             kernel_block_size=BLOCK_SIZE,

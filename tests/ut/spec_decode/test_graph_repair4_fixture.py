@@ -467,6 +467,8 @@ def test_real_p3_p6_binding_on_host_owned_buffers():
         metadata=AscendMetadata(attn_state=AscendAttentionState.SpecDecoding),
     )
     binding = fixture.ProductionBinding(owner)
+    # DSpark Base uses sample_from_anchor=True: K == query width, not K+1.
+    assert binding.capture_identity.fingerprint.static_k == 7
     addresses = (owner.table.data_ptr(), owner.length.data_ptr())
     for case in fixture.cases():
         owner.full_table.copy_(torch.tensor([case["full_table"]]))
