@@ -957,7 +957,18 @@ def run_case(args):
         "task_trace": None,
         "physical_read_trace": None,
     }
-    llm = session = target_probe = full_target_probe = lifecycle_probe = None
+    llm = session = target_probe = full_target_probe = lifecycle_probe = profile_probe = None
+    profile_mode = getattr(args, "repair5_profile", "none")
+    capture_profile = getattr(args, "repair5_capture_profile", "base")
+    if profile_mode != "none" and (
+        args.target_probe
+        or args.full_target_probe
+        or args.repair5_controlled_target
+        or (args.repair5_lifecycle and profile_mode != "life")
+        or (not args.repair5_lifecycle and profile_mode == "life")
+        or (profile_mode != "life" and args.case not in ("A0", "B-observer-off"))
+    ):
+        raise ValueError("profiling requires observer-OFF/no heavy diagnostics, except explicit LIFE profile")
     additional = {} if args.case == "A0" else {"draft_window_size": 1024}
     config = dict(
         model=args.target_model,
@@ -977,11 +988,25 @@ def run_case(args):
         },
         additional_config=additional,
         disable_log_stats=True,
-        compilation_config={"cudagraph_mode": "FULL_DECODE_ONLY", "cudagraph_capture_sizes": [7, 14, 28]},
+        compilation_config={
+            "cudagraph_mode": "FULL_DECODE_ONLY",
+            "cudagraph_capture_sizes": [7, 14, 28] if capture_profile == "base" else [7, 14, 28, 32],
+        },
     )
     record["llm_kwargs"] = config
+    record["capture_profile"] = capture_profile
+    record["config_sha256"] = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()
     _write(output / "progress.json", {"identity": identity, "phase": "BEFORE_STARTUP"})
     try:
+        if profile_mode != "none":
+            import torch_npu
+
+            from tools.p7x_graph_repair5_profile import preflight
+
+            profile_capability = preflight(torch_npu)
+            _write(output / "profile-capability.json", profile_capability)
+            if profile_capability["status"] != "APIS_AVAILABLE_DEVICE_NOT_RUN":
+                raise RuntimeError("profiler capability unavailable before model load")
         if getattr(args, "repair5_controlled_target", False) or getattr(args, "repair5_lifecycle", False):
             tool_spec = importlib.util.spec_from_file_location("_repair5", ROOT / "tools/p7x_graph_repair5.py")
             if tool_spec is None or tool_spec.loader is None:
@@ -995,7 +1020,9 @@ def run_case(args):
             _write(output / "capability.json", capability)
             if capability["status"] != "EXECUTION_APIS_AVAILABLE":
                 raise RuntimeError("CORE_CAPABILITY_MISSING before model load")
+        initialization_start = time.monotonic()
         llm = LLM(**config)
+        record["initialization_seconds"] = time.monotonic() - initialization_start
         core = llm.llm_engine.engine_core.engine_core
         runner = core.model_executor.driver_worker.worker.model_runner
         spec = runner.speculator
@@ -1011,6 +1038,9 @@ def run_case(args):
         record["draft_inventory"] = _manager_inventory(spec.query_cudagraph_manager)
         record["draft_graph_keys"] = [[d["num_reqs"], d["num_tokens"]] for d in record["draft_inventory"]["graphs"]]
         record["draft_layer_names"] = list(spec.draft_attn_layer_names)
+        target_keys = {(d["num_reqs"], d["num_tokens"]) for d in record["target_inventory"]["graphs"]}
+        if capture_profile == "target4" and not {(1, 8), (2, 16), (4, 32)} <= target_keys:
+            raise RuntimeError("Target4 declared capture inventory not realized")
         record["startup_complete"] = True
         _write(
             output / "progress.json",
@@ -1042,7 +1072,7 @@ def run_case(args):
         if getattr(args, "repair5_lifecycle", False):
             lifecycle = repair5.load_tool("p7x_graph_repair5_lifecycle")
             lifecycle_probe = lifecycle.MRV2LifecycleProbe(
-                spec, output / "mrv2-lifecycle.json", identity, abort_at=args.repair5_abort_at
+                spec, output / "mrv2-lifecycle.json", identity, abort_at=args.repair5_abort_at, campaign=record
             )
             lifecycle_probe.__enter__()
         if getattr(args, "repair5_controlled_target", False):
@@ -1053,6 +1083,7 @@ def run_case(args):
                 arm="OFF" if args.case == "A0" else "ON",
                 scheduler=core.scheduler,
                 identity=identity,
+                profile=capture_profile,
             )
             fixture.execute(output / "controlled-target.pt", include_draft=args.repair5_controlled_mrv2)
             record["controlled_target_numeric"] = {
@@ -1083,6 +1114,22 @@ def run_case(args):
                 max_records=args.full_target_max_records,
             )
             full_target_probe.__enter__()
+        if profile_mode != "none":
+            from tools.p7x_graph_repair5_profile import RequestProfiler
+
+            profile_probe = RequestProfiler(
+                runner, output, identity, enabled=profile_mode != "control", diagnostic=profile_mode == "life"
+            )
+            profile_probe.__enter__()
+            request = requests[0]
+            with profile_probe.group("warmup/" + request["label"]):
+                warmup = llm.generate(
+                    request["prompts"],
+                    SamplingParams(temperature=0.0, seed=0, ignore_eos=True, max_tokens=16),
+                    use_tqdm=False,
+                )
+            record["warmup"] = {"label": request["label"], "token_ids": [r.outputs[0].token_ids for r in warmup]}
+            profile_probe.begin_active()
         # Fixed 1/2/4 requests are attempts; checker requires actual descriptor events.
         for request in requests:
             _write(
@@ -1090,11 +1137,14 @@ def run_case(args):
                 {"identity": identity, "phase": "BEFORE_GENERATE", "request": request["label"]},
             )
             start = time.monotonic_ns()
-            results = llm.generate(
-                request["prompts"],
-                SamplingParams(temperature=0.0, seed=0, ignore_eos=True, max_tokens=request["max_tokens"]),
-                use_tqdm=False,
-            )
+            from contextlib import nullcontext
+
+            with profile_probe.group(request["label"]) if profile_probe is not None else nullcontext():
+                results = llm.generate(
+                    request["prompts"],
+                    SamplingParams(temperature=0.0, seed=0, ignore_eos=True, max_tokens=request["max_tokens"]),
+                    use_tqdm=False,
+                )
             record["outputs"].append(
                 {
                     "label": request["label"],
@@ -1118,6 +1168,11 @@ def run_case(args):
         )
         # Preserve original exception. Cleanup/artifact errors are separate fields.
     finally:
+        if profile_probe is not None:
+            try:
+                profile_probe.__exit__(None, None, None)
+            except Exception as error:
+                record["profile_probe_error"] = repr(error)
         if lifecycle_probe is not None:
             try:
                 lifecycle_probe.__exit__(None, None, None)
@@ -1154,6 +1209,16 @@ def run_case(args):
                 record["snapshot"] = json.loads((output / "partial.json").read_text())
         except Exception as error:
             record["artifact_collection_error"] = repr(error)
+        from tools.p7x_graph_repair5_evidence import file_sha
+
+        try:
+            record["diagnostic_artifacts"] = {
+                p.name: {"sha256": file_sha(p), "bytes": p.stat().st_size}
+                for p in (output / "controlled-target.pt", output / "mrv2-lifecycle.json", output / "profile.json")
+                if p.is_file()
+            }
+        except OSError as error:
+            record["diagnostic_artifact_error"] = repr(error)
         _write(output / "campaign.json", record)
         if lifecycle_probe is not None and lifecycle_probe.poisoned:
             # Diagnostic child only: uncertain submission is never reused or
@@ -1254,6 +1319,13 @@ def main():
         run.add_argument(f"--{name}", required=True, type=Path)
     run.add_argument("--requests", type=Path)
     run.add_argument("--target-probe", action="store_true", help="extra D2H after capture; not for timing")
+    run.add_argument("--repair5-capture-profile", choices=("base", "target4"), default="base")
+    run.add_argument(
+        "--repair5-profile",
+        choices=("none", "normal", "control", "life"),
+        default="none",
+        help="request-stage torch_npu profiler, never propose(is_profile=True)",
+    )
     run.add_argument(
         "--repair5-controlled-target",
         action="store_true",

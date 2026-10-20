@@ -23,7 +23,7 @@ import torch
 
 
 class MRV2LifecycleProbe:
-    def __init__(self, speculator: Any, output: Path, identity: dict, *, abort_at: str = "none"):
+    def __init__(self, speculator: Any, output: Path, identity: dict, *, abort_at: str = "none", campaign=None):
         if abort_at not in ("none", "before_replay", "after_replay", "after_update", "after_completion"):
             raise ValueError("unknown abort point")
         self.owner, self.manager = speculator, speculator.query_cudagraph_manager
@@ -33,6 +33,7 @@ class MRV2LifecycleProbe:
         self.current: dict | None = None
         self.consumer_event = None
         self.poisoned = False
+        self.campaign = campaign
 
     def _flush(self):
         temporary = self.output.with_suffix(".tmp")
@@ -48,12 +49,22 @@ class MRV2LifecycleProbe:
                     "abort_at": self.abort_at,
                     "quarantined": self.poisoned,
                     "clock_domain": "host_monotonic_ns_NOT_device",
+                    "draft_layer_names": sorted(self.owner.draft_attn_layer_names),
+                    "event_producer": "MRV2LifecycleProbe:ordinary_Event_after_replay_and_update:v2",
+                    "recorder": self.owner._draft_window_graph_characterization.recorder.snapshot(),
                 },
                 indent=2,
             )
             + "\n"
         )
         temporary.replace(self.output)
+        if self.poisoned and self.campaign is not None:
+            partial = dict(
+                self.campaign,
+                status="ABORT_PARTIAL",
+                snapshot=self.owner._draft_window_graph_characterization.recorder.snapshot(),
+            )
+            self.output.with_name("abort-campaign.json").write_text(json.dumps(partial, indent=2) + "\n")
 
     def _abort(self, point: str):
         if self.abort_at != point:
@@ -143,6 +154,10 @@ class MRV2LifecycleProbe:
                 complete_ns=time.monotonic_ns(),
                 update_event=id(update_event),
                 update_stream=int(probe.manager.update_stream.npu_stream),
+                consumer_event_kind="torch.npu.Event",
+                update_event_kind="torch.npu.Event",
+                consumer_observation="record_after_replay_then_synchronize_then_query",
+                update_observation="record_on_update_stream_then_synchronize_then_query",
             )
             count = probe.owner.input_batch.num_reqs
             tokens = probe.owner.draft_tokens[:count]
@@ -196,6 +211,7 @@ class MRV2LifecycleProbe:
 
 
 def check_lifecycle(document: dict) -> dict:
+    """Low-level structure ONLY; final acceptance requires the CLI external join."""
     result: dict[str, Any] = {
         "status": "INVALID_EVIDENCE",
         "normal_overlap": "UNPROVEN",
@@ -207,12 +223,27 @@ def check_lifecycle(document: dict) -> dict:
         if document["quarantined"] or document["abort_at"] != "none":
             result["status"] = "QUARANTINED_NOT_NORMAL_PASS"
             return result
-        if not all(document["identity"].get(k) is not None for k in ("run_id", "case_id", "attempt_id")):
-            raise ValueError("missing run/case/attempt")
+        if not all(
+            document["identity"].get(k) is not None
+            for k in (
+                "run_id",
+                "case_id",
+                "attempt_id",
+                "source_sha",
+                "source_tree",
+                "process_id",
+                "engine_id",
+                "driver_mode",
+            )
+        ):
+            raise ValueError("missing run/source/process identity")
+        if document["event_producer"] != "MRV2LifecycleProbe:ordinary_Event_after_replay_and_update:v2":
+            raise ValueError("unknown completion observation producer")
         seen = set()
         previous = None
         provider = None
-        generation = -1
+        generation = epoch = -1
+        backings: dict[tuple[int, ...], dict] = {}
         for record in document["records"]:
             key = (record["provider"], record["generation"], record["epoch"])
             if key in seen:
@@ -220,9 +251,77 @@ def check_lifecycle(document: dict) -> dict:
             seen.add(key)
             if provider is None:
                 provider = record["provider"]
-            if record["provider"] != provider or record["generation"] <= generation or not record["backing"]:
+            if (
+                record["provider"] != provider
+                or type(record["generation"]) is not int
+                or type(record["epoch"]) is not int
+                or record["generation"] <= generation
+                or record["epoch"] <= epoch
+            ):
                 raise ValueError("provider/generation/backing mismatch")
-            generation = record["generation"]
+            generation, epoch = record["generation"], record["epoch"]
+            desc = record["descriptor"]
+            if desc not in ([1, 7], [2, 14], [4, 28]):
+                raise ValueError("unsupported Draft descriptor")
+            backing = record["backing"]
+            if type(backing["owner_id"]) is not int or backing["owner_id"] <= 0:
+                raise ValueError("missing backing owner")
+            for name in (
+                "window_block_table",
+                "valid_num_blocks",
+                "device_window_exact",
+                "cpu_window_exact",
+                "cpu_window_upper",
+            ):
+                value = backing[name]
+                if (
+                    type(value["data_ptr"]) is not int
+                    or value["data_ptr"] <= 0
+                    or type(value["storage_data_ptr"]) is not int
+                    or value["storage_data_ptr"] <= 0
+                    or not value["dtype"]
+                    or not value["device"]
+                    or not value["shape"]
+                    or len(value["stride"]) != len(value["shape"])
+                    or any(type(n) is not int or n <= 0 for n in value["shape"])
+                    or type(value["storage_offset"]) is not int
+                    or value["storage_offset"] < 0
+                ):
+                    raise ValueError("invalid tensor backing")
+            key_desc = tuple(desc)
+            if key_desc in backings and backings[key_desc] != backing:
+                raise ValueError("descriptor backing changed")
+            backings[key_desc] = backing
+            if (
+                backing["window_block_table"]["shape"][0] != desc[0]
+                or backing["device_window_exact"]["shape"] != [desc[0]]
+                or backing["cpu_window_exact"]["shape"] != [desc[0]]
+                or backing["cpu_window_upper"]["shape"] != [desc[0]]
+            ):
+                raise ValueError("backing shape differs from descriptor")
+            for kind in ("consumer", "update"):
+                if (
+                    type(record[f"{kind}_event"]) is not int
+                    or record[f"{kind}_event"] <= 0
+                    or type(record[f"{kind}_stream"]) is not int
+                    or record[f"{kind}_stream"] < 0
+                    or record[f"{kind}_event_kind"] != "torch.npu.Event"
+                ):
+                    raise ValueError("missing ordinary event/stream provenance")
+            if (
+                record["consumer_observation"] != "record_after_replay_then_synchronize_then_query"
+                or record["update_observation"] != "record_on_update_stream_then_synchronize_then_query"
+            ):
+                raise ValueError("unknown completion observation")
+            active = record["active_requests"]
+            if (
+                type(active) is not int
+                or not 0 < active <= desc[0]
+                or record["token_shape"] != [active, 7]
+                or len(record["draft_tokens"]) != active
+                or any(len(row) != 7 or any(type(t) is not int or t < 0 for t in row) for row in record["draft_tokens"])
+            ):
+                raise ValueError("active requests/token geometry mismatch")
             if (
                 record["completion"] != "DIAGNOSTIC_COMPLETE"
                 or not record["retired"]
@@ -240,10 +339,14 @@ def check_lifecycle(document: dict) -> dict:
                     "retirement_return_ns",
                 )
             ]
-            if times != sorted(times) or (previous is not None and times[0] <= previous):
+            if (
+                any(type(t) is not int or t <= 0 for t in times)
+                or times != sorted(times)
+                or (previous is not None and times[0] <= previous)
+            ):
                 raise ValueError("invalid diagnostic order/reuse")
             previous = times[-1]
-        result.update(status="PASS_DIAGNOSTIC_SERIALIZED", generations=len(seen))
+        result.update(status="STRUCTURE_VALID_NOT_EXECUTION_ACCEPTED", generations=len(seen))
     except (KeyError, TypeError, ValueError) as error:
         result["error"] = str(error)
     return result

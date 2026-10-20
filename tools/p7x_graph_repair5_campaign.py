@@ -4,7 +4,7 @@
 
 Use the resulting argv arrays or commands.sh AFTER publication and independent
 network source verification. Dependency failures stop descendants, not unrelated
-private fixtures. No trace rerun is scheduled without a new capability.
+private fixtures. Normal profiling is separate from physical-read evidence.
 """
 
 import argparse
@@ -12,6 +12,7 @@ import hashlib
 import json
 import shlex
 from pathlib import Path
+from typing import Any
 
 FIXTURE_SHA = "1c485bc43a6e8f6d0d83c1dc6ebfd0fb9bb1f31a8ad9e498ef1d3e9d562e7cd4"
 
@@ -34,6 +35,7 @@ def build_plan(
     repair5 = str(repo / "tools/p7x_graph_repair5.py")
     acceptance = str(repo / "tools/p7x_graph_repair4_acceptance.py")
     cases: dict = {}
+    case: Any
     cases["P0"] = {
         "dependencies": [],
         "timeout_seconds": 60,
@@ -185,6 +187,7 @@ def build_plan(
         entry = json.loads(json.dumps(cases["LIFE"]))
         entry["dependencies"] = ["LIFE"]
         entry["case_id"] = name
+        entry["outputs"] = str(output / name)
         entry.pop("check_argv")
         entry["acceptance_identity"]["case_id"] = name
         for key in ("argv", "launch_argv"):
@@ -248,6 +251,149 @@ def build_plan(
             str(output / "LIFE/lifecycle-check.json"),
         ]
     ]
+    # Independent Target4 and profiling experiments retain the original Base.
+    for arm in ("OFF", "ON"):
+        source = cases[f"G4F_{arm}"]
+        name = f"TARGET4_{arm}"
+        entry = json.loads(json.dumps(source))
+        entry["case_id"] = entry["acceptance_identity"]["case_id"] = name
+        entry["outputs"] = str(output / name)
+        # Base's absent four-row Target bucket is expected OPEN, not a
+        # prerequisite PASS for the independently captured extension.
+        entry["dependencies"] = ["A0"] if arm == "OFF" else ["B0", "C2"]
+        for key in ("argv", "launch_argv"):
+            entry[key] = [a.replace(f"G4F_{arm}", name) for a in entry[key]]
+            entry[key] += ["--repair5-capture-profile", "target4"]
+        entry.pop("additional_checks", None)
+        entry["profile"] = "target4_[7,14,28,32]_NOT_BASE"
+        cases[name] = entry
+    for arm, source in (("OFF", "A0"), ("ON", "O0")):
+        for length, request_name in (("short", "smoke"), ("long", "combined")):
+            for capture in ("control", "normal"):
+                name = f"PROFILE_{arm}_{length}_{capture}"
+                entry = json.loads(json.dumps(cases[source]))
+                entry["case_id"] = entry["acceptance_identity"]["case_id"] = name
+                entry["dependencies"] = ["B0"]
+                entry["outputs"] = str(output / name)
+                entry["request_path"] = str(inputs / "requests" / f"{request_name}.json")
+                entry["requests_sha256"] = hashlib.sha256(Path(entry["request_path"]).read_bytes()).hexdigest()
+                for key in ("argv", "launch_argv"):
+                    argv = entry[key]
+                    argv = [
+                        a.replace(str(output / source), str(output / name)).replace(
+                            str(output / "launchers" / source), str(output / "launchers" / name)
+                        )
+                        if str(output) in a
+                        else a
+                        for a in argv
+                    ]
+                    # --case-id occurs twice in supervised argv; --case mode stays baseline.
+                    for i, value in enumerate(argv):
+                        if value == "--case-id":
+                            argv[i + 1] = name
+                        if value == "--requests":
+                            argv[i + 1] = entry["request_path"]
+                    entry[key] = argv + ["--repair5-profile", capture]
+                entry.pop("check_argv", None)
+                entry["acceptance"] = "normal request joint + profile replay/cost inventory; no physical read claim"
+                cases[name] = entry
+    name = "PROFILE_LIFE"
+    entry = json.loads(json.dumps(cases["LIFE"]))
+    entry["case_id"] = entry["acceptance_identity"]["case_id"] = name
+    entry["outputs"] = str(output / name)
+    for key in ("argv", "launch_argv"):
+        entry[key] = [
+            a.replace(str(output / "LIFE"), str(output / name)).replace(
+                str(output / "launchers/LIFE"), str(output / "launchers" / name)
+            )
+            if str(output) in a
+            else name
+            if a == "LIFE"
+            else a
+            for a in entry[key]
+        ]
+        entry[key] += ["--repair5-profile", "life"]
+    entry["dependencies"] = ["LIFE"]
+    cases[name] = entry
+
+    def diagnostic(name, kind, filename):
+        return [
+            python,
+            repair5,
+            "check-diagnostic",
+            "--kind",
+            kind,
+            "--input",
+            str(output / name / filename),
+            "--campaign",
+            str(output / name / ("abort-campaign.json" if kind == "abort" else "campaign.json")),
+            "--launcher",
+            str(output / "launchers" / name / "launcher.json"),
+            "--plan",
+            str(output / "case-plan.json"),
+            "--case-id",
+            name,
+            "--output",
+            str(output / name / f"{kind}-joint.json"),
+        ]
+
+    for name, case in cases.items():
+        if name.startswith("ABORT_"):
+            case["check_argv"] = diagnostic(name, "abort", "mrv2-lifecycle.json")
+        elif name.startswith(("G4F_", "TARGET4_")):
+            case["check_argv"] = diagnostic(name, "target", "controlled-target.pt")
+            case["additional_checks"] = [diagnostic(name, "aba", "controlled-target.pt")] if name.endswith("ON") else []
+        elif name in ("LIFE", "PROFILE_LIFE"):
+            case["lifecycle_coverage"] = {
+                "descriptors": [[1, 7], [2, 14], [4, 28]],
+                "minimum_generations_per_descriptor": 2,
+            }
+            case["check_argv"] = diagnostic(name, "lifecycle", "mrv2-lifecycle.json")
+            case["additional_checks"] = []
+        elif name.startswith("PROFILE_"):
+            case["check_argv"] = [
+                python,
+                acceptance,
+                "check-joint",
+                str(output / name / "campaign.json"),
+                "--launcher",
+                str(output / "launchers" / name / "launcher.json"),
+                "--requests",
+                case["request_path"],
+                "--plan",
+                str(output / "case-plan.json"),
+                "--case-id",
+                name,
+                "--output",
+                str(output / name / "joint.json"),
+            ]
+        if name.startswith("PROFILE_"):
+            case.setdefault("additional_checks", []).append(diagnostic(name, "profile", "profile.json"))
+        if name.startswith("PROFILE_") and not name.endswith("_control"):
+            case.setdefault("additional_checks", []).append(
+                [
+                    python,
+                    str(repo / "tools/p7x_graph_repair5_profile.py"),
+                    "analyze",
+                    "--input",
+                    str(output / name / "trace"),
+                    "--output",
+                    str(output / name / "trace-analysis.json"),
+                ]
+            )
+    for prefix in ("G4F", "TARGET4"):
+        cases[f"{prefix}_ON"]["additional_checks"].append(
+            [
+                python,
+                repair5,
+                "compare-target",
+                str(output / f"{prefix}_OFF/controlled-target.pt"),
+                str(output / f"{prefix}_ON/controlled-target.pt"),
+                "--output",
+                str(output / f"{prefix}-paired.json"),
+            ]
+        )
+
     # Emit executable references in dependency order, including the independent
     # private C2 before its consumers. A failed branch must not erase its siblings.
     ordered: dict = {}
@@ -268,9 +414,9 @@ def build_plan(
         "publication_required": True,
         "device_execution": "NOT_RUN",
         "cases": ordered,
-        "trace": "NO_REPEAT_WITHOUT_NEW_FIELDS; task operands/physical reads require external capability",
+        "trace": "NORMAL_SCHEDULING_AND_COST_REQUIRED; NO_REPEAT_AS_STRONGER_PHYSICAL_PROOF_WITHOUT_NEW_FIELDS",
         "limits": {
-            "max_records_controlled": 11,
+            "max_records_controlled": {"base": 11, "target4": 12},
             "per_checkpoint_bytes": 536870912,
             "controlled_output_disk_budget_bytes": 17179869184,
             "watchdog_required": True,

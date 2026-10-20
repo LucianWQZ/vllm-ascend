@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -48,9 +49,10 @@ def require(ok: bool, message: str) -> None:
         raise ValueError(message)
 
 
-def case_plan() -> list[dict]:
+def case_plan(profile="base") -> list[dict]:
     # Query width is TARGET's K+1=8, not Draft's seven. No bucket is manufactured.
-    return [
+    require(profile in ("base", "target4"), "unknown capture profile")
+    cases = [
         {"scenario": name, "step": i, "ends": ends, "padded": padded, "query_width": 8}
         for i, (name, ends, padded) in enumerate(
             (
@@ -68,6 +70,11 @@ def case_plan() -> list[dict]:
             )
         )
     ]
+    if profile == "target4":
+        cases.append(
+            dict(scenario="four-active", step=len(cases), ends=[32, 1024, 1152, 1153], padded=4, query_width=8)
+        )
+    return cases
 
 
 def sample_identity(case: dict, fixture_id: str) -> dict:
@@ -90,9 +97,17 @@ def outside_digest(caches: dict, selected: dict) -> dict:
     for name, tensor in caches.items():
         included = set(selected[name].tolist())
         digest = hashlib.sha256()
-        for block in range(tensor.shape[0]):
-            if block not in included:
-                digest.update(tensor[block].detach().cpu().contiguous().view(torch.uint8).numpy().tobytes())
+        # Preserve the v1 byte stream exactly: ascending unselected blocks.
+        # One bounded contiguous D2H per chunk instead of one per block.
+        chunk_blocks = max(1, (8 * 1024 * 1024) // (tensor[0].numel() * tensor.element_size()))
+        for start in range(0, tensor.shape[0], chunk_blocks):
+            stop = min(start + chunk_blocks, tensor.shape[0])
+            if all(b in included for b in range(start, stop)):
+                continue
+            host = tensor[start:stop].detach().cpu().contiguous()
+            for b in range(start, stop):
+                if b not in included:
+                    digest.update(memoryview(host[b - start].view(torch.uint8).numpy()))
         result[name] = {"sha256": digest.hexdigest(), "blocks": tensor.shape[0] - len(included)}
     return result
 
@@ -109,7 +124,7 @@ def logical_kv(snapshot: dict, block_owners: dict[int, tuple]) -> dict:
 
 
 class ControlledTarget:
-    def __init__(self, runner: Any, *, fixture_id: str, arm: str, scheduler: Any, identity: dict):
+    def __init__(self, runner: Any, *, fixture_id: str, arm: str, scheduler: Any, identity: dict, profile="base"):
         require(arm in ("OFF", "ON"), "invalid arm")
         # Explicit scheduler emptiness is necessary; this is not a live checkpoint.
         require(
@@ -126,11 +141,47 @@ class ControlledTarget:
             "missing run/source identity",
         )
         self.identity = dict(identity)
-        self.probe = self.base.LiveTargetAdapter(runner, fixture_id=fixture_id, max_records=len(case_plan()))
+        self.profile = profile
+        self.cases = case_plan(profile)
+        self.probe = self.base.LiveTargetAdapter(runner, fixture_id=fixture_id, max_records=len(self.cases))
         self.probe._validate_runner()
         self.inventory = self.base.target_inventory(runner)
         self.records: list[dict] = []
-        self.cases = case_plan()
+        self.deadline = time.monotonic() + 3300
+        self.disk_budget = 16 * 1024**3
+
+    def _budget(self, output):
+        require(time.monotonic() < self.deadline, "controlled diagnostic time budget exceeded")
+        require(
+            sum(p.stat().st_size for p in output.parent.glob("*") if p.is_file()) <= self.disk_budget,
+            "controlled diagnostic disk budget exceeded",
+        )
+
+    def _save(self, result, output):
+        """Enforce byte/time limits during serialization, not only afterwards."""
+        self._budget(output)
+        used = sum(p.stat().st_size for p in output.parent.glob("*") if p.is_file())
+        remaining = self.disk_budget - used
+        deadline = self.deadline
+        partial = output.with_suffix(".pt.partial")
+        with partial.open("wb") as stream:
+
+            class BoundedWriter:
+                def __init__(self):
+                    self.total = 0
+
+                def write(self, data):
+                    if self.total + len(data) > remaining or time.monotonic() >= deadline:
+                        raise OSError("controlled serialization budget exceeded; partial retained")
+                    count = stream.write(data)
+                    self.total += count
+                    return count
+
+                def flush(self):
+                    stream.flush()
+
+            torch.save(result, BoundedWriter())
+        partial.replace(output)
 
     def _stage(self, case: dict):
         from vllm.config.compilation import CUDAGraphMode
@@ -221,6 +272,7 @@ class ControlledTarget:
     def execute(self, output: Path, *, include_draft: bool = False) -> dict:
         result = {
             "schema": SCHEMA,
+            "capture_profile": self.profile,
             "identity": self.identity,
             "execution_device": str(self.runner.device),
             "arm": self.arm,
@@ -236,6 +288,8 @@ class ControlledTarget:
         output.parent.mkdir(parents=True, exist_ok=True)
         try:
             for case in self.cases:
+                self._budget(output)
+                started = time.monotonic()
                 record = {
                     "identity": sample_identity(case, self.fixture_id),
                     "status": "PREPARING",
@@ -246,9 +300,19 @@ class ControlledTarget:
                 try:
                     self.probe._synchronize()
                     desc, batch, owners = self._stage(case)
+                    record["target_geometry"] = {
+                        "descriptor": [desc.num_reqs, desc.num_tokens],
+                        "active": batch.num_reqs,
+                        "padded": desc.num_reqs,
+                        "query_layout": batch.query_start_loc_np.tolist(),
+                    }
+                    record["timings_seconds"] = {"stage": time.monotonic() - started}
                     inputs, access, slots, blocks, reads = self.probe._boundary(desc, batch)
+                    hash_start = time.monotonic()
                     record["outside_before"] = outside_digest(access(), blocks)
+                    record["timings_seconds"]["outside_hash_before"] = time.monotonic() - hash_start
                     # Calls the actual ModelAclGraphManager, not compute_logits.
+                    forward_start = time.monotonic()
                     hidden = self.probe.run(
                         lambda desc=desc: self.runner.cudagraph_manager.run_fullgraph(desc),
                         inputs=inputs,
@@ -259,13 +323,16 @@ class ControlledTarget:
                         block_ids=blocks,
                         declared_reads=reads,
                     )
+                    record["timings_seconds"]["forward_with_checkpoint_and_sync"] = time.monotonic() - forward_start
                     checkpoint = self.probe.records[-1]
                     require(checkpoint["status"] == "CAPTURED", "incomplete Target checkpoint")
                     record["checkpoint"] = checkpoint
                     record["block_owners"] = owners
                     record["logical_pre_kv"] = logical_kv(checkpoint["kv_before"], owners)
                     record["logical_post_kv"] = logical_kv(checkpoint["kv_after"], owners)
+                    hash_start = time.monotonic()
                     record["outside_after"] = outside_digest(access(), blocks)
+                    record["timings_seconds"]["outside_hash_after"] = time.monotonic() - hash_start
                     actual_hidden = hidden[0] if isinstance(hidden, tuple) else hidden
                     record["hidden"] = actual_hidden[: batch.num_tokens].detach().cpu().clone()
                     record["logits"] = (
@@ -309,13 +376,18 @@ class ControlledTarget:
                         record["draft_semantics"] = f"Window {self.arm}; draft values NOT compared OFF/ON"
                         session = getattr(spec, "_draft_window_graph_characterization", None)
                         record["draft_snapshot"] = None if session is None else session.recorder.snapshot()
+                        if session is not None:
+                            record["draft_geometry"] = draft_geometry(spec, record["draft_snapshot"], nr)
                         require(
                             self.runner.model_state.attn_metadata is target_root, "Draft replaced Target metadata owner"
                         )
+                        hash_start = time.monotonic()
+                        outside_after_draft = outside_digest(access(), blocks)
+                        record["timings_seconds"]["outside_hash_after_draft"] = time.monotonic() - hash_start
                         record["target_after_draft"] = {
                             "kv": self.base._snapshot(access(), [self.probe.max_bytes], blocks),
                             "inputs": self.base._snapshot(inputs, [self.probe.max_bytes]),
-                            "outside": outside_digest(access(), blocks),
+                            "outside": outside_after_draft,
                             "root_same": True,
                             "draft_slots": spec.block_tables.slot_mappings[0, : nr * 7].detach().cpu().clone(),
                             "draft_positions": spec.input_buffers.positions[: nr * 7].detach().cpu().clone(),
@@ -332,11 +404,34 @@ class ControlledTarget:
                     record.update(status="EXECUTION_FAILED", error=f"{type(error).__name__}: {error}")
                     raise
                 finally:
-                    torch.save(result, output)
+                    record.setdefault("timings_seconds", {})["before_dump"] = time.monotonic() - started
+                    self._budget(output)
+                    dump_start = time.monotonic()
+                    self._save(result, output)
+                    record["timings_seconds"]["dump"] = time.monotonic() - dump_start
+                    self._budget(output)
             result["device_verification"] = "EXECUTED_SCOPED_NOT_GATE_CLOSURE"
         finally:
-            torch.save(result, output)
+            self._save(result, output)
         return result
+
+
+def draft_geometry(spec, snapshot, active):
+    """Use the executed binding, not Target padding or a guessed descriptor."""
+    g4 = snapshot["g4_records"][-1]
+    bound = [e for e in snapshot["events"] if e["stage"] == "bound" and e["generation_id"] == g4["generation_id"]]
+    require(len(bound) == 1, "missing unique Draft binding")
+    parts = dict(p.split("=", 1) for p in bound[0]["capture_descriptor"].split(";"))
+    padded, tokens = int(parts["reqs"]), int(parts["tokens"])
+    return {
+        "descriptor": [padded, tokens],
+        "active": active,
+        "padded": padded,
+        "query_layout": spec.input_buffers.query_start_loc[: padded + 1].detach().cpu().tolist(),
+        "generation": g4["generation_id"],
+        "epoch": g4["mapping_epoch"],
+        "source_identity": g4["runtime_oracle_inputs"]["source_identity"],
+    }
 
 
 def _tensor_equal(a: Any, b: Any) -> bool:
@@ -439,6 +534,26 @@ def validate_controlled_record(record: dict) -> dict:
     return semantics
 
 
+def check_collection(document):
+    result = {"status": "INVALID_EVIDENCE", "numeric_off_on": "NOT_ASSESSED", "records": []}
+    try:
+        require(document["schema"] == SCHEMA, "wrong collection schema")
+        cases = case_plan(document.get("capture_profile", "base"))
+        require(document["cases"] == cases and len(document["records"]) == len(cases), "incomplete plan")
+        for case, record in zip(cases, document["records"]):
+            require(record["identity"] == sample_identity(case, document["fixture_id"]), "wrong sample identity")
+            if record["status"] == "BLOCKED":
+                result["records"].append("BLOCKED")
+                continue
+            require(record["status"] == "CAPTURED_COMPLETE", "producer incomplete")
+            validate_controlled_record(record)
+            result["records"].append("VALID")
+        result["status"] = "OPEN" if "BLOCKED" in result["records"] else "SINGLE_ARM_STRUCTURE_VALID"
+    except (KeyError, TypeError, ValueError) as error:
+        result["error"] = str(error)
+    return result
+
+
 def compare_collections(a: dict, b: dict) -> dict:
     result: dict[str, Any] = {
         "schema": SCHEMA,
@@ -449,7 +564,10 @@ def compare_collections(a: dict, b: dict) -> dict:
     }
     try:
         require(a["schema"] == b["schema"] == SCHEMA and a["arm"] == "OFF" and b["arm"] == "ON", "schema/arm mismatch")
-        require(a["fixture_id"] == b["fixture_id"] and a["cases"] == b["cases"] == case_plan(), "plan/fixture mismatch")
+        profile = a.get("capture_profile", "base")
+        require(profile == b.get("capture_profile", "base"), "cross-profile comparison")
+        cases = case_plan(profile)
+        require(a["fixture_id"] == b["fixture_id"] and a["cases"] == b["cases"] == cases, "plan/fixture mismatch")
         require(
             all(
                 a["identity"][k] == b["identity"][k] and a["identity"][k]
@@ -463,7 +581,7 @@ def compare_collections(a: dict, b: dict) -> dict:
             "tolerance changed",
         )
         require(a["inventory"] == b["inventory"], "model inventory mismatch")
-        expected = {json.dumps(sample_identity(c, a["fixture_id"]), sort_keys=True) for c in case_plan()}
+        expected = {json.dumps(sample_identity(c, a["fixture_id"]), sort_keys=True) for c in cases}
         indices = []
         for doc in (a, b):
             index = {}
@@ -563,11 +681,12 @@ def check_mrv2_aba(document: dict) -> dict:
     result: dict[str, Any] = {"status": "INVALID_EVIDENCE", "physical_read": "OPEN", "normal_overlap": "UNPROVEN"}
     try:
         require(document["schema"] == SCHEMA and document["arm"] == "ON", "not controlled Window ON")
-        require(document["cases"] == case_plan(), "incomplete declared plan")
+        cases = case_plan(document.get("capture_profile", "base"))
+        require(document["cases"] == cases, "incomplete declared plan")
         records = document["records"]
-        require(len(records) == len(case_plan()), "missing/extra generation")
+        require(len(records) == len(cases), "missing/extra generation")
         require(
-            [r["identity"] for r in records] == [sample_identity(c, document["fixture_id"]) for c in case_plan()],
+            [r["identity"] for r in records] == [sample_identity(c, document["fixture_id"]) for c in cases],
             "wrong scenario order/identity",
         )
         a, b, again = records[:3]
@@ -595,11 +714,29 @@ def check_mrv2_aba(document: dict) -> dict:
             raw = g4["runtime_oracle_inputs"]
             target_inputs = _base()._snapshot_value(record["checkpoint"]["inputs"])
             canonical = next(iter(target_inputs["layers"].values()))["block_tables"].tolist()
+            geometry = record["draft_geometry"]
+            active, padded = geometry["active"], geometry["padded"]
             require(
-                g4["canonical_table_values"][: record["identity"]["padded"]] == canonical,
+                active == record["identity"]["active"]
+                and padded in (1, 2, 4)
+                and padded == next(n for n in (1, 2, 4) if n >= active)
+                and geometry["descriptor"] == [padded, padded * 7],
+                "wrong executed Draft geometry",
+            )
+            require(
+                geometry["generation"] == g4["generation_id"] and geometry["epoch"] == g4["mapping_epoch"],
+                "Draft geometry generation mismatch",
+            )
+            require(
+                geometry["query_layout"][: active + 1] == [i * 7 for i in range(active + 1)],
+                "Draft active query layout differs",
+            )
+            require(
+                g4["canonical_table_values"][:active] == canonical[:active],
                 "Draft source differs from controlled canonical Target table",
             )
             require(raw["source_identity"] is not None, "missing canonical provenance")
+            require(geometry["source_identity"] == raw["source_identity"], "Draft lineage mismatch")
             require(raw["request_ids"] == record["identity"]["logical_requests"], "wrong logical request")
             ends = [p[-1] + 1 + 7 for p in record["identity"]["positions"]]
             require(
@@ -621,7 +758,9 @@ def check_mrv2_aba(document: dict) -> dict:
                 e for e in snapshot["events"] if e["stage"] == "bound" and e["generation_id"] == g4["generation_id"]
             ]
             require(len(events) == 1 and events[0]["mapping_epoch"] == g4["mapping_epoch"], "missing/duplicate bind")
-            padded = record["identity"]["padded"]
+            require(
+                all(not any(row) for row in g4["window_table_values"][active:padded]), "nonzero padded Draft read table"
+            )
             lengths = expected_exact + [0] * (padded - len(ends))
             require(
                 events[0]["exact_lengths"] == lengths and events[0]["upper_lengths"] == lengths,

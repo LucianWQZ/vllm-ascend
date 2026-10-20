@@ -8,7 +8,6 @@ No command enables the public graph gate. Device commands never fall back to CPU
 from __future__ import annotations
 
 import argparse
-import hashlib
 import importlib.util
 import json
 import sys
@@ -104,8 +103,104 @@ def main() -> int:
     for name in ("input", "launcher", "plan", "output"):
         abort.add_argument("--" + name, type=Path, required=True)
     abort.add_argument("--case-id", required=True)
+    joint = sub.add_parser("check-diagnostic", help="external frozen-plan/launcher/campaign + diagnostic")
+    joint.add_argument("--kind", choices=("target", "aba", "lifecycle", "abort", "profile"), required=True)
+    for name in ("input", "campaign", "launcher", "plan", "output"):
+        joint.add_argument("--" + name, type=Path, required=True)
+    joint.add_argument("--case-id", required=True)
     args = parser.parse_args()
-    if args.command == "capabilities":
+    if args.command == "check-diagnostic":
+        evidence = load_tool("p7x_graph_repair5_evidence")
+        import torch
+
+        document = (
+            torch.load(args.input, weights_only=True, map_location="cpu")
+            if args.kind in ("target", "aba")
+            else json.loads(args.input.read_text())
+        )
+        campaign = json.loads(args.campaign.read_text())
+        launcher = json.loads(args.launcher.read_text())
+        expected = json.loads(args.plan.read_text())["cases"][args.case_id]
+        execution = evidence.audit_execution(
+            document, campaign, launcher, expected, args.input, abort=args.kind == "abort"
+        )
+        result = {"status": execution["status"], "execution": execution}
+        if execution["status"] == "EXECUTION_ASSOCIATED":
+            if args.kind in ("target", "aba"):
+                target = load_tool("p7x_graph_repair5_target")
+                # The Target self-check establishes completeness/structure; it
+                # does NOT replace the separately executed OFF/ON comparison.
+                checked = (
+                    target.check_collection(document) if args.kind == "target" else target.check_mrv2_aba(document)
+                )
+                result.update(status=checked["status"], diagnostic=checked)
+                result["scope"] = "EXECUTION_ASSOCIATED_SINGLE_ARM; OFF/ON paired comparison remains required"
+                required_profile = "target4" if "--repair5-capture-profile" in expected["argv"] else "base"
+                if (
+                    document.get("capture_profile") != required_profile
+                    or campaign.get("capture_profile") != required_profile
+                    or not str(document.get("execution_device", "")).startswith("npu")
+                    or campaign.get("outputs") != []
+                    or document.get("device_verification") != "EXECUTED_SCOPED_NOT_GATE_CLOSURE"
+                ):
+                    result.update(status="INVALID_EVIDENCE", error="profile/device/controlled completion mismatch")
+            elif args.kind == "abort":
+                checked = load_tool("p7x_graph_repair5_lifecycle").check_abort(document, launcher, expected)
+                result.update(status=checked["status"], diagnostic=checked)
+                if checked["status"] == "EXPECTED_QUARANTINE_OBSERVED":
+                    try:
+                        result["association"] = evidence.correlate_abort(document, campaign["snapshot"])
+                    except (KeyError, ValueError, TypeError) as error:
+                        result.update(status="INVALID_EVIDENCE", error=str(error))
+            elif args.kind == "profile":
+                normal = evidence.audit_normal_requests(campaign, launcher, expected)
+                result.update(requests=normal, status="OPEN")
+                valid = (
+                    document["status"] == "GRAPH_REPLAY_OBSERVED"
+                    and normal["status"] == "PASS"
+                    and document["python_worker_pid"] == launcher["pid"]
+                )
+                if "_ON_long_" in args.case_id:
+                    valid = valid and any(
+                        d.get("source_start_column", 0) > 0
+                        for c in document["calls"]
+                        if c["active"]
+                        for d in c.get("window_descriptors", [])
+                    )
+                if document["profiler_enabled"]:
+                    valid = valid and bool(document["raw_exports"])
+                    valid = valid and all((args.input.parent / p).is_file() for p in document["raw_exports"])
+                if valid:
+                    result["status"] = "PASS_SCOPED_PROFILING"
+                result["physical_read"] = "OPEN"
+            else:
+                checked = load_tool("p7x_graph_repair5_lifecycle").check_lifecycle(document)
+                normal = evidence.audit_normal_requests(campaign, launcher, expected)
+                result.update(diagnostic=checked, requests=normal, status="INVALID_EVIDENCE")
+                if normal["status"] == "FAIL":
+                    result["status"] = "FAIL"
+                if checked["status"] == "STRUCTURE_VALID_NOT_EXECUTION_ACCEPTED" and normal["status"] == "PASS":
+                    try:
+                        result["association"] = evidence.correlate_lifecycle(
+                            document, campaign["snapshot"], expected, launcher
+                        )
+                        result["status"] = "PASS_DIAGNOSTIC_SERIALIZED"
+                    except (KeyError, ValueError, TypeError) as error:
+                        result["error"] = str(error)
+        code = (
+            0
+            if result["status"]
+            in (
+                "PASS",
+                "PASS_SCOPED_NUMERIC",
+                "PASS_DIAGNOSTIC_SERIALIZED",
+                "EXPECTED_QUARANTINE_OBSERVED",
+                "PASS_SCOPED_PROFILING",
+                "SINGLE_ARM_STRUCTURE_VALID",
+            )
+            else 2
+        )
+    elif args.command == "capabilities":
         try:
             import torch
             import torch_npu
@@ -120,10 +215,12 @@ def main() -> int:
             json.loads(args.launcher.read_text()),
             json.loads(args.plan.read_text())["cases"][args.case_id],
         )
-        code = 0 if result["status"] == "EXPECTED_QUARANTINE_OBSERVED" else 2
+        result["scope"] = "LOW_LEVEL_ONLY_USE_check-diagnostic_FOR_FINAL_EXECUTION"
+        code = 2
     elif args.command == "check-lifecycle":
         result = load_tool("p7x_graph_repair5_lifecycle").check_lifecycle(json.loads(args.input.read_text()))
-        code = 0 if result["status"] == "PASS_DIAGNOSTIC_SERIALIZED" else 2
+        result["scope"] = "LOW_LEVEL_STRUCTURE_ONLY_USE_check-diagnostic"
+        code = 2
     else:
         target = load_tool("p7x_graph_repair5_target")
         if args.command == "target-plan":
@@ -133,7 +230,8 @@ def main() -> int:
             import torch
 
             result = target.check_mrv2_aba(torch.load(args.input, weights_only=True, map_location="cpu"))
-            code = 0 if result["status"] == "PASS_SCOPED_NUMERIC" else 2
+            result["scope"] = "LOW_LEVEL_ONLY_USE_check-diagnostic_FOR_FINAL_EXECUTION"
+            code = 2
         else:
             import torch
 
@@ -141,9 +239,9 @@ def main() -> int:
                 torch.load(args.left, weights_only=True, map_location="cpu"),
                 torch.load(args.right, weights_only=True, map_location="cpu"),
             )
-            result["source_artifacts"] = {
-                str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in (args.left, args.right)
-            }
+            evidence = load_tool("p7x_graph_repair5_evidence")
+            result["source_artifacts"] = {str(p): evidence.file_sha(p) for p in (args.left, args.right)}
+            result["scope"] = "NUMERIC_COMPARISON_ONLY; both arms require check-diagnostic execution acceptance"
             code = 0 if result["status"] == "PASS" else 2
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2, allow_nan=False) + "\n")

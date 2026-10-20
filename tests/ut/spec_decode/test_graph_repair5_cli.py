@@ -20,6 +20,11 @@ from tests.ut.spec_decode.test_graph_repair5_contracts import ROOT, load, token_
         ("p7x_graph_repair5", ["check-abort"]),
         ("p7x_graph_repair5", ["check-lifecycle"]),
         ("p7x_graph_repair5", ["check-mrv2-aba"]),
+        ("p7x_graph_repair5", ["check-diagnostic"]),
+        ("p7x_graph_repair5_profile", ["preflight"]),
+        ("p7x_graph_repair5_profile", ["analyze"]),
+        ("p7x_graph_repair5_pack", ["pack"]),
+        ("p7x_graph_repair5_pack", ["verify"]),
         ("p7x_graph_repair5_campaign", []),
         ("p7x_graph_repair2", ["run"]),
     ],
@@ -54,7 +59,11 @@ def test_plan_to_official_joint_expected_schema(monkeypatch, tmp_path):
         # Launcher must not create the engine's exclusive output directory.
         outer = launch[launch.index("--output") + 1]
         child = argv[argv.index("--output") + 1]
+        assert child == case["outputs"]
         assert not outer.startswith(child + "/")
+        for check in [case.get("check_argv", [])] + case.get("additional_checks", []):
+            if "--input" in check:
+                assert check[check.index("--input") + 1].startswith(case["outputs"] + "/")
     assert "--repair5-controlled-mrv2" in plan["cases"]["G4F_ON"]["argv"]
     seen = set()
     for name, case in plan["cases"].items():
@@ -62,7 +71,10 @@ def test_plan_to_official_joint_expected_schema(monkeypatch, tmp_path):
         seen.add(name)
     assert "--target-probe" in plan["cases"]["G4_ON_long2"]["argv"]
     assert "--repair5-controlled-target" not in plan["cases"]["G4_ON_long2"]["argv"]
-    assert "trace" in plan and "NO_REPEAT" in plan["trace"]
+    assert "NORMAL_SCHEDULING" in plan["trace"]
+    assert "G4F_OFF" not in plan["cases"]["TARGET4_OFF"]["dependencies"]
+    assert "G4F_ON" not in plan["cases"]["TARGET4_ON"]["dependencies"]
+    assert plan["limits"]["max_records_controlled"] == {"base": 11, "target4": 12}
 
 
 def test_optimized_python_rejects_corrupt_lifecycle(tmp_path):
