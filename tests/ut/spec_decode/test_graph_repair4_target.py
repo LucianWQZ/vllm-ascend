@@ -9,6 +9,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -335,11 +336,16 @@ def live_fixture(monkeypatch):
         num_computed_tokens_np=[2],
     )
     k, v = torch.ones(8, 2, 1, 2), torch.ones(8, 2, 1, 2)
-    impl_cls = type("AscendAttentionBackendImpl", (), {"__module__": "vllm_ascend.attention.attention_v1"})
-    impl = impl_cls()
+    from vllm_ascend.attention import attention_v1 as backend
+
+    impl = object.__new__(backend.AscendAttentionBackendImpl)
     impl.use_bnsd_kv_cache = impl.enable_c8_quant = False
     impl.sliding_window = impl.sinks = impl.kv_sharing_target_layer_name = None
     impl.key_cache, impl.value_cache = k, v
+    impl.num_heads = impl.num_kv_heads = 1
+    impl.head_size, impl.scale = 2, 1.0
+    impl._use_max_workspace_for_fia_graph = False
+    impl._use_layer_aware_fia_graph_replay = False
     layer = SimpleNamespace(kv_cache=(k, v), impl=impl)
     runner.block_tables = SimpleNamespace(slot_mappings=torch.tensor([[0, 1]]))
     metadata = SimpleNamespace(
@@ -352,7 +358,7 @@ def live_fixture(monkeypatch):
         actual_seq_lengths_q=[2],
         query_start_loc=data["query_start_loc"],
         attn_mask=None,
-        attn_state=4,
+        attn_state=backend.AscendAttentionState.DecodeOnly,
     )
     runner.model_state = SimpleNamespace(attn_metadata={"target": metadata})
     runner.attn_groups = [[SimpleNamespace(layer_names=["target"])]]
@@ -363,9 +369,19 @@ def live_fixture(monkeypatch):
     manager = runner.cudagraph_manager
     manager.graphs, manager.calls, manager.failure = {Descriptor(): object()}, 0, None
     manager.layer, manager.output = layer, torch.arange(4.0).reshape(2, 2)
-    params = [None] * 23
-    params[1], params[2] = k.view(8, 2, 2), v.view(8, 2, 2)
-    graph_params = SimpleNamespace(attn_params={2: [tuple(params)]}, handles={2: [object()]}, events={2: [object()]})
+    graph_params = SimpleNamespace(attn_params={2: []}, handles={2: []}, events={2: []}, workspaces={2: object()})
+    monkeypatch.setattr(backend, "get_graph_params", lambda: graph_params)
+    monkeypatch.setattr(backend, "_EXTRA_CTX", SimpleNamespace(is_draft_model=False))
+    monkeypatch.setattr(backend, "weak_ref_tensors", lambda tensor: tensor)
+    # Only native operations are substituted. The real _get_fia_params and
+    # full_graph_fia construct the captured tuple consumed by the target probe.
+    monkeypatch.setattr(backend.torch_npu.npu, "current_stream", lambda: object())
+    monkeypatch.setattr(torch.npu, "ExternalEvent", MagicMock())
+    monkeypatch.setattr(torch.npu, "graph_task_group_begin", MagicMock())
+    monkeypatch.setattr(torch.npu, "graph_task_group_end", MagicMock())
+    monkeypatch.setattr(backend.torch_npu.npu_fused_infer_attention_score, "out", MagicMock())
+    q = torch.ones(2, 1, 2)
+    impl.full_graph_fia(q, k, v, metadata, q.clone())
     original_import = tool.importlib.import_module
     monkeypatch.setattr(
         tool.importlib,
@@ -381,6 +397,67 @@ def live_fixture(monkeypatch):
     monkeypatch.setattr(tool.LiveTargetAdapter, "_validate_runner", lambda self: None)
     monkeypatch.setattr(tool.LiveTargetAdapter, "_synchronize", lambda self: None)
     return runner, graph_params
+
+
+def test_production_fia_tuple_is_consumed_by_target_probe(monkeypatch):
+    runner, params = live_fixture(monkeypatch)
+    p = params.attn_params[2][0]
+    assert len(p) == 22
+    k, v = runner.cudagraph_manager.layer.kv_cache
+    assert tool._view(p[1]) == tool._view(k.view(8, 2, 2))
+    assert tool._view(p[2]) == tool._view(v.view(8, 2, 2))
+    assert p[17:21] == (None,) * 4 and p[21] is None
+    tool.LiveTargetAdapter(runner, fixture_id="host")._boundary(Descriptor(), runner.batch)
+
+
+@pytest.mark.parametrize("fault", ["length", "swap_kv", "block_size", "heads", "quant", "layer", "lengths"])
+def test_production_fia_schema_drift_is_rejected(monkeypatch, fault):
+    runner, params = live_fixture(monkeypatch)
+    p = list(params.attn_params[2][0])
+    if fault == "length":
+        p.append(None)
+    elif fault == "swap_kv":
+        p[1], p[2] = p[2], p[1]
+    else:
+        index, value = {
+            "block_size": (5, 128),
+            "heads": (8, 99),
+            "quant": (17, torch.ones(1)),
+            "layer": (21, "draft"),
+            "lengths": (7, [99]),
+        }[fault]
+        p[index] = value
+    params.attn_params[2][0] = tuple(p)
+    with pytest.raises(tool.EvidenceError):
+        tool.LiveTargetAdapter(runner, fixture_id="host")._boundary(Descriptor(), runner.batch)
+
+
+@pytest.mark.parametrize("statuses", [("PASS", "OPEN"), ("FAIL", "OPEN"), ("FAIL", "INVALID_EVIDENCE")])
+def test_cli_summary_retains_confirmed_failures(tmp_path, monkeypatch, statuses):
+    a, *_ = execute()
+    b, *_ = execute()
+    left, right = tmp_path / "left.pt", tmp_path / "right.pt"
+    a.records *= 2
+    b.records *= 2
+    if statuses[0] == "FAIL":
+        b.records[0] = deepcopy(b.records[0])
+        b.records[0]["output"]["tensors"][""]["data"] += 1
+    b.records[1] = deepcopy(b.records[1])
+    if statuses[1] == "OPEN":
+        b.records[1]["inputs"]["tensors"]["/input_ids"]["data"][0] += 1
+    else:
+        del b.records[1]["output"]
+    a.save(left)
+    b.save(right)
+    output = tmp_path / "result.json"
+    monkeypatch.setattr(
+        sys, "argv", ["target", str(left), str(right), "--tolerance-reason", "exact", "--output", str(output)]
+    )
+    assert tool.main() == 2
+    report = json.loads(output.read_text())
+    assert report["observed_forward_pair"] == ("FAIL" if "FAIL" in statuses else "OPEN")
+    assert report["confirmed_failure_count"] == statuses.count("FAIL")
+    assert report["evidence_complete"] is False
 
 
 def test_live_instance_seam_observes_real_return_and_restores_methods(monkeypatch):

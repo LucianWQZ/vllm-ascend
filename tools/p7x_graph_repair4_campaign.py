@@ -145,6 +145,14 @@ def make_plan(handoff: dict, inputs: Path, output: Path, vllm: Path, run_id: str
             argv += ["--target-probe"]
         cases[case] = {
             "argv": argv,
+            "acceptance_identity": {
+                "run_id": run_id,
+                "case_id": case,
+                "attempt_id": "1",
+                "driver_mode": mode,
+                "source_sha": sha,
+                "source_tree": handoff["tree"],
+            },
             "depends_on": dependencies,
             "launcher_argv": [
                 sys.executable,
@@ -166,6 +174,22 @@ def make_plan(handoff: dict, inputs: Path, output: Path, vllm: Path, run_id: str
                 *argv,
             ],
             "requests_sha256": digest(request_path),
+            "joint_acceptance_argv": [
+                sys.executable,
+                "tools/p7x_graph_repair4_acceptance.py",
+                "check-joint",
+                str(output / case / "campaign.json"),
+                "--launcher",
+                str(output / f"{case}-launcher" / "launcher.json"),
+                "--requests",
+                str(request_path),
+                "--plan",
+                "REPLACE_WITH_SAVED_PLAN_PATH",
+                "--case-id",
+                case,
+                "--output",
+                str(output / f"{case}-joint.json"),
+            ],
             "status": "NOT_RUN",
             "time_limit_seconds": 1800,
             "evidence_limit": (
@@ -292,6 +316,12 @@ def main() -> None:
             args.vllm_repo.resolve(),
             args.run_id,
         )
+        for entry in result["cases"].values():
+            if "joint_acceptance_argv" in entry:
+                entry["joint_acceptance_argv"] = [
+                    str(args.output.resolve()) if a == "REPLACE_WITH_SAVED_PLAN_PATH" else a
+                    for a in entry["joint_acceptance_argv"]
+                ]
         args.output.write_text(json.dumps(result, indent=2) + "\n")
     elif args.command == "pack":
         pack(args.root, args.output)

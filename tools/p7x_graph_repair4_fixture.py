@@ -39,7 +39,6 @@ import inspect
 import json
 import math
 import os
-import re
 import signal
 import subprocess
 import sys
@@ -48,6 +47,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
+
+import regex as re
 
 if TYPE_CHECKING:
     from torch import Tensor
@@ -65,6 +66,9 @@ CAPACITY_TOKENS = WINDOW_SIZE + BLOCK_SIZE - 1
 TABLE_WIDTH = (CAPACITY_TOKENS + BLOCK_SIZE - 1) // BLOCK_SIZE
 FULL_TABLE_WIDTH = 12
 ABS_TOL = 0.016
+# Pre-device acceptance budget, not a claim about native FIA error: normal
+# values <32 have FP16 half-ULP <=1/128 at input and output (sum <=0.015625).
+# The sentinel's larger input error is diluted by 1/1025 in the sole tail case.
 TORCH_NPU_VERSION = "2.10.0.post4"
 LAYER = "draft.layers.0.self_attn"
 SOURCE_FILES = (
@@ -228,6 +232,13 @@ def scope() -> dict[str, Any]:
         "sequence": "stage -> update.wait_stream(replay) -> replay -> consumer Event -> update -> update Event",
         "completion": "ordinary update Event and last-consumer Event synchronize+query outside capture",
         "oracle": "independent full-table token enumeration; A != B and A_prime == A",
+        "numerical_acceptance": {
+            "atol": ABS_TOL,
+            "rtol": 0,
+            "dtype": "float16",
+            "reason": "predeclared input/output quantization budget; native FIA accuracy must pass on device",
+        },
+        "outside_window_only_perturbation": "NOT_IMPLEMENTED",
         "blockers": dict(BLOCKERS),
         "ready": False,
         "api_references": dict(API_REFERENCES),

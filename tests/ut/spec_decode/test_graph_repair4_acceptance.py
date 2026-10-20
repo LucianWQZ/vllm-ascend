@@ -8,6 +8,7 @@ import subprocess
 import sys
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -139,6 +140,171 @@ def _campaign():
             )
         )
     return doc
+
+
+def joint_inputs(case="B0"):
+    document = _campaign()
+    document["identity"].update(case_id=case, driver_mode="A1" if case == "A1" else "B")
+    requests = [{"label": f"smoke-{n}", "prompts": ["Hello"] * n, "max_tokens": 16} for n in (1, 2, 4)]
+    payload = json.dumps(requests).encode()
+    fingerprint = {"sha256": hashlib.sha256(payload).hexdigest(), "entries": requests}
+    document["request_manifest"] = fingerprint
+    for entry in document["outputs"]:
+        entry["token_ids"] = [[3] * 16 for _ in entry["token_ids"]]
+        entry["prompts"] = ["Hello"] * len(entry["token_ids"])
+    argv = ["python", "tools/p7x_graph_repair2.py", "run"]
+    expected = dict(document["identity"], requests_sha256=fingerprint["sha256"], argv=argv)
+    launcher = dict(
+        document["identity"],
+        requests_sha256=fingerprint["sha256"],
+        argv=argv,
+        pid=1,
+        status="EXITED",
+        returncode=0,
+        signal=None,
+        timeout=False,
+        host_start_ns=1,
+        host_end_ns=1000,
+    )
+    return document, launcher, payload, expected
+
+
+def test_joint_acceptance_requires_tokens_and_external_success():
+    tool = _tool()
+    doc, launch, payload, expected = joint_inputs()
+    assert tool.audit_joint(doc, launch, payload, expected)["status"] == "PASS"
+    doc["outputs"][0]["token_ids"][0].pop()
+    assert tool.audit_campaign(doc)["DEVICE_FUNCTIONAL_GATES"]["B0"] == "PASS"
+    assert tool.audit_joint(doc, launch, payload, expected)["status"] == "FAIL"
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "timeout",
+        "signal",
+        "returncode",
+        "run",
+        "case",
+        "attempt",
+        "pid",
+        "sha",
+        "requests",
+        "argv",
+        "missing_output",
+        "extra_output",
+        "max_tokens",
+    ],
+)
+def test_joint_acceptance_rejects_cross_artifact_mismatch(fault):
+    doc, launch, payload, expected = joint_inputs()
+    if fault in ("timeout", "signal", "returncode"):
+        launch[fault] = {"timeout": True, "signal": 11, "returncode": 2}[fault]
+    elif fault in ("run", "case", "attempt"):
+        launch[fault + "_id"] = "other"
+    elif fault == "pid":
+        launch["pid"] = 999
+    elif fault == "sha":
+        launch["source_sha"] = "c" * 40
+    elif fault == "requests":
+        payload += b" "
+    elif fault == "argv":
+        launch["argv"] = launch["argv"] + ["--other"]
+    elif fault == "missing_output":
+        doc["outputs"].pop()
+    elif fault == "extra_output":
+        doc["outputs"].append(deepcopy(doc["outputs"][0]))
+    else:
+        doc["request_manifest"]["entries"][0]["max_tokens"] = 15
+    assert _tool().audit_joint(doc, launch, payload, expected)["status"] != "PASS"
+
+
+def test_joint_expected_public_gate_is_not_normal_or_resource_failure():
+    doc, launch, payload, expected = joint_inputs("A1")
+    doc.update(
+        status="EXCEPTION",
+        startup_complete=False,
+        outputs=[],
+        exception_type="NotImplementedError",
+        exception_message="GRAPH_FROZEN",
+    )
+    result = _tool().audit_joint(doc, launch, payload, expected)
+    assert result["status"] == "PASS" and result["acceptance_kind"] == "EXPECTED_PUBLIC_GATE"
+    doc["exception_message"] = "out of memory"
+    assert _tool().audit_joint(doc, launch, payload, expected)["status"] != "PASS"
+
+
+def test_joint_cli_joins_real_json_files_and_keeps_raw_records(tmp_path):
+    doc, launch, payload, expected = joint_inputs()
+    paths = {name: tmp_path / (name + ".json") for name in ("campaign", "launcher", "plan", "requests")}
+    plan = {
+        "run_id": "run",
+        "commit": expected["source_sha"],
+        "tree": expected["source_tree"],
+        "cases": {
+            "B0": {
+                "acceptance_identity": expected,
+                "argv": expected["argv"],
+                "requests_sha256": expected["requests_sha256"],
+            }
+        },
+    }
+    for name, data in (("campaign", doc), ("launcher", launch), ("plan", plan)):
+        paths[name].write_text(json.dumps(data))
+    paths["requests"].write_bytes(payload)
+    before = {k: p.read_bytes() for k, p in paths.items()}
+    command = [sys.executable, str(TOOL), "check-joint", str(paths["campaign"]), "--case-id", "B0"]
+    for name in ("launcher", "plan", "requests"):
+        command += ["--" + name, str(paths[name])]
+    result = subprocess.run(command, capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(result.stdout)["original_b0_checker"]["DEVICE_FUNCTIONAL_GATES"]["B0"] == "PASS"
+    assert before == {k: p.read_bytes() for k, p in paths.items()}
+
+
+def test_real_external_launcher_fingerprints_request_bytes(tmp_path):
+    requests = tmp_path / "requests.json"
+    requests.write_text('[{"label":"request","prompts":["hi"],"max_tokens":16}]')
+    output = tmp_path / "launcher"
+    args = SimpleNamespace(
+        output=output,
+        run_id="host",
+        case_id="A0",
+        mode="A0",
+        attempt="1",
+        timeout=10,
+        argv=[sys.executable, "-c", "print('host child only')", "--requests", str(requests)],
+    )
+    assert _tool()._repair2().launch_case(args) == 0
+    record = json.loads((output / "launcher.json").read_text())
+    assert record["requests_sha256"] == hashlib.sha256(requests.read_bytes()).hexdigest()
+    assert record["returncode"] == 0 and record["signal"] is None and record["timeout"] is False
+
+
+@pytest.mark.parametrize("fault", [None, "signal", "timeout", "unrelated_error", "cross_run", "reuse"])
+def test_expected_abort_nonzero_is_separate_from_normal_acceptance(fault):
+    manifest = {"abort_at": "after_replay", "run_id": "run", "attempt": "abort"}
+    doc = {
+        "identity": deepcopy(manifest),
+        "manifest_digest": hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest(),
+        "status": "ABORTED",
+        "error": "RuntimeError: injected abort after replay; no completion claim",
+        "process_exit": {"returncode": 2, "timeout": False},
+        "abort": {"unsafe_reuse_rejected": True, "reused": False},
+    }
+    if fault == "signal":
+        doc["process_exit"]["returncode"] = -11
+    elif fault == "timeout":
+        doc["process_exit"]["timeout"] = True
+    elif fault == "unrelated_error":
+        doc["error"] = "RuntimeError: out of memory"
+    elif fault == "cross_run":
+        doc["identity"]["run_id"] = "other"
+    elif fault == "reuse":
+        doc["abort"]["reused"] = True
+    result = _tool().audit_abort(doc, manifest)
+    assert (result["status"] == "EXPECTED_ABORT_OBSERVED") == (fault is None)
+    assert result["completion"] == "NOT_ASSESSED"
 
 
 def _tensor(values, dtype="int64"):

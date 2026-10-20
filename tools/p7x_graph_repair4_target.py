@@ -589,9 +589,36 @@ class LiveTargetAdapter(FullForwardCheckpointer):
             expected[signature] = name
         seen = set()
         for param in captured:
-            _require(isinstance(param, tuple) and len(param) == 23, "unknown captured FIA parameter schema")
+            # full_graph_fia: 17 base operands, four quantization slots, layer.
+            # full_graph_fia_v2/PA and future tuple revisions are not this schema.
+            _require(isinstance(param, tuple) and len(param) == 22, "unknown captured FIA parameter schema")
+            _require(
+                all(isinstance(param[i], torch.Tensor) for i in (0, 1, 2, 3, 11, 12))
+                and (param[4] is None or isinstance(param[4], torch.Tensor)),
+                "invalid captured FIA tensor fields",
+            )
             signature = (_view(param[1]), _view(param[2]))
             _require(signature in expected and signature not in seen, "captured KV read inventory mismatch")
+            name = expected[signature]
+            impl = context[name].impl
+            _require(
+                param[5] == context[name].kv_cache[0].shape[1]
+                and param[8:11] == (impl.num_kv_heads, impl.num_heads, impl.scale)
+                and param[16] is None
+                and all(value is None for value in param[17:21])
+                and param[21] in (None, name),
+                "captured FIA geometry/quantization/layer schema mismatch",
+            )
+            _require(
+                all(
+                    isinstance(param[i], list) and param[i] and all(type(v) is int and v >= 0 for v in param[i])
+                    for i in (6, 7)
+                )
+                and len(param[6]) == len(param[7])
+                and param[7][-1] == n
+                and all(type(param[i]) is int for i in (13, 14, 15)),
+                "invalid captured FIA sequence/sparse fields",
+            )
             seen.add(signature)
         _require(seen == expected.keys(), "uncaptured target KV layer")
         inputs = {
@@ -700,29 +727,40 @@ def main() -> int:
         "update_effective_generation": "UNKNOWN",
         "block_mapping_comparison": "EXACT_PHYSICAL_IDS_NO_LOGICAL_REMAP",
         "pairs": [],
+        "confirmed_failure_count": 0,
+        "evidence_complete": False,
     }
     try:
         a, b = (torch.load(path, map_location="cpu", weights_only=True) for path in (args.left, args.right))
         _require(a.get("schema") == b.get("schema") == SCHEMA, "invalid collection schema")
-        if (
+        omissions = bool(
             a.get("skipped_for_limit")
             or b.get("skipped_for_limit")
             or not a.get("records")
             or len(a["records"]) != len(b.get("records", []))
-        ):
+        )
+        if omissions:
             report["reason"] = "missing/unpaired records or bounded collection omissions"
-        else:
-            results = [
-                compare_records(x, y, atol=args.atol, rtol=args.rtol, tolerance_reason=args.tolerance_reason)
-                for x, y in zip(a["records"], b["records"])
-            ]
-            statuses = {result["observed_forward_pair"] for result in results}
-            report["pairs"] = results
-            report["observed_forward_pair"] = next(
-                status for status in ("INVALID_EVIDENCE", "OPEN", "FAIL", "PASS") if status in statuses
-            )
-            if all(result["alignment"] == "MATCHED_COMPLETE_DECLARED_PRE_KV" for result in results):
-                report["alignment"] = "MATCHED_COMPLETE_DECLARED_PRE_KV"
+        results = [
+            compare_records(x, y, atol=args.atol, rtol=args.rtol, tolerance_reason=args.tolerance_reason)
+            for x, y in zip(a.get("records", []), b.get("records", []))
+        ]
+        statuses = [result["observed_forward_pair"] for result in results]
+        report["pairs"] = results
+        report["confirmed_failure_count"] = statuses.count("FAIL")
+        report["evidence_complete"] = bool(results) and not omissions and all(s in ("PASS", "FAIL") for s in statuses)
+        report["evidence_issues"] = {
+            "invalid_pairs": statuses.count("INVALID_EVIDENCE"),
+            "open_pairs": statuses.count("OPEN"),
+            "collection_omissions": omissions,
+        }
+        # A proven aligned difference survives unrelated missing/invalid evidence.
+        candidates = set(statuses) | ({"OPEN"} if omissions or not results else set())
+        report["observed_forward_pair"] = next(
+            status for status in ("FAIL", "INVALID_EVIDENCE", "OPEN", "PASS") if status in candidates
+        )
+        if report["evidence_complete"]:
+            report["alignment"] = "MATCHED_COMPLETE_DECLARED_PRE_KV"
     except Exception as error:
         report.update(observed_forward_pair="INVALID_EVIDENCE", reason=f"{type(error).__name__}: {error}")
     payload = json.dumps(report, indent=2) + "\n"

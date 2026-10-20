@@ -26,6 +26,27 @@ def manifest(abort_at="none"):
     return fixture.make_manifest("host-test-not-device", "1", "npu:0", abort_at)
 
 
+def test_tolerance_is_frozen_in_manifest_and_outside_only_control_not_claimed():
+    scope = manifest()["scope"]
+    assert scope["numerical_acceptance"]["atol"] == fixture.ABS_TOL
+    assert scope["numerical_acceptance"]["rtol"] == 0
+    assert scope["outside_window_only_perturbation"] == "NOT_IMPLEMENTED"
+
+
+def test_fp16_input_and_output_rounding_fit_predeclared_tolerance():
+    import torch
+
+    for case in fixture.cases():
+        oracle = fixture.full_table_oracle(case)
+        points = [(case["full_table"][pos // 128], pos % 128) for pos in range(oracle["start"], case["exact"])]
+        values = torch.tensor([[fixture.value_at(p, o, c) for c in range(64)] for p, o in points], dtype=torch.float64)
+        quantized = values.half().double()
+        # This quantization bound does not prove native FIA accumulation accuracy.
+        rounded_output = quantized.mean(dim=0).half().double()
+        reference = torch.tensor(oracle["output"][0][0], dtype=torch.float64)
+        assert (rounded_output - reference).abs().max().item() < fixture.ABS_TOL
+
+
 def synthetic_document(expected):
     """Manufacture checker inputs in tests; never write them as device evidence."""
     shapes = {

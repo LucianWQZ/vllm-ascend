@@ -700,6 +700,9 @@ def launch_case(args):
         "timeout": False,
         "host_start_ns": time.monotonic_ns(),
     }
+    if "--requests" in argv:
+        request_path = Path(argv[argv.index("--requests") + 1])
+        record["requests_sha256"] = hashlib.sha256(request_path.read_bytes()).hexdigest()
     path = args.output / "launcher.json"
     _write(path, record)
     with (args.output / "stdout.log").open("wb") as stdout, (args.output / "stderr.log").open("wb") as stderr:
@@ -908,6 +911,16 @@ def run_case(args):
         or _git(args.vllm_repo, "status", "--porcelain")
     ):
         raise RuntimeError("pinned vLLM SHA/tree/clean mismatch")
+    request_bytes = args.requests.read_bytes() if args.requests else None
+    requests = (
+        json.loads(request_bytes)
+        if request_bytes is not None
+        else [{"label": f"smoke-{n}", "prompts": ["Hello, my name is"] * n, "max_tokens": 16} for n in (1, 2, 4)]
+    )
+    request_manifest = {
+        "sha256": hashlib.sha256(request_bytes).hexdigest() if request_bytes is not None else None,
+        "entries": requests,
+    }
     fixtures = json.loads(args.fixture_manifest.read_text())
     for item in fixtures["files"]:
         path = Path(item["path"])
@@ -939,6 +952,7 @@ def run_case(args):
         "imports": {"vllm": vllm.__file__, "vllm_ascend": vllm_ascend.__file__},
         "observer_enabled": args.case != "B-observer-off",
         "outputs": [],
+        "request_manifest": request_manifest,
         "controlled_target_numeric": None,
         "task_trace": None,
         "physical_read_trace": None,
@@ -1034,11 +1048,6 @@ def run_case(args):
             )
             full_target_probe.__enter__()
         # Fixed 1/2/4 requests are attempts; checker requires actual descriptor events.
-        requests = (
-            json.loads(args.requests.read_text())
-            if args.requests
-            else [{"label": f"smoke-{n}", "prompts": ["Hello, my name is"] * n, "max_tokens": 16} for n in (1, 2, 4)]
-        )
         for request in requests:
             _write(
                 output / "progress.json",
@@ -1053,6 +1062,7 @@ def run_case(args):
             record["outputs"].append(
                 {
                     "label": request["label"],
+                    "prompts": request["prompts"],
                     "host_start_ns": start,
                     "host_end_ns": time.monotonic_ns(),
                     "prompt_token_ids": [r.prompt_token_ids for r in results],

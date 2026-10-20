@@ -638,11 +638,176 @@ def _read_document(path):
     return json.loads(path.read_text(), object_pairs_hook=unique_object, parse_constant=invalid_constant)
 
 
+def audit_joint(document, launcher, request_bytes, expected):
+    """Join immutable request bytes, child campaign and its external supervisor.
+
+    This adds external execution acceptance, not numeric/device Gate closure.
+    The original B0 checker is nested verbatim and never edits its input.
+    """
+    result = {
+        "schema": "repair4-joint-acceptance-v1",
+        "status": "INVALID_EVIDENCE",
+        "acceptance_kind": "NORMAL_REQUESTS",
+        "scope": "external execution/request completion; B0 additionally checks its graph contracts",
+        "errors": [],
+        "numeric_gates": "OPEN",
+    }
+    try:
+        identity = document["identity"]
+        keys = (*IDENTITY_KEYS, "driver_mode", "source_sha", "source_tree")
+        _require(all(isinstance(expected.get(k), str) and expected[k] for k in keys), "missing expected identity")
+        _require(
+            all(identity.get(k) == launcher.get(k) == expected[k] for k in keys),
+            "run/case/attempt/source/mode association mismatch",
+        )
+        _require(launcher["argv"] == expected["argv"], "launcher argv differs from frozen plan")
+        _require(
+            type(launcher["pid"]) is int and launcher["pid"] > 0 and launcher["pid"] == identity["process_id"],
+            "launcher/child PID mismatch",
+        )
+        checksum = hashlib.sha256(request_bytes).hexdigest()
+        requests = json.loads(request_bytes)
+        _require(
+            checksum
+            == expected["requests_sha256"]
+            == launcher.get("requests_sha256")
+            == document["request_manifest"]["sha256"],
+            "request bytes association mismatch",
+        )
+        _require(requests == document["request_manifest"]["entries"], "request content mismatch")
+        _require(isinstance(requests, list) and bool(requests), "empty request manifest")
+        labels = []
+        for request in requests:
+            _require(
+                type(request.get("max_tokens")) is int and request["max_tokens"] == 16, "frozen max_tokens must be 16"
+            )
+            _require(isinstance(request.get("label"), str) and request["label"], "missing request label")
+            _require(
+                isinstance(request.get("prompts"), list)
+                and request["prompts"]
+                and all(isinstance(p, str) and p for p in request["prompts"]),
+                "invalid prompts",
+            )
+            labels.append(request["label"])
+        _require(len(labels) == len(set(labels)), "duplicate request labels")
+        _require(
+            type(launcher["host_start_ns"]) is int
+            and type(launcher["host_end_ns"]) is int
+            and 0 <= launcher["host_start_ns"] < launcher["host_end_ns"],
+            "invalid launcher interval",
+        )
+        result["status"] = "FAIL"
+        _require(
+            launcher["status"] == "EXITED"
+            and type(launcher["returncode"]) is int
+            and launcher["returncode"] == 0
+            and launcher["signal"] is None
+            and launcher["timeout"] is False,
+            "external launcher did not finish normally",
+        )
+        _require(
+            not any(
+                document.get(k)
+                for k in ("cleanup_error", "artifact_collection_error", "target_probe_error", "full_target_probe_error")
+            ),
+            "campaign cleanup/evidence error",
+        )
+        if expected["case_id"] == "A1":
+            result["acceptance_kind"] = "EXPECTED_PUBLIC_GATE"
+            _require(
+                expected["driver_mode"] == "A1"
+                and document["status"] == "EXCEPTION"
+                and document.get("exception_type") == "NotImplementedError"
+                and "GRAPH_FROZEN" in document.get("exception_message", "")
+                and document.get("outputs") == [],
+                "A1 did not hit the expected public Graph gate",
+            )
+        else:
+            _require(not expected["case_id"].startswith("ABORT"), "abort requires check-abort, not normal acceptance")
+            _require(document["status"] == "OK" and document["startup_complete"] is True, "startup/request failure")
+            outputs = document["outputs"]
+            _require([o["label"] for o in outputs] == labels, "missing/extra/reordered request outputs")
+            for request, output in zip(requests, outputs):
+                _require(output.get("prompts") == request["prompts"], "output/request prompt mismatch")
+                _require(
+                    launcher["host_start_ns"]
+                    <= output["host_start_ns"]
+                    < output["host_end_ns"]
+                    <= launcher["host_end_ns"],
+                    "output outside launcher interval",
+                )
+                prompts, tokens = output["prompt_token_ids"], output["token_ids"]
+                _require(len(prompts) == len(tokens) == len(request["prompts"]), "request cardinality mismatch")
+                _require(
+                    all(isinstance(p, list) and p and all(type(t) is int and t >= 0 for t in p) for p in prompts),
+                    "missing prompt tokens",
+                )
+                _require(
+                    all(
+                        isinstance(t, list) and len(t) == 16 and all(type(x) is int and x >= 0 for x in t)
+                        for t in tokens
+                    ),
+                    "request did not produce frozen 16 tokens",
+                )
+            if expected["case_id"] == "B0":
+                result["original_b0_checker"] = audit_campaign(document, _identity(expected))
+                _require(
+                    result["original_b0_checker"]["DEVICE_FUNCTIONAL_GATES"]["B0"] == "PASS",
+                    "internal B0 contract failed",
+                )
+        result["status"] = "PASS"
+    except (KeyError, TypeError, ValueError, IndexError) as error:
+        result["errors"].append(str(error))
+    return result
+
+
+def audit_abort(document, manifest):
+    """Expected injected nonzero exit is NOT a normal-run or completion PASS."""
+    result = {"status": "INVALID_EVIDENCE", "completion": "NOT_ASSESSED", "device_gates": "OPEN", "errors": []}
+    try:
+        errors = {
+            "before_replay": "RuntimeError: injected abort before replay",
+            "after_replay": "RuntimeError: injected abort after replay; no completion claim",
+            "after_update": "RuntimeError: injected abort after update",
+            "after_completion": "RuntimeError: injected abort after completion",
+        }
+        expected_error = errors[manifest["abort_at"]]
+        # The fixture uses its own canonical digest format (default separators).
+        checksum = hashlib.sha256(json.dumps(manifest, sort_keys=True, allow_nan=False).encode()).hexdigest()
+        _require(
+            document["identity"] == manifest and document["manifest_digest"] == checksum, "abort identity mismatch"
+        )
+        _require(document["status"] == "ABORTED" and document["error"] == expected_error, "not the injected abort")
+        exit_record = document["process_exit"]
+        _require(
+            type(exit_record["returncode"]) is int
+            and exit_record["returncode"] == 2
+            and exit_record["timeout"] is False,
+            "unexpected abort exit/signal/timeout",
+        )
+        _require(
+            document["abort"]["unsafe_reuse_rejected"] is True and document["abort"]["reused"] is False,
+            "abort reuse was not rejected",
+        )
+        result["status"] = "EXPECTED_ABORT_OBSERVED"
+    except (KeyError, TypeError, ValueError) as error:
+        result["errors"].append(str(error))
+    return result
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
     check = sub.add_parser("check", help="authoritative B0 acceptance using Repair2 integrity/math checks")
     check.add_argument("campaign", type=Path)
+    joint = sub.add_parser("check-joint", help="join frozen requests, campaign, external launcher and saved plan")
+    joint.add_argument("campaign", type=Path)
+    for key in ("launcher", "requests", "plan"):
+        joint.add_argument("--" + key, type=Path, required=True)
+    joint.add_argument("--case-id", required=True)
+    abort = sub.add_parser("check-abort", help="expected injected exit only; not completion or normal-run acceptance")
+    abort.add_argument("result", type=Path)
+    abort.add_argument("--manifest", type=Path, required=True)
     trace = sub.add_parser("trace-fields", help="inspect actual exported CSV headers and row counts for T0 OR T1")
     trace.add_argument("paths", nargs="+", type=Path)
     target = sub.add_parser("check-target", help="SUPPLIED_EVIDENCE_ONLY; live aligned pair NOT_VERIFIED, G4F BLOCKED")
@@ -651,11 +816,33 @@ def main(argv=None):
     for command in (check, trace):
         for key in IDENTITY_KEYS:
             command.add_argument("--" + key.replace("_", "-"), required=command is trace)
-    for command in (check, trace, target):
+    for command in (check, trace, target, joint, abort):
         command.add_argument("--output", type=Path)
     args = parser.parse_args(argv)
     try:
-        if args.command == "check":
+        if args.command == "check-joint":
+            plan = _read_document(args.plan)
+            entry = plan["cases"][args.case_id]
+            expected = {
+                **entry["acceptance_identity"],
+                "argv": entry["argv"],
+                "requests_sha256": entry["requests_sha256"],
+            }
+            _require(
+                expected["case_id"] == args.case_id
+                and expected["run_id"] == plan["run_id"]
+                and expected["source_sha"] == plan["commit"]
+                and expected["source_tree"] == plan["tree"],
+                "plan identity inconsistent",
+            )
+            result = audit_joint(
+                _read_document(args.campaign), _read_document(args.launcher), args.requests.read_bytes(), expected
+            )
+            passed = result["status"] == "PASS"
+        elif args.command == "check-abort":
+            result = audit_abort(_read_document(args.result), _read_document(args.manifest))
+            passed = result["status"] == "EXPECTED_ABORT_OBSERVED"
+        elif args.command == "check":
             expected = {k: getattr(args, k) for k in IDENTITY_KEYS}
             result = audit_campaign(_read_document(args.campaign), expected if any(expected.values()) else None)
             passed = result["DEVICE_FUNCTIONAL_GATES"]["B0"] == "PASS"
@@ -665,7 +852,7 @@ def main(argv=None):
         else:
             result = compare_full_target(_read_document(args.left), _read_document(args.right))
             passed = result["status"] == "PASS"
-    except (OSError, ValueError) as error:
+    except (OSError, ValueError, KeyError, TypeError) as error:
         result, passed = (
             {
                 "status": "INVALID_EVIDENCE",
