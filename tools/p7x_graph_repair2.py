@@ -943,7 +943,7 @@ def run_case(args):
         "task_trace": None,
         "physical_read_trace": None,
     }
-    llm = session = target_probe = None
+    llm = session = target_probe = full_target_probe = None
     additional = {} if args.case == "A0" else {"draft_window_size": 1024}
     config = dict(
         model=args.target_model,
@@ -1012,6 +1012,27 @@ def run_case(args):
         if args.target_probe:
             target_probe = TargetBoundaryProbe(runner, output)
             target_probe.install()
+        if getattr(args, "full_target_probe", False):
+            adapter_spec = importlib.util.spec_from_file_location(
+                "_repair4_full_target", ROOT / "tools/p7x_graph_repair4_target.py"
+            )
+            if adapter_spec is None or adapter_spec.loader is None:
+                raise RuntimeError("FULL target adapter module unavailable")
+            adapter_module = importlib.util.module_from_spec(adapter_spec)
+            adapter_spec.loader.exec_module(adapter_module)
+            fixture_id = hashlib.sha256(
+                json.dumps(
+                    {"files": fixtures["files"], "source": identity["source_sha"], "vllm": identity["vllm_sha"]},
+                    sort_keys=True,
+                ).encode()
+            ).hexdigest()
+            full_target_probe = adapter_module.LiveTargetAdapter(
+                runner,
+                fixture_id=fixture_id,
+                max_bytes=args.full_target_max_bytes,
+                max_records=args.full_target_max_records,
+            )
+            full_target_probe.__enter__()
         # Fixed 1/2/4 requests are attempts; checker requires actual descriptor events.
         requests = (
             json.loads(args.requests.read_text())
@@ -1051,6 +1072,25 @@ def run_case(args):
         )
         # Preserve original exception. Cleanup/artifact errors are separate fields.
     finally:
+        if full_target_probe is not None:
+            try:
+                full_target_probe.__exit__(None, None, None)
+                full_target_probe.save(output / "target-full-forward.pt")
+                record["full_target_probe"] = {
+                    "artifact": "target-full-forward.pt",
+                    "status": "ALIGNMENT_REQUIRED",
+                    "controlled_pair_generated": False,
+                    "live_readiness": "NOT_ESTABLISHED",
+                    "record_statuses": [r["status"] for r in full_target_probe.records],
+                    "skipped_for_limit": full_target_probe.skipped_for_limit,
+                    "max_bytes_per_record": full_target_probe.max_bytes,
+                    "max_records": full_target_probe.max_records,
+                    "scope": "actual target forward; complete declared read/write KV blocks; no restore",
+                    "update_effective_generation": "UNKNOWN",
+                    "impact": "stream synchronization and D2H; NOT PERFORMANCE REPRESENTATIVE",
+                }
+            except Exception as error:
+                record["full_target_probe_error"] = repr(error)
         if target_probe is not None:
             try:
                 target_probe.close()
@@ -1157,6 +1197,13 @@ def main():
         run.add_argument(f"--{name}", required=True, type=Path)
     run.add_argument("--requests", type=Path)
     run.add_argument("--target-probe", action="store_true", help="extra D2H after capture; not for timing")
+    run.add_argument(
+        "--full-target-probe", action="store_true", help="actual target FULL forward/KV checkpoints after capture"
+    )
+    run.add_argument("--full-target-max-bytes", type=int, default=536870912, help="hard per-record CPU payload budget")
+    run.add_argument(
+        "--full-target-max-records", type=int, default=4, help="hard retained-record bound; omissions reported"
+    )
     args = parser.parse_args()
     if args.command == "launch":
         return launch_case(args)

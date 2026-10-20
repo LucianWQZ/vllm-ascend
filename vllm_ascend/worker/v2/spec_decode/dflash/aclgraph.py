@@ -104,8 +104,8 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
                     progress_bar_desc,
                 )
 
-    def run_fullgraph(self, desc: BatchExecutionDescriptor) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
-        """Override run_fullgraph to update full graph params in run_fullgraph."""
+    def run_fullgraph(self, desc: BatchExecutionDescriptor) -> None:
+        """Submit replay and UPDATE; propose reads persistent draft_tokens later."""
         num_tokens = desc.num_tokens
 
         prepare_parallel_draft_window_graph_characterization(

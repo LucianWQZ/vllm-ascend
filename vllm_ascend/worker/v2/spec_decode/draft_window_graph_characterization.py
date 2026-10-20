@@ -181,6 +181,10 @@ class DraftWindowGraphG4OracleRecord:
     draft_output_hash: str | None
     target_output_hash: str | None
     runtime_oracle_inputs: dict[str, Any] | None = None
+    draft_output_status: str = "OUTPUT_NOT_CAPTURED"
+    draft_output_reason: str | None = "OUTPUT_NOT_OBSERVED"
+    target_output_status: str = "OUTPUT_NOT_CAPTURED"
+    target_output_reason: str | None = "OUTPUT_NOT_OBSERVED"
 
 
 @dataclass(frozen=True, slots=True)
@@ -587,10 +591,16 @@ class DraftWindowGraphCharacterizationRecorder:
         if len(matches) != 1:
             raise RuntimeError("Graph output does not resolve one G4 generation record")
         index = matches[0]
+        draft_hash, draft_status, draft_reason = _optional_output_evidence(draft_output)
+        target_hash, target_status, target_reason = _optional_output_evidence(target_output)
         self._g4_records[index] = replace(
             self._g4_records[index],
-            draft_output_hash=_hash_tensor_tree(draft_output),
-            target_output_hash=(None if target_output is None else _hash_tensor_tree(target_output)),
+            draft_output_hash=draft_hash,
+            target_output_hash=target_hash,
+            draft_output_status=draft_status,
+            draft_output_reason=draft_reason,
+            target_output_status=target_status,
+            target_output_reason=("TARGET_OUTPUT_NOT_SUPPLIED" if target_output is None else target_reason),
         )
         self.write_artifact()
 
@@ -1217,7 +1227,7 @@ def record_parallel_graph_update_operator_operand(
 
 
 def record_parallel_graph_replay_submission(owner: Any) -> None:
-    """Record a real stream event after replay without synchronizing it."""
+    """Record host submission only; neither create nor query a device event."""
     session = getattr(owner, "_draft_window_graph_characterization", None)
     if session is None:
         return
@@ -1252,16 +1262,20 @@ def record_parallel_graph_output(
 ) -> None:
     """Attach reproducible output hashes to the current G4 machine record.
 
-    The host copy is characterization-only and therefore not performance
-    representative.  The Draft graph manager can provide its output here;
-    Target output remains ``None`` unless an external campaign driver supplies
-    the real Target result explicitly.
+    The upstream Draft graph manager returns None: its token output lives in
+    the speculator's persistent draft_tokens and is returned by propose later.
+    We do not sample that mutable buffer here or infer device completion.
+    Missing/empty values stay explicit missing evidence. An explicitly supplied
+    nonempty tensor tree is copied only in this diagnostic path, after UPDATE
+    submission; this is not performance representative or FULL_TARGET proof.
     """
     session = getattr(owner, "_draft_window_graph_characterization", None)
     if session is None:
         return
     if not isinstance(session, DraftWindowGraphCharacterizationSession):
         raise TypeError("invalid Graph characterization session")
+    if not session.recorder.enabled:
+        return
     carriers = session.provider.submitted_carriers
     identities = tuple(carrier.runtime_identity for carrier in carriers if carrier.runtime_identity is not None)
     if len(identities) != 1:
@@ -1476,6 +1490,24 @@ def _length_operand_snapshot(value: Any) -> tuple[str, int | None, tuple[int, ..
             raise TypeError("host length operand must contain integers")
         return ("host_sequence", None, tuple(int(item) for item in value))
     raise TypeError(f"unsupported graph length operand type: {type(value).__name__}")
+
+
+def _optional_output_evidence(value: Any) -> tuple[str | None, str, str | None]:
+    """Classify optional evidence without masking identity or device failures."""
+    if value is None:
+        return None, "OUTPUT_NOT_CAPTURED", "GRAPH_MANAGER_RETURNS_NONE"
+
+    def nonempty_tensor_tree(item: Any) -> bool:
+        if isinstance(item, torch.Tensor):
+            return item.numel() > 0
+        if isinstance(item, (tuple, list)):
+            return bool(item) and all(nonempty_tensor_tree(child) for child in item)
+        return False
+
+    if not nonempty_tensor_tree(value):
+        return None, "OUTPUT_NOT_CAPTURED", "EMPTY_OR_UNSUPPORTED_OUTPUT"
+    # No broad exception handler: real Tensor/NPU failures must still escape.
+    return _hash_tensor_tree(value), "HASHED", None
 
 
 def _hash_tensor_tree(value: Any) -> str:

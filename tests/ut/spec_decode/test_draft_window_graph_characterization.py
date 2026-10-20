@@ -975,6 +975,38 @@ def test_runtime_candidate_host_a_b_a_refreshes_content_at_stable_address() -> N
         session.provider.require_runtime_identity(inputs_a.identity)
 
 
+@pytest.mark.parametrize("output", [None, (), [], "", torch.empty(0)])
+def test_optional_output_does_not_invent_numeric_evidence(output: Any) -> None:
+    owner, descriptor = _characterization_owner()
+    session = install_parallel_draft_window_graph_characterization(owner, runtime_context=_runtime_context())
+    inputs = _materialize(owner._draft_window_runtime_state, mapping_epoch=10)
+    _publish_eager_generation(owner, inputs)
+    _install_metadata_builder(owner)
+    prepare_parallel_draft_window_graph_characterization(owner, descriptor)
+    consume_draft_window_graph_metadata(owner, route=DraftWindowGraphRoute.DFLASH, expected_consumer_count=1)
+    record_parallel_graph_output(owner, output)
+    record = session.recorder.g4_records[-1]
+    assert record.draft_output_hash is None
+    assert record.draft_output_status == "OUTPUT_NOT_CAPTURED"
+    assert record.draft_output_reason
+    assert session.recorder.snapshot() == session.recorder.snapshot()
+
+
+def test_missing_output_does_not_hide_missing_generation() -> None:
+    owner, _ = _characterization_owner()
+    install_parallel_draft_window_graph_characterization(owner, runtime_context=_runtime_context())
+    with pytest.raises(RuntimeError, match="submitted generation"):
+        record_parallel_graph_output(owner, None)
+
+
+def test_observer_off_output_has_no_carrier_or_tensor_access() -> None:
+    owner, _ = _characterization_owner()
+    session = install_parallel_draft_window_graph_characterization(owner, runtime_context=_runtime_context())
+    session.recorder.enabled = False
+    record_parallel_graph_output(owner, object())
+    assert session.recorder.g4_records == ()
+
+
 def test_manager_prepares_candidate_before_consuming_graph_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
