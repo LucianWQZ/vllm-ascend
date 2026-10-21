@@ -19,7 +19,7 @@ if __name__ == "__main__":
 
 import torch
 
-from tools.p7x_graph_repair6 import metrics
+from tools.p7x_graph_repair6 import metrics, verdict_exit
 from tools.p7x_graph_repair6_storage import atomic_json, digest, require
 
 
@@ -120,8 +120,13 @@ def main():
         p.add_argument("--" + name, type=Path, required=True)
     a = p.parse_args()
     torch.set_num_threads(2)
-    atomic_json(a.output, compare(a.off, a.on))
+    try:
+        result = compare(a.off, a.on)
+    except (ValueError, KeyError, TypeError, OSError, RuntimeError) as error:
+        result = dict(status="INVALID_EVIDENCE", error=str(error))
+    atomic_json(a.output, result)
+    return verdict_exit(result["status"])
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

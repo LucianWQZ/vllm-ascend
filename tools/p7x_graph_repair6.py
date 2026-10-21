@@ -50,7 +50,16 @@ def compare(left, right, *, timeout=1800, progress=None):
             identity = tool.sample_identity(case, a.header["fixture_id"])
             pair = dict(identity=identity, status="INCOMPLETE_COVERAGE")
             if index < min(len(a.samples), len(b.samples)):
-                x, y = a.record(index), b.record(index)
+                try:
+                    if a.incomplete(index) or b.incomplete(index):
+                        pair["reason"] = "UNCOMMITTED_PREPARING_TAIL"
+                        result["pairs"].append(pair)
+                        continue
+                    x, y = a.record(index), b.record(index)
+                except (ValueError, KeyError, TypeError, OSError, RuntimeError) as error:
+                    pair.update(status="INVALID_EVIDENCE", error=str(error))
+                    result["pairs"].append(pair)
+                    continue
                 if x["status"] == y["status"] == "CAPTURED_COMPLETE":
                     partial = tool.compare_collections(dict(a.header, records=[x]), dict(b.header, records=[y]))
                     pair = next(p for p in partial["pairs"] if p["identity"] == identity)
@@ -71,7 +80,12 @@ def compare(left, right, *, timeout=1800, progress=None):
             else "INVALID_EVIDENCE"
             if "INVALID_EVIDENCE" in statuses
             else "SAMPLE_COMPLETE"
-            if statuses and all(s == "PASS" for s in statuses)
+            if statuses
+            and all(s == "PASS" for s in statuses)
+            and all(
+                e in ("COMPLETE", "EXECUTED_SCOPED_NOT_GATE_CLOSURE", "LEGACY_PARTIAL_OR_COMPLETE_SEE_LAUNCHER")
+                for e in result["execution"]
+            )
             else "ALIGNMENT_PRECONDITION_NOT_MET"
             if "ALIGNMENT_PRECONDITION_NOT_MET" in statuses
             else "PARTIAL_PREFIX_VALID"
@@ -88,6 +102,28 @@ def compare(left, right, *, timeout=1800, progress=None):
             result["status"] = "NUMERIC_MISMATCH"
     result["elapsed_seconds"] = time.monotonic() - started
     return result
+
+
+def verdict_exit(status):
+    """0 means the declared scope succeeded, never 'JSON was written'."""
+    if status in (
+        "SAMPLE_COMPLETE",
+        "SINGLE_ARM_STRUCTURE_VALID",
+        "PREFIX_STRUCTURE_VALID_NOT_CAMPAIGN_PASS",
+        "PASS_DIAGNOSTIC_CONTINUOUS_REFERENCE",
+        "OBSERVED_NORMAL_ORDER_NOT_REUSE_PROOF",
+        "ESTIMATE_NOT_DEVICE_VERIFIED",
+    ):
+        return 0
+    if status == "NUMERIC_MISMATCH":
+        return 3
+    if status == "INVALID_EVIDENCE":
+        return 4
+    if status == "COMPARISON_TIMEOUT":
+        return 124
+    if status.startswith("BLOCKED_RESOURCE"):
+        return 5
+    return 2
 
 
 def metrics(x, y):
@@ -117,6 +153,17 @@ def joint(artifact, campaign, launcher, expected, kind):
             reader = CollectionReader(artifact)
             document = reader.header
         result["execution"] = audit_execution(document, campaign, launcher, expected, artifact)
+        if kind == "numeric":
+            from tools.p7x_graph_repair6_numeric_check import check_collection
+
+            # Failed children can still retain a confirmed durable mismatch.
+            # Execution validity and evidence/numeric validity remain separate.
+            result.update(check_collection(reader, campaign, expected))
+            if result["execution"]["status"] != "EXECUTION_ASSOCIATED" and result["status"] != "NUMERIC_MISMATCH":
+                result["status"] = (
+                    "INVALID_EVIDENCE" if result["execution"]["status"] == "INVALID_EVIDENCE" else "EXECUTION_FAILED"
+                )
+            return result
         if result["execution"]["status"] != "EXECUTION_ASSOCIATED":
             result["status"] = result["execution"]["status"]
             return result
@@ -192,50 +239,6 @@ def joint(artifact, campaign, launcher, expected, kind):
                 "normal three-bucket/multigeneration coverage incomplete",
             )
             result["status"] = "OBSERVED_NORMAL_ORDER_NOT_REUSE_PROOF"
-        elif kind == "numeric":
-            tool = load_tool("p7x_graph_repair5_target")
-            expected_cases = tool.case_plan(expected.get("capture_profile", "base"))
-            rows = [reader.record(i) for i in range(len(reader.samples))]
-            require(0 < len(rows) <= len(expected_cases), "numeric sample coverage empty/extra")
-            statuses = []
-            previous = (-1, -1)
-            for r, c in zip(rows, expected_cases):
-                require(
-                    r["case_identity"]["scenario"] == c["scenario"] and r["case_identity"]["step"] == c["step"],
-                    "numeric plan identity mismatch",
-                )
-                require(r["generation"] > previous[0] and r["epoch"] > previous[1], "numeric stale generation")
-                previous = r["generation"], r["epoch"]
-                require(
-                    r["identity"] == dict(document["identity"], generation=r["generation"], epoch=r["epoch"]),
-                    "numeric source/generation mismatch",
-                )
-                require(
-                    r["active"] == len(c["ends"]) and r["descriptor"] in ([1, 7], [2, 14], [4, 28]),
-                    "numeric active/descriptor mismatch",
-                )
-                require(
-                    r["descriptor"][0] == (1 if r["active"] == 1 else 2 if r["active"] == 2 else 4),
-                    "Target padding mistaken for Draft padding",
-                )
-                require(r["pre_kv"].keys() == r["graph_post_kv"].keys() and bool(r["pre_kv"]), "missing KV pre-state")
-                require(r["inputs"]["input_ids"].shape[0] == r["descriptor"][1], "numeric input coverage")
-                n = r["active"] * 7
-                measured = metrics(r["graph"][:n], r["reference"][:n])
-                require(
-                    r["graph"].shape == r["reference"].shape and r["graph"].shape[0] == r["descriptor"][1],
-                    "numeric output bucket mismatch",
-                )
-                statuses.append("PASS" if measured["finite"] and measured["max_abs"] == 0 else "FAIL")
-            result.update(
-                status="NUMERIC_MISMATCH"
-                if "FAIL" in statuses
-                else "PASS_DIAGNOSTIC_CONTINUOUS_REFERENCE"
-                if len(rows) == len(expected_cases)
-                else "INCOMPLETE_COVERAGE",
-                samples=statuses,
-            )
-            result["serialized_generation_discriminator"] = generation_discriminator(rows)
         else:
             tool = load_tool("p7x_graph_repair5_target")
             expected_cases = tool.case_plan(document.get("capture_profile", "base"))
@@ -339,19 +342,7 @@ def main():
             config=str(args.config),
         )
     atomic_json(args.output, result)
-    return (
-        0
-        if result["status"]
-        in (
-            "SAMPLE_COMPLETE",
-            "SINGLE_ARM_STRUCTURE_VALID",
-            "PREFIX_STRUCTURE_VALID_NOT_CAMPAIGN_PASS",
-            "PASS_DIAGNOSTIC_CONTINUOUS_REFERENCE",
-            "OBSERVED_NORMAL_ORDER_NOT_REUSE_PROOF",
-            "ESTIMATE_NOT_DEVICE_VERIFIED",
-        )
-        else 2
-    )
+    return verdict_exit(result["status"])
 
 
 if __name__ == "__main__":

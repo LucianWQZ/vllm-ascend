@@ -178,8 +178,15 @@ class MRV2LifecycleProbe:
             try:
                 with original_scope(*args, **kwargs):
                     yield
-            except BaseException:
-                probe.poisoned = True
+            except BaseException as error:
+                from tools.p7x_graph_repair6_submission import CompletedDiagnosticContractError, NumericMismatch
+
+                completed = (
+                    len(probe.records) > previous and probe.records[-1].get("completion") == "DIAGNOSTIC_COMPLETE"
+                )
+                probe.poisoned = not (
+                    completed and isinstance(error, (NumericMismatch, CompletedDiagnosticContractError))
+                )
                 probe._flush()
                 raise
             if len(probe.records) > previous:

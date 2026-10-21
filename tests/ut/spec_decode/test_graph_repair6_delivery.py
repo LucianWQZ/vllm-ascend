@@ -168,7 +168,7 @@ def test_optimized_python_rejects_empty_collection(tmp_path):
         capture_output=True,
         timeout=30,
     )
-    assert result.returncode == 2
+    assert result.returncode == 4
     assert json.loads(output.read_text())["status"] == "INVALID_EVIDENCE"
 
 

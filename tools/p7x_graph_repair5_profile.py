@@ -59,6 +59,8 @@ class RequestProfiler:
         self.saved, self.calls, self.groups = [], [], []
         self.profiler = None
         self.active = False
+        self.current_group = None
+        self.installations = {}
         self.deadline = time.monotonic() + 900
         self.device = str(runner.device) if hasattr(runner, "device") else "UNAVAILABLE"
 
@@ -66,17 +68,33 @@ class RequestProfiler:
         original = getattr(owner, name)
         self.saved.append((owner, name, name in vars(owner), vars(owner).get(name)))
         probe = self
+        self.installations[label] = dict(installed=True, method=name, owner=type(owner).__name__)
 
         def wrapped(_self, *args, **kwargs):
             start = time.monotonic_ns()
+            live_before = getattr(probe.runner.speculator, "_draft_window_live_inputs", None)
             with probe.torch.profiler.record_function("repair5/" + label):
                 result = original(*args, **kwargs)
             # CPU-only record AFTER the wrapped operation. No device tensor read.
             probe.calls.append(
                 dict(
-                    label=label, start_ns=start, end_ns=time.monotonic_ns(), descriptor=descriptor, active=probe.active
+                    label=label,
+                    start_ns=start,
+                    end_ns=time.monotonic_ns(),
+                    descriptor=descriptor,
+                    active=probe.active,
+                    request_group=probe.current_group,
+                    clock_domain="HOST_MONOTONIC_NS",
+                    boundary="HOST_CALL_NOT_DEVICE_COMPLETION",
                 )
             )
+            identity = getattr(result, "identity", None) or getattr(live_before, "identity", None)
+            if identity is None and label == "Draft_retire_host" and args:
+                identity = args[0]
+            if identity is not None and hasattr(identity, "generation_id"):
+                probe.calls[-1].update(generation=identity.generation_id, mapping_epoch=identity.mapping_epoch)
+            if args and hasattr(args[0], "num_tokens"):
+                probe.calls[-1]["descriptor"] = [args[0].num_reqs, args[0].num_tokens]
             if label == "Draft_REPLAY_PLUS_UPDATE":
                 live = getattr(probe.runner.speculator, "_draft_window_live_inputs", None)
                 if live is not None:
@@ -96,6 +114,9 @@ class RequestProfiler:
             if spec._draft_window_graph_characterization.recorder.enabled:
                 raise ValueError("normal profiling requires heavy observer OFF")
         try:
+            self.window_active = getattr(spec, "_draft_window_graph_characterization", None) is not None
+            for label in ("Draft_materialize", "Draft_metadata_bind", "Draft_UPDATE_CALL", "Draft_retire_host"):
+                self.installations[label] = dict(installed=False, reason="METHOD_OR_RUNTIME_NOT_PRESENT")
             self._wrap(spec, "propose", "Draft_propose")
             for method, label in (
                 ("_materialize_draft_window_read_inputs", "Draft_materialize"),
@@ -143,9 +164,11 @@ class RequestProfiler:
         if time.monotonic() > self.deadline:
             raise TimeoutError("profiling request-stage budget exceeded")
         start = time.monotonic_ns()
+        self.current_group = label
         with self.torch.profiler.record_function("repair5/request/" + label):
             yield
         self.groups.append(dict(label=label, active=self.active, start_ns=start, end_ns=time.monotonic_ns()))
+        self.current_group = None
         if self.active and self.profiler is not None:
             self.profiler.step()
         if time.monotonic() > self.deadline:
@@ -178,6 +201,7 @@ class RequestProfiler:
                 capability=getattr(self, "capability", None),
                 groups=self.groups,
                 calls=self.calls,
+                host_subrange_coverage=self.subrange_coverage(),
                 status="GRAPH_REPLAY_OBSERVED" if active_replays else "OPEN_NO_DRAFT_REPLAY",
                 scope="DIAGNOSTIC_SERIALIZED" if self.diagnostic else "NORMAL_OBSERVER_OFF",
                 clock_domain="HOST_MONOTONIC_NS_ONLY",
@@ -192,6 +216,36 @@ class RequestProfiler:
                 str(p.relative_to(self.output)) for p in sorted((self.output / "trace").rglob("*")) if p.is_file()
             ]
             (self.output / "profile.json").write_text(json.dumps(payload, indent=2) + "\n")
+
+    def subrange_coverage(self):
+        replays = [c for c in self.calls if c["active"] and c["label"] == "Draft_REPLAY_PLUS_UPDATE"]
+        result = {}
+        for label, installation in self.installations.items():
+            if label not in ("Draft_materialize", "Draft_metadata_bind", "Draft_UPDATE_CALL", "Draft_retire_host"):
+                continue
+            calls = [c for c in self.calls if c["active"] and c["label"] == label]
+            expected = (
+                len(replays) if self.window_active or label in ("Draft_metadata_bind", "Draft_UPDATE_CALL") else 0
+            )
+            expected_gens = {c["generation"] for c in replays if "generation" in c}
+            actual_gens = {c["generation"] for c in calls if "generation" in c}
+            missing = sorted(expected_gens - actual_gens) if self.window_active else []
+            result[label] = dict(
+                installation,
+                expected_minimum=expected,
+                actual=len(calls),
+                missing_generations=missing,
+                status="MISSING"
+                if expected and (not installation["installed"] or len(calls) < expected or missing)
+                else "OBSERVED"
+                if calls
+                else "NOT_APPLICABLE_WINDOW_OFF"
+                if not self.window_active
+                else "NOT_EXECUTED",
+                expected_rule="minimum one per observed Draft graph; extra context/prefill calls retained",
+                timing_scope="nested host ranges; do not sum as device elapsed",
+            )
+        return result
 
 
 def host_statistics(calls):

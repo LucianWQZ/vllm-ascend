@@ -118,8 +118,8 @@ def _descriptor() -> BatchExecutionDescriptor:
     )
 
 
-def _characterization_owner(*, method: str = "dflash") -> tuple[Any, Any]:
-    runtime, capability, block_tables = _runtime_fixture(method=method)
+def _characterization_owner(*, method: str = "dflash", **geometry) -> tuple[Any, Any]:
+    runtime, capability, block_tables = _runtime_fixture(method=method, **geometry)
     descriptor = _descriptor()
     input_buffers = InputBuffers(8, 64, torch.device("cpu"))
     input_buffers.query_start_loc[:5].copy_(torch.tensor([0, 2, 4, 6, 8], dtype=torch.int32))

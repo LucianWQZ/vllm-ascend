@@ -16,14 +16,16 @@ class DraftGraphOutputReferences:
         self.owner = owner
         self.outputs: dict[int, torch.Tensor] = {}
         self.frozen = False
+        self.collecting = False
 
     def retain(self, owner, num_tokens, output):
         if owner is not self.owner or self.frozen:
             raise RuntimeError("numeric capture owner/scope mismatch")
         if not isinstance(output, torch.Tensor) or output.ndim != 2 or output.shape[0] != num_tokens:
             raise RuntimeError("unknown Draft model continuous output contract")
-        # Warmup is not retained. Multiple FULL capture invocations for a bucket
-        # replace the reference before freeze; the final capture owns the tensor.
+        # Pinned CudaGraphManager invokes warmup then capture with mode NONE.
+        # During the owner's capture scope, the last invocation per bucket is
+        # the captured allocation. Freeze occurs only after capture succeeds.
         self.outputs[num_tokens] = output
 
     def freeze(self, captured_tokens):

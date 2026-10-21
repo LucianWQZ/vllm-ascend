@@ -170,6 +170,15 @@ def main() -> int:
                 if document["profiler_enabled"]:
                     valid = valid and bool(document["raw_exports"])
                     valid = valid and all((args.input.parent / p).is_file() for p in document["raw_exports"])
+                if expected.get("require_host_subrange_coverage"):
+                    coverage = document.get("host_subrange_coverage", {})
+                    labels = {"Draft_materialize", "Draft_metadata_bind", "Draft_UPDATE_CALL", "Draft_retire_host"}
+                    valid = (
+                        valid
+                        and set(coverage) == labels
+                        and all(r["status"] in ("OBSERVED", "NOT_APPLICABLE_WINDOW_OFF") for r in coverage.values())
+                    )
+                    result["host_subrange_coverage"] = coverage
                 if valid:
                     result["status"] = "PASS_SCOPED_PROFILING"
                 result["physical_read"] = "OPEN"

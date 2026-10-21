@@ -71,6 +71,10 @@ class TensorStore:
         require(time.monotonic() < self.deadline, "storage deadline exceeded")
         require(self.used + additional <= self.max_bytes, "BLOCKED_RESOURCE: store bytes")
 
+    def _disk(self, additional):
+        # Reserve for durable manifest/partial persistence, checked per chunk.
+        require_space(self.root, additional + CHUNK)
+
     @staticmethod
     def key(t):
         return (t.untyped_storage().data_ptr(), t.storage_offset(), tuple(t.shape), tuple(t.stride()), str(t.dtype))
@@ -81,6 +85,7 @@ class TensorStore:
         shape = tuple(tensor.shape) if selected is None else (len(selected), *tensor.shape[1:])
         total = math.prod(shape) * tensor.element_size()
         self._budget(total)
+        self._disk(total)
         temporary = self.root / f"tensor-{os.getpid()}.partial"
         require(not temporary.exists(), "unfinished tensor write; use a new attempt")
         hasher, chunks, offset = hashlib.sha256(), [], 0
@@ -97,6 +102,7 @@ class TensorStore:
                     self._budget(total)
                     cpu = row[start : start + step].detach().to("cpu", copy=True).contiguous()
                     data = memoryview(cpu.view(torch.uint8).numpy())
+                    self._disk(len(data))
                     f.write(data)
                     hasher.update(data)
                     chunks.append(dict(offset=offset, bytes=len(data), sha256=hashlib.sha256(data).hexdigest()))
@@ -221,6 +227,17 @@ class CollectionReader:
         ids = [json.dumps(s["identity"], sort_keys=True) for s in self.samples]
         require(len(ids) == len(set(ids)), "duplicate sample identity")
 
+    def incomplete(self, index):
+        s = self.samples[index]
+        if self.legacy:
+            return s["status"] == "PREPARING"
+        if s["status"] == "PREPARING":
+            require(s.get("path") is None and index == len(self.samples) - 1, "PREPARING must be the uncommitted tail")
+            require(self.execution != "COMPLETE", "complete collection claims an unfinished sample")
+            return True
+        require(s.get("path") is not None, "complete sample missing payload")
+        return False
+
     def record(self, index):
         if self.legacy:
             return self.document["records"][index]
@@ -239,14 +256,19 @@ class CollectionReader:
         return r
 
 
-def resource_plan(cases, *, layers, kv_heads, head_dim, element_bytes, hidden_size, vocab_size, mask_bytes):
+def resource_plan(
+    cases, *, layers, kv_heads, head_dim, element_bytes, hidden_size, vocab_size, mask_bytes, sample_limit=None
+):
     """Conservative no-content-dedup bound, derived from complete block union.
 
     Four KV copies allow before/after/after-draft plus serializer/mmap margin.
     Shared mask appears once in each of the two metadata checkpoints.
     """
+    require(
+        sample_limit is None or type(sample_limit) is int and 0 < sample_limit <= len(cases), "invalid resource prefix"
+    )
     rows = []
-    for c in cases:
+    for c in cases[:sample_limit]:
         blocks = sum((e + 127) // 128 for e in c["ends"]) + int(c["padded"] > len(c["ends"]))
         kv = layers * 2 * blocks * 128 * kv_heads * head_dim * element_bytes
         outputs = c["padded"] * 8 * (hidden_size * 8 + vocab_size) * element_bytes
@@ -264,6 +286,16 @@ def resource_plan(cases, *, layers, kv_heads, head_dim, element_bytes, hidden_si
     return dict(
         samples=rows,
         one_arm_bytes=total,
+        required_free_bytes=total + CHUNK,
+        execution_scope="ONE_ARM_PREFIX" if sample_limit is not None else "ONE_ARM_FULL",
+        declared_samples=len(cases),
+        phases=dict(
+            single_arm=total + CHUNK,
+            both_arms_retained=2 * total + CHUNK,
+            comparison_additional=CHUNK,
+            raw_pack_additional=2 * total + CHUNK,
+            final_peak_including_two_arms_and_raw=4 * total + CHUNK,
+        ),
         off_on_with_raw_and_atomic_bytes=4 * total + CHUNK,
         host_temporary_bytes=CHUNK,
         device_copy_temporary_bytes=CHUNK,

@@ -103,13 +103,15 @@ def test_real_upstream_none_return_is_not_hashed(monkeypatch):
     assert record.draft_output_reason == "GRAPH_MANAGER_RETURNS_NONE"
 
 
-def _lifetime_fixture(monkeypatch):
+def _lifetime_fixture(monkeypatch, **geometry):
     """Reuse source/capture fixtures; all owner integration methods are real."""
-    template, _ = _characterization_owner()
+    template, _ = _characterization_owner(**geometry)
     owner = AscendDFlashSpeculator.__new__(AscendDFlashSpeculator)
     owner.__dict__.update(vars(template))
     owner.num_query_per_req = QUERY_WIDTH
-    owner.speculative_config = SimpleNamespace(num_speculative_tokens=QUERY_WIDTH - 1)
+    owner.speculative_config = SimpleNamespace(
+        num_speculative_tokens=QUERY_WIDTH if geometry.get("method") == "dspark" else QUERY_WIDTH - 1
+    )
     owner.arange = torch.arange(9, dtype=torch.int32)
     owner._initialize_draft_window_eager_state()
     descriptors = [
@@ -154,7 +156,7 @@ def _lifetime_fixture(monkeypatch):
                 True,
             )
             assert state.attn_metadata[LAYER].block_tables.shape[0] == desc.num_reqs
-    tables.slot_mappings.copy_(torch.arange(64, dtype=torch.int32).reshape(1, -1))
+    tables.slot_mappings.copy_(torch.arange(tables.slot_mappings.numel(), dtype=torch.int32).reshape(1, -1))
     calls = []
     manager = _manager(monkeypatch, owner, descriptors, calls)
     # Audit the exact methods this harness will execute, including scope cleanup.

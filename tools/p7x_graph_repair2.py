@@ -17,7 +17,6 @@ import json
 import math
 import os
 import shutil
-import signal
 import subprocess
 import sys
 import time
@@ -718,12 +717,9 @@ def launch_case(args):
             code = child.wait(timeout=args.timeout)
         except subprocess.TimeoutExpired:
             record["timeout"] = True
-            os.killpg(child.pid, signal.SIGTERM)
-            try:
-                code = child.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                os.killpg(child.pid, signal.SIGKILL)
-                code = child.wait()
+            from tools.p7x_graph_repair6_watchdog import stop_owned_tree
+
+            code, record["owned_processes_terminated"] = stop_owned_tree(child)
     record.update(returncode=code, signal=-code if code < 0 else None, status="EXITED", host_end_ns=time.monotonic_ns())
     _write(path, record)
     return 124 if record["timeout"] else code if code >= 0 else 128 - code
@@ -1049,9 +1045,10 @@ def run_case(args):
                 hidden_size=h,
                 vocab_size=model_geometry["vocab_size"],
                 mask_bytes=2048**2,
+                sample_limit=getattr(args, "repair6_target_prefix", None),
             )
             _write(output / "preload-resource-plan.json", planned)
-            require_space(output, planned["off_on_with_raw_and_atomic_bytes"])
+            require_space(output, planned["required_free_bytes"])
         if profile_mode != "none":
             import torch_npu
 
@@ -1134,8 +1131,19 @@ def run_case(args):
             if getattr(args, "repair6_numeric_reference", False):
                 from tools.p7x_graph_repair6_numeric import ContinuousReference
 
-                numeric_probe = ContinuousReference(runner, core.scheduler, output / "numeric-reference.json", identity)
+                numeric_probe = ContinuousReference(
+                    runner,
+                    core.scheduler,
+                    output / "numeric-reference.json",
+                    identity,
+                    provenance=dict(
+                        fixture_id=hashlib.sha256(args.fixture_manifest.read_bytes()).hexdigest(),
+                        profile=capture_profile,
+                        config_sha256=record["config_sha256"],
+                    ),
+                )
                 numeric_probe.__enter__()
+                record["numeric_contract"] = numeric_probe.provenance
             fixture = controlled.ControlledTarget(
                 runner,
                 fixture_id=hashlib.sha256(args.fixture_manifest.read_bytes()).hexdigest(),
@@ -1245,7 +1253,10 @@ def run_case(args):
         )
         # Preserve original exception. Cleanup/artifact errors are separate fields.
     finally:
-        if profile_probe is not None:
+        from tools.p7x_graph_repair6_submission import needs_quarantine
+
+        uncertain = needs_quarantine(lifecycle_probe, numeric_probe, normal_probe)
+        if profile_probe is not None and not uncertain:
             try:
                 profile_probe.__exit__(None, None, None)
             except Exception as error:
@@ -1261,7 +1272,8 @@ def run_case(args):
                 lifecycle_probe.__exit__(None, None, None)
             except Exception as error:
                 record["lifecycle_probe_error"] = repr(error)
-        if full_target_probe is not None:
+        uncertain = needs_quarantine(lifecycle_probe, numeric_probe, normal_probe)
+        if full_target_probe is not None and not uncertain:
             try:
                 full_target_probe.__exit__(None, None, None)
                 full_target_probe.save(output / "target-full-forward.pt")
@@ -1280,7 +1292,7 @@ def run_case(args):
                 }
             except Exception as error:
                 record["full_target_probe_error"] = repr(error)
-        if target_probe is not None:
+        if target_probe is not None and not uncertain:
             try:
                 target_probe.close()
             except Exception as error:
@@ -1301,6 +1313,7 @@ def run_case(args):
                     output / "controlled-target.pt",
                     output / "controlled-target.json",
                     output / "numeric-reference.json",
+                    output / "numeric-summary.json",
                     output / "normal-lifecycle.json",
                     output / "mrv2-lifecycle.json",
                     output / "profile.json",
@@ -1310,7 +1323,7 @@ def run_case(args):
         except OSError as error:
             record["diagnostic_artifact_error"] = repr(error)
         _write(output / "campaign.json", record)
-        if lifecycle_probe is not None and lifecycle_probe.poisoned:
+        if needs_quarantine(lifecycle_probe, numeric_probe, normal_probe):
             # Diagnostic child only: uncertain submission is never reused or
             # fed to normal engine teardown. External launch/watchdog owns it.
             record["diagnostic_quarantine"] = "PROCESS_EXIT_74_NO_REUSE"
@@ -1329,7 +1342,11 @@ def run_case(args):
             and "GRAPH_FROZEN" in record.get("exception_message", "")
             else 2
         )
-    return 0 if record["status"] == "OK" else 2
+    if record.get("exception_type") == "NumericMismatch":
+        return 3
+    if "BLOCKED_RESOURCE" in record.get("exception_message", ""):
+        return 5
+    return 0 if record["status"] == "OK" and not record.get("cleanup_error") else 2
 
 
 def trace_probe(output):

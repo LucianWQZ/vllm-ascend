@@ -334,9 +334,10 @@ class ControlledTarget:
                 hidden_size=cfg.hidden_size,
                 vocab_size=cfg.vocab_size,
                 mask_bytes=mask_bytes,
+                sample_limit=self.sample_limit,
             )
             atomic_json(output.with_name("target-resource-plan.json"), budget)
-            require_space(output.parent, budget["off_on_with_raw_and_atomic_bytes"])
+            require_space(output.parent, budget["required_free_bytes"])
             self.probe.max_bytes = max(row["checkpoint"] for row in budget["samples"])
             self.disk_budget = budget["one_arm_bytes"]
             header = {k: v for k, v in result.items() if k != "records"}

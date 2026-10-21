@@ -5,6 +5,7 @@
 import argparse
 import hashlib
 import json
+import shutil
 import stat
 import zipfile
 from pathlib import Path, PurePosixPath
@@ -29,6 +30,13 @@ def pack(source, output):
     source, output = Path(source).resolve(), Path(output).resolve()
     if output.is_relative_to(source):
         raise ValueError("output must be outside input directory")
+    paths = [p for p in source.rglob("*") if p.is_file()]
+    # Compression ratio is unknown. Reserve a conservative deflate/ZIP overhead
+    # bound before creating the new archive; do not delete old evidence.
+    needed = sum(p.stat().st_size for p in paths) * 101 // 100 + (16 << 20) + len(paths) * 4096
+    free = shutil.disk_usage(output.parent).free
+    if free < needed:
+        raise ValueError(f"BLOCKED_RESOURCE: packing needs {needed}, free {free}")
     members = []
     with zipfile.ZipFile(output, "x", zipfile.ZIP_DEFLATED, allowZip64=True) as archive:
         for path in sorted(source.rglob("*")):

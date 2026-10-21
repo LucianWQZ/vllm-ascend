@@ -114,6 +114,8 @@ def _runtime_fixture(
     method: str = "eagle3",
     max_num_reqs: int = 8,
     row_width: int = 8,
+    block_size: int = 64,
+    window_size: int = 128,
 ) -> tuple[Any, Any, SimpleNamespace]:
     canonical_counts = torch.full((1, max_num_reqs), row_width, dtype=torch.int32)
     canonical_table = torch.arange(
@@ -122,8 +124,8 @@ def _runtime_fixture(
         dtype=torch.int32,
     ).reshape(max_num_reqs, row_width)
     block_tables = SimpleNamespace(
-        block_sizes=[64],
-        kernel_block_sizes=[64],
+        block_sizes=[block_size],
+        kernel_block_sizes=[block_size],
         input_block_tables=[canonical_table],
         slot_mappings=torch.arange(
             max_num_reqs * row_width,
@@ -140,9 +142,9 @@ def _runtime_fixture(
         layer_names=("draft.layers.0.self_attn",),
         backend_class=AscendAttentionBackend,
         builder_class=AscendAttentionMetadataBuilder,
-        logical_block_size=64,
-        kernel_block_size=64,
-        block_span_tokens=64,
+        logical_block_size=block_size,
+        kernel_block_size=block_size,
+        block_span_tokens=block_size,
         causal=True,
         layout_category=DraftWindowLayoutCategory.DENSE_GQA_DIRECT_PREFIX,
         capability_failures=(),
@@ -151,7 +153,7 @@ def _runtime_fixture(
         method=method,
         target_model_type="qwen3",
         runtime_route=method,
-        window_size=128,
+        window_size=window_size,
         groups=(group,),
         empty_global_group_ids=(),
         capability_failures=(),
@@ -166,7 +168,7 @@ def _runtime_fixture(
         provider=SingleGroupDirectPrefixProvider(
             inventory=inventory,
             full_source=full_source,
-            legacy_block_size=64,
+            legacy_block_size=block_size,
             expected_future_offset=3 if method == "eagle3" else 0,
         ),
     )

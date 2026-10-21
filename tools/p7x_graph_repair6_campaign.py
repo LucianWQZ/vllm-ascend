@@ -13,7 +13,7 @@ if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tools.p7x_graph_repair5_campaign import build_plan as previous
-from tools.p7x_graph_repair6_storage import atomic_json
+from tools.p7x_graph_repair6_storage import atomic_json, digest
 
 
 def build_plan(repo, inputs, output, vllm, python, sha, tree, run_id):
@@ -114,6 +114,22 @@ def build_plan(repo, inputs, output, vllm, python, sha, tree, run_id):
             selection="READ_ONLY_AFTER_BOTH_ATTEMPTS_ALSO_ON_PRODUCER_FAILURE",
         )
     for name, case in cases.items():
+        case["fixture_sha256"] = digest(inputs / "fixture_manifest.json")
+        case["resource_policy"] = dict(
+            global_full_target_prerequisite=False,
+            minimum_launch_free_bytes=(2 << 30) if name.startswith("PROFILE_") else (64 << 20),
+            launch_reserve_scope="trace/log reserve, not a maximum trace size guarantee; external timeout also applies",
+            geometry_preflight="ONE_ARM_PREFIX_1"
+            if name.startswith("PREFIX_")
+            else "ONE_ARM_FULL_PLUS_NUMERIC_ADDITIONAL"
+            if name == "NUMERIC_TARGET4"
+            else "ONE_ARM_FULL"
+            if name in ("G4F_OFF", "G4F_ON", "TARGET4_OFF", "TARGET4_ON")
+            else "NO_FULL_TARGET_ALLOCATION",
+            per_chunk_disk_check="--repair6-target-store" in case["argv"],
+            compression_assumed=False,
+            existing_evidence="PRESERVE; never auto-clean",
+        )
         case.setdefault("selection", "HISTORICAL_OR_CONDITIONAL_NOT_AUTOMATIC_RERUN")
         if name in ("P0", "A0", "A1", "B0"):
             case["selection"] = "REQUIRED_EXACT_SOURCE_ANCHOR"
@@ -121,6 +137,8 @@ def build_plan(repo, inputs, output, vllm, python, sha, tree, run_id):
             case["selection"] = (
                 "AFFECTED_NEW_HOST_SUBRANGES_NORMAL_COST" if name != "PROFILE_LIFE" else "HISTORICAL_DIAGNOSTIC"
             )
+        if name.startswith("PROFILE_"):
+            case["require_host_subrange_coverage"] = True
         # Normalize every command into the repository-owned runner's schema.
         checks = ([case["check_argv"]] if "check_argv" in case else []) + case.get("additional_checks", [])
         case["validation_commands"] = [dict(argv=c, timeout=3300, kind="read_only_acceptance") for c in checks]

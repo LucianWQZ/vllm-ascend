@@ -129,7 +129,12 @@ class AscendDSparkSpeculator(DraftWindowEagerMixin, DSparkSpeculator):
             if hasattr(self, "_draft_graph_output_references"):
                 raise RuntimeError("numeric capture diagnostic already installed")
             self._draft_graph_output_references = DraftGraphOutputReferences(self)
-        super().capture()
+            self._draft_graph_output_references.collecting = True
+        try:
+            super().capture()
+        finally:
+            if diagnostic:
+                self._draft_graph_output_references.collecting = False
         if diagnostic:
             self._draft_graph_output_references.freeze(d.num_tokens for d in self.query_cudagraph_manager.graphs)
 
@@ -140,7 +145,7 @@ class AscendDSparkSpeculator(DraftWindowEagerMixin, DSparkSpeculator):
             num_tokens, attn_metadata, slot_mappings, num_tokens_across_dp, cudagraph_runtime_mode
         )
         sink = getattr(self, "_draft_graph_output_references", None)
-        if sink is not None and cudagraph_runtime_mode == CUDAGraphMode.FULL:
+        if sink is not None and (sink.collecting or cudagraph_runtime_mode == CUDAGraphMode.FULL):
             sink.retain(self, num_tokens, output)
         return output
 

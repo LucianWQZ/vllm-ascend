@@ -123,7 +123,8 @@ def test_independent_canonical_window_and_invalid_source():
         tool.independent_window(full, [1159], [9], 1, 1, 9)
 
 
-def test_continuous_reference_actual_pinned_forward_and_real_generation(monkeypatch, tmp_path):
+@pytest.mark.parametrize("fault", [None, "numeric", "native"])
+def test_continuous_reference_actual_pinned_forward_and_real_generation(monkeypatch, tmp_path, fault):
     import vllm.v1.worker.gpu.spec_decode.dflash.speculator as upstream
 
     from tests.ut.spec_decode import test_graph_repair4_integration as integration
@@ -180,6 +181,18 @@ def test_continuous_reference_actual_pinned_forward_and_real_generation(monkeypa
             static_forward_context={integration.LAYER: SimpleNamespace(kv_cache=[cache])}
         ),
     )
+    original_forward = owner._run_model
+
+    def reference_forward(*args, **kwargs):
+        result = original_forward(*args, **kwargs)
+        if fault == "numeric":
+            return result + 2
+        if fault == "native":
+            cache[1].fill_(999)
+            raise RuntimeError("native reference partially submitted")
+        return result
+
+    owner._run_model = reference_forward
     path = tmp_path / "numeric.json"
     with ContinuousReference(
         runner, SimpleNamespace(requests={}, running=[], waiting=[]), path, {"run_id": "host"}
@@ -189,9 +202,17 @@ def test_continuous_reference_actual_pinned_forward_and_real_generation(monkeypa
             with owner._draft_window_proposal_scope(owner.input_batch, dummy_run=False, is_profile=False):
                 _publish_in_scope(owner, descriptors[padded])
                 owner.input_buffers.seq_lens[:active].fill_(64)
-                probe.current_case = dict(active=active, step=step, scenario=str(step))
+                probe.current_case = dict(active=active, padded=padded, step=step, scenario=str(step))
                 with torch.inference_mode():
                     cache.zero_()
+                    if fault:
+                        with pytest.raises(
+                            RuntimeError, match="NUMERIC_MISMATCH" if fault == "numeric" else "partially submitted"
+                        ):
+                            manager.run_fullgraph(descriptors[padded])
+                        assert cache[1, 0, 0, 0] == (999 if fault == "native" else 1)
+                        assert probe.poisoned is (fault == "native")
+                        return
                     assert manager.run_fullgraph(descriptors[padded]) is None
                 assert cache[1, 0, 0, 0] == 1  # reference post-state restored to actual Graph post-state
             assert owner._draft_window_live_inputs is None
