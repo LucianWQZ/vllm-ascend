@@ -166,7 +166,7 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
                     draft_attn_metadatas=draft_attn_metadatas,
                 )
             )
-            update_full_graph_params(
+            self._update_full_graph_params(
                 # FIXME(Ronald1995): support hybrid attn backend
                 list(self.speculator.attn_backends.values())[0],
                 self.update_stream,
@@ -182,3 +182,7 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
         # This does not reorder replay/consumer/update or prove its device timing.
         record_parallel_graph_output(self.speculator, ret)
         return ret
+
+    def _update_full_graph_params(self, *args, **kwargs):
+        """Instance boundary for opt-in Host ranges; exact original UPDATE call."""
+        return update_full_graph_params(*args, **kwargs)

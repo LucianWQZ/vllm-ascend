@@ -119,6 +119,31 @@ class AscendDSparkSpeculator(DraftWindowEagerMixin, DSparkSpeculator):
         super().__init__(vllm_config, device)
         self.input_batch: InputBatch | None = None
 
+    def capture(self) -> None:
+        diagnostic = self.vllm_config.additional_config.get("draft_window_graph_numeric_diagnostic", False)
+        if diagnostic:
+            if not experimental_draft_window_graph_characterization_enabled():
+                raise RuntimeError("numeric capture diagnostic requires the experimental Graph gate")
+            from vllm_ascend.worker.v2.spec_decode.draft_window_graph_diagnostics import DraftGraphOutputReferences
+
+            if hasattr(self, "_draft_graph_output_references"):
+                raise RuntimeError("numeric capture diagnostic already installed")
+            self._draft_graph_output_references = DraftGraphOutputReferences(self)
+        super().capture()
+        if diagnostic:
+            self._draft_graph_output_references.freeze(d.num_tokens for d in self.query_cudagraph_manager.graphs)
+
+    def _run_model(
+        self, num_tokens, attn_metadata, slot_mappings, num_tokens_across_dp, cudagraph_runtime_mode=CUDAGraphMode.NONE
+    ):
+        output = super()._run_model(
+            num_tokens, attn_metadata, slot_mappings, num_tokens_across_dp, cudagraph_runtime_mode
+        )
+        sink = getattr(self, "_draft_graph_output_references", None)
+        if sink is not None and cudagraph_runtime_mode == CUDAGraphMode.FULL:
+            sink.retain(self, num_tokens, output)
+        return output
+
     def load_draft_model(
         self,
         target_model: torch.nn.Module,
