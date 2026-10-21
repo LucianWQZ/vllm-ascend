@@ -100,20 +100,31 @@ def _flatten(value: Any, path: str = "") -> tuple[dict[str, torch.Tensor], dict[
     return tensors, literals
 
 
-def _snapshot(value: Any, budget: list[int], block_ids: Mapping[str, torch.Tensor] | None = None) -> dict:
+def _snapshot(
+    value: Any, budget: list[int], block_ids: Mapping[str, torch.Tensor] | None = None, *, tensor_sink=None
+) -> dict:
     tensors, literals = _flatten(value)
     selections: dict[str, torch.Tensor] = {}
     if block_ids is not None:
         selections, _ = _flatten(block_ids)
         _require(set(selections) == set(tensors), "incomplete selected-block inventory")
+    # A group metadata object is shared by multiple real layer keys. Account
+    # and copy an identical view only once; retain every field and alias label.
+    keys = {
+        name: (_view(t), t.storage_offset(), tuple(selections[name].tolist()) if name in selections else None)
+        for name, t in tensors.items()
+    }
+    unique = {keys[name]: name for name in tensors}
     size = sum(
         (selections[name].numel() * t[0].numel() if name in selections else t.numel()) * t.element_size()
-        for name, t in tensors.items()
+        for name in unique.values()
+        for t in (tensors[name],)
     )
     _require(size <= budget[0], f"complete checkpoint needs {size} bytes; remaining budget {budget[0]}")
     budget[0] -= size
     aliases: dict[tuple[str, int], int] = {}
     entries: dict[str, Any] = {}
+    copies: dict[tuple, torch.Tensor] = {}
     for name, tensor in tensors.items():
         storage = tensor.untyped_storage()
         storage_key = (str(tensor.device), storage.data_ptr())
@@ -126,10 +137,18 @@ def _snapshot(value: Any, budget: list[int], block_ids: Mapping[str, torch.Tenso
             selected = tuple(ids.tolist())
             _require(bool(selected) and list(selected) == sorted(set(selected)), "empty/duplicate/unsorted block ids")
             _require(selected[0] >= 0 and selected[-1] < tensor.shape[0], "selected block out of bounds")
-            payload = tensor.index_select(0, ids.to(tensor.device))
+            if tensor_sink is None:
+                payload = tensor.index_select(0, ids.to(tensor.device))
+        if keys[name] not in copies:
+            copies[keys[name]] = (
+                tensor_sink(tensor, selected)
+                if tensor_sink is not None
+                else payload.detach().to(device="cpu", copy=True).contiguous()
+            )
+        copied = copies[keys[name]]
         entries[name] = {
-            "data": payload.detach().to(device="cpu", copy=True).contiguous(),
-            "shape": tuple(payload.shape),
+            "data": copied,
+            "shape": tuple(copied.shape),
             "source_shape": tuple(tensor.shape),
             "block_ids": selected,
             "stride": tuple(tensor.stride()),
@@ -286,12 +305,16 @@ def _validate_read_coverage(record: dict) -> None:
 class FullForwardCheckpointer:
     """Reusable explicit-callable runner. A caller-supplied callable is not NPU proof."""
 
-    def __init__(self, *, fixture_id: str, max_bytes: int = DEFAULT_MAX_BYTES, max_records: int = 4):
+    def __init__(self, *, fixture_id: str, max_bytes: int = DEFAULT_MAX_BYTES, max_records: int = 4, tensor_sink=None):
         _require(bool(fixture_id), "fixture_id must identify the model weights and controlled case")
         _require(max_bytes > 0 and max_records > 0, "checkpoint limits must be positive")
         self.fixture_id, self.max_bytes, self.max_records = fixture_id, max_bytes, max_records
         self.records: list[dict] = []
         self.skipped_for_limit = 0
+        self.tensor_sink = tensor_sink
+
+    def snapshot(self, value, budget, block_ids=None):
+        return _snapshot(value, budget, block_ids, tensor_sink=self.tensor_sink)
 
     def run(
         self,
@@ -327,13 +350,13 @@ class FullForwardCheckpointer:
             else "EXPLICIT_CALLABLE_OBSERVATION",
             "status": "PREPARED",
             "kv_keys": sorted(kv),
-            "inputs": _snapshot(inputs, budget),
-            "kv_before": _snapshot(kv, budget, block_ids),
-            "write_slots": _snapshot(write_slots, budget),
+            "inputs": self.snapshot(inputs, budget),
+            "kv_before": self.snapshot(kv, budget, block_ids),
+            "write_slots": self.snapshot(write_slots, budget),
             "update_effective_generation": "UNKNOWN",
             "physical_read_coverage": "UNPROVEN",
             "kv_scope": "FULL_DECLARED_READ_WRITE_BLOCKS" if block_ids is not None else "ALL_BOUND_KV_TENSORS",
-            "declared_reads": _snapshot(declared_reads, budget),
+            "declared_reads": self.snapshot(declared_reads, budget),
         }
         _validate_read_coverage(before)
         # Reserve the complete second KV copy before running the model.
@@ -348,9 +371,9 @@ class FullForwardCheckpointer:
         try:
             synchronize()
             _require(isinstance(output, (torch.Tensor, tuple, list)), "full forward returned no tensor output")
-            before["output"] = _snapshot(output, budget)
+            before["output"] = self.snapshot(output, budget)
             _require(bool(before["output"]["tensors"]), "empty full-forward output")
-            before["kv_after"] = _snapshot(dict(kv_access()), budget, block_ids)
+            before["kv_after"] = self.snapshot(dict(kv_access()), budget, block_ids)
             before["write_coverage"] = _write_coverage(before["kv_before"], before["kv_after"], before["write_slots"])
             before["status"] = "CAPTURED"
         except EvidenceError as error:

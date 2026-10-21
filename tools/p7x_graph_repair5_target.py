@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -124,7 +125,19 @@ def logical_kv(snapshot: dict, block_owners: dict[int, tuple]) -> dict:
 
 
 class ControlledTarget:
-    def __init__(self, runner: Any, *, fixture_id: str, arm: str, scheduler: Any, identity: dict, profile="base"):
+    def __init__(
+        self,
+        runner: Any,
+        *,
+        fixture_id: str,
+        arm: str,
+        scheduler: Any,
+        identity: dict,
+        profile="base",
+        bounded_store=False,
+        numeric_probe=None,
+        sample_limit=None,
+    ):
         require(arm in ("OFF", "ON"), "invalid arm")
         # Explicit scheduler emptiness is necessary; this is not a live checkpoint.
         require(
@@ -149,6 +162,12 @@ class ControlledTarget:
         self.records: list[dict] = []
         self.deadline = time.monotonic() + 3300
         self.disk_budget = 16 * 1024**3
+        self.bounded_store = bounded_store
+        self.writer: Any = None  # optional, lazily imported versioned evidence writer
+        self.persisted = 0
+        self.numeric_probe = numeric_probe
+        require(sample_limit is None or (bounded_store and 0 < sample_limit <= len(self.cases)), "invalid prefix limit")
+        self.sample_limit = sample_limit
 
     def _budget(self, output):
         require(time.monotonic() < self.deadline, "controlled diagnostic time budget exceeded")
@@ -159,6 +178,14 @@ class ControlledTarget:
 
     def _save(self, result, output):
         """Enforce byte/time limits during serialization, not only afterwards."""
+        if self.writer is not None:
+            if len(self.records) > self.persisted:
+                self.writer.finish(self.records[-1])
+                self.persisted += 1
+                # Completed values are durable; retain only small status records.
+                self.records[-1] = {k: self.records[-1][k] for k in ("identity", "status", "generation")}
+                self.probe.records.clear()
+            return
         self._budget(output)
         used = sum(p.stat().st_size for p in output.parent.glob("*") if p.is_file())
         remaining = self.disk_budget - used
@@ -286,8 +313,39 @@ class ControlledTarget:
             "device_verification": "IN_PROGRESS",
         }
         output.parent.mkdir(parents=True, exist_ok=True)
+        if self.bounded_store:
+            from tools.p7x_graph_repair6_storage import CollectionWriter, atomic_json, require_space, resource_plan
+
+            context = self.runner.compilation_config.static_forward_context
+            tensors = [t for name in self.inventory["target_layers"] for t in context[name].kv_cache]
+            geometries = {(tuple(t.shape[1:]), t.element_size()) for t in tensors}
+            require(len(geometries) == 1, "heterogeneous KV geometry outside Base")
+            (block, heads, dim), size = geometries.pop()
+            require(block == BLOCK, "wrong block geometry")
+            cfg = self.runner.model.config
+            masks = [getattr(m, "attn_mask", None) for m in self.runner.model_state.attn_metadata.values()]
+            mask_bytes = max((m.numel() * m.element_size() for m in masks if m is not None), default=0)
+            budget = resource_plan(
+                self.cases,
+                layers=len(self.inventory["target_layers"]),
+                kv_heads=heads,
+                head_dim=dim,
+                element_bytes=size,
+                hidden_size=cfg.hidden_size,
+                vocab_size=cfg.vocab_size,
+                mask_bytes=mask_bytes,
+            )
+            atomic_json(output.with_name("target-resource-plan.json"), budget)
+            require_space(output.parent, budget["off_on_with_raw_and_atomic_bytes"])
+            self.probe.max_bytes = max(row["checkpoint"] for row in budget["samples"])
+            self.disk_budget = budget["one_arm_bytes"]
+            header = {k: v for k, v in result.items() if k != "records"}
+            self.writer = CollectionWriter(output, header, max_bytes=self.disk_budget, timeout=3300)
+            self.probe.tensor_sink = self.writer.store.put
         try:
             for case in self.cases:
+                if self.sample_limit is not None and len(self.records) >= self.sample_limit:
+                    break
                 self._budget(output)
                 started = time.monotonic()
                 record = {
@@ -297,6 +355,8 @@ class ControlledTarget:
                     "arm": self.arm,
                 }
                 self.records.append(record)
+                if self.writer is not None:
+                    self.writer.start(record["identity"])
                 try:
                     self.probe._synchronize()
                     desc, batch, owners = self._stage(case)
@@ -340,6 +400,8 @@ class ControlledTarget:
                     )
                     record["status"] = "CAPTURED_COMPLETE"
                     if include_draft:
+                        if self.numeric_probe is not None:
+                            self.numeric_probe.current_case = record["identity"]
                         spec = self.runner.speculator
                         target_root = self.runner.model_state.attn_metadata
                         require(
@@ -385,8 +447,8 @@ class ControlledTarget:
                         outside_after_draft = outside_digest(access(), blocks)
                         record["timings_seconds"]["outside_hash_after_draft"] = time.monotonic() - hash_start
                         record["target_after_draft"] = {
-                            "kv": self.base._snapshot(access(), [self.probe.max_bytes], blocks),
-                            "inputs": self.base._snapshot(inputs, [self.probe.max_bytes]),
+                            "kv": self.probe.snapshot(access(), [self.probe.max_bytes], blocks),
+                            "inputs": self.probe.snapshot(inputs, [self.probe.max_bytes]),
                             "outside": outside_after_draft,
                             "root_same": True,
                             "draft_slots": spec.block_tables.slot_mappings[0, : nr * 7].detach().cpu().clone(),
@@ -405,15 +467,22 @@ class ControlledTarget:
                     raise
                 finally:
                     record.setdefault("timings_seconds", {})["before_dump"] = time.monotonic() - started
-                    self._budget(output)
-                    dump_start = time.monotonic()
-                    self._save(result, output)
-                    record["timings_seconds"]["dump"] = time.monotonic() - dump_start
-                    self._budget(output)
+                    self._flush_preserving_error(result, output)
             result["device_verification"] = "EXECUTED_SCOPED_NOT_GATE_CLOSURE"
         finally:
-            self._save(result, output)
+            self._flush_preserving_error(result, output)
+            if self.writer is not None:
+                self.writer.close(result["device_verification"])
         return result
+
+    def _flush_preserving_error(self, result, output):
+        original = sys.exc_info()[1]
+        try:
+            self._save(result, output)
+        except Exception as error:
+            if original is None:
+                raise
+            original.add_note(f"Secondary evidence flush failure: {type(error).__name__}: {error}")
 
 
 def draft_geometry(spec, snapshot, active):

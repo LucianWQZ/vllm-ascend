@@ -103,6 +103,8 @@ def audit_execution(document, campaign, launcher, expected, artifact, *, abort=F
                         "profile_probe_error",
                         "lifecycle_probe_error",
                         "diagnostic_artifact_error",
+                        "numeric_probe_error",
+                        "normal_probe_error",
                     )
                 ),
                 "campaign cleanup/export failure",

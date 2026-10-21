@@ -48,11 +48,14 @@ def preflight(torch_npu):
 
 
 class RequestProfiler:
-    def __init__(self, runner, output, identity, *, enabled, diagnostic=False):
+    def __init__(self, runner, output, identity, *, enabled, diagnostic=False, detailed=False):
         import torch
 
         self.torch, self.runner, self.output = torch, runner, Path(output)
         self.identity, self.enabled, self.diagnostic = identity, enabled, diagnostic
+        if detailed and (not enabled or diagnostic):
+            raise ValueError("detailed profile requires a separate enabled normal-path experiment")
+        self.detailed = detailed
         self.saved, self.calls, self.groups = [], [], []
         self.profiler = None
         self.active = False
@@ -94,6 +97,17 @@ class RequestProfiler:
                 raise ValueError("normal profiling requires heavy observer OFF")
         try:
             self._wrap(spec, "propose", "Draft_propose")
+            for method, label in (
+                ("_materialize_draft_window_read_inputs", "Draft_materialize"),
+                ("build_draft_attn_metadatas", "Draft_metadata_bind"),
+            ):
+                if hasattr(spec, method):
+                    self._wrap(spec, method, label)
+            if hasattr(spec.query_cudagraph_manager, "_update_full_graph_params"):
+                self._wrap(spec.query_cudagraph_manager, "_update_full_graph_params", "Draft_UPDATE_CALL")
+            runtime = getattr(spec, "_draft_window_runtime_state", None)
+            if runtime is not None:
+                self._wrap(runtime, "retire_generation", "Draft_retire_host")
             for name, manager in (("Target", self.runner.cudagraph_manager), ("Draft", spec.query_cudagraph_manager)):
                 self._wrap(manager, "run_fullgraph", name + "_REPLAY_PLUS_UPDATE")
                 for desc, graph in manager.graphs.items():
@@ -110,11 +124,15 @@ class RequestProfiler:
             self.capability = preflight(torch_npu)
             if self.capability["status"] != "APIS_AVAILABLE_DEVICE_NOT_RUN":
                 raise RuntimeError(self.capability)
+            if self.detailed:
+                parameters = inspect.signature(torch_npu.profiler.profile).parameters
+                if not all(k in parameters for k in ("record_shapes", "with_stack")):
+                    raise RuntimeError("CAPABILITY_UNVERIFIED: detailed profile keyword signature unavailable")
             self.profiler = torch_npu.profiler.profile(
                 activities=[torch_npu.profiler.ProfilerActivity.CPU, torch_npu.profiler.ProfilerActivity.NPU],
-                record_shapes=False,
+                record_shapes=self.detailed,
                 profile_memory=False,
-                with_stack=False,
+                with_stack=self.detailed,
                 on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(str(self.output / "trace")),
             )
             self.profiler.__enter__()
@@ -155,6 +173,8 @@ class RequestProfiler:
                 device=self.device,
                 wrapper_pid=None,
                 profiler_enabled=self.enabled,
+                profile_configuration=dict(record_shapes=self.detailed, with_stack=self.detailed, profile_memory=False),
+                detailed_diagnostic=self.detailed,
                 capability=getattr(self, "capability", None),
                 groups=self.groups,
                 calls=self.calls,
@@ -163,7 +183,7 @@ class RequestProfiler:
                 clock_domain="HOST_MONOTONIC_NS_ONLY",
                 initialization_capture="EXCLUDED",
                 warmup="first request group once before begin_active",
-                update_host_range="UNRESOLVED_SEPARATE; manager range includes replay plus UPDATE",
+                update_host_range="Draft_UPDATE_CALL when instance seam exists; submission not completion",
                 physical_read="NOT_PROVEN",
                 completion="NOT_PROVEN",
             )

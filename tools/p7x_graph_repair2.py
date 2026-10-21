@@ -769,6 +769,8 @@ class TargetBoundaryProbe:
         self.runner, self.output = runner, output
         self.records, self.errors = [], []
         self._saved = []
+        self.request_label = None
+        self.sample_identity = None
 
     def _safe(self, callback):
         try:
@@ -814,6 +816,32 @@ class TargetBoundaryProbe:
         probe = self
         spec, model = self.runner.speculator, self.runner.model
         original_propose, original_logits = spec.propose, model.compute_logits
+        original_sample = getattr(self.runner, "sample", None)
+
+        def sample(_self, hidden_states, input_batch, *args, **kwargs):
+            # After Target forward, before Draft replay/update; diagnostic D2H.
+            def identify():
+                batch = input_batch
+                probe.sample_identity = {
+                    "schema": "repair6-natural-head-identity-v1",
+                    "request_group": probe.request_label,
+                    "requests": list(batch.req_ids),
+                    "phase": "TARGET_SAMPLE_AFTER_FORWARD",
+                    "tokens": batch.input_ids[: batch.num_tokens].detach().cpu().tolist(),
+                    "positions": batch.positions[: batch.num_tokens].detach().cpu().tolist(),
+                    "query_layout": batch.query_start_loc_np.tolist(),
+                    "active": batch.num_reqs,
+                    "padded_tokens": int(batch.positions.shape[0]),
+                    "logits_indices": batch.logits_indices.detach().cpu().tolist(),
+                    "full_kv_precondition": "NOT_CAPTURED_USE_CONTROLLED_TARGET",
+                }
+
+            probe.sample_identity = None
+            probe._safe(identify)
+            try:
+                return original_sample(hidden_states, input_batch, *args, **kwargs)
+            finally:
+                probe.sample_identity = None
 
         def propose(_self, *args, **kwargs):
             record = {
@@ -849,6 +877,7 @@ class TargetBoundaryProbe:
                 probe.records.append(
                     {
                         "kind": "target_logits_head",
+                        "logical_identity": probe.sample_identity,
                         "path": str(path),
                         "input_sha256": digest,
                         "input_shape": list(host_input.shape),
@@ -862,7 +891,10 @@ class TargetBoundaryProbe:
             probe._safe(collect)
             return result
 
-        for owner, name, replacement in ((spec, "propose", propose), (model, "compute_logits", logits)):
+        wrappers = [(spec, "propose", propose), (model, "compute_logits", logits)]
+        if original_sample is not None:
+            wrappers.append((self.runner, "sample", sample))
+        for owner, name, replacement in wrappers:
             self._saved.append((owner, name, vars(owner).get(name), name in vars(owner)))
             setattr(owner, name, MethodType(replacement, owner))
 
@@ -957,7 +989,9 @@ def run_case(args):
         "task_trace": None,
         "physical_read_trace": None,
     }
-    llm = session = target_probe = full_target_probe = lifecycle_probe = profile_probe = None
+    llm = session = target_probe = full_target_probe = lifecycle_probe = profile_probe = numeric_probe = (
+        normal_probe
+    ) = None
     profile_mode = getattr(args, "repair5_profile", "none")
     capture_profile = getattr(args, "repair5_capture_profile", "base")
     if profile_mode != "none" and (
@@ -970,6 +1004,8 @@ def run_case(args):
     ):
         raise ValueError("profiling requires observer-OFF/no heavy diagnostics, except explicit LIFE profile")
     additional = {} if args.case == "A0" else {"draft_window_size": 1024}
+    if getattr(args, "repair6_numeric_reference", False):
+        additional["draft_window_graph_numeric_diagnostic"] = True
     config = dict(
         model=args.target_model,
         max_model_len=4096,
@@ -998,6 +1034,24 @@ def run_case(args):
     record["config_sha256"] = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()
     _write(output / "progress.json", {"identity": identity, "phase": "BEFORE_STARTUP"})
     try:
+        if getattr(args, "repair6_target_store", False):
+            from tools.p7x_graph_repair5_target import case_plan
+            from tools.p7x_graph_repair6_storage import require_space, resource_plan
+
+            model_geometry = json.loads((Path(args.target_model) / "config.json").read_text())
+            h = model_geometry["hidden_size"]
+            planned = resource_plan(
+                case_plan(capture_profile),
+                layers=model_geometry["num_hidden_layers"],
+                kv_heads=model_geometry["num_key_value_heads"],
+                head_dim=model_geometry.get("head_dim", h // model_geometry["num_attention_heads"]),
+                element_bytes=2,
+                hidden_size=h,
+                vocab_size=model_geometry["vocab_size"],
+                mask_bytes=2048**2,
+            )
+            _write(output / "preload-resource-plan.json", planned)
+            require_space(output, planned["off_on_with_raw_and_atomic_bytes"])
         if profile_mode != "none":
             import torch_npu
 
@@ -1077,6 +1131,11 @@ def run_case(args):
             lifecycle_probe.__enter__()
         if getattr(args, "repair5_controlled_target", False):
             controlled = repair5.load_tool("p7x_graph_repair5_target")
+            if getattr(args, "repair6_numeric_reference", False):
+                from tools.p7x_graph_repair6_numeric import ContinuousReference
+
+                numeric_probe = ContinuousReference(runner, core.scheduler, output / "numeric-reference.json", identity)
+                numeric_probe.__enter__()
             fixture = controlled.ControlledTarget(
                 runner,
                 fixture_id=hashlib.sha256(args.fixture_manifest.read_bytes()).hexdigest(),
@@ -1084,15 +1143,26 @@ def run_case(args):
                 scheduler=core.scheduler,
                 identity=identity,
                 profile=capture_profile,
+                bounded_store=getattr(args, "repair6_target_store", False),
+                numeric_probe=numeric_probe,
+                sample_limit=getattr(args, "repair6_target_prefix", None),
             )
-            fixture.execute(output / "controlled-target.pt", include_draft=args.repair5_controlled_mrv2)
+            target_artifact = (
+                "controlled-target.json" if getattr(args, "repair6_target_store", False) else "controlled-target.pt"
+            )
+            fixture.execute(output / target_artifact, include_draft=args.repair5_controlled_mrv2)
             record["controlled_target_numeric"] = {
-                "artifact": "controlled-target.pt",
+                "artifact": target_artifact,
                 "kind": "FULL_TARGET_CONTROLLED_SYNTHETIC_KV",
                 "status": "EXECUTED_SCOPED_NOT_GATE_CLOSURE",
             }
             # A disposable engine is never returned to serving after diagnostic KV staging.
             requests = []
+        if getattr(args, "repair6_normal_lifecycle", False):
+            from tools.p7x_graph_repair6_lifecycle import NormalOrderProbe
+
+            normal_probe = NormalOrderProbe(spec, output / "normal-lifecycle.json", identity)
+            normal_probe.__enter__()
         if getattr(args, "full_target_probe", False):
             adapter_spec = importlib.util.spec_from_file_location(
                 "_repair4_full_target", ROOT / "tools/p7x_graph_repair4_target.py"
@@ -1118,7 +1188,12 @@ def run_case(args):
             from tools.p7x_graph_repair5_profile import RequestProfiler
 
             profile_probe = RequestProfiler(
-                runner, output, identity, enabled=profile_mode != "control", diagnostic=profile_mode == "life"
+                runner,
+                output,
+                identity,
+                enabled=profile_mode != "control",
+                diagnostic=profile_mode == "life",
+                detailed=getattr(args, "repair6_profile_detail", False),
             )
             profile_probe.__enter__()
             request = requests[0]
@@ -1132,6 +1207,8 @@ def run_case(args):
             profile_probe.begin_active()
         # Fixed 1/2/4 requests are attempts; checker requires actual descriptor events.
         for request in requests:
+            if target_probe is not None:
+                target_probe.request_label = request["label"]
             _write(
                 output / "progress.json",
                 {"identity": identity, "phase": "BEFORE_GENERATE", "request": request["label"]},
@@ -1173,6 +1250,12 @@ def run_case(args):
                 profile_probe.__exit__(None, None, None)
             except Exception as error:
                 record["profile_probe_error"] = repr(error)
+        for name, probe in (("numeric_probe", numeric_probe), ("normal_probe", normal_probe)):
+            if probe is not None:
+                try:
+                    probe.__exit__(RuntimeError if record["status"] == "EXCEPTION" else None, None, None)
+                except Exception as error:
+                    record[name + "_error"] = repr(error)
         if lifecycle_probe is not None:
             try:
                 lifecycle_probe.__exit__(None, None, None)
@@ -1214,7 +1297,14 @@ def run_case(args):
         try:
             record["diagnostic_artifacts"] = {
                 p.name: {"sha256": file_sha(p), "bytes": p.stat().st_size}
-                for p in (output / "controlled-target.pt", output / "mrv2-lifecycle.json", output / "profile.json")
+                for p in (
+                    output / "controlled-target.pt",
+                    output / "controlled-target.json",
+                    output / "numeric-reference.json",
+                    output / "normal-lifecycle.json",
+                    output / "mrv2-lifecycle.json",
+                    output / "profile.json",
+                )
                 if p.is_file()
             }
         except OSError as error:
@@ -1321,6 +1411,19 @@ def main():
     run.add_argument("--target-probe", action="store_true", help="extra D2H after capture; not for timing")
     run.add_argument("--repair5-capture-profile", choices=("base", "target4"), default="base")
     run.add_argument(
+        "--repair6-target-store", action="store_true", help="bounded chunk Target evidence, versioned manifest"
+    )
+    run.add_argument("--repair6-target-prefix", type=int, help="partial preflight; never full coverage PASS")
+    run.add_argument("--repair6-profile-detail", action="store_true", help="separate shapes/stack diagnostic profile")
+    run.add_argument(
+        "--repair6-numeric-reference", action="store_true", help="exclusive serialized same-Window backbone reference"
+    )
+    run.add_argument(
+        "--repair6-normal-lifecycle",
+        action="store_true",
+        help="bounded device copies; completion wait only at campaign end",
+    )
+    run.add_argument(
         "--repair5-profile",
         choices=("none", "normal", "control", "life"),
         default="none",
@@ -1355,6 +1458,22 @@ def main():
     )
     args = parser.parse_args()
     if args.command == "run":
+        if args.repair6_target_prefix is not None and not (
+            args.repair6_target_store and args.repair6_target_prefix > 0
+        ):
+            parser.error("prefix limit requires bounded store and positive count")
+        if args.repair6_profile_detail and args.repair5_profile != "normal":
+            parser.error("detailed profile requires the separate normal profiler mode")
+        if args.repair6_target_store and not args.repair5_controlled_target:
+            parser.error("Repair6 store requires controlled Target")
+        if args.repair6_numeric_reference and not (
+            args.repair6_target_store and args.repair5_controlled_mrv2 and args.case == "B"
+        ):
+            parser.error("numeric reference requires controlled Window ON with bounded store")
+        if args.repair6_normal_lifecycle and (
+            args.case != "B-observer-off" or args.repair5_lifecycle or args.repair5_controlled_target
+        ):
+            parser.error("normal lifecycle requires observer-OFF without serialized LIFE/controlled Target")
         if args.repair5_controlled_mrv2 and not (
             args.repair5_controlled_target and (args.case == "A0" or args.repair5_lifecycle)
         ):
