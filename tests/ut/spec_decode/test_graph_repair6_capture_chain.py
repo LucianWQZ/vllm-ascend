@@ -31,6 +31,10 @@ def capture_owner(monkeypatch, enabled=True):
     del owner.build_draft_attn_metadatas
     owner.query_cudagraph_manager = manager
     owner.vllm_config = SimpleNamespace(additional_config={"draft_window_graph_numeric_diagnostic": enabled})
+    from vllm_ascend.ascend_config import AscendConfig
+
+    # Validate the real schema before crossing the native-only Host boundary.
+    AscendConfig(sparse_kv_offload_config=None, **owner.vllm_config.additional_config)
     owner.device = torch.device("cpu")
     owner.num_speculative_steps = 7
     owner.max_model_len = 4096

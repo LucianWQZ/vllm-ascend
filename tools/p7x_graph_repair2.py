@@ -911,6 +911,57 @@ class TargetBoundaryProbe:
         )
 
 
+def build_llm_kwargs(args):
+    """Single configuration producer for launch and model-free validation."""
+    profile_mode = getattr(args, "repair5_profile", "none")
+    capture_profile = getattr(args, "repair5_capture_profile", "base")
+    if profile_mode != "none" and (
+        args.target_probe
+        or args.full_target_probe
+        or args.repair5_controlled_target
+        or (args.repair5_lifecycle and profile_mode != "life")
+        or (not args.repair5_lifecycle and profile_mode == "life")
+        or (profile_mode != "life" and args.case not in ("A0", "B-observer-off"))
+    ):
+        raise ValueError("profiling requires observer-OFF/no heavy diagnostics, except explicit LIFE profile")
+    additional = {} if args.case == "A0" else {"draft_window_size": 1024}
+    if getattr(args, "repair6_numeric_reference", False):
+        additional["draft_window_graph_numeric_diagnostic"] = True
+    config = dict(
+        model=args.target_model,
+        max_model_len=4096,
+        enforce_eager=False,
+        async_scheduling=False,
+        enable_prefix_caching=False,
+        gpu_memory_utilization=0.80,
+        max_num_seqs=4,
+        max_num_batched_tokens=4096,
+        seed=0,
+        speculative_config={
+            "model": args.draft_model,
+            "method": "dspark",
+            "num_speculative_tokens": 7,
+            "enable_adaptive_verification": False,
+        },
+        additional_config=additional,
+        disable_log_stats=True,
+        compilation_config={
+            "cudagraph_mode": "FULL_DECODE_ONLY",
+            "cudagraph_capture_sizes": [7, 14, 28] if capture_profile == "base" else [7, 14, 28, 32],
+        },
+    )
+    return config
+
+
+def configure_run_environment(args, output):
+    """Set the same startup environment for model-free preflight and launch."""
+    os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1"
+    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+    os.environ["VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH"] = "1" if args.case.startswith("B") else "0"
+    os.environ["VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH_OBSERVE"] = "0" if args.case == "B-observer-off" else "1"
+    os.environ["VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH_ARTIFACT"] = str(output / "partial.json")
+
+
 def run_case(args):
     """Fixed startup/serving smoke, with no hidden capture-size downgrade.
 
@@ -960,11 +1011,7 @@ def run_case(args):
             raise RuntimeError(f"fixture hash mismatch: {path}")
     if len(fixtures["files"]) < 9:
         raise RuntimeError("fixture manifest must include target config/index/5 shards and draft config/weights")
-    os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1"
-    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
-    os.environ["VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH"] = "1" if args.case.startswith("B") else "0"
-    os.environ["VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH_OBSERVE"] = "0" if args.case == "B-observer-off" else "1"
-    os.environ["VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH_ARTIFACT"] = str(output / "partial.json")
+    configure_run_environment(args, output)
     import vllm
     from vllm import LLM, SamplingParams
 
@@ -990,41 +1037,7 @@ def run_case(args):
     ) = None
     profile_mode = getattr(args, "repair5_profile", "none")
     capture_profile = getattr(args, "repair5_capture_profile", "base")
-    if profile_mode != "none" and (
-        args.target_probe
-        or args.full_target_probe
-        or args.repair5_controlled_target
-        or (args.repair5_lifecycle and profile_mode != "life")
-        or (not args.repair5_lifecycle and profile_mode == "life")
-        or (profile_mode != "life" and args.case not in ("A0", "B-observer-off"))
-    ):
-        raise ValueError("profiling requires observer-OFF/no heavy diagnostics, except explicit LIFE profile")
-    additional = {} if args.case == "A0" else {"draft_window_size": 1024}
-    if getattr(args, "repair6_numeric_reference", False):
-        additional["draft_window_graph_numeric_diagnostic"] = True
-    config = dict(
-        model=args.target_model,
-        max_model_len=4096,
-        enforce_eager=False,
-        async_scheduling=False,
-        enable_prefix_caching=False,
-        gpu_memory_utilization=0.80,
-        max_num_seqs=4,
-        max_num_batched_tokens=4096,
-        seed=0,
-        speculative_config={
-            "model": args.draft_model,
-            "method": "dspark",
-            "num_speculative_tokens": 7,
-            "enable_adaptive_verification": False,
-        },
-        additional_config=additional,
-        disable_log_stats=True,
-        compilation_config={
-            "cudagraph_mode": "FULL_DECODE_ONLY",
-            "cudagraph_capture_sizes": [7, 14, 28] if capture_profile == "base" else [7, 14, 28, 32],
-        },
-    )
+    config = build_llm_kwargs(args)
     record["llm_kwargs"] = config
     record["capture_profile"] = capture_profile
     record["config_sha256"] = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()
@@ -1140,6 +1153,7 @@ def run_case(args):
                         fixture_id=hashlib.sha256(args.fixture_manifest.read_bytes()).hexdigest(),
                         profile=capture_profile,
                         config_sha256=record["config_sha256"],
+                        sample_limit=getattr(args, "repair6_target_prefix", None),
                     ),
                 )
                 numeric_probe.__enter__()
@@ -1384,7 +1398,7 @@ def trace_probe(output):
     _write(output, report)
 
 
-def main():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
     analyze = sub.add_parser("analyze")
@@ -1473,7 +1487,7 @@ def main():
     run.add_argument(
         "--full-target-max-records", type=int, default=4, help="hard retained-record bound; omissions reported"
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.command == "run":
         if args.repair6_target_prefix is not None and not (
             args.repair6_target_store and args.repair6_target_prefix > 0
@@ -1497,6 +1511,11 @@ def main():
             parser.error("controlled MRV2 requires controlled Target; Window ON also requires lifecycle")
         if args.repair5_abort_at != "none" and not args.repair5_lifecycle:
             parser.error("abort requires lifecycle in disposable child supervised by launch")
+    return args
+
+
+def main():
+    args = parse_args()
     if args.command == "launch":
         return launch_case(args)
     if args.command == "compare-probes":

@@ -27,6 +27,7 @@ from vllm.v1.worker.gpu.spec_decode.dspark.speculator import (
     DSparkSpeculator,
 )
 
+from vllm_ascend.ascend_config import validate_additional_config_bool
 from vllm_ascend.utils import (
     get_rotation_path,
     vllm_version_is,
@@ -120,7 +121,10 @@ class AscendDSparkSpeculator(DraftWindowEagerMixin, DSparkSpeculator):
         self.input_batch: InputBatch | None = None
 
     def capture(self) -> None:
-        diagnostic = self.vllm_config.additional_config.get("draft_window_graph_numeric_diagnostic", False)
+        diagnostic = validate_additional_config_bool(
+            self.vllm_config.additional_config.get("draft_window_graph_numeric_diagnostic", False),
+            "additional_config.draft_window_graph_numeric_diagnostic",
+        )
         if diagnostic:
             if not experimental_draft_window_graph_characterization_enabled():
                 raise RuntimeError("numeric capture diagnostic requires the experimental Graph gate")

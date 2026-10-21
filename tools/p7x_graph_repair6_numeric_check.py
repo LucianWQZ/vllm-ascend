@@ -259,6 +259,13 @@ def check_collection(reader, campaign, expected):
             "campaign/model contract mismatch",
         )
         cases = case_plan(provenance["profile"])
+        limit = provenance.get("sample_limit")
+        if limit is not None:
+            require(limit == expected.get("numeric_samples") == 3, "sentinel scope mismatch")
+            require("--repair6-target-prefix" in expected["argv"], "undeclared sentinel")
+            index = expected["argv"].index("--repair6-target-prefix")
+            require(expected["argv"][index + 1] == "3", "sentinel argv mismatch")
+            cases = cases[:limit]
         require(0 < len(reader.samples) <= len(cases), "empty/extra numeric samples")
         summary_path = reader.path.with_name("numeric-summary.json")
         summary = json.loads(summary_path.read_text())
@@ -357,6 +364,10 @@ def check_collection(reader, campaign, expected):
         result["status"] = (
             "PASS_DIAGNOSTIC_CONTINUOUS_REFERENCE" if len(reader.samples) == len(cases) else "INCOMPLETE_COVERAGE"
         )
+        if limit is not None and result["status"] == "PASS_DIAGNOSTIC_CONTINUOUS_REFERENCE":
+            result["status"] = (
+                "PASS_NUMERIC_SENTINEL_ONLY" if result.get("aba") == "PASS_SCOPED" else "INCOMPLETE_COVERAGE"
+            )
     except (ValueError, KeyError, TypeError, OSError, RuntimeError, IndexError) as error:
         result["evidence_errors"].append(str(error))
     if confirmed_failure:

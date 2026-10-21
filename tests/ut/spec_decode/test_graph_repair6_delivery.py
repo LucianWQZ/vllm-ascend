@@ -180,7 +180,13 @@ def test_abort_runner_keeps_nonzero_exit_and_requires_specific_checker(
 
     def execute(argv, directory, timeout):
         directory.mkdir(parents=True)
-        return dict(argv=argv, returncode=exit_code if argv == ["child"] else checker, timeout=False)
+        code = exit_code if argv == ["child"] else checker
+        return dict(
+            argv=argv,
+            returncode=code,
+            timeout=False,
+            status="EXECUTION_FAILED" if code else "COMMAND_COMPLETED_NOT_GATE_PASS",
+        )
 
     monkeypatch.setattr(runner, "execute", execute)
     plan = dict(

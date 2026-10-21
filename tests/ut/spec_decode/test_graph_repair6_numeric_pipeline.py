@@ -26,7 +26,7 @@ from tools.p7x_graph_repair6_storage import CollectionReader, CollectionWriter, 
 from vllm_ascend.worker.v2.spec_decode.draft_window import DraftWindowExecutionPhase, DraftWindowReadDescriptor
 
 
-def produce(monkeypatch, directory, fault=None):
+def produce(monkeypatch, directory, fault=None, sample_limit=None):
     import vllm.v1.worker.gpu.spec_decode.dflash.speculator as upstream
 
     owner, session, manager, descs, cache = capture_owner(monkeypatch)
@@ -84,6 +84,8 @@ def produce(monkeypatch, directory, fault=None):
     )
     path = directory / "numeric-reference.json"
     provenance = dict(profile="target4", fixture_id="host", config_sha256="config")
+    if sample_limit is not None:
+        provenance["sample_limit"] = sample_limit
     with ContinuousReference(
         runner,
         SimpleNamespace(requests={}, running=[], waiting=[]),
@@ -91,7 +93,7 @@ def produce(monkeypatch, directory, fault=None):
         dict(IDENTITY, process_id=os.getpid()),
         provenance=provenance,
     ) as probe:
-        for case in case_plan("target4"):
+        for case in case_plan("target4")[:sample_limit]:
             active = len(case["ends"])
             padded = 1 if active == 1 else 2 if active == 2 else 4
             desc = descs[padded]

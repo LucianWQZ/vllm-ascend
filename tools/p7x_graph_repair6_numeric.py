@@ -78,6 +78,10 @@ class ContinuousReference:
         # Independent branch budget, computed from the real Draft cache geometry.
         # Four snapshots plus inputs/output; no assumed compression or dedup.
         cases = case_plan(self.provenance.get("profile", "target4"))
+        limit = self.provenance.get("sample_limit")
+        if limit is not None:
+            require(limit == 3, "numeric sentinel must cover A/B/A_prime")
+            cases = cases[:limit]
         bytes_per_block = sum(
             t[0].numel() * t.element_size()
             for n in sorted(self.owner.draft_attn_layer_names)

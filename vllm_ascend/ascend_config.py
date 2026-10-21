@@ -466,6 +466,8 @@ class AscendConfig:
     enable_force_eplb: bool = False
     enable_pcp_o_proj_weight_sharding: bool = False
     draft_window_size: int | None = None
+    # Internal DSpark capture-output diagnostic; does not open the Graph gate.
+    draft_window_graph_numeric_diagnostic: bool = False
     mix_placement: bool = False
     # When non-zero, force the MC2 combine stage's comm quant_mode to this
     # value (e.g. 4 = MXFP float8_e4m3 communication quantization) regardless of the
@@ -1659,6 +1661,10 @@ def init_ascend_config(vllm_config):
     # vllm_config run here, explicitly, before the instance is usable. This is
     # the single legitimate entry point — bypassing the factory leaves derived
     # fields at their sentinel defaults.
+    if new_config.draft_window_graph_numeric_diagnostic:
+        speculative = vllm_config.speculative_config
+        if speculative is None or speculative.method != "dspark" or new_config.draft_window_size != 1024:
+            raise ValueError("numeric Graph diagnostic requires DSpark and draft_window_size=1024")
     new_config.derive_and_validate(vllm_config)
     new_config.rl_config.apply(new_config)
     new_config.finegrained_tp_config._validate_preconditions(vllm_config)

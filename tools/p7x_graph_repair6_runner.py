@@ -29,11 +29,15 @@ def execute(argv, directory, timeout):
     with (directory / "stdout.log").open("wb") as out, (directory / "stderr.log").open("wb") as err:
         process = subprocess.Popen(argv, stdout=out, stderr=err, start_new_session=True)
         timed_out = False
+        interrupted = False
         terminated = []
         try:
             rc = process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             timed_out = True
+            rc, terminated = stop_owned_tree(process)
+        except KeyboardInterrupt:
+            interrupted = True
             rc, terminated = stop_owned_tree(process)
     result = dict(
         argv=argv,
@@ -41,6 +45,7 @@ def execute(argv, directory, timeout):
         returncode=rc,
         signal=-rc if rc < 0 else None,
         timeout=timed_out,
+        interrupted=interrupted,
         owned_processes_terminated=terminated,
         elapsed_seconds=time.monotonic() - start,
         max_rss_children=resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss,
@@ -54,11 +59,40 @@ def run_case(plan, case_id, root):
     case = plan["cases"][case_id]
     if plan.get("publication_status") != "VERIFIED":
         raise ValueError("PRE_PUBLICATION plan cannot execute; verify published source and regenerate")
+    if plan.get("schema") == "repair7-case-plan-v1" and case.get("requires_device_admission"):
+        from tools.p7x_graph_repair7_device import validate_admission
+
+        try:
+            validate_admission(plan, case_id)
+        except (ValueError, KeyError, TypeError, OSError) as error:
+            directory = root / case_id
+            directory.mkdir(parents=True, exist_ok=False)
+            result = dict(
+                case_id=case_id,
+                status="BLOCKED_DEVICE_MAPPING",
+                dependency_satisfied=False,
+                primary_failure=str(error),
+                records=[],
+                device_started=False,
+                source_identity=[plan["run_id"], plan["commit"], plan["tree"]],
+            )
+            (directory / "runner-result.json").write_text(json.dumps(result, indent=2) + "\n")
+            return result
     records = []
     for dependency in case.get("dependencies", []):
         path = root / dependency / "runner-result.json"
         if not path.exists() or not json.loads(path.read_text()).get("dependency_satisfied"):
             raise ValueError("dependency not accepted: " + dependency)
+        previous = json.loads(path.read_text())
+        if plan.get("schema") == "repair7-case-plan-v1":
+            if previous.get("source_identity") != [plan["run_id"], plan["commit"], plan["tree"]]:
+                raise ValueError("dependency belongs to a different source/run")
+    for dependency in case.get("attempt_dependencies", []):
+        path = root / dependency / "runner-result.json"
+        if not path.exists():
+            raise ValueError("comparison must wait for both arms to finish attempts")
+        if json.loads(path.read_text()).get("source_identity") != [plan["run_id"], plan["commit"], plan["tree"]]:
+            raise ValueError("arm attempt belongs to a different source/run")
     from tools.p7x_graph_repair6_storage import require_space
 
     root.mkdir(parents=True, exist_ok=True)
@@ -66,7 +100,12 @@ def run_case(plan, case_id, root):
         require_space(root, case.get("resource_policy", {}).get("minimum_launch_free_bytes", 0))
     except ValueError as error:
         result = dict(
-            case_id=case_id, records=[], dependency_satisfied=False, status="BLOCKED_RESOURCE", reason=str(error)
+            case_id=case_id,
+            records=[],
+            dependency_satisfied=False,
+            status="BLOCKED_RESOURCE",
+            reason=str(error),
+            source_identity=[plan.get("run_id"), plan.get("commit"), plan.get("tree")],
         )
         (root / case_id).mkdir(exist_ok=False)
         (root / case_id / "runner-result.json").write_text(json.dumps(result, indent=2) + "\n")
@@ -81,7 +120,7 @@ def run_case(plan, case_id, root):
         records.append(row)
         # Producer failure does not erase a complete prefix. Independent
         # read-only comparator still runs; normal dependent execution stops.
-        if row["timeout"] and command["kind"] == "launch":
+        if (row["timeout"] or row.get("interrupted")) and command["kind"] == "launch":
             break
     expected_launch = 73 if case_id.startswith("ABORT_") else 0
     # An expected abort is accepted only together with its dedicated external
@@ -108,6 +147,39 @@ def run_case(plan, case_id, root):
         else "EXECUTION_FAILED"
         if records[0]["kind"] == "launch" and records[0]["returncode"] != expected_launch
         else "INCOMPLETE_COVERAGE",
+    )
+    first = records[0]
+    acceptance = result["status"]
+    primary = next(
+        (
+            dict(command_index=i, **r)
+            for i, r in enumerate(records)
+            if r["timeout"] or r.get("interrupted") or r["returncode"] != (expected_launch if i == 0 else 0)
+        ),
+        None,
+    )
+    producer_failed = first["kind"] == "launch" and first["returncode"] != expected_launch
+    if first.get("interrupted"):
+        result["status"] = "USER_INTERRUPTED"
+    elif producer_failed:
+        result["status"] = (
+            "EXECUTION_TIMEOUT"
+            if first["timeout"]
+            else "SUBMISSION_UNCERTAIN_QUARANTINED"
+            if first["returncode"] == 74
+            else "NUMERIC_MISMATCH"
+            if first["returncode"] == 3
+            else "BLOCKED_RESOURCE"
+            if first["returncode"] == 5
+            else "EXECUTION_FAILED"
+        )
+    result.update(
+        primary_failure=primary,
+        producer_status=first["status"],
+        artifact_status="SEE_READ_ONLY_ACCEPTANCE_RECORDS",
+        acceptance_status=acceptance,
+        dependency_status="SATISFIED" if ok else "BLOCKED",
+        source_identity=[plan.get("run_id"), plan.get("commit"), plan.get("tree")],
     )
     (root / case_id / "runner-result.json").write_text(json.dumps(result, indent=2) + "\n")
     return result
