@@ -78,15 +78,15 @@ def validate_eagle_single_request_review_config(vllm_config, *, experimental_gra
             f"'eager': {getattr(speculative, 'enforce_eager', None)!r}, "
             f"'K': {getattr(speculative, 'num_speculative_tokens', None)!r}, "
             f"'draft_tp': {getattr(draft_parallel, 'tensor_parallel_size', None)!r}, "
-            f"'tp_dp_pp_pcp_dcp': {
+            f"""'tp_dp_pp_pcp_dcp': {
                 (
                     parallel.tensor_parallel_size,
                     parallel.data_parallel_size,
                     parallel.pipeline_parallel_size,
                     parallel.prefill_context_parallel_size,
                     parallel.decode_context_parallel_size,
-                )!r
-            }, "
+                )
+            }, """
             f"'EP': {getattr(parallel, 'enable_expert_parallel', None)!r}, "
             f"'all2all_backend': {target_backend!r}, 'SP': {target_sp!r}, "
             f"'mode': {mode!r}, 'async': {scheduler.async_scheduling!r}, 'prefix': {cache.enable_prefix_caching!r}, "
