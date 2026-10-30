@@ -16,7 +16,7 @@
 # This file is a part of the vllm-ascend project.
 #
 from collections.abc import Mapping, Sequence
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, nullcontext
 from typing import Any, cast
 
 import numpy as np
