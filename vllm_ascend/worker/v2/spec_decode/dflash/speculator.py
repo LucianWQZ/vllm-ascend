@@ -3,7 +3,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Callable, Mapping
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from typing import Any, cast
 
 import numpy as np
@@ -17,8 +17,25 @@ from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.spec_decode.dflash import speculator as dflash_speculator
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 
+from vllm_ascend.ascend_config import validate_additional_config_bool
 from vllm_ascend.ops.triton.v2.spec_decode.prepare_dflash_inputs import prepare_dflash_inputs_triton
 from vllm_ascend.worker.v2.attn_utils import build_attn_metadata_factory, build_attn_metadata_wrapper
+from vllm_ascend.worker.v2.spec_decode.draft_window import (
+    DraftWindowPolicyDecision,
+    DraftWindowPolicyState,
+    build_draft_window_runtime_state,
+    build_draft_window_source_capability,
+)
+from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowEagerMixin
+from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
+    DraftWindowGraphRoute,
+    consume_draft_window_graph_metadata,
+)
+from vllm_ascend.worker.v2.spec_decode.draft_window_graph_characterization import (
+    build_parallel_draft_window_graph_characterization_source,
+    experimental_draft_window_graph_characterization_enabled,
+    install_parallel_draft_window_graph_characterization,
+)
 from vllm_ascend.worker.v2.spec_decode.lmhead_tp_utils import LmheadTPDraftSamplingMixin
 from vllm_ascend.worker.v2.spec_decode.pcp_utils import (
     disable_profiling_chunk_for_draft,
@@ -126,7 +143,242 @@ def prepare_dflash_inputs_factory(
     return prepare_with_block_size
 
 
-class AscendDFlashSpeculator(LmheadTPDraftSamplingMixin, DFlashSpeculator):
+@contextmanager
+def _draft_window_context_kv_scope(owner, input_batch):
+    """Protect the upstream zero-draft write without creating a Graph reader.
+
+    The fixed core stores context K/V on the current stream and returns before
+    query metadata or Graph dispatch. Reuse the ordinary Source completion
+    contract for these writes; captured Window banks and generations stay idle.
+    """
+    runtime = owner._draft_window_runtime_state
+    if runtime.quarantined_identity is not None or getattr(owner, "_draft_window_graph_submission_uncertain", False):
+        raise RuntimeError("Draft Window backing is quarantined before a context-only KV write")
+    from vllm_ascend.worker.v2.spec_decode.draft_window_lifetime import DraftWindowOwnerPool
+    from vllm_ascend.worker.v2.spec_decode.draft_window_runtime import _NPUCompletion
+
+    if (
+        getattr(owner, "_draft_window_proposal_context", None) is not None
+        or getattr(owner, "_draft_window_bypass_active", False)
+        or getattr(owner, "_draft_window_context_kv_active", False)
+    ):
+        raise RuntimeError("A Draft Window proposal scope is already active")
+    pool = getattr(owner, "_draft_window_context_kv_pool", None)
+    if pool is None:
+        pool = DraftWindowOwnerPool(int(owner.vllm_config.max_concurrent_batches))
+        owner._draft_window_context_kv_pool = pool
+    owner._draft_window_context_kv_active = True
+    try:
+        with pool.operation(_NPUCompletion) as completion_owner:
+            pool.retain(completion_owner, owner, input_batch)
+            pool.begin_native(completion_owner)
+            yield
+    except BaseException:
+        # A partial context write or failed completion record also makes the
+        # canonical state unsafe for a later normal Graph proposal.
+        owner._draft_window_graph_submission_uncertain = True
+        raise
+    finally:
+        owner._draft_window_context_kv_active = False
+
+
+def _draft_window_owner_scope(owner, input_batch, dummy_run=False, is_profile=False, *, num_speculative_tokens=None):
+    """Choose exactly one existing proposal owner at the Ascend boundary."""
+    runtime = getattr(owner, "_draft_window_runtime", None)
+    graph_runtime = getattr(owner, "_draft_window_runtime_state", None)
+    limit = getattr(owner, "_draft_graph_review_limit", None)
+    context_only_full8 = (
+        graph_runtime is not None
+        and limit == "full8_local_active_at_most_one"
+        and type(num_speculative_tokens) is int
+        and num_speculative_tokens == 0
+    )
+    if limit is not None and not context_only_full8:
+        from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import validate_draft_graph_review_requests
+
+        # This boundary certifies Draft query shapes. Core544's explicit zero
+        # branch writes context K/V and returns before query/Graph dispatch;
+        # its Target padding is not evidence of a Draft query being executed.
+        validate_draft_graph_review_requests(owner, input_batch, dummy_run=dummy_run, is_profile=is_profile)
+    if runtime is not None and graph_runtime is not None:
+        raise RuntimeError("Draft Window eager and Graph owners cannot share one proposal")
+    if graph_runtime is not None:
+        if getattr(owner, "_draft_window_context_kv_active", False):
+            raise RuntimeError("A context-only Draft KV write is already active")
+        if num_speculative_tokens is not None and (
+            type(num_speculative_tokens) is not int or num_speculative_tokens not in (0, owner.num_speculative_steps)
+        ):
+            raise RuntimeError("Draft Window Graph cannot change its captured static K")
+        effective_dummy = dummy_run or getattr(input_batch, "is_dummy", False)
+        if num_speculative_tokens == 0 and not (effective_dummy or is_profile):
+            return _draft_window_context_kv_scope(owner, input_batch)
+        return owner._draft_window_proposal_scope(input_batch, dummy_run=effective_dummy, is_profile=is_profile)
+    if runtime is not None:
+        return runtime.proposal_context(
+            owner, input_batch, dummy_run, is_profile, context_kv_only=num_speculative_tokens == 0
+        )
+    return nullcontext()
+
+
+def _build_graph_uniform_metadata(
+    owner,
+    *,
+    num_reqs,
+    batch_desc,
+    query_start_loc_np,
+    seq_lens_cpu_upper_bound,
+    step,
+    causal,
+    dcp_local_seq_lens=None,
+    slot_mappings=None,
+):
+    """Adapt the fixed core uniform hook to the existing owned Graph reader.
+
+    No context-KV operands are projected here. The upstream precompute path
+    keeps its original positions and Full context slots, including dummy PAD.
+    """
+    if getattr(owner, "_draft_window_runtime", None) is not None:
+        raise RuntimeError("Graph metadata cannot also use the typed eager owner")
+    if step != owner.num_query_per_req:
+        raise RuntimeError("Draft Graph metadata step differs from its fixed query width")
+    expected_query = np.arange(num_reqs + 1, dtype=query_start_loc_np.dtype) * owner.num_query_per_req
+    if query_start_loc_np.shape != expected_query.shape or not np.array_equal(query_start_loc_np, expected_query):
+        raise RuntimeError("Draft Graph requires the actual uniform query layout")
+    padded_reqs = batch_desc.num_reqs or num_reqs
+    tokens = batch_desc.num_tokens if batch_desc.cg_mode == CUDAGraphMode.FULL else int(query_start_loc_np[-1])
+    if batch_desc.cg_mode == CUDAGraphMode.FULL and tokens != padded_reqs * owner.num_query_per_req:
+        raise RuntimeError("Draft Graph descriptor differs from its fixed padded query width")
+    full_slots = owner.block_tables.slot_mappings[:, :tokens]
+    if slot_mappings is not None and (
+        slot_mappings.shape != full_slots.shape
+        or slot_mappings.dtype != full_slots.dtype
+        or slot_mappings.device != full_slots.device
+        or slot_mappings.stride() != full_slots.stride()
+        or slot_mappings.data_ptr() != full_slots.data_ptr()
+    ):
+        raise RuntimeError("Draft Graph metadata must retain the canonical Full write slots")
+    # The existing builder reconstructs this same uniform CPU query layout.
+    # Supplying None follows its declared uniform seam only after validation.
+    return DraftWindowEagerMixin._build_draft_attn_metadata(
+        owner,
+        num_reqs=num_reqs,
+        num_reqs_padded=padded_reqs,
+        num_tokens_padded=tokens,
+        seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+        step=step,
+        causal=causal,
+        query_start_loc_np=None,
+        dcp_local_seq_lens=dcp_local_seq_lens,
+    )
+
+
+class AscendDFlashSpeculator(DraftWindowEagerMixin, LmheadTPDraftSamplingMixin, DFlashSpeculator):
+    def _configure_draft_window(self, decision: DraftWindowPolicyDecision) -> None:
+        """Attach the eligible P1 policy contract without enabling a window."""
+        if decision.state is not DraftWindowPolicyState.ELIGIBLE_ON:
+            raise ValueError("draft-window owner requires an ELIGIBLE_ON policy decision")
+        if hasattr(self, "_draft_window_policy"):
+            raise RuntimeError("draft-window policy is already configured")
+        if hasattr(self, "draft_window_policy") or hasattr(self, "_draft_window_runtime"):
+            raise RuntimeError("Graph Window cannot attach to an existing typed eager policy or owner")
+        self._draft_window_policy = decision
+
+    def _initialize_draft_window_source_capability(self) -> None:
+        """Atomically bind eligible P2 source and P3 ownership state."""
+        policy = getattr(self, "_draft_window_policy", None)
+        if policy is None:
+            return
+        if hasattr(self, "_draft_window_source_capability") or hasattr(
+            self,
+            "_draft_window_runtime_state",
+        ):
+            raise RuntimeError("draft-window runtime ownership is already initialized")
+        if hasattr(self, "_draft_window_runtime"):
+            raise RuntimeError("Graph Window cannot replace the typed eager runtime")
+        runtime_route = self._speculator_name.lower()
+        graph_context = None
+        if experimental_draft_window_graph_characterization_enabled():
+            from vllm_ascend.worker.v2.spec_decode.draft_window import (
+                build_draft_window_runtime_context,
+            )
+
+            runtime_context = build_draft_window_runtime_context(
+                self.vllm_config,
+                self.block_tables,
+            )
+        else:
+            runtime_context = None
+        if runtime_context is not None and runtime_context.graph_mode != "NONE":
+            capability, graph_context = build_parallel_draft_window_graph_characterization_source(
+                policy=policy,
+                runtime_route=runtime_route,
+                attn_groups=self.attn_groups,
+                block_tables=self.block_tables,
+                causal=self._group_causal,
+                vllm_config=self.vllm_config,
+                input_buffers=self.input_buffers,
+            )
+        else:
+            capability = build_draft_window_source_capability(
+                policy=policy,
+                runtime_route=runtime_route,
+                attn_groups=self.attn_groups,
+                block_tables=self.block_tables,
+                causal=self._group_causal,
+                vllm_config=self.vllm_config,
+            )
+        runtime_state = build_draft_window_runtime_state(capability)
+        self._draft_window_source_capability = capability
+        self._draft_window_runtime_state = runtime_state
+        self._initialize_draft_window_eager_state()
+        if graph_context is not None:
+            self._draft_window_graph_characterization_context = graph_context
+
+    def capture(self) -> None:
+        diagnostic = validate_additional_config_bool(
+            self.vllm_config.additional_config.get("draft_window_graph_numeric_diagnostic", False),
+            "additional_config.draft_window_graph_numeric_diagnostic",
+        )
+        if diagnostic:
+            if not experimental_draft_window_graph_characterization_enabled():
+                raise RuntimeError("numeric capture diagnostic requires the experimental Graph gate")
+            from vllm_ascend.worker.v2.spec_decode.draft_window_graph_diagnostics import DraftGraphOutputReferences
+
+            if hasattr(self, "_draft_graph_output_references"):
+                raise RuntimeError("numeric capture diagnostic already installed")
+            owned = validate_additional_config_bool(
+                self.vllm_config.additional_config.get("draft_window_graph_numeric_owned_output",False),
+                "additional_config.draft_window_graph_numeric_owned_output",
+            )
+            self._draft_graph_output_references = DraftGraphOutputReferences(self,owned=owned)
+            if owned:
+                from vllm_ascend.worker.v2.spec_decode.draft_window_graph_diagnostics import owned_attention_probe_layer
+
+                name = owned_attention_probe_layer(self)
+                layer=self.vllm_config.compilation_config.static_forward_context[name]
+                self._draft_graph_output_references.attention_layer_name = name
+                self._draft_graph_output_references.install_attention_probe(layer.impl)
+            self._draft_graph_output_references.collecting = True
+        try:
+            super().capture()
+        finally:
+            if diagnostic:
+                self._draft_graph_output_references.collecting = False
+        if diagnostic:
+            self._draft_graph_output_references.freeze(d.num_tokens for d in self.query_cudagraph_manager.graphs)
+
+    def _run_model(
+        self, num_tokens, attn_metadata, slot_mappings, num_tokens_across_dp, cudagraph_runtime_mode=CUDAGraphMode.NONE
+    ):
+        self._mark_draft_window_async_reader_started()
+        output = super()._run_model(
+            num_tokens, attn_metadata, slot_mappings, num_tokens_across_dp, cudagraph_runtime_mode
+        )
+        sink = getattr(self, "_draft_graph_output_references", None)
+        if sink is not None and sink.collecting:
+            sink.retain(self, num_tokens, output)
+        return output
+
     def load_draft_model(
         self,
         target_model: torch.nn.Module,
@@ -143,6 +395,14 @@ class AscendDFlashSpeculator(LmheadTPDraftSamplingMixin, DFlashSpeculator):
         return model
 
     def build_draft_attn_metadatas(self, num_reqs_padded, seq_lens_cpu_upper_bound):
+        from vllm_ascend.worker.v2.spec_decode.draft_window_graph_metadata import is_parallel_graph_dp_dummy
+
+        if hasattr(self, "_draft_window_runtime_state") and not is_parallel_graph_dp_dummy(self):
+            graph_metadata = consume_draft_window_graph_metadata(
+                self, route=DraftWindowGraphRoute.DFLASH, expected_consumer_count=1
+            )
+            if graph_metadata is not None:
+                return list(graph_metadata)
         num_tokens_padded = num_reqs_padded * self.num_query_per_req
         with build_attn_metadata_wrapper():
             # vLLM main (#56181) replaced _build_draft_attn_metadata with
@@ -194,6 +454,11 @@ class AscendDFlashSpeculator(LmheadTPDraftSamplingMixin, DFlashSpeculator):
         # It needs this speculator to update full-graph params, so set it here.
         self.query_cudagraph_manager.speculator = self
         self.query_cudagraph_manager.update_stream = self.update_stream
+        graph_context = getattr(self, "_draft_window_graph_characterization_context", None)
+        if graph_context is not None:
+            if not experimental_draft_window_graph_characterization_enabled():
+                raise RuntimeError("Graph characterization flag changed during initialization")
+            install_parallel_draft_window_graph_characterization(self, runtime_context=graph_context)
 
     def set_attn(
         self,
@@ -236,7 +501,11 @@ class AscendDFlashSpeculator(LmheadTPDraftSamplingMixin, DFlashSpeculator):
             block_tables,
         )
 
-        if hasattr(self, "draft_window_policy"):
+        if hasattr(self, "_draft_window_policy"):
+            if hasattr(self, "draft_window_policy"):
+                raise RuntimeError("Draft Window cannot initialize both eager and Graph policies")
+            self._initialize_draft_window_source_capability()
+        elif hasattr(self, "draft_window_policy"):
             from vllm_ascend.worker.v2.spec_decode.draft_window_runtime import DraftWindowRuntime
 
             self._draft_window_runtime = DraftWindowRuntime(self, self.draft_window_policy)
@@ -252,6 +521,15 @@ class AscendDFlashSpeculator(LmheadTPDraftSamplingMixin, DFlashSpeculator):
         dcp_local_seq_lens: torch.Tensor | None = None,
         slot_mappings: torch.Tensor | None = None,
     ) -> dict[str, Any] | None:
+        if hasattr(self, "_draft_window_runtime_state") and not getattr(self, "_draft_window_bypass_active", False):
+            with build_attn_metadata_wrapper():
+                return _build_graph_uniform_metadata(
+                    self, num_reqs=num_reqs, batch_desc=batch_desc,
+                    query_start_loc_np=query_start_loc_np,
+                    seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound, step=step,
+                    causal=causal, dcp_local_seq_lens=dcp_local_seq_lens,
+                    slot_mappings=slot_mappings,
+                )
         runtime = getattr(self, "_draft_window_runtime", None)
         # Older vLLM releases do not accept this optional upstream argument.
         slot_kwargs = {} if slot_mappings is None else {"slot_mappings": slot_mappings}
@@ -306,6 +584,10 @@ class AscendDFlashSpeculator(LmheadTPDraftSamplingMixin, DFlashSpeculator):
         is_profile: bool = False,
         num_speculative_tokens: int | None = None,
     ) -> torch.Tensor:
+        # Check checkpoint admission/static K before replacing proposal state.
+        owner_scope = _draft_window_owner_scope(
+            self, input_batch, dummy_run, is_profile, num_speculative_tokens=num_speculative_tokens
+        )
         self.input_batch = input_batch
         sync_state = dp_sync_state
         if dummy_run and skip_attn_for_dummy_run:
@@ -315,17 +597,8 @@ class AscendDFlashSpeculator(LmheadTPDraftSamplingMixin, DFlashSpeculator):
             # TODO: Remove this guard once main2main includes upstream vLLM
             # #54856 (facd9a74a1), which resets the profiling DP counts.
             sync_state = None
-        runtime = getattr(self, "_draft_window_runtime", None)
         with (
-            runtime.proposal_context(
-                self,
-                input_batch,
-                dummy_run,
-                is_profile,
-                context_kv_only=num_speculative_tokens == 0,
-            )
-            if runtime is not None
-            else nullcontext(),
+            owner_scope,
             build_attn_metadata_wrapper(),
         ):
             return super().propose(

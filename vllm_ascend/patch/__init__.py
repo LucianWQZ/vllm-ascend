@@ -1367,6 +1367,20 @@
 #       Remove this patch once upstream exposes a backend-dispatchable spec-decode
 #       graph manager abstraction.
 #
+#   2. `vllm.v1.worker.gpu.spec_decode.dflash.cudagraph._prepare_dflash_inputs_to_capture`
+#    Why:
+#       Qualified Draft Window Graph capture needs its instance-owned read
+#       table and current exact lengths while preserving canonical full writes.
+#    How:
+#       Delegate unchanged without an explicit InputBuffers capture context;
+#       otherwise validate the descriptor, private bank and exact read owner.
+#       Upstream context-KV precomputation remains ahead of the query forward.
+#    Related PR (if no, explain why):
+#       No; default-off adapt integration candidate, not public capability.
+#    Future Plan:
+#       Replace this helper interception with an upstream instance-level
+#       attention-metadata factory hook when that extension is available.
+#
 # ** 25. File: worker/patch_v2/patch_eagle_speculator.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.v1.worker.gpu.spec_decode.target_dependent_ar.speculator.SpeculatorCudaGraphManager`

@@ -21,11 +21,15 @@ import vllm.v1.worker.gpu.spec_decode.dflash2.speculator as speculator2_module
 
 from vllm_ascend.worker.v2.attn_utils import build_attn_metadata
 from vllm_ascend.worker.v2.spec_decode.dflash.aclgraph import DFlashAclGraphManager
+from vllm_ascend.worker.v2.spec_decode.dflash.capture import (
+    ascend_prepare_dflash_inputs_to_capture,
+)
 from vllm_ascend.worker.v2.spec_decode.dflash2.speculator import (
     _selector_walk_kernel_ascend,
 )
 
 cudagraph_module.build_attn_metadata = build_attn_metadata
+cudagraph_module._prepare_dflash_inputs_to_capture = ascend_prepare_dflash_inputs_to_capture
 speculator_module.DFlashCudaGraphManager = DFlashAclGraphManager
 
 # triton-ascend cannot lower tldevice.log1p in the upstream selector walk;

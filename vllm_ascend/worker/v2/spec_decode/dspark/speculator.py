@@ -16,7 +16,7 @@
 # This file is a part of the vllm-ascend project.
 #
 from collections.abc import Mapping, Sequence
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import AbstractContextManager
 from typing import Any, cast
 
 import numpy as np
@@ -48,7 +48,29 @@ from vllm_ascend.worker.v2.attn_utils import (
     build_attn_metadata_wrapper,
 )
 from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
-from vllm_ascend.worker.v2.spec_decode.dflash.speculator import prepare_dflash_inputs_factory
+from vllm_ascend.worker.v2.spec_decode.dflash.speculator import (
+    _build_graph_uniform_metadata,
+    _draft_window_owner_scope,
+    prepare_dflash_inputs_factory,
+)
+from vllm_ascend.ascend_config import validate_additional_config_bool
+from vllm_ascend.worker.v2.spec_decode.draft_window import (
+    DraftWindowPolicyDecision,
+    DraftWindowPolicyState,
+    build_draft_window_runtime_state,
+    build_draft_window_source_capability,
+)
+from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowEagerMixin
+from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
+    DraftWindowGraphRoute,
+    consume_draft_window_graph_metadata,
+)
+from vllm_ascend.worker.v2.spec_decode.draft_window_graph_characterization import (
+    build_parallel_draft_window_graph_characterization_source,
+    experimental_draft_window_graph_characterization_enabled,
+    install_parallel_draft_window_graph_characterization,
+)
+
 from vllm_ascend.worker.v2.spec_decode.lmhead_tp_utils import LmheadTPDraftSamplingMixin
 from vllm_ascend.worker.v2.spec_decode.pcp_utils import (
     disable_profiling_chunk_for_draft,
@@ -56,7 +78,7 @@ from vllm_ascend.worker.v2.spec_decode.pcp_utils import (
 )
 
 
-class AscendDSparkSpeculator(LmheadTPDraftSamplingMixin, DSparkSpeculator):
+class AscendDSparkSpeculator(DraftWindowEagerMixin, LmheadTPDraftSamplingMixin, DSparkSpeculator):
     _speculator_name = "DSpark"
     # DSpark samples via compute_draft_logits and never calls sample_draft, so
     # the mixin sample_draft alignment is not used; instead load_draft_model
@@ -64,6 +86,87 @@ class AscendDSparkSpeculator(LmheadTPDraftSamplingMixin, DSparkSpeculator):
     # the group-agreed capacity and trim the logits back (no _sample_sequential
     # override, upstream sampling logic untouched).
     _lmhead_tp_sample_draft_supported = True
+
+    def _configure_draft_window(self, decision: DraftWindowPolicyDecision) -> None:
+        """Attach the eligible P1 policy contract without enabling a window."""
+        if decision.state is not DraftWindowPolicyState.ELIGIBLE_ON:
+            raise ValueError("draft-window owner requires an ELIGIBLE_ON policy decision")
+        if hasattr(self, "_draft_window_policy"):
+            raise RuntimeError("draft-window policy is already configured")
+        if hasattr(self, "draft_window_policy") or hasattr(self, "_draft_window_runtime"):
+            raise RuntimeError("Graph Window cannot attach to an existing typed eager policy or owner")
+        self._draft_window_policy = decision
+
+    def _initialize_draft_window_source_capability(self) -> None:
+        """Atomically bind eligible P2 source and P3 ownership state."""
+        policy = getattr(self, "_draft_window_policy", None)
+        if policy is None:
+            return
+        if hasattr(self, "_draft_window_source_capability") or hasattr(
+            self,
+            "_draft_window_runtime_state",
+        ):
+            raise RuntimeError("draft-window runtime ownership is already initialized")
+        if hasattr(self, "_draft_window_runtime"):
+            raise RuntimeError("Graph Window cannot replace the typed eager runtime")
+        graph_context = None
+        if experimental_draft_window_graph_characterization_enabled():
+            from vllm_ascend.worker.v2.spec_decode.draft_window import (
+                build_draft_window_runtime_context,
+            )
+
+            runtime_context = build_draft_window_runtime_context(
+                self.vllm_config,
+                self.block_tables,
+            )
+        else:
+            runtime_context = None
+        if runtime_context is not None and runtime_context.graph_mode != "NONE":
+            capability, graph_context = build_parallel_draft_window_graph_characterization_source(
+                policy=policy,
+                runtime_route=self._speculator_name.lower(),
+                attn_groups=self.attn_groups,
+                block_tables=self.block_tables,
+                causal=self._group_causal,
+                vllm_config=self.vllm_config,
+            )
+        else:
+            capability = build_draft_window_source_capability(
+                policy=policy,
+                runtime_route=self._speculator_name.lower(),
+                attn_groups=self.attn_groups,
+                block_tables=self.block_tables,
+                causal=self._group_causal,
+                vllm_config=self.vllm_config,
+            )
+        runtime_state = build_draft_window_runtime_state(capability)
+        self._draft_window_source_capability = capability
+        self._draft_window_runtime_state = runtime_state
+        self._initialize_draft_window_eager_state()
+        if graph_context is not None:
+            self._draft_window_graph_characterization_context = graph_context
+
+    def capture(self) -> None:
+        diagnostic = validate_additional_config_bool(
+            self.vllm_config.additional_config.get("draft_window_graph_numeric_diagnostic", False),
+            "additional_config.draft_window_graph_numeric_diagnostic",
+        )
+        if diagnostic:
+            if not experimental_draft_window_graph_characterization_enabled():
+                raise RuntimeError("numeric capture diagnostic requires the experimental Graph gate")
+            from vllm_ascend.worker.v2.spec_decode.draft_window_graph_diagnostics import DraftGraphOutputReferences
+
+            if hasattr(self, "_draft_graph_output_references"):
+                raise RuntimeError("numeric capture diagnostic already installed")
+            self._draft_graph_output_references = DraftGraphOutputReferences(self)
+            self._draft_graph_output_references.collecting = True
+        try:
+            super().capture()
+        finally:
+            if diagnostic:
+                self._draft_graph_output_references.collecting = False
+        if diagnostic:
+            self._draft_graph_output_references.freeze(d.num_tokens for d in self.query_cudagraph_manager.graphs)
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         vllm_config, self.replicated_pcp = prepare_replicated_pcp_config(vllm_config)
@@ -145,6 +248,11 @@ class AscendDSparkSpeculator(LmheadTPDraftSamplingMixin, DSparkSpeculator):
         # It needs this speculator to update full-graph params, so set it here.
         self.query_cudagraph_manager.speculator = self
         self.query_cudagraph_manager.update_stream = self.update_stream
+        graph_context = getattr(self, "_draft_window_graph_characterization_context", None)
+        if graph_context is not None:
+            if not experimental_draft_window_graph_characterization_enabled():
+                raise RuntimeError("Graph characterization flag changed during initialization")
+            install_parallel_draft_window_graph_characterization(self, runtime_context=graph_context)
 
     @torch.inference_mode()
     def get_draft_context_group_layout(self) -> tuple[tuple[int, ...], tuple[int, ...], dict[int, int]]:
@@ -259,7 +367,11 @@ class AscendDSparkSpeculator(LmheadTPDraftSamplingMixin, DSparkSpeculator):
                 block_tables,
             )
 
-        if hasattr(self, "draft_window_policy"):
+        if hasattr(self, "_draft_window_policy"):
+            if hasattr(self, "draft_window_policy"):
+                raise RuntimeError("Draft Window cannot initialize both eager and Graph policies")
+            self._initialize_draft_window_source_capability()
+        elif hasattr(self, "draft_window_policy"):
             from vllm_ascend.worker.v2.spec_decode.draft_window_runtime import DraftWindowRuntime
 
             self._draft_window_runtime = DraftWindowRuntime(self, self.draft_window_policy)
@@ -293,6 +405,14 @@ class AscendDSparkSpeculator(LmheadTPDraftSamplingMixin, DSparkSpeculator):
 
     # Graph capture builds metadata from the padded request shape.
     def build_draft_attn_metadatas(self, num_reqs_padded, seq_lens_cpu_upper_bound):
+        from vllm_ascend.worker.v2.spec_decode.draft_window_graph_metadata import is_parallel_graph_dp_dummy
+
+        if hasattr(self, "_draft_window_runtime_state") and not is_parallel_graph_dp_dummy(self):
+            graph_metadata = consume_draft_window_graph_metadata(
+                self, route=DraftWindowGraphRoute.DSPARK, expected_consumer_count=1
+            )
+            if graph_metadata is not None:
+                return list(graph_metadata)
         assert self.input_batch is not None
         num_tokens_padded = num_reqs_padded * self.num_query_per_req
         seq_lens_cpu, is_prefilling = self._prepare_draft_dcp_metadata_inputs(
@@ -339,6 +459,25 @@ class AscendDSparkSpeculator(LmheadTPDraftSamplingMixin, DSparkSpeculator):
         slot_mappings: torch.Tensor | None = None,
     ) -> dict[str, Any] | None:
         """Build Ascend draft metadata through the upstream attention hook."""
+        if hasattr(self, "_draft_window_runtime_state") and not getattr(self, "_draft_window_bypass_active", False):
+            # The Graph read transport owns the current exact CPU/device pair.
+            # Do not run PR eager projection or its CPU-upper preparer again.
+            with (
+                build_attn_metadata_wrapper(),
+                build_attn_metadata_factory(
+                    self.input_buffers.positions,
+                    batch_desc.num_tokens,
+                    torch.from_numpy(self.input_batch.is_prefilling_np),
+                    parallel_config=self.attn_vllm_config.parallel_config,
+                ),
+            ):
+                return _build_graph_uniform_metadata(
+                    self, num_reqs=num_reqs, batch_desc=batch_desc,
+                    query_start_loc_np=query_start_loc_np,
+                    seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound, step=step,
+                    causal=causal, dcp_local_seq_lens=dcp_local_seq_lens,
+                    slot_mappings=slot_mappings,
+                )
         runtime = getattr(self, "_draft_window_runtime", None)
         # Older vLLM releases do not accept this optional upstream argument.
         slot_kwargs = {} if slot_mappings is None else {"slot_mappings": slot_mappings}
@@ -441,6 +580,7 @@ class AscendDSparkSpeculator(LmheadTPDraftSamplingMixin, DSparkSpeculator):
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
     ) -> torch.Tensor:
+        self._mark_draft_window_async_reader_started()
         hidden_states = super()._run_model(
             num_tokens, attn_metadata, slot_mappings, num_tokens_across_dp, cudagraph_runtime_mode
         )
@@ -449,6 +589,9 @@ class AscendDSparkSpeculator(LmheadTPDraftSamplingMixin, DSparkSpeculator):
         hidden_states, _ = AscendPCPManager.broadcast_replicated_hidden_states(
             hidden_states, hidden_states, num_tokens, replicated_pcp=self.replicated_pcp
         )
+        sink = getattr(self, "_draft_graph_output_references", None)
+        if sink is not None and sink.collecting:
+            sink.retain(self, num_tokens, hidden_states)
         return hidden_states
 
     def propose(
@@ -471,6 +614,10 @@ class AscendDSparkSpeculator(LmheadTPDraftSamplingMixin, DSparkSpeculator):
         is_profile: bool = False,
         num_speculative_tokens: int | None = None,
     ) -> torch.Tensor:
+        # Check checkpoint admission/static K before replacing proposal state.
+        owner_scope = _draft_window_owner_scope(
+            self, input_batch, dummy_run, is_profile, num_speculative_tokens=num_speculative_tokens
+        )
         self.input_batch = input_batch
         assert self.input_batch is not None
         # Replicated drafts consume global requests, unlike sharded targets.
@@ -494,17 +641,8 @@ class AscendDSparkSpeculator(LmheadTPDraftSamplingMixin, DSparkSpeculator):
             seq_lens_cpu, is_prefilling = self._prepare_draft_dcp_metadata_inputs(
                 input_batch.num_reqs, self.max_num_reqs, self.num_query_per_req
             )
-        runtime = getattr(self, "_draft_window_runtime", None)
         with (
-            runtime.proposal_context(
-                self,
-                input_batch,
-                dummy_run,
-                is_profile,
-                context_kv_only=num_speculative_tokens == 0,
-            )
-            if runtime is not None
-            else nullcontext(),
+            owner_scope,
             build_attn_metadata_wrapper(),
             build_attn_metadata_factory(
                 self.input_buffers.positions,

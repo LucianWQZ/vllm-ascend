@@ -481,6 +481,12 @@ class AscendSFADSACPMetadataBuilder(AscendSFAMetadataBuilder):
         )
         # Mixed FULL graphs may append a dummy request after a full batch.
         max_num_reqs = vllm_config.scheduler_config.max_num_seqs + 1
+        self.dsa_cp_max_num_tokens = _round_up(
+            vllm_config.scheduler_config.max_num_batched_tokens, get_tp_group().world_size
+        )
+        # Capture keeps these input addresses after temporary metadata is gone.
+        # Retain one fixed-capacity bank per speculative step for this builder.
+        self.dsa_cp_metadata_buffers: dict[int | None, dict[str, torch.Tensor]] = {}
         self.dsa_cp_actual_seq_lengths_query = torch.zeros(max_num_reqs + 1, dtype=torch.int32, device=device)
         self.dsa_cp_actual_seq_lengths_key = torch.empty_like(self.dsa_cp_actual_seq_lengths_query)
         self.dsa_cp_spec_actual_seq_lengths_query: list[torch.Tensor] | None = None
@@ -495,6 +501,51 @@ class AscendSFADSACPMetadataBuilder(AscendSFAMetadataBuilder):
             self.dsa_cp_spec_actual_seq_lengths_key = [
                 torch.zeros(spec_rows, dtype=torch.int32, device=device) for _ in range(spec_token_num)
             ]
+
+    def _padded_metadata_inputs(
+        self,
+        cos: torch.Tensor | None,
+        sin: torch.Tensor | None,
+        slots: torch.Tensor,
+        num_tokens_pad: int,
+        draft_index: int | None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor]:
+        """Stage current values at stable addresses on the current stream.
+
+        Allocation happens while building metadata before capture/replay. Never
+        grow or replace an existing bank: previously captured graphs can still
+        reference it. Normal current-stream ordering also orders these copies
+        after the previous Target replay; no Host sync or value read is added.
+        """
+        capacity = self.dsa_cp_max_num_tokens
+        if num_tokens_pad > capacity:
+            raise RuntimeError(f"DSA-CP metadata exceeds fixed capture capacity: {num_tokens_pad} > {capacity}")
+        if (cos is None) != (sin is None):
+            raise RuntimeError("DSA-CP RoPE inputs must both be present or absent")
+        sources = {"slots": slots}
+        if cos is not None:
+            assert sin is not None and cos.shape == sin.shape
+            sources.update(cos=cos, sin=sin)
+        bank = self.dsa_cp_metadata_buffers.get(draft_index)
+        if bank is None:
+            bank = {
+                key: torch.empty((capacity, *tensor.shape[1:]), dtype=tensor.dtype, device=tensor.device)
+                for key, tensor in sources.items()
+            }
+            self.dsa_cp_metadata_buffers[draft_index] = bank
+        if set(bank) != set(sources):
+            raise RuntimeError("DSA-CP captured RoPE input presence changed")
+        views = {}
+        for key, source in sources.items():
+            target = bank[key]
+            if (target.dtype != source.dtype or target.device != source.device
+                    or target.shape[1:] != source.shape[1:]):
+                raise RuntimeError(f"DSA-CP captured metadata layout changed: {key}")
+            count = min(source.shape[0], num_tokens_pad)
+            target[:count].copy_(source[:count])
+            target[count:num_tokens_pad].fill_(-1 if key == "slots" else 0)
+            views[key] = target[:num_tokens_pad]
+        return views.get("cos"), views.get("sin"), views["slots"]
 
     def _prepare_parallel_metadata(
         self,
@@ -523,20 +574,14 @@ class AscendSFADSACPMetadataBuilder(AscendSFAMetadataBuilder):
         local_end_with_pad = local_start + num_tokens_per_device
         local_end = min(local_end_with_pad, common_attn_metadata.num_actual_tokens)
 
+        cos, sin, slot_mapping = self._padded_metadata_inputs(
+            cos, sin, slot_mapping, num_tokens_pad, draft_index
+        )
         if cos is not None:
-            assert sin is not None and cos.shape == sin.shape
-            pad_size = num_tokens_pad - cos.shape[0]
-            if pad_size > 0:
-                cos = nn.functional.pad(cos, (0, 0, 0, 0, 0, 0, 0, pad_size))
-                sin = nn.functional.pad(sin, (0, 0, 0, 0, 0, 0, 0, pad_size))
+            assert sin is not None
             cos = cos[local_start:local_end_with_pad]
             sin = sin[local_start:local_end_with_pad]
             assert cos.shape[0] == num_tokens_per_device
-        pad_size_slot = num_tokens_pad - slot_mapping.shape[0]
-        if pad_size_slot > 0:
-            slot_mapping = nn.functional.pad(slot_mapping, (0, pad_size_slot), value=-1)
-        else:
-            slot_mapping = slot_mapping[:num_tokens_pad]
 
         slot_mapping_cp = slot_mapping[local_start:local_end_with_pad]
         assert slot_mapping_cp.shape[0] == num_tokens_per_device
@@ -625,7 +670,10 @@ class AscendSFADSACPMetadataBuilder(AscendSFAMetadataBuilder):
             )
         else:
             local_mapping = local_mapping[: dsa_cp_context.num_tokens_pad]
-        dsa_cp_context.slot_mapping_cp = local_mapping[dsa_cp_context.local_start : dsa_cp_context.local_end_with_pad]
+        # Keep the address captured by the native KV/RoPE operation.
+        dsa_cp_context.slot_mapping_cp.copy_(
+            local_mapping[dsa_cp_context.local_start : dsa_cp_context.local_end_with_pad]
+        )
 
 
 class AscendSFADSACPImpl(OProjWeightSwitchMixin, AscendSFAImpl):

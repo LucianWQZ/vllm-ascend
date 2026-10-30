@@ -37,6 +37,12 @@ from vllm_ascend.worker.v2.aclgraph_utils import (
     collect_sorted_captured_token_sizes,
     model_capture_wrapper,
 )
+from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
+    DraftWindowGraphRoute,
+    assert_draft_window_graph_metadata_batch,
+    build_draft_window_graph_update_binding,
+    observe_draft_window_graph_capture,
+)
 from vllm_ascend.worker.v2.utils import communicator_switch
 
 
@@ -89,6 +95,21 @@ class AutoRegressiveAclGraphManager(SpeculatorCudaGraphManager):
     ) -> None:
         """Capture ACL graphs for autoregressive speculative decoding."""
 
+        session = getattr(self.speculator, "_eagle3_graph_session", None)
+        if session is not None:
+            observe_draft_window_graph_capture(self.speculator, capture_context=session)
+            actual_forward = forward_fn
+
+            def forward_fn(*args, **kwargs):
+                if self.is_draft_model_prefill:
+                    n, tokens = args[0], args[1]
+                else:
+                    desc = args[2]
+                    n = desc.num_reqs or min(desc.num_tokens, self.max_num_reqs)
+                    tokens = desc.num_tokens
+                with session.capture_call(first=self.is_draft_model_prefill, n=n, tokens=tokens):
+                    return actual_forward(*args, **kwargs)
+
         with communicator_switch(), model_capture_wrapper(self.speculator, self.is_draft_model_prefill):
             if self.is_draft_model_prefill:
                 super().capture(
@@ -139,6 +160,9 @@ class AutoRegressiveAclGraphManager(SpeculatorCudaGraphManager):
 
     def run_fullgraph(self, desc: BatchExecutionDescriptor) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         """Replay the draft ACL graph and update its attention parameters."""
+        session = getattr(self.speculator, "_eagle3_graph_session", None)
+        if session is not None and self.speculator._eagle3_window_is_active():
+            return self._run_eagle_window_fullgraph(desc, session)
         num_tokens = desc.num_tokens
         logger.info_once(
             "ACL graph replay is active for the V2 draft model (%s, logged once per phase).",
@@ -214,3 +238,86 @@ class AutoRegressiveAclGraphManager(SpeculatorCudaGraphManager):
         ret = super().run_fullgraph(desc)
         graph.update(self.update_stream, resolved_tasks)
         return ret
+
+    def dispatch(self, num_reqs, num_tokens, uniform_token_count, num_active_loras,
+                 max_query_len=None, num_ubatches=1):
+        owner = self.speculator
+        if (getattr(owner, "_eagle3_graph_session", None) is not None
+                and getattr(owner, "_eagle3_window_continuing_prefill", False)):
+            # Only the explicit existing nonuniform/continuing-prefill phase.
+            # Missing buckets and UPDATE exceptions never enter this branch.
+            return BatchExecutionDescriptor(
+                cg_mode=CUDAGraphMode.NONE, num_tokens=num_tokens, num_reqs=num_reqs,
+                num_active_loras=self._resolve_effective_loras(num_active_loras),
+                num_ubatches=num_ubatches,
+            )
+        return super().dispatch(num_reqs, num_tokens, uniform_token_count,
+                                num_active_loras, max_query_len, num_ubatches)
+
+    def _run_eagle_window_fullgraph(self, desc, session):
+        owner = self.speculator
+        try:
+            session.controller.require_reusable()
+            if self.update_stream is None:
+                raise RuntimeError("Eagle3 Graph has no UPDATE stream")
+            stream = int(self.update_stream.npu_stream)
+            if not hasattr(session, "_update_stream_identity"):
+                session._update_stream_identity = stream
+            if stream != session._update_stream_identity:
+                raise RuntimeError("Eagle3 UPDATE stream changed across proposals")
+            if self.is_draft_model_prefill:
+                context = owner._require_eagle3_window_context()
+                session.controller.begin(
+                    context.mapping_epoch, context.ordered_request_ids,
+                    num_speculative_tokens=owner._eagle3_window_scheduled_tokens,
+                )
+                inputs = owner._materialize_eagle3_first_pass(
+                    num_reqs=owner.input_batch.num_reqs, num_reqs_padded=desc.num_reqs,
+                )
+                session.stage(inputs, first=True, n=desc.num_reqs,
+                              tokens=desc.num_tokens, ordinal=0)
+            metadata_batch = owner.build_draft_attn_metadatas(
+                desc.num_reqs, desc.num_tokens, self.is_draft_model_prefill,
+            )
+            route = (DraftWindowGraphRoute.EAGLE3_FIRST_PASS if self.is_draft_model_prefill
+                     else DraftWindowGraphRoute.EAGLE3_AR_STEP)
+            assert_draft_window_graph_metadata_batch(
+                owner, route=route, draft_attn_metadatas=metadata_batch,
+                num_reqs=desc.num_reqs, num_tokens=desc.num_tokens,
+                graph_mode=desc.cg_mode.name,
+            )
+            binding = build_draft_window_graph_update_binding(
+                owner, route=route, draft_attn_metadatas=metadata_batch,
+            )
+            graph = self.graphs[desc]
+            if not isinstance(graph, UpdatableGraph):
+                raise RuntimeError("Eagle3 Window requires the inventoried typed FIA Graph")
+            expected = 1 if self.is_draft_model_prefill else owner.num_speculative_steps - 1
+            if len(metadata_batch) != expected:
+                raise RuntimeError("Eagle3 Graph omitted a real first-pass/AR consumer")
+            # SharedSource filters by layer. Each layer's provider_index is the
+            # consumer ordinal, so AR1 and AR2 retain their own table/length bank.
+            params = [
+                {"layer_name": name,
+                 "actual_seq_lengths": metadata.actual_seq_lengths_q,
+                 "actual_seq_lengths_kv": metadata.seq_lens_list,
+                 "block_table": metadata.block_tables}
+                for consumer in metadata_batch
+                for name, metadata in consumer.items()
+                if metadata is not None
+            ]
+            resolved = graph.resolve_tasks(SharedSource(params))
+            self.update_stream.wait_stream(torch.npu.current_stream())
+            ret = super().run_fullgraph(desc)
+            graph.update(
+                self.update_stream, resolved,
+                draft_window_graph_update_binding=binding,
+                draft_attn_metadatas=metadata_batch,
+                attn_backend=owner.attn_backend,
+                num_tokens=desc.num_tokens,
+            )
+            return ret
+        except BaseException as error:
+            session.controller.quarantine(type(error).__name__ + ": " + str(error))
+            owner._draft_window_graph_submission_uncertain = True
+            raise

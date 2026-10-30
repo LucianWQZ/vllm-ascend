@@ -1353,6 +1353,8 @@ def test_dsa_cp_indexer_cache_follows_runtime_ownership(
 @pytest.mark.parametrize("nope", [False, True])
 def test_sfa_dsa_cp_builder_shards_tokens_and_sequence_lengths(nope) -> None:
     builder = AscendSFADSACPMetadataBuilder.__new__(AscendSFADSACPMetadataBuilder)
+    builder.dsa_cp_max_num_tokens = 128
+    builder.dsa_cp_metadata_buffers = {}
     builder.actual_seq_lengths_query = torch.tensor([3, 5, 0], dtype=torch.int32)
     builder.actual_seq_lengths_key = torch.tensor([3, 5, 0], dtype=torch.int32)
     builder.dsa_cp_actual_seq_lengths_query = torch.zeros(3, dtype=torch.int32)
@@ -1395,6 +1397,8 @@ def test_sfa_dsa_cp_metadata_builder_masks_graph_padding() -> None:
     # TP8, graph size 80 and MTP3 produce 20 four-token request slots. With
     # nine real requests, rank 6 splits a padded slot at its local boundary.
     builder = AscendSFADSACPMetadataBuilder.__new__(AscendSFADSACPMetadataBuilder)
+    builder.dsa_cp_max_num_tokens = 128
+    builder.dsa_cp_metadata_buffers = {}
     builder.dsa_cp_actual_seq_lengths_query = torch.zeros(21, dtype=torch.int32)
     builder.dsa_cp_actual_seq_lengths_key = torch.zeros(21, dtype=torch.int32)
     builder.dsa_cp_spec_actual_seq_lengths_query = None

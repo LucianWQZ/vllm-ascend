@@ -82,6 +82,9 @@ class AscendInputBatch(InputBatch):
     attn_state: AscendAttentionState | None = None
     is_dummy: bool = False
     is_cpp_profile: bool = False
+    # Authoritative CPU request limits, only populated by the finite Eagle review.
+    # (req_id, req_state_idx, original_prompt_len, prompt_plus_max_output, prefill_len)
+    draft_graph_review_request_rows: tuple[tuple[str, int, int, int, int], ...] | None = None
 
     @staticmethod
     def _prepare_cpp_profile_dummy(

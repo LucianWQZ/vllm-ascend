@@ -26,6 +26,20 @@ from vllm_ascend.compilation.updatable_graph import (
 )
 from vllm_ascend.utils import use_updatable_graph
 from vllm_ascend.worker.v2.aclgraph_utils import collect_sorted_captured_token_sizes, model_capture_wrapper
+from vllm_ascend.worker.v2.spec_decode.dflash.capture import draft_window_dflash_capture_scope
+from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
+    DraftWindowGraphStage,
+    assert_draft_window_graph_metadata_batch,
+    build_draft_window_graph_update_binding,
+    observe_draft_window_graph_capture,
+    observe_draft_window_graph_source,
+    resolve_parallel_draft_window_graph_route,
+)
+from vllm_ascend.worker.v2.spec_decode.draft_window_graph_characterization import (
+    prepare_parallel_draft_window_graph_characterization,
+    record_parallel_graph_output,
+    record_parallel_graph_replay_submission,
+)
 from vllm_ascend.worker.v2.utils import communicator_switch
 
 
@@ -60,6 +74,34 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
         if super().needs_capture():
             set_draft_graph_params(self.capture_sizes)
 
+    def dispatch(
+        self,
+        num_reqs: int,
+        num_tokens: int,
+        uniform_token_count: int | None,
+        num_active_loras: int,
+        max_query_len: int | None = None,
+        num_ubatches: int = 1,
+    ) -> BatchExecutionDescriptor:
+        if getattr(self.speculator, "_draft_window_prefill_bypass_active", False):
+            # Continuing prefill owns no Window generation. Captured Window
+            # operands cannot stand in for its baseline full read. Select the
+            # existing eager branch before upstream metadata/padding is built;
+            # this is a declared phase rule, never a missing-bucket fallback.
+            return BatchExecutionDescriptor(
+                cg_mode=CUDAGraphMode.NONE,
+                num_tokens=num_tokens,
+                num_reqs=num_reqs,
+                num_active_loras=self._resolve_effective_loras(num_active_loras),
+                num_ubatches=num_ubatches,
+            )
+        descriptor = super().dispatch(
+            num_reqs, num_tokens, uniform_token_count, num_active_loras, max_query_len, num_ubatches
+        )
+        from vllm_ascend.worker.v2.spec_decode.draft_window_graph_metadata import select_parallel_graph_metadata
+        select_parallel_graph_metadata(self.speculator, descriptor)
+        return descriptor
+
     def capture(
         self,
         forward_fn: Callable,
@@ -80,35 +122,60 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
         one the installed vLLM expects.
         """
         prepare_kwargs: dict[str, Any] = {"prepare_forward": prepare_forward}
-        with communicator_switch(), model_capture_wrapper(self.speculator, False):
-            super().capture(
-                forward_fn,
-                input_buffers,
-                block_tables,
-                attn_groups,
-                kv_cache_config,
-                max_model_len,
-                causal=causal,
-                progress_bar_desc=progress_bar_desc,
-                **prepare_kwargs,
-            )
+        with draft_window_dflash_capture_scope(
+            self.speculator,
+            input_buffers,
+            getattr(self, "_capture_descs", {}),
+            max_num_reqs=getattr(self, "max_num_reqs", 0),
+        ) as capture_context:
+            observe_draft_window_graph_capture(self.speculator, capture_context=capture_context)
+            # Keep core544's preparation callback and canonical context slots;
+            # it receives both num_reqs and the actual built metadata.
+            with communicator_switch(), model_capture_wrapper(self.speculator, False):
+                super().capture(
+                    forward_fn,
+                    input_buffers,
+                    block_tables,
+                    attn_groups,
+                    kv_cache_config,
+                    max_model_len,
+                    causal=causal,
+                    progress_bar_desc=progress_bar_desc,
+                    **prepare_kwargs,
+                )
 
     def run_fullgraph(self, desc: BatchExecutionDescriptor) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         """Override run_fullgraph to update full graph params in run_fullgraph."""
         num_tokens = desc.num_tokens
+        from vllm_ascend.worker.v2.spec_decode.draft_window_graph_metadata import is_parallel_graph_dp_dummy
+
+        dp_dummy = is_parallel_graph_dp_dummy(self.speculator)
+        graph_route = None if dp_dummy else resolve_parallel_draft_window_graph_route(self.speculator)
         attn_backend = list(self.speculator.attn_backends.values())[0]
+        if graph_route is not None and not use_updatable_graph(attn_backend):
+            raise NotImplementedError("Draft Window Graph requires the admitted updatable backend binding contract")
         if all(backend is AscendFlashAttentionBackend for backend in self.speculator.attn_backends.values()):
             # Length preparation and FlashAttn tiling run inside the graph,
             # reading the draft's persistent device buffers on every replay.
             return super().run_fullgraph(desc)
+        if not dp_dummy:
+            prepare_parallel_draft_window_graph_characterization(self.speculator, desc)
         draft_attn_metadatas = self.speculator.build_draft_attn_metadatas(
             desc.num_reqs,
             self.speculator.input_batch.seq_lens_cpu_upper_bound,
         )
+        if graph_route is not None:
+            graph_mode_name = getattr(desc.cg_mode, "name", None)
+            if not isinstance(graph_mode_name, str):
+                raise RuntimeError("Draft Window Graph requires an explicit replay mode")
+            assert_draft_window_graph_metadata_batch(
+                self.speculator, route=graph_route, draft_attn_metadatas=draft_attn_metadatas,
+                num_reqs=desc.num_reqs, num_tokens=num_tokens, graph_mode=graph_mode_name,
+            )
         if use_updatable_graph(attn_backend):
             return self._updatable_graph_replay(desc, draft_attn_metadatas)
         else:
-            # This will be removed once the refactoring is fully complete.
+            # Ordinary OFF/eager Target policy keeps the original fallback.
             return self._graph_replay(desc, attn_backend, num_tokens, draft_attn_metadatas)
 
     def _graph_replay(self, desc, attn_backend, num_tokens, draft_attn_metadatas):
@@ -146,7 +213,32 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
         graph = self.graphs[desc]
         assert isinstance(graph, UpdatableGraph)
         resolved_tasks = graph.resolve_tasks(ContextSource(draft_attn_metadatas[0]))
+        from vllm_ascend.worker.v2.spec_decode.draft_window_graph_metadata import is_parallel_graph_dp_dummy
+
+        dp_dummy = is_parallel_graph_dp_dummy(self.speculator)
+        graph_route = None if dp_dummy else resolve_parallel_draft_window_graph_route(self.speculator)
         self.update_stream.wait_stream(torch.npu.current_stream())
+        if graph_route is not None:
+            observe_draft_window_graph_source(self.speculator, DraftWindowGraphStage.REPLAY)
         ret = super().run_fullgraph(desc)
-        graph.update(self.update_stream, resolved_tasks)
+        if graph_route is None:
+            # Exact existing OFF updatable call; no Window-only construction.
+            graph.update(self.update_stream, resolved_tasks)
+        else:
+            record_parallel_graph_replay_submission(self.speculator)
+            observe_draft_window_graph_source(self.speculator, DraftWindowGraphStage.CONSUMER)
+            binding = build_draft_window_graph_update_binding(
+                self.speculator, route=graph_route, draft_attn_metadatas=draft_attn_metadatas
+            )
+            graph.update(
+                self.update_stream,
+                resolved_tasks,
+                draft_window_graph_update_binding=binding,
+                draft_attn_metadatas=draft_attn_metadatas,
+                attn_backend=list(self.speculator.attn_backends.values())[0],
+                num_tokens=desc.num_tokens,
+            )
+            # Diagnostics, when explicitly enabled, run only after UPDATE was
+            # submitted. A Host return/record here is not device completion.
+            record_parallel_graph_output(self.speculator, ret)
         return ret

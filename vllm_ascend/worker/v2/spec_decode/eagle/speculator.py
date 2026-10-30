@@ -24,8 +24,12 @@ from vllm_ascend.worker.v2.spec_decode.target_dependent_ar.speculator import (
 )
 
 
-class AscendEagleSpeculator(AscendTargetDependentARSpeculator, EagleSpeculator):
+from vllm_ascend.worker.v2.spec_decode.draft_window_eagle3_adapter import Eagle3GraphIntegrationMixin
+
+
+class AscendEagleSpeculator(Eagle3GraphIntegrationMixin, AscendTargetDependentARSpeculator, EagleSpeculator):
     """Ascend Eagle speculator: the NPU loop from AscendTargetDependentARSpeculator
+
     layered on upstream EagleSpeculator (flat/GQA attention)."""
 
     def _create_draft_vllm_config(self) -> VllmConfig:
