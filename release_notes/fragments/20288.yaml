@@ -6,3 +6,5 @@ entries:
     text: Restored native symmetric SWA and full KV backing for admitted noncausal DFlash2 drafts. The storage compatibility measure can reduce cache-token capacity at a fixed memory budget, and does not enable Full attention.
   - category: feature
     text: Added a global-first-rank startup warning when an additional MRV2 Draft window narrows certified native SWA groups. Supported settings remain opt-in and are not automatically disabled.
+  - category: feature
+    text: Added default-off, controlled Draft Window Graph review entry points with explicit checkpoint and topology limits. Unqualified combinations remain blocked, including ordinary Full8 on the PR017/vLLM544 pair; DFlash2 retains its typed eager route.

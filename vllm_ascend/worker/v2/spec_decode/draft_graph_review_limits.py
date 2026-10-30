@@ -265,7 +265,12 @@ def resolve_draft_graph_review_limit(vllm_config, *, experimental_graph_review=F
         return None
     if speculative.method == "dflash" and digest == _FULL8_CONFIG:
         validate_full8_single_request_review_config(vllm_config)
-        return "full8_local_active_at_most_one"
+        raise NotImplementedError(
+            "This Full8 checkpoint's ordinary single-request Draft Graph qualification "
+            "on the PR017/vLLM544 pair is incomplete, so this entry is not open. "
+            "The explicit private numerical diagnostic and independently supported "
+            "typed Draft eager route remain available; no fallback is selected."
+        )
     if speculative.method == "dflash" and digest == _SWA6_CONFIG:
         raise NotImplementedError(
             "This SWA6 checkpoint's Draft Graph route is blocked by an unresolved "

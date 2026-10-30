@@ -64,9 +64,13 @@ class ReviewBoundaryControls(unittest.TestCase):
 
     def test_full8_one_actual_row_requires_qualified_padding_and_rejects_multirow(self):
         with self.identified("_FULL8_CONFIG"):
-            limit = self.resolve(self.config)
-        self.assertEqual(limit, "full8_local_active_at_most_one")
-        owner = NS(_draft_graph_review_limit=limit)
+            for gate in (False, True):
+                with self.subTest(gate=gate), self.assertRaisesRegex(
+                        NotImplementedError, "PR017/vLLM544 pair is incomplete"):
+                    self.resolve(self.config, experimental_graph_review=gate)
+        # Keep the internal row guard for a later qualified entry; its shape
+        # checks do not by themselves admit the ordinary checkpoint service.
+        owner = NS(_draft_graph_review_limit="full8_local_active_at_most_one")
         self.validate(owner, NS(num_reqs=0, num_reqs_after_padding=1))
         self.validate(owner, NS(num_reqs=1, num_reqs_after_padding=1,
                                 global_num_reqs=1, client_concurrency=64))
@@ -116,7 +120,8 @@ class ReviewBoundaryControls(unittest.TestCase):
         dense = actual_function(SOURCE / "vllm_ascend/ascend_config.py", "_dense_dp_graph_window_review",
                                 {"validate_additional_config_bool": lambda value, name: value})
         with patch.dict(sys.modules, {MODULE: module}), self.identified("_FULL8_CONFIG"):
-            self.assertTrue(dense(self.config, 32768))
+            with self.assertRaisesRegex(NotImplementedError, "PR017/vLLM544 pair is incomplete"):
+                dense(self.config, 32768)
             self.config.scheduler_config.max_num_seqs = 2
             with self.assertRaisesRegex(NotImplementedError, "max_num_seqs=1"):
                 dense(self.config, 32768)
@@ -169,14 +174,17 @@ class ReviewBoundaryControls(unittest.TestCase):
             self.assertIsNone(self.resolve(self.config))
 
     def test_explicit_existing_numeric_diagnostic_retains_original_interface(self):
-        with self.identified("_SWA6_CONFIG"):
-            self.config.additional_config["draft_window_graph_numeric_diagnostic"] = True
-            with self.assertRaises(NotImplementedError):
-                self.resolve(self.config)
-            self.assertIsNone(self.resolve(self.config, experimental_graph_review=True))
-            self.config.additional_config["draft_window_graph_numeric_diagnostic"] = "true"
-            with self.assertRaises(TypeError):
-                self.resolve(self.config)
+        for checkpoint in ("_SWA6_CONFIG", "_FULL8_CONFIG"):
+            with self.subTest(checkpoint=checkpoint), self.identified(checkpoint):
+                self.config.additional_config["draft_window_graph_numeric_diagnostic"] = True
+                with self.assertRaises(NotImplementedError):
+                    self.resolve(self.config)
+                self.assertIsNone(self.resolve(self.config, experimental_graph_review=True))
+                self.config.additional_config["draft_window_graph_numeric_diagnostic"] = "true"
+                with self.assertRaises(TypeError):
+                    self.resolve(self.config)
+                self.config.additional_config.clear()
+                self.config.additional_config["draft_window_size"] = 32768
 
     def test_different_config_and_other_methods_are_not_typewide_bans(self):
         self.assertIsNone(self.resolve(self.config))
@@ -210,9 +218,16 @@ class ReviewBoundaryControls(unittest.TestCase):
         self.assertEqual(calls, [])
         self.config.scheduler_config.max_num_seqs = 1
         with patch.dict(sys.modules, {MODULE: module, "vllm_ascend": ascend}), self.identified("_FULL8_CONFIG"):
+            for gate in (False, True):
+                ascend.envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH = gate
+                with self.subTest(gate=gate), self.assertRaisesRegex(
+                        NotImplementedError, "PR017/vLLM544 pair is incomplete"):
+                    factory(self.config, None)
+            self.assertEqual(calls, [])
+            self.config.speculative_config.enforce_eager = True
             self.assertIs(factory(self.config, None), owner)
         self.assertEqual(calls, ["construct"])
-        self.assertEqual(owner._draft_graph_review_limit, "full8_local_active_at_most_one")
+        self.assertFalse(hasattr(owner, "_draft_graph_review_limit"))
 
     def test_actual_proposal_boundary_checks_before_runtime_or_submission(self):
         module = ModuleType(MODULE)
