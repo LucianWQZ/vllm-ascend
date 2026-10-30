@@ -325,14 +325,17 @@ class AutoRegressiveAclGraphManager(SpeculatorCudaGraphManager):
             resolved = graph.resolve_tasks(SharedSource(params))
             self.update_stream.wait_stream(torch.npu.current_stream())
             ret = super().run_fullgraph(desc)
-            graph.update(
-                self.update_stream,
-                resolved,
-                draft_window_graph_update_binding=binding,
-                draft_attn_metadatas=metadata_batch,
-                attn_backend=owner.attn_backend,
-                num_tokens=desc.num_tokens,
-            )
+            # Keep typed backend validation and optional UPDATE observations in
+            # the same configuration that owns this captured graph manager.
+            with set_current_vllm_config(self.vllm_config):
+                graph.update(
+                    self.update_stream,
+                    resolved,
+                    draft_window_graph_update_binding=binding,
+                    draft_attn_metadatas=metadata_batch,
+                    attn_backend=owner.attn_backend,
+                    num_tokens=desc.num_tokens,
+                )
             return ret
         except BaseException as error:
             session.controller.quarantine(type(error).__name__ + ": " + str(error))

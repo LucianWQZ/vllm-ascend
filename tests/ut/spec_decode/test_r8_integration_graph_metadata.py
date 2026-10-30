@@ -377,3 +377,124 @@ def test_private_full_distinct_bad_owner_after_shared_group_is_rejected(graph_de
         _run_actual_private_binding_loop(graph_device_binding, read, by_layer)
     assert metadata.seq_lens is read.device_window_exact
     assert bad.seq_lens is not read.device_window_exact
+
+
+@pytest.mark.parametrize(
+    "relative,method_name",
+    [
+        ("dflash/aclgraph.py", "_updatable_graph_replay"),
+        ("target_dependent_ar/aclgraph.py", "_run_eagle_window_fullgraph"),
+    ],
+)
+@pytest.mark.parametrize("fail_update", [False, True])
+def test_typed_update_uses_manager_config_and_restores_context(relative, method_name, fail_update):
+    """Execute the actual UPDATE statement with context-sensitive API stand-ins."""
+    from contextlib import contextmanager
+    from contextvars import ContextVar
+
+    source = SOURCE.parent / relative
+    tree = ast.parse(source.read_text())
+    method = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == method_name)
+    statements = [
+        n
+        for n in ast.walk(method)
+        if isinstance(n, ast.With)
+        and any(ast.unparse(item.context_expr) == "set_current_vllm_config(self.vllm_config)" for item in n.items)
+    ]
+    assert len(statements) == 1
+    statement = statements[0]
+    assert len(statement.body) == 1
+    call = statement.body[0]
+    assert isinstance(call, ast.Expr) and isinstance(call.value, ast.Call)
+    assert ast.unparse(call.value.func) == "graph.update"
+    assert "draft_window_graph_update_binding" in {k.arg for k in call.value.keywords}
+    current = ContextVar("current_vllm_config", default=None)
+    manager_config, ambient_config = object(), object()
+    context_entries, observations = [], []
+    backend = object()
+    binding = object()
+    metadata = [object()]
+
+    @contextmanager
+    def set_current_vllm_config(config):
+        context_entries.append(config)
+        token = current.set(config)
+        try:
+            yield
+        finally:
+            current.reset(token)
+
+    def require_actual_config():
+        assert current.get() is manager_config, "Current vLLM config is not set"
+        return current.get()
+
+    def update(stream, tasks, **kwargs):
+        assert stream is self.update_stream and tasks is resolved
+        assert kwargs["draft_window_graph_update_binding"] is binding
+        assert kwargs["draft_attn_metadatas"] is metadata
+        assert kwargs["attn_backend"] is backend and kwargs["num_tokens"] == 16
+        # The getter and optional observer execute under the same actual owner.
+        observations.append((require_actual_config(), require_actual_config()))
+        if fail_update:
+            raise RuntimeError("original UPDATE failure")
+
+    self = SimpleNamespace(
+        vllm_config=manager_config,
+        update_stream=object(),
+        speculator=SimpleNamespace(attn_backends={"draft": backend}),
+    )
+    resolved = object()
+    namespace = dict(
+        self=self,
+        graph=SimpleNamespace(update=update),
+        desc=SimpleNamespace(num_tokens=16),
+        resolved=resolved,
+        resolved_tasks=resolved,
+        binding=binding,
+        draft_attn_metadatas=metadata,
+        metadata_batch=metadata,
+        owner=SimpleNamespace(attn_backend=backend),
+        set_current_vllm_config=set_current_vllm_config,
+    )
+
+    def execute(nodes):
+        module = ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[]))
+        exec(compile(module, str(source), "exec"), namespace)
+
+    # The actual old unwrapped statement reproduces the saved first failure.
+    with pytest.raises(AssertionError, match="Current vLLM config is not set"):
+        execute([call])
+    assert observations == [] and context_entries == []
+    token = current.set(ambient_config)
+    try:
+        if fail_update:
+            with pytest.raises(RuntimeError, match="original UPDATE failure"):
+                execute([statement])
+        else:
+            execute([statement])
+        assert current.get() is ambient_config
+    finally:
+        current.reset(token)
+    assert current.get() is None
+    assert context_entries == [manager_config]
+    assert observations == [(manager_config, manager_config)]
+
+
+def test_window_off_update_keeps_the_original_two_argument_call():
+    for relative in ["dflash/aclgraph.py", "target_dependent_ar/aclgraph.py"]:
+        tree = ast.parse((SOURCE.parent / relative).read_text())
+        method = next(
+            n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_updatable_graph_replay"
+        )
+        if relative.startswith("dflash"):
+            branch = next(
+                n for n in method.body if isinstance(n, ast.If) and ast.unparse(n.test) == "graph_route is None"
+            )
+            actual = branch.body
+        else:
+            assert not any(isinstance(n, ast.With) for n in ast.walk(method))
+            actual = [n for n in method.body if isinstance(n, ast.Expr) and ast.unparse(n).startswith("graph.update(")]
+        expected = ast.parse("graph.update(self.update_stream, resolved_tasks)").body
+        assert ast.dump(ast.Module(body=actual, type_ignores=[])) == ast.dump(
+            ast.Module(body=expected, type_ignores=[])
+        )

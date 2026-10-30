@@ -2,7 +2,7 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 import torch
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import get_forward_context, set_forward_context
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -235,14 +235,17 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
             binding = build_draft_window_graph_update_binding(
                 self.speculator, route=graph_route, draft_attn_metadatas=draft_attn_metadatas
             )
-            graph.update(
-                self.update_stream,
-                resolved_tasks,
-                draft_window_graph_update_binding=binding,
-                draft_attn_metadatas=draft_attn_metadatas,
-                attn_backend=list(self.speculator.attn_backends.values())[0],
-                num_tokens=desc.num_tokens,
-            )
+            # Backend dispatch resolves CP classes from the captured manager's
+            # configuration, also when this path is entered outside a model forward.
+            with set_current_vllm_config(self.vllm_config):
+                graph.update(
+                    self.update_stream,
+                    resolved_tasks,
+                    draft_window_graph_update_binding=binding,
+                    draft_attn_metadatas=draft_attn_metadatas,
+                    attn_backend=list(self.speculator.attn_backends.values())[0],
+                    num_tokens=desc.num_tokens,
+                )
             # Diagnostics, when explicitly enabled, run only after UPDATE was
             # submitted. A Host return/record here is not device completion.
             record_parallel_graph_output(self.speculator, ret)
