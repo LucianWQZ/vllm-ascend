@@ -87,14 +87,23 @@ class AscendDraftAttentionReadInputs:
             raise ValueError("Draft attention CPU exact and upper lengths must have the same shape")
 
     def validate_builder_sources(
-        self, *, num_reqs, block_tables, seq_lens, seq_lens_cpu,
-        seq_lens_cpu_upper_bound, max_seq_len,
+        self,
+        *,
+        num_reqs,
+        block_tables,
+        seq_lens,
+        seq_lens_cpu,
+        seq_lens_cpu_upper_bound,
+        max_seq_len,
     ) -> None:
         """Authorize only this build's existing exact/read owners."""
         if num_reqs != self.seq_lens.shape[0] or max_seq_len != self.max_seq_len:
             raise ValueError("Graph metadata read geometry differs from current inputs")
-        if (seq_lens is not self.seq_lens or seq_lens_cpu is not self.seq_lens_cpu_exact
-                or seq_lens_cpu_upper_bound is not self.seq_lens_cpu_upper_bound):
+        if (
+            seq_lens is not self.seq_lens
+            or seq_lens_cpu is not self.seq_lens_cpu_exact
+            or seq_lens_cpu_upper_bound is not self.seq_lens_cpu_upper_bound
+        ):
             raise ValueError("Graph metadata exact/upper owners differ from current inputs")
         if len(block_tables) != len(self.block_tables) or any(
             actual is not expected for actual, expected in zip(block_tables, self.block_tables)
@@ -107,15 +116,17 @@ class AscendDraftAttentionReadInputs:
             raise ValueError("Graph metadata group is outside current read inputs")
         if hasattr(common, "_draft_window_read") or hasattr(common, "_draft_window_device_read"):
             raise ValueError("Graph metadata already has a read projection owner")
-        if (common.num_reqs != self.seq_lens.shape[0]
-                or common.block_table_tensor is not self.block_tables[gid]
-                or common.seq_lens_cpu is not self.seq_lens_cpu_exact
-                or common.seq_lens_cpu_upper_bound is not self.seq_lens_cpu_upper_bound
-                or common.seq_lens.data_ptr() != self.seq_lens.data_ptr()
-                or common.seq_lens.shape != self.seq_lens.shape
-                or common.seq_lens.stride() != self.seq_lens.stride()
-                or common.seq_lens.dtype != self.seq_lens.dtype
-                or common.seq_lens.device != self.seq_lens.device):
+        if (
+            common.num_reqs != self.seq_lens.shape[0]
+            or common.block_table_tensor is not self.block_tables[gid]
+            or common.seq_lens_cpu is not self.seq_lens_cpu_exact
+            or common.seq_lens_cpu_upper_bound is not self.seq_lens_cpu_upper_bound
+            or common.seq_lens.data_ptr() != self.seq_lens.data_ptr()
+            or common.seq_lens.shape != self.seq_lens.shape
+            or common.seq_lens.stride() != self.seq_lens.stride()
+            or common.seq_lens.dtype != self.seq_lens.dtype
+            or common.seq_lens.device != self.seq_lens.device
+        ):
             raise ValueError("Fresh Graph common metadata lost its current read owners")
         # The generic builder slices device lengths. Reattach that same view's
         # explicit owner for the certificate; no data is copied or projected.
@@ -131,12 +142,14 @@ class _AscendDraftAttentionReadCertificate:
 
     def exact_cpu_for(self, common: Any) -> torch.Tensor:
         read = self.inputs
-        if (common.seq_lens is not read.seq_lens
-                or common.seq_lens_cpu is not read.seq_lens_cpu_exact
-                or common._seq_lens_cpu is not read.seq_lens_cpu_exact
-                or common.seq_lens_cpu_upper_bound is not read.seq_lens_cpu_upper_bound
-                or common.block_table_tensor is not read.block_tables[self.group_id]
-                or common.num_reqs != read.seq_lens.shape[0]):
+        if (
+            common.seq_lens is not read.seq_lens
+            or common.seq_lens_cpu is not read.seq_lens_cpu_exact
+            or common._seq_lens_cpu is not read.seq_lens_cpu_exact
+            or common.seq_lens_cpu_upper_bound is not read.seq_lens_cpu_upper_bound
+            or common.block_table_tensor is not read.block_tables[self.group_id]
+            or common.num_reqs != read.seq_lens.shape[0]
+        ):
             raise ValueError("Graph read operands were replaced after exact certification")
         return read.seq_lens_cpu_exact
 
@@ -316,6 +329,7 @@ class DraftWindowEagerMixin:
         self._draft_window_prefill_bypass_active = False
         self._draft_window_dp_dummy_active = False
         from vllm_ascend.ascend_config import validate_additional_config_bool
+
         additional = getattr(getattr(self, "vllm_config", None), "additional_config", None) or {}
         self._draft_window_single_metadata_enabled = validate_additional_config_bool(
             additional.get("draft_window_graph_single_metadata", False),
@@ -336,11 +350,7 @@ class DraftWindowEagerMixin:
         # route instead owns persistent capture backing and orders the next
         # generation's current-stream writes after the prior replay.  Building
         # an eager pool here would both reject Graph mode and split ownership.
-        if (
-            topology is not None
-            and topology.async_scheduling
-            and topology.graph_mode == "NONE"
-        ):
+        if topology is not None and topology.async_scheduling and topology.graph_mode == "NONE":
             additional_config = getattr(self.vllm_config, "additional_config", None) or {}
             host_batch_depth = int(self.vllm_config.max_concurrent_batches)
             if host_batch_depth <= 0:
@@ -395,7 +405,10 @@ class DraftWindowEagerMixin:
             # Keep this distinct from real prefill and startup profiling.
             dp_size = getattr(self, "dp_size", 1)
             self._draft_window_dp_dummy_active = (
-                dummy_run and not is_profile and type(dp_size) is int and dp_size > 1
+                dummy_run
+                and not is_profile
+                and type(dp_size) is int
+                and dp_size > 1
                 and hasattr(self, "_draft_window_graph_characterization")
             )
             try:
@@ -629,10 +642,14 @@ class DraftWindowEagerMixin:
 
             if self._draft_window_native_full_snapshot is not None:
                 raise RuntimeError("native SWA full-length snapshot was not retired")
-            snapshot = NativeSWAFullSnapshot(inputs.identity,cpu_full_exact,cpu_apply_time_full_upper,
-                                              self.input_buffers.seq_lens[:num_reqs_padded])
+            snapshot = NativeSWAFullSnapshot(
+                inputs.identity,
+                cpu_full_exact,
+                cpu_apply_time_full_upper,
+                self.input_buffers.seq_lens[:num_reqs_padded],
+            )
             self._draft_window_native_full_snapshot = snapshot
-            snapshot.validate(inputs.identity,capability.native_swa_graph)
+            snapshot.validate(inputs.identity, capability.native_swa_graph)
         return inputs
 
     def _validated_draft_attention_read_inputs(
@@ -720,6 +737,7 @@ class DraftWindowEagerMixin:
         from vllm_ascend.worker.v2.spec_decode.draft_window_graph_metadata import (
             defer_parallel_graph_metadata,
         )
+
         if defer_parallel_graph_metadata(
             self, inputs, padded_requests=num_reqs_padded, padded_tokens=num_tokens_padded
         ):
@@ -787,13 +805,22 @@ class DraftWindowEagerMixin:
         input preparation, slot calculation, forward, and sampling remain in
         upstream. ``UPSTREAM_DRIFT_GUARD`` tests pin the source contract.
         """
-        native_swa = getattr(getattr(self,"_draft_window_source_capability",None),"native_swa_graph",None)
+        native_swa = getattr(getattr(self, "_draft_window_source_capability", None), "native_swa_graph", None)
         if native_swa is not None and attn_groups is None:
             from vllm_ascend.worker.v2.spec_decode.draft_window_swa_graph import build_group_metadata
 
-            return build_group_metadata(self,read_inputs=read_inputs,builder_kwargs=dict(
-                num_reqs=num_reqs,num_reqs_padded=num_reqs_padded,num_tokens_padded=num_tokens_padded,
-                causal=causal,query_start_loc_np=query_start_loc_np,dcp_local_seq_lens=dcp_local_seq_lens))
+            return build_group_metadata(
+                self,
+                read_inputs=read_inputs,
+                builder_kwargs=dict(
+                    num_reqs=num_reqs,
+                    num_reqs_padded=num_reqs_padded,
+                    num_tokens_padded=num_tokens_padded,
+                    causal=causal,
+                    query_start_loc_np=query_start_loc_np,
+                    dcp_local_seq_lens=dcp_local_seq_lens,
+                ),
+            )
         if query_start_loc_np is not None:
             raise NotImplementedError("MRV2 draft-window P4a requires the uniform DFlash/DSpark query layout")
         # a982 keeps its range on CPU as NumPy; retain the existing uniform

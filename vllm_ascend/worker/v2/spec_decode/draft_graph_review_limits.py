@@ -9,10 +9,9 @@ Default-off numeric diagnostics keep their existing private capture interface.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import hashlib
+from dataclasses import dataclass
 from pathlib import Path
-
 
 _FULL8_CONFIG = "d2be70579f0b8e7b109e776dbf14bd88ac5be115d2dabbb20e6373988939f410"
 _SWA6_CONFIG = "20784b063040f7871efec4bf63342e5cb941907925943540176dfbb8aaf186dc"
@@ -41,48 +40,64 @@ def validate_eagle_single_request_review_config(vllm_config, *, experimental_gra
     # again. Both exact phases describe the same already-qualified topology.
     target_backend = getattr(parallel, "all2all_backend", None)
     target_sp = getattr(parallel, "use_sequence_parallel_moe", None)
-    qualified_target_phase = (
-        (target_backend == "allgather_reducescatter" and target_sp is True)
-        or (target_backend == "flashinfer_all2allv" and target_sp is False)
+    qualified_target_phase = (target_backend == "allgather_reducescatter" and target_sp is True) or (
+        target_backend == "flashinfer_all2allv" and target_sp is False
     )
-    if (experimental_graph_review is not True or speculative is None
-            or speculative.method != "eagle3" or speculative.enforce_eager
-            or speculative.uses_dynamic_speculative_decoding()
-            or speculative.num_speculative_tokens != 3
-            or getattr(draft_parallel, "tensor_parallel_size", None) != 4
-            or parallel.tensor_parallel_size != 4 or parallel.data_parallel_size != 1
-            or parallel.pipeline_parallel_size != 1
-            or parallel.prefill_context_parallel_size != 1
-            or parallel.decode_context_parallel_size != 1
-            # The independent dense Draft source retains its separately
-            # validated replicated read geometry; this is Target config only.
-            or getattr(parallel, "enable_expert_parallel", False) is not True
-            or not qualified_target_phase
-            or additional.get("enable_dsa_cp", False) is not False
-            or additional.get("enable_flashcomm1", False) is not False
-            or scheduler.async_scheduling is not False
-            or cache.enable_prefix_caching is not False or mode != "FULL_DECODE_ONLY"
-            or additional.get("draft_window_size") != 1024
-            or additional.get("draft_window_graph_replicated_tp_review") is not True
-            or additional.get("draft_window_graph_numeric_diagnostic", False) is not False
-            or speculative.enable_adaptive_verification is not False):
+    if (
+        experimental_graph_review is not True
+        or speculative is None
+        or speculative.method != "eagle3"
+        or speculative.enforce_eager
+        or speculative.uses_dynamic_speculative_decoding()
+        or speculative.num_speculative_tokens != 3
+        or getattr(draft_parallel, "tensor_parallel_size", None) != 4
+        or parallel.tensor_parallel_size != 4
+        or parallel.data_parallel_size != 1
+        or parallel.pipeline_parallel_size != 1
+        or parallel.prefill_context_parallel_size != 1
+        or parallel.decode_context_parallel_size != 1
+        # The independent dense Draft source retains its separately
+        # validated replicated read geometry; this is Target config only.
+        or getattr(parallel, "enable_expert_parallel", False) is not True
+        or not qualified_target_phase
+        or additional.get("enable_dsa_cp", False) is not False
+        or additional.get("enable_flashcomm1", False) is not False
+        or scheduler.async_scheduling is not False
+        or cache.enable_prefix_caching is not False
+        or mode != "FULL_DECODE_ONLY"
+        or additional.get("draft_window_size") != 1024
+        or additional.get("draft_window_graph_replicated_tp_review") is not True
+        or additional.get("draft_window_graph_numeric_diagnostic", False) is not False
+        or speculative.enable_adaptive_verification is not False
+    ):
         raise ValueError(
             "Eagle single-request review requires static K3/W1024, TP4/DP1/PP1/PCP1/DCP1, "
             "the qualified Ascend Target EP/SP topology, FULL_DECODE_ONLY, "
             "non-async/no-prefix/non-adaptive and the experimental Graph gate; "
             f"actual={{'gate': {experimental_graph_review!r}, 'method': {getattr(speculative, 'method', None)!r}, "
-            f"'eager': {getattr(speculative, 'enforce_eager', None)!r}, 'K': {getattr(speculative, 'num_speculative_tokens', None)!r}, "
+            f"'eager': {getattr(speculative, 'enforce_eager', None)!r}, "
+            f"'K': {getattr(speculative, 'num_speculative_tokens', None)!r}, "
             f"'draft_tp': {getattr(draft_parallel, 'tensor_parallel_size', None)!r}, "
-            f"'tp_dp_pp_pcp_dcp': {(parallel.tensor_parallel_size, parallel.data_parallel_size, parallel.pipeline_parallel_size, parallel.prefill_context_parallel_size, parallel.decode_context_parallel_size)!r}, "
-            f"'EP': {getattr(parallel, 'enable_expert_parallel', None)!r}, 'all2all_backend': {target_backend!r}, 'SP': {target_sp!r}, "
+            f"'tp_dp_pp_pcp_dcp': {
+                (
+                    parallel.tensor_parallel_size,
+                    parallel.data_parallel_size,
+                    parallel.pipeline_parallel_size,
+                    parallel.prefill_context_parallel_size,
+                    parallel.decode_context_parallel_size,
+                )!r
+            }, "
+            f"'EP': {getattr(parallel, 'enable_expert_parallel', None)!r}, "
+            f"'all2all_backend': {target_backend!r}, 'SP': {target_sp!r}, "
             f"'mode': {mode!r}, 'async': {scheduler.async_scheduling!r}, 'prefix': {cache.enable_prefix_caching!r}, "
-            f"'window': {additional.get('draft_window_size')!r}, 'replicated': {additional.get('draft_window_graph_replicated_tp_review')!r}, "
-            f"'FC': {additional.get('enable_flashcomm1', False)!r}, 'DSACP': {additional.get('enable_dsa_cp', False)!r}, "
+            f"'window': {additional.get('draft_window_size')!r}, "
+            f"'replicated': {additional.get('draft_window_graph_replicated_tp_review')!r}, "
+            f"'FC': {additional.get('enable_flashcomm1', False)!r}, "
+            f"'DSACP': {additional.get('enable_dsa_cp', False)!r}, "
             f"'numeric': {additional.get('draft_window_graph_numeric_diagnostic', False)!r}, "
             f"'adaptive': {getattr(speculative, 'enable_adaptive_verification', None)!r}}}"
         )
     return EagleSingleRequestReviewScope()
-
 
 
 def note_eagle_single_request_review_lifecycle(owner, scheduler_output):
@@ -96,8 +111,11 @@ def note_eagle_single_request_review_lifecycle(owner, scheduler_output):
         return
     finished = scheduler_output.finished_req_ids
     preempted = scheduler_output.preempted_req_ids or set()
-    if (not isinstance(finished, set) or not isinstance(preempted, set)
-            or any(not isinstance(req_id, str) or not req_id for req_id in finished | preempted)):
+    if (
+        not isinstance(finished, set)
+        or not isinstance(preempted, set)
+        or any(not isinstance(req_id, str) or not req_id for req_id in finished | preempted)
+    ):
         raise TypeError("Eagle review requires the actual scheduler finished/preempted request ID sets")
     blocked = getattr(owner, "_draft_graph_review_preempted_request_ids", None)
     if blocked is None:
@@ -118,8 +136,15 @@ def eagle_single_request_review_rows(owner, req_states, req_ids, idx_mapping_np)
         index = int(raw_index)
         if req_states.req_id_to_index.get(req_id) != index:
             raise RuntimeError("Eagle review request mapping changed during input preparation")
-        rows.append((req_id, index, int(req_states.prompt_len.np[index]),
-                     int(req_states.max_seq_len[index]), int(req_states.prefill_len.np[index])))
+        rows.append(
+            (
+                req_id,
+                index,
+                int(req_states.prompt_len.np[index]),
+                int(req_states.max_seq_len[index]),
+                int(req_states.prefill_len.np[index]),
+            )
+        )
     if len(rows) != len(req_ids):
         raise RuntimeError("Eagle review lacks complete authoritative request rows")
     return tuple(rows)
@@ -128,14 +153,24 @@ def eagle_single_request_review_rows(owner, req_states, req_ids, idx_mapping_np)
 def _eagle_single_request_row(owner, input_batch):
     scope = owner._draft_graph_review_limit
     rows = getattr(input_batch, "draft_graph_review_request_rows", None)
-    if (type(input_batch.num_reqs) is not int or input_batch.num_reqs != 1
-            or input_batch.num_reqs_after_padding != 1 or not isinstance(rows, tuple) or len(rows) != 1):
+    if (
+        type(input_batch.num_reqs) is not int
+        or input_batch.num_reqs != 1
+        or input_batch.num_reqs_after_padding != 1
+        or not isinstance(rows, tuple)
+        or len(rows) != 1
+    ):
         raise NotImplementedError("Eagle single-request review requires one actual request and one padded row")
     row = rows[0]
-    if (not isinstance(row, tuple) or len(row) != 5 or not isinstance(row[0], str)
-            or any(type(value) is not int for value in row[1:])
-            or row[0] != input_batch.req_ids[0] or row[1] != int(input_batch.idx_mapping_np[0])
-            or row[4] != int(input_batch.prefill_len_np[0])):
+    if (
+        not isinstance(row, tuple)
+        or len(row) != 5
+        or not isinstance(row[0], str)
+        or any(type(value) is not int for value in row[1:])
+        or row[0] != input_batch.req_ids[0]
+        or row[1] != int(input_batch.idx_mapping_np[0])
+        or row[4] != int(input_batch.prefill_len_np[0])
+    ):
         raise RuntimeError("Eagle review request identity/source row differs")
     if row[0] in getattr(owner, "_draft_graph_review_preempted_request_ids", ()):
         raise NotImplementedError("Eagle single-request review does not qualify resumption after preemption")
@@ -154,9 +189,16 @@ def validate_eagle_single_request_review_exact(owner, input_batch, exact, *, num
     if not isinstance(scope, EagleSingleRequestReviewScope):
         return
     _, _, prompt, maximum, _ = _eagle_single_request_row(owner, input_batch)
-    if (num_reqs != 1 or padded != 1 or type(step) is not int or not 0 <= step < scope.static_k
-            or exact.device.type != "cpu" or exact.ndim != 1 or exact.shape[0] != 1
-            or str(exact.dtype) != "torch.int32"):
+    if (
+        num_reqs != 1
+        or padded != 1
+        or type(step) is not int
+        or not 0 <= step < scope.static_k
+        or exact.device.type != "cpu"
+        or exact.ndim != 1
+        or exact.shape[0] != 1
+        or str(exact.dtype) != "torch.int32"
+    ):
         raise RuntimeError("Eagle review lost its one-row CPU exact consumer input")
     value = exact[0].item()
     if type(value) is not int or not prompt <= value <= maximum + scope.static_k:
@@ -168,12 +210,15 @@ def validate_eagle_single_request_graph_stage(owner, inputs, *, first, n, tokens
     if not isinstance(scope, EagleSingleRequestReviewScope):
         return
     _eagle_single_request_row(owner, owner.input_batch)
-    if (inputs.actual_request_count != 1 or inputs.padded_request_count != 1
-            or n != 1 or tokens != (4 if first else 1)
-            or ordinal not in ((0,) if first else (0, 1))
-            or inputs.identity.step != (0 if first else ordinal + 1)):
+    if (
+        inputs.actual_request_count != 1
+        or inputs.padded_request_count != 1
+        or n != 1
+        or tokens != (4 if first else 1)
+        or ordinal not in ((0,) if first else (0, 1))
+        or inputs.identity.step != (0 if first else ordinal + 1)
+    ):
         raise NotImplementedError("Eagle review Graph must use first Q4 and exactly two AR Q1 consumers, padded1")
-
 
 
 def validate_full8_single_request_review_config(vllm_config):
@@ -187,23 +232,29 @@ def validate_full8_single_request_review_config(vllm_config):
     parallel = vllm_config.parallel_config
     scheduler = vllm_config.scheduler_config
     additional = vllm_config.additional_config or {}
-    sizes = (parallel.tensor_parallel_size, parallel.data_parallel_size,
-             parallel.pipeline_parallel_size, parallel.prefill_context_parallel_size,
-             parallel.decode_context_parallel_size)
-    if (sizes != (4, 1, 1, 1, 1)
-            or getattr(speculative.draft_parallel_config, "tensor_parallel_size", None) != 4
-            or speculative.num_speculative_tokens != 7
-            or speculative.enable_adaptive_verification is not False
-            or getattr(parallel, "enable_expert_parallel", False) is not True
-            or speculative.uses_dynamic_speculative_decoding()
-            or type(scheduler.max_num_seqs) is not int or scheduler.max_num_seqs != 1
-            or scheduler.async_scheduling is not False
-            or vllm_config.cache_config.enable_prefix_caching is not False
-            or additional.get("draft_window_size") != 32768
-            or additional.get("enable_dsa_cp", False) is not False
-            or additional.get("enable_flashcomm1", False) is not False
-            or getattr(vllm_config.compilation_config.cudagraph_mode, "name", None)
-            != "FULL_DECODE_ONLY"):
+    sizes = (
+        parallel.tensor_parallel_size,
+        parallel.data_parallel_size,
+        parallel.pipeline_parallel_size,
+        parallel.prefill_context_parallel_size,
+        parallel.decode_context_parallel_size,
+    )
+    if (
+        sizes != (4, 1, 1, 1, 1)
+        or getattr(speculative.draft_parallel_config, "tensor_parallel_size", None) != 4
+        or speculative.num_speculative_tokens != 7
+        or speculative.enable_adaptive_verification is not False
+        or getattr(parallel, "enable_expert_parallel", False) is not True
+        or speculative.uses_dynamic_speculative_decoding()
+        or type(scheduler.max_num_seqs) is not int
+        or scheduler.max_num_seqs != 1
+        or scheduler.async_scheduling is not False
+        or vllm_config.cache_config.enable_prefix_caching is not False
+        or additional.get("draft_window_size") != 32768
+        or additional.get("enable_dsa_cp", False) is not False
+        or additional.get("enable_flashcomm1", False) is not False
+        or getattr(vllm_config.compilation_config.cudagraph_mode, "name", None) != "FULL_DECODE_ONLY"
+    ):
         raise NotImplementedError(
             "This Full8 checkpoint's temporary Draft Graph review permits only static K7/W32768, "
             "TP4/DP1/PP1/PCP1/DCP1 with EP, max_num_seqs=1, FULL_DECODE_ONLY, "
@@ -217,13 +268,15 @@ def resolve_draft_graph_review_limit(vllm_config, *, experimental_graph_review=F
     speculative = vllm_config.speculative_config
     additional = getattr(vllm_config, "additional_config", None) or {}
     from vllm_ascend.ascend_config import validate_additional_config_bool
+
     finite_review = validate_additional_config_bool(
         additional.get("draft_window_graph_eagle_single_request_review", False),
         "additional_config.draft_window_graph_eagle_single_request_review",
     )
     if finite_review:
         validate_eagle_single_request_review_config(
-            vllm_config, experimental_graph_review=experimental_graph_review,
+            vllm_config,
+            experimental_graph_review=experimental_graph_review,
         )
     if speculative.method not in ("dflash", "eagle3") or speculative.enforce_eager is True:
         return None
@@ -254,7 +307,8 @@ def resolve_draft_graph_review_limit(vllm_config, *, experimental_graph_review=F
         if speculative.method != "eagle3" or digest != _EAGLE_CONFIG:
             raise NotImplementedError("Eagle single-request review requires its fixed checkpoint configuration")
         return validate_eagle_single_request_review_config(
-            vllm_config, experimental_graph_review=experimental_graph_review,
+            vllm_config,
+            experimental_graph_review=experimental_graph_review,
         )
     diagnostic = additional.get("draft_window_graph_numeric_diagnostic", False)
     if type(diagnostic) is not bool:

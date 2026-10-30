@@ -828,7 +828,10 @@ class NPUModelRunner(GPUModelRunner):
         # even before its first output token; a982 v2 resumes it as a new row.
         owner = getattr(self, "speculator", None)
         if getattr(owner, "_draft_graph_review_limit", None) is not None:
-            from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import note_eagle_single_request_review_lifecycle
+            from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import (
+                note_eagle_single_request_review_lifecycle,
+            )
+
             note_eagle_single_request_review_lifecycle(owner, scheduler_output)
         return super().finish_requests(scheduler_output)
 
@@ -1086,8 +1089,12 @@ class NPUModelRunner(GPUModelRunner):
         # an original prompt-length substitute. This reads existing CPU state.
         if getattr(self.speculator, "_draft_graph_review_limit", None) is not None:
             from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import eagle_single_request_review_rows
+
             input_batch.draft_graph_review_request_rows = eagle_single_request_review_rows(
-                self.speculator, self.req_states, req_ids, idx_mapping_np,
+                self.speculator,
+                self.req_states,
+                req_ids,
+                idx_mapping_np,
             )
         # vLLM main (#57980) dropped the module-level maybe_partition_pcp_batch
         # helper; PCPManager.partition_batch now takes the batch descriptor.

@@ -848,9 +848,12 @@ def _validate_dense_graph_context(
     )
     if topology != (tensor_parallel_size, data_parallel_size, 1, 1, 1):
         raise NotImplementedError(
-            f"base Graph characterization requires TP={tensor_parallel_size}, DP={data_parallel_size}, PP=1, PCP=1, DCP=1")
-    if type(runtime_context.tensor_parallel_rank) is not int or not (0 <= runtime_context.tensor_parallel_rank <
-                                                                     tensor_parallel_size):
+            f"base Graph characterization requires TP={tensor_parallel_size}, DP={data_parallel_size}, "
+            "PP=1, PCP=1, DCP=1"
+        )
+    if type(runtime_context.tensor_parallel_rank) is not int or not (
+        0 <= runtime_context.tensor_parallel_rank < tensor_parallel_size
+    ):
         raise ValueError("Graph characterization requires a real integer TP rank")
     if runtime_context.sequence_parallel and not allow_required_service_features:
         raise NotImplementedError("base Graph characterization does not include sequence parallel")
@@ -862,8 +865,9 @@ def _validate_dense_graph_context(
         raise NotImplementedError("base Graph characterization does not include prefix caching")
 
 
-def validate_parallel_graph_characterization_context(runtime_context: DraftWindowRuntimeContext,
-                                                     vllm_config: Any) -> bool:
+def validate_parallel_graph_characterization_context(
+    runtime_context: DraftWindowRuntimeContext, vllm_config: Any
+) -> bool:
     from vllm_ascend.ascend_config import validate_draft_window_replicated_tp_review
 
     review = validate_draft_window_replicated_tp_review(vllm_config)
@@ -874,15 +878,18 @@ def validate_parallel_graph_characterization_context(runtime_context: DraftWindo
     eagle_tp4_prefix = review and method == "eagle3" and runtime_context.tensor_parallel_size == 4
     parallel_prefix = method in {"dspark", "dflash"} or eagle_tp4_prefix
     if not review:
-        _validate_dense_graph_context(runtime_context, tensor_parallel_size=1,
-                                      allow_parallel_prefix=parallel_prefix)
+        _validate_dense_graph_context(runtime_context, tensor_parallel_size=1, allow_parallel_prefix=parallel_prefix)
         return False
     # The source context must retain the actual configured full rank domain;
     # no fake TP1/TP2 context is substituted for a larger executor.
     dp = getattr(vllm_config.parallel_config, "data_parallel_size", 1)
-    if dp == 2 and (runtime_context.async_scheduling or runtime_context.prefix_caching
-                    or runtime_context.sequence_parallel or runtime_context.dsa_context_parallel
-                    or runtime_context.flashcomm):
+    if dp == 2 and (
+        runtime_context.async_scheduling
+        or runtime_context.prefix_caching
+        or runtime_context.sequence_parallel
+        or runtime_context.dsa_context_parallel
+        or runtime_context.flashcomm
+    ):
         from vllm_ascend.ascend_config import _dense_dp_graph_window_review
 
         speculative = vllm_config.speculative_config
@@ -892,19 +899,24 @@ def validate_parallel_graph_characterization_context(runtime_context: DraftWindo
         # Each real DP/TP worker keeps its own source/provider/captured bank.
         # Retain Async/prefix/SP/FlashComm in the final topology identity; this
         # is not permission to normalize a different method/backend/DSA route.
-        if (not _dense_dp_graph_window_review(vllm_config, window)
-                or not isinstance(layers, (list, tuple)) or len(layers) != 8
-                or type(getattr(speculative, "num_speculative_tokens", None)) is not int
-                or speculative.num_speculative_tokens != 7
-                or runtime_context.dsa_context_parallel):
+        if (
+            not _dense_dp_graph_window_review(vllm_config, window)
+            or not isinstance(layers, (list, tuple))
+            or len(layers) != 8
+            or type(getattr(speculative, "num_speculative_tokens", None)) is not int
+            or speculative.num_speculative_tokens != 7
+            or runtime_context.dsa_context_parallel
+        ):
             raise NotImplementedError(
                 "DFlash DP2 combined Graph review requires the named dense Full8 K7/Q8 W32768 route without DSA-CP"
             )
-    _validate_dense_graph_context(runtime_context,
-                                  tensor_parallel_size=vllm_config.parallel_config.tensor_parallel_size,
-                                  data_parallel_size=dp,
-                                  allow_parallel_prefix=parallel_prefix,
-                                  allow_required_service_features=True)
+    _validate_dense_graph_context(
+        runtime_context,
+        tensor_parallel_size=vllm_config.parallel_config.tensor_parallel_size,
+        data_parallel_size=dp,
+        allow_parallel_prefix=parallel_prefix,
+        allow_required_service_features=True,
+    )
     if runtime_context.graph_mode != "FULL_DECODE_ONLY":
         raise ValueError("replicated TP Graph runtime mode differs from FULL_DECODE_ONLY")
     return True
@@ -949,14 +961,22 @@ def build_parallel_draft_window_graph_characterization_source(
     from vllm_ascend.worker.v2.spec_decode.draft_window_swa_graph import partition_source
 
     source_groups, native_swa = partition_source(
-        attn_groups=attn_groups, block_tables=block_tables, input_buffers=input_buffers,
-        causal=causal, window_size=policy.effective_window_size,
-        query_width=int(speculative_config.num_speculative_tokens)+1,
+        attn_groups=attn_groups,
+        block_tables=block_tables,
+        input_buffers=input_buffers,
+        causal=causal,
+        window_size=policy.effective_window_size,
+        query_width=int(speculative_config.num_speculative_tokens) + 1,
     )
     if native_swa is not None and (
-        runtime_route != "dflash" or not replicated_review or runtime_context.tensor_parallel_size != 4
-        or runtime_context.async_scheduling or runtime_context.prefix_caching or runtime_context.sequence_parallel
-        or runtime_context.dsa_context_parallel or runtime_context.flashcomm
+        runtime_route != "dflash"
+        or not replicated_review
+        or runtime_context.tensor_parallel_size != 4
+        or runtime_context.async_scheduling
+        or runtime_context.prefix_caching
+        or runtime_context.sequence_parallel
+        or runtime_context.dsa_context_parallel
+        or runtime_context.flashcomm
     ):
         raise NotImplementedError("native SWA Graph first requires the actual uncombined DFlash TP4 review route")
     capability = _build_draft_window_source_capability_for_context(
@@ -1150,6 +1170,7 @@ def prepare_parallel_draft_window_graph_characterization(
     from vllm_ascend.worker.v2.spec_decode.draft_window_graph_metadata import (
         validate_deferred_parallel_graph_metadata,
     )
+
     validate_deferred_parallel_graph_metadata(owner, inputs, descriptor)
 
     # The normal DFlash path rebuilt and published eager metadata immediately
@@ -1529,10 +1550,11 @@ def _build_private_graph_metadata(
     # final metadata uses shallow copies of its layer objects so restoring the
     # canonical full write/query owners cannot retroactively weaken that view.
     final_metadata: dict[str, Any] = {}
-    native_swa = getattr(owner._draft_window_runtime_state.capability,"native_swa_graph",None)
-    native_snapshot = getattr(owner,"_draft_window_native_full_snapshot",None) if native_swa is not None else None
-    native_gids = {} if native_swa is None else {
-        name:group.gid for group in native_swa.native_groups for name in group.layers}
+    native_swa = getattr(owner._draft_window_runtime_state.capability, "native_swa_graph", None)
+    native_snapshot = getattr(owner, "_draft_window_native_full_snapshot", None) if native_swa is not None else None
+    native_gids = (
+        {} if native_swa is None else {name: group.gid for group in native_swa.native_groups for name in group.layers}
+    )
     for layer_name, layer_metadata in private_isolation_view.items():
         if layer_metadata is None:
             final_metadata[layer_name] = None
@@ -1549,13 +1571,14 @@ def _build_private_graph_metadata(
             gid = native_gids[layer_name]
             if native_snapshot is None:
                 raise RuntimeError("native SWA private Graph metadata has no current full-length snapshot")
-            native_snapshot.validate(owner._draft_window_live_inputs.identity,native_swa)
+            native_snapshot.validate(owner._draft_window_live_inputs.identity, native_swa)
             final_layer_metadata.block_tables = owner.block_tables.input_block_tables[gid][
-                :read_inputs.padded_request_count]
+                : read_inputs.padded_request_count
+            ]
             final_layer_metadata.seq_lens = native_snapshot.device_exact
             final_layer_metadata.seq_lens_cpu = native_snapshot.cpu_exact
             final_layer_metadata.seq_lens_list = native_snapshot.cpu_exact.tolist()
-            final_layer_metadata.slot_mapping = owner.block_tables.slot_mappings[gid,:fingerprint.padded_token_count]
+            final_layer_metadata.slot_mapping = owner.block_tables.slot_mappings[gid, : fingerprint.padded_token_count]
             final_layer_metadata.causal = True
             final_layer_metadata.attn_state = layer_metadata.attn_state
         final_metadata[layer_name] = final_layer_metadata

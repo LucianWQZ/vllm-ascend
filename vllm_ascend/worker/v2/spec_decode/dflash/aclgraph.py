@@ -99,6 +99,7 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
             num_reqs, num_tokens, uniform_token_count, num_active_loras, max_query_len, num_ubatches
         )
         from vllm_ascend.worker.v2.spec_decode.draft_window_graph_metadata import select_parallel_graph_metadata
+
         select_parallel_graph_metadata(self.speculator, descriptor)
         return descriptor
 
@@ -169,8 +170,12 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
             if not isinstance(graph_mode_name, str):
                 raise RuntimeError("Draft Window Graph requires an explicit replay mode")
             assert_draft_window_graph_metadata_batch(
-                self.speculator, route=graph_route, draft_attn_metadatas=draft_attn_metadatas,
-                num_reqs=desc.num_reqs, num_tokens=num_tokens, graph_mode=graph_mode_name,
+                self.speculator,
+                route=graph_route,
+                draft_attn_metadatas=draft_attn_metadatas,
+                num_reqs=desc.num_reqs,
+                num_tokens=num_tokens,
+                graph_mode=graph_mode_name,
             )
         if use_updatable_graph(attn_backend):
             return self._updatable_graph_replay(desc, draft_attn_metadatas)

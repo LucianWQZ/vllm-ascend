@@ -223,8 +223,15 @@ class DraftWindowGraphRouteFingerprint:
             and self.route is DraftWindowGraphRoute.DFLASH
             and self.tensor_parallel_size == 4
             and self.graph_mode in {"FULL", "FULL_DECODE_ONLY"}
-            and not any((self.sequence_parallel, self.dsa_context_parallel,
-                         self.flashcomm, self.async_scheduling, self.prefix_caching))
+            and not any(
+                (
+                    self.sequence_parallel,
+                    self.dsa_context_parallel,
+                    self.flashcomm,
+                    self.async_scheduling,
+                    self.prefix_caching,
+                )
+            )
         )
         # The combined Full8 product uses the same rank-local single Graph
         # lane and persistent capture banks. Startup separately verifies its
@@ -235,7 +242,8 @@ class DraftWindowGraphRouteFingerprint:
             and self.route is DraftWindowGraphRoute.DFLASH
             and self.tensor_parallel_size == 4
             and self.graph_mode in {"FULL", "FULL_DECODE_ONLY"}
-            and self.query_width == 8 and self.static_k == 7
+            and self.query_width == 8
+            and self.static_k == 7
             and self.window_size == 32768
             and not self.dsa_context_parallel
         )
@@ -248,15 +256,23 @@ class DraftWindowGraphRouteFingerprint:
         if unsupported_topology:
             raise ValueError("graph route fingerprint is outside the P6 single-lane topology")
         eagle_prefix = (
-            self.method == "eagle3" and self.tensor_parallel_size == 4
-            and self.static_k == 3 and self.window_size == 1024
+            self.method == "eagle3"
+            and self.tensor_parallel_size == 4
+            and self.static_k == 3
+            and self.window_size == 1024
             and self.layout == "dense_gqa_direct_prefix"
-            and self.graph_mode == "FULL" and not self.dsa_context_parallel
-            and ((self.route is DraftWindowGraphRoute.EAGLE3_FIRST_PASS and self.query_width == 4)
-                 or (self.route is DraftWindowGraphRoute.EAGLE3_AR_STEP and self.query_width == 1))
+            and self.graph_mode == "FULL"
+            and not self.dsa_context_parallel
+            and (
+                (self.route is DraftWindowGraphRoute.EAGLE3_FIRST_PASS and self.query_width == 4)
+                or (self.route is DraftWindowGraphRoute.EAGLE3_AR_STEP and self.query_width == 1)
+            )
         )
-        if (self.prefix_caching and self.route not in (DraftWindowGraphRoute.DSPARK, DraftWindowGraphRoute.DFLASH)
-                and not eagle_prefix):
+        if (
+            self.prefix_caching
+            and self.route not in (DraftWindowGraphRoute.DSPARK, DraftWindowGraphRoute.DFLASH)
+            and not eagle_prefix
+        ):
             raise ValueError("prefix Graph carriers require parallel Draft or the named Eagle3 TP4/K3/W1024 consumer")
 
 
@@ -660,7 +676,7 @@ class DraftWindowGraphBindingProvider:
             raise TypeError("validation identity memo requires an explicit bool")
         self._validation_identity_memo = validation_identity_memo
         self._runtime_state = runtime_state
-        self._native_swa_capture_plan = getattr(runtime_state.capability,"native_swa_graph",None)
+        self._native_swa_capture_plan = getattr(runtime_state.capability, "native_swa_graph", None)
         self._observer = observer
         self._current_descriptor: DraftWindowGraphBindingDescriptor | None = None
         self._current_inputs: DraftMetadataInputs | None = None
@@ -758,7 +774,7 @@ class DraftWindowGraphBindingProvider:
 
     @property
     def native_swa_graph_plan(self):
-        plan = getattr(self._runtime_state.capability,"native_swa_graph",None)
+        plan = getattr(self._runtime_state.capability, "native_swa_graph", None)
         if plan is not self._native_swa_capture_plan:
             raise RuntimeError("native SWA program/source contract changed after provider installation")
         return plan
@@ -775,12 +791,17 @@ class DraftWindowGraphBindingProvider:
             return
         from vllm_ascend.worker.v2.spec_decode.draft_window_swa_graph import NativeSWAFullSnapshot
 
-        if not isinstance(snapshot,NativeSWAFullSnapshot):
+        if not isinstance(snapshot, NativeSWAFullSnapshot):
             raise RuntimeError("native SWA Graph carrier has no generation-owned full snapshot")
         if identity is None:
             raise RuntimeError("native SWA Graph update has no active generation")
-        plan.validate_native_metadata(metadata,source=self._runtime_state.capability.full_source._block_tables_owner,
-                                      snapshot=snapshot,expected=identity,write_side=write_side)
+        plan.validate_native_metadata(
+            metadata,
+            source=self._runtime_state.capability.full_source._block_tables_owner,
+            snapshot=snapshot,
+            expected=identity,
+            write_side=write_side,
+        )
 
     @property
     def current_descriptor(self) -> DraftWindowGraphBindingDescriptor:
@@ -982,7 +1003,7 @@ class DraftWindowGraphBindingProvider:
             write_side_snapshot,
             validation_identity_memo=self._validation_identity_memo,
         )
-        self._validate_native_metadata(metadata,native_snapshot,generation,write_side_reference)
+        self._validate_native_metadata(metadata, native_snapshot, generation, write_side_reference)
         self._runtime_state.publish_metadata(
             inputs,
             metadata,
@@ -1180,9 +1201,12 @@ class DraftWindowGraphBindingProvider:
                 carrier.write_side_snapshot,
                 validation_identity_memo=self._validation_identity_memo,
             )
-            self._validate_native_metadata(carrier.metadata,carrier.native_full_snapshot,
-                                           getattr(self._runtime_state._active_inputs,"identity",None),
-                                           carrier.write_side_reference)
+            self._validate_native_metadata(
+                carrier.metadata,
+                carrier.native_full_snapshot,
+                getattr(self._runtime_state._active_inputs, "identity", None),
+                carrier.write_side_reference,
+            )
         attribution = DraftWindowGraphBackendAttribution(
             consumer_kind=DraftWindowGraphConsumerKind.TASK_REBOUND,
             metadata_owner=DraftWindowGraphMetadataOwner.GRAPH_TASK,
@@ -1321,9 +1345,12 @@ class DraftWindowGraphBindingProvider:
             raise RuntimeError("Graph P2 TP world/rank must be explicit integers within range")
         expected = world, rank, topology.parallel_read_semantics
         runtime = self._runtime_state.topology_fingerprint
-        if (runtime is None or type(runtime.tensor_parallel_size) is not int
-                or type(runtime.tensor_parallel_rank) is not int or expected
-                != (runtime.tensor_parallel_size, runtime.tensor_parallel_rank, runtime.parallel_read_semantics)):
+        if (
+            runtime is None
+            or type(runtime.tensor_parallel_size) is not int
+            or type(runtime.tensor_parallel_rank) is not int
+            or expected != (runtime.tensor_parallel_size, runtime.tensor_parallel_rank, runtime.parallel_read_semantics)
+        ):
             raise RuntimeError("Graph P2/runtime TP identity drift")
         return expected
 
@@ -1470,8 +1497,7 @@ class DraftWindowGraphBindingProvider:
                 raise RuntimeError(f"Draft graph metadata {layer_name!r} has a mismatched causal contract")
             metadata_positions = getattr(layer_metadata, "positions", None)
             if metadata_positions is not None and (
-                not isinstance(metadata_positions, torch.Tensor)
-                or identity(metadata_positions) != expected_positions
+                not isinstance(metadata_positions, torch.Tensor) or identity(metadata_positions) != expected_positions
             ):
                 raise RuntimeError(f"Draft graph metadata {layer_name!r} does not preserve full positions")
 
@@ -1737,6 +1763,7 @@ def install_draft_window_graph_binding_provider(
     if not isinstance(runtime_state, DraftWindowRuntimeState):
         raise RuntimeError("Draft Window graph binding requires an initialized P3 runtime")
     from vllm_ascend.ascend_config import validate_additional_config_bool
+
     config = getattr(getattr(owner, "vllm_config", None), "additional_config", None) or {}
     validation_memo = validate_additional_config_bool(
         config.get("draft_window_graph_validation_memo", False),

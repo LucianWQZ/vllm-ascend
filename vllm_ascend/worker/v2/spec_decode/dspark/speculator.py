@@ -34,6 +34,7 @@ from vllm.v1.worker.gpu.spec_decode.dspark.speculator import (
 )
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import get_eagle3_aux_layers_from_config
 
+from vllm_ascend.ascend_config import validate_additional_config_bool
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.dspark_context import (
@@ -53,7 +54,6 @@ from vllm_ascend.worker.v2.spec_decode.dflash.speculator import (
     _draft_window_owner_scope,
     prepare_dflash_inputs_factory,
 )
-from vllm_ascend.ascend_config import validate_additional_config_bool
 from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftWindowPolicyDecision,
     DraftWindowPolicyState,
@@ -70,7 +70,6 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_graph_characterization impor
     experimental_draft_window_graph_characterization_enabled,
     install_parallel_draft_window_graph_characterization,
 )
-
 from vllm_ascend.worker.v2.spec_decode.lmhead_tp_utils import LmheadTPDraftSamplingMixin
 from vllm_ascend.worker.v2.spec_decode.pcp_utils import (
     disable_profiling_chunk_for_draft,
@@ -472,10 +471,14 @@ class AscendDSparkSpeculator(DraftWindowEagerMixin, LmheadTPDraftSamplingMixin, 
                 ),
             ):
                 return _build_graph_uniform_metadata(
-                    self, num_reqs=num_reqs, batch_desc=batch_desc,
+                    self,
+                    num_reqs=num_reqs,
+                    batch_desc=batch_desc,
                     query_start_loc_np=query_start_loc_np,
-                    seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound, step=step,
-                    causal=causal, dcp_local_seq_lens=dcp_local_seq_lens,
+                    seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+                    step=step,
+                    causal=causal,
+                    dcp_local_seq_lens=dcp_local_seq_lens,
                     slot_mappings=slot_mappings,
                 )
         runtime = getattr(self, "_draft_window_runtime", None)

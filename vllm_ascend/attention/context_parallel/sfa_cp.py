@@ -538,8 +538,7 @@ class AscendSFADSACPMetadataBuilder(AscendSFAMetadataBuilder):
         views = {}
         for key, source in sources.items():
             target = bank[key]
-            if (target.dtype != source.dtype or target.device != source.device
-                    or target.shape[1:] != source.shape[1:]):
+            if target.dtype != source.dtype or target.device != source.device or target.shape[1:] != source.shape[1:]:
                 raise RuntimeError(f"DSA-CP captured metadata layout changed: {key}")
             count = min(source.shape[0], num_tokens_pad)
             target[:count].copy_(source[:count])
@@ -574,9 +573,7 @@ class AscendSFADSACPMetadataBuilder(AscendSFAMetadataBuilder):
         local_end_with_pad = local_start + num_tokens_per_device
         local_end = min(local_end_with_pad, common_attn_metadata.num_actual_tokens)
 
-        cos, sin, slot_mapping = self._padded_metadata_inputs(
-            cos, sin, slot_mapping, num_tokens_pad, draft_index
-        )
+        cos, sin, slot_mapping = self._padded_metadata_inputs(cos, sin, slot_mapping, num_tokens_pad, draft_index)
         if cos is not None:
             assert sin is not None
             cos = cos[local_start:local_end_with_pad]

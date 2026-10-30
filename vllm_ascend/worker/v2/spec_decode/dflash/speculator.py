@@ -347,15 +347,15 @@ class AscendDFlashSpeculator(DraftWindowEagerMixin, LmheadTPDraftSamplingMixin, 
             if hasattr(self, "_draft_graph_output_references"):
                 raise RuntimeError("numeric capture diagnostic already installed")
             owned = validate_additional_config_bool(
-                self.vllm_config.additional_config.get("draft_window_graph_numeric_owned_output",False),
+                self.vllm_config.additional_config.get("draft_window_graph_numeric_owned_output", False),
                 "additional_config.draft_window_graph_numeric_owned_output",
             )
-            self._draft_graph_output_references = DraftGraphOutputReferences(self,owned=owned)
+            self._draft_graph_output_references = DraftGraphOutputReferences(self, owned=owned)
             if owned:
                 from vllm_ascend.worker.v2.spec_decode.draft_window_graph_diagnostics import owned_attention_probe_layer
 
                 name = owned_attention_probe_layer(self)
-                layer=self.vllm_config.compilation_config.static_forward_context[name]
+                layer = self.vllm_config.compilation_config.static_forward_context[name]
                 self._draft_graph_output_references.attention_layer_name = name
                 self._draft_graph_output_references.install_attention_probe(layer.impl)
             self._draft_graph_output_references.collecting = True
@@ -524,10 +524,14 @@ class AscendDFlashSpeculator(DraftWindowEagerMixin, LmheadTPDraftSamplingMixin, 
         if hasattr(self, "_draft_window_runtime_state") and not getattr(self, "_draft_window_bypass_active", False):
             with build_attn_metadata_wrapper():
                 return _build_graph_uniform_metadata(
-                    self, num_reqs=num_reqs, batch_desc=batch_desc,
+                    self,
+                    num_reqs=num_reqs,
+                    batch_desc=batch_desc,
                     query_start_loc_np=query_start_loc_np,
-                    seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound, step=step,
-                    causal=causal, dcp_local_seq_lens=dcp_local_seq_lens,
+                    seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+                    step=step,
+                    causal=causal,
+                    dcp_local_seq_lens=dcp_local_seq_lens,
                     slot_mappings=slot_mappings,
                 )
         runtime = getattr(self, "_draft_window_runtime", None)

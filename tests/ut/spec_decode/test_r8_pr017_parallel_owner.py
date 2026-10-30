@@ -5,16 +5,17 @@
 The real lifetime pool is used. Only the device completion token is a stand-in;
 this does not claim device completion, model correctness or Graph qualification.
 """
+
 from __future__ import annotations
 
 import ast
 import builtins
-from contextlib import contextmanager, nullcontext
 import importlib.util
-from pathlib import Path
 import sys
-from types import MethodType, SimpleNamespace
 import unittest
+from contextlib import contextmanager, nullcontext
+from pathlib import Path
+from types import MethodType, SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[3]
 SPEC = ROOT / "vllm_ascend/worker/v2/spec_decode/dflash/speculator.py"
@@ -38,16 +39,24 @@ def extract(path, names, namespace):
     tree = ast.parse(path.read_text())
     nodes = [node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name in names]
     assert {node.name for node in nodes} == set(names)
-    module = ast.Module(body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), *nodes], type_ignores=[])
+    module = ast.Module(
+        body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), *nodes],
+        type_ignores=[],
+    )
     exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
 
 
 def load_seam(completion):
     runtime = SimpleNamespace(_NPUCompletion=completion)
     guard_namespace = {"EagleSingleRequestReviewScope": type("EagleSingleRequestReviewScope", (), {})}
-    extract(ROOT / "vllm_ascend/worker/v2/spec_decode/draft_graph_review_limits.py",
-            {"validate_draft_graph_review_requests"}, guard_namespace)
-    guard_module = SimpleNamespace(validate_draft_graph_review_requests=guard_namespace["validate_draft_graph_review_requests"])
+    extract(
+        ROOT / "vllm_ascend/worker/v2/spec_decode/draft_graph_review_limits.py",
+        {"validate_draft_graph_review_requests"},
+        guard_namespace,
+    )
+    guard_module = SimpleNamespace(
+        validate_draft_graph_review_requests=guard_namespace["validate_draft_graph_review_requests"]
+    )
     original_import = builtins.__import__
 
     def importing(name, globals=None, locals=None, fromlist=(), level=0):
@@ -59,8 +68,11 @@ def load_seam(completion):
             return guard_module
         return original_import(name, globals, locals, fromlist, level)
 
-    namespace = {"contextmanager": contextmanager, "nullcontext": nullcontext,
-                 "__builtins__": dict(vars(builtins), __import__=importing)}
+    namespace = {
+        "contextmanager": contextmanager,
+        "nullcontext": nullcontext,
+        "__builtins__": dict(vars(builtins), __import__=importing),
+    }
     extract(SPEC, {"_draft_window_context_kv_scope", "_draft_window_owner_scope"}, namespace)
     return namespace
 
@@ -102,9 +114,7 @@ class ParallelOwnerTests(unittest.TestCase):
         self.owner._draft_window_proposal_scope = normal_scope
 
     def scope(self, tokens, **kwargs):
-        return self.seam["_draft_window_owner_scope"](
-            self.owner, self.batch, num_speculative_tokens=tokens, **kwargs
-        )
+        return self.seam["_draft_window_owner_scope"](self.owner, self.batch, num_speculative_tokens=tokens, **kwargs)
 
     def test_zero_uses_real_completion_pool_without_graph_reader(self):
         with self.scope(0):
@@ -118,27 +128,33 @@ class ParallelOwnerTests(unittest.TestCase):
 
     def test_zero_original_error_quarantines_and_actual_normal_scope_rejects(self):
         first = RuntimeError("native context write stand-in")
-        with self.assertRaises(RuntimeError) as seen:
-            with self.scope(0):
-                raise first
+        with (
+            self.assertRaises(RuntimeError) as seen,
+            self.scope(0),
+        ):
+            raise first
         self.assertIs(seen.exception, first)
         self.assertTrue(self.owner._draft_window_context_kv_pool._poisoned)
         self.assertTrue(self.owner._draft_window_graph_submission_uncertain)
         actual = {"contextmanager": contextmanager}
         extract(EAGER, {"_draft_window_proposal_scope"}, actual)
         self.owner._draft_window_proposal_scope = MethodType(actual["_draft_window_proposal_scope"], self.owner)
-        with self.assertRaisesRegex(RuntimeError, "quarantined"):
-            with self.scope(8):
-                self.fail("normal Graph body must not execute")
+        with (
+            self.assertRaisesRegex(RuntimeError, "quarantined"),
+            self.scope(8),
+        ):
+            self.fail("normal Graph body must not execute")
 
     def test_normal_uncertain_or_quarantined_refuses_zero_before_native(self):
         for identity, uncertain in [(object(), False), (None, True)]:
             with self.subTest(uncertain=uncertain):
                 self.owner._draft_window_runtime_state.quarantined_identity = identity
                 self.owner._draft_window_graph_submission_uncertain = uncertain
-                with self.assertRaisesRegex(RuntimeError, "quarantined"):
-                    with self.scope(0):
-                        self.fail("context write must not execute")
+                with (
+                    self.assertRaisesRegex(RuntimeError, "quarantined"),
+                    self.scope(0),
+                ):
+                    self.fail("context write must not execute")
                 self.assertFalse(hasattr(self.owner, "_draft_window_context_kv_pool"))
         self.assertEqual(Completion.recorded, 0)
 
@@ -150,9 +166,11 @@ class ParallelOwnerTests(unittest.TestCase):
                 raise first
 
         self.seam = load_seam(BrokenCompletion)
-        with self.assertRaises(RuntimeError) as seen:
-            with self.scope(0):
-                pass
+        with (
+            self.assertRaises(RuntimeError) as seen,
+            self.scope(0),
+        ):
+            pass
         self.assertIs(seen.exception, first)
         self.assertTrue(self.owner._draft_window_graph_submission_uncertain)
         self.assertTrue(self.owner._draft_window_context_kv_pool._poisoned)
@@ -164,9 +182,11 @@ class ParallelOwnerTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "already active"):
                 self.scope(0)
         self.owner._draft_window_proposal_context = object()
-        with self.assertRaisesRegex(RuntimeError, "already active"):
-            with self.scope(0):
-                self.fail("nested context write must not execute")
+        with (
+            self.assertRaisesRegex(RuntimeError, "already active"),
+            self.scope(0),
+        ):
+            self.fail("nested context write must not execute")
 
     def test_normal_static_k_and_dummy_keep_existing_graph_scope(self):
         for tokens in (None, 8):
@@ -182,9 +202,11 @@ class ParallelOwnerTests(unittest.TestCase):
         self.assertTrue(self.normal[-1][1]["dummy_run"])
         self.assertFalse(hasattr(self.owner, "_draft_window_context_kv_pool"))
         for tokens in (1, 7, 9, False, 0.0):
-            with self.subTest(tokens=tokens):
-                with self.assertRaisesRegex(RuntimeError, "static K"):
-                    self.scope(tokens)
+            with (
+                self.subTest(tokens=tokens),
+                self.assertRaisesRegex(RuntimeError, "static K"),
+            ):
+                self.scope(tokens)
 
     def test_public_typed_eager_keeps_context_only_flag_and_off_is_idle(self):
         del self.owner._draft_window_runtime_state
@@ -242,7 +264,11 @@ class ParallelOwnerTests(unittest.TestCase):
             self.assertIn("num_speculative_tokens", [arg.arg for arg in function.args.args])
             self.assertIsInstance(function.body[0], ast.Assign)
             self.assertEqual(function.body[0].value.func.id, "_draft_window_owner_scope")
-            forwarded = [node for node in ast.walk(function) if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "propose"]
+            forwarded = [
+                node
+                for node in ast.walk(function)
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "propose"
+            ]
             self.assertEqual(len(forwarded), 1)
             count = [kw.value for kw in forwarded[0].keywords if kw.arg == "num_speculative_tokens"]
             self.assertEqual(len(count), 1)
@@ -252,12 +278,38 @@ class ParallelOwnerTests(unittest.TestCase):
         path = ROOT / "vllm_ascend/worker/v2/spec_decode/dflash/aclgraph.py"
         tree = ast.parse(path.read_text())
         capture = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "capture")
-        self.assertTrue(any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "draft_window_dflash_capture_scope" for node in ast.walk(capture)))
+        self.assertTrue(
+            any(
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "draft_window_dflash_capture_scope"
+                for node in ast.walk(capture)
+            )
+        )
         values = [node for node in ast.walk(capture) if isinstance(node, ast.Dict)]
-        self.assertTrue(any(any(isinstance(key, ast.Constant) and key.value == "prepare_forward" for key in node.keys) for node in values))
-        replay = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "run_fullgraph")
-        guard = next(node for node in ast.walk(replay) if isinstance(node, ast.Raise) and isinstance(node.exc, ast.Call) and getattr(node.exc.func, "id", None) == "NotImplementedError")
-        fast_path = next(node for node in ast.walk(replay) if isinstance(node, ast.If) and isinstance(node.test, ast.Call) and getattr(node.test.func, "id", None) == "all")
+        self.assertTrue(
+            any(
+                any(isinstance(key, ast.Constant) and key.value == "prepare_forward" for key in node.keys)
+                for node in values
+            )
+        )
+        replay = next(
+            node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "run_fullgraph"
+        )
+        guard = next(
+            node
+            for node in ast.walk(replay)
+            if isinstance(node, ast.Raise)
+            and isinstance(node.exc, ast.Call)
+            and getattr(node.exc.func, "id", None) == "NotImplementedError"
+        )
+        fast_path = next(
+            node
+            for node in ast.walk(replay)
+            if isinstance(node, ast.If)
+            and isinstance(node.test, ast.Call)
+            and getattr(node.test.func, "id", None) == "all"
+        )
         self.assertLess(guard.lineno, fast_path.lineno)
 
 

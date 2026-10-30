@@ -104,6 +104,7 @@ def _resolve_window_policy(vllm_config: VllmConfig) -> DraftWindowPolicyDecision
         is_dflash2="DFlash2DraftModel" in architectures,
     )
 
+
 def _use_graph_window_owner(vllm_config: VllmConfig, policy: DraftWindowPolicyDecision | None) -> bool:
     """Select one ownership implementation without changing eager policy.
 
@@ -144,7 +145,11 @@ def _configure_graph_window_owner(speculator, policy: DraftWindowPolicyDecision,
     """
     from vllm_ascend.worker.v2.spec_decode.draft_window import (
         DraftWindowPolicyDecision as GraphPolicyDecision,
+    )
+    from vllm_ascend.worker.v2.spec_decode.draft_window import (
         DraftWindowPolicyState as GraphPolicyState,
+    )
+    from vllm_ascend.worker.v2.spec_decode.draft_window import (
         resolve_static_future_offset,
         validate_eligible_window_numbers,
     )

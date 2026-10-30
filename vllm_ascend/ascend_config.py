@@ -71,14 +71,23 @@ def validate_draft_window_eagle_pinned_h2d_review(vllm_config: Any) -> bool:
     if not enabled:
         return False
     from vllm_ascend import envs
+
     speculative = vllm_config.speculative_config
     tp = vllm_config.parallel_config.tensor_parallel_size
     k = getattr(speculative, "num_speculative_tokens", None)
-    if (speculative is None or speculative.method != "eagle3" or speculative.enforce_eager
-            or speculative.uses_dynamic_speculative_decoding() or type(k) is not int or k <= 1
-            or additional.get("draft_window_size") != 1024 or type(tp) is not int or tp != 1
-            or not envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH
-            or getattr(vllm_config.compilation_config.cudagraph_mode, "name", None) != "FULL_DECODE_ONLY"):
+    if (
+        speculative is None
+        or speculative.method != "eagle3"
+        or speculative.enforce_eager
+        or speculative.uses_dynamic_speculative_decoding()
+        or type(k) is not int
+        or k <= 1
+        or additional.get("draft_window_size") != 1024
+        or type(tp) is not int
+        or tp != 1
+        or not envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH
+        or getattr(vllm_config.compilation_config.cudagraph_mode, "name", None) != "FULL_DECODE_ONLY"
+    ):
         raise ValueError(
             "pinned H2D review requires experimental static Eagle3 Graph, K>1, TP1, W1024 and FULL_DECODE_ONLY"
         )
@@ -91,16 +100,25 @@ def _native_swa_graph_window_review(speculative: Any, window_size: Any) -> bool:
     The extra Window must contain the earliest of K+1 causal native query
     bands. This is a passthrough eligibility bound, not a substitute length.
     """
-    if speculative is None or getattr(speculative,"method",None) != "dflash":
+    if speculative is None or getattr(speculative, "method", None) != "dflash":
         return False
-    hf = getattr(getattr(speculative,"draft_model_config",None),"hf_config",None)
-    native = getattr(hf,"sliding_window",None)
-    k = getattr(speculative,"num_speculative_tokens",None)
-    layers = getattr(hf,"layer_types",None)
-    return (type(window_size) is int and type(native) is int and type(k) is int and native > 0 and k > 0
-            and window_size >= native+k and getattr(hf,"use_sliding_window",False) is True
-            and isinstance(layers,(list,tuple)) and layers.count("full_attention") == 1
-            and "sliding_attention" in layers and set(layers) == {"full_attention","sliding_attention"})
+    hf = getattr(getattr(speculative, "draft_model_config", None), "hf_config", None)
+    native = getattr(hf, "sliding_window", None)
+    k = getattr(speculative, "num_speculative_tokens", None)
+    layers = getattr(hf, "layer_types", None)
+    return (
+        type(window_size) is int
+        and type(native) is int
+        and type(k) is int
+        and native > 0
+        and k > 0
+        and window_size >= native + k
+        and getattr(hf, "use_sliding_window", False) is True
+        and isinstance(layers, (list, tuple))
+        and layers.count("full_attention") == 1
+        and "sliding_attention" in layers
+        and set(layers) == {"full_attention", "sliding_attention"}
+    )
 
 
 def _dense_dp_graph_window_review(vllm_config: Any, window_size: Any) -> bool:
@@ -113,12 +131,18 @@ def _dense_dp_graph_window_review(vllm_config: Any, window_size: Any) -> bool:
     parallel = vllm_config.parallel_config
     hf = getattr(getattr(speculative, "draft_model_config", None), "hf_config", None)
     layers = getattr(hf, "layer_types", None)
-    dense = (type(window_size) is int and window_size == 32768
-            and getattr(speculative, "method", None) == "dflash"
-            and type(parallel.tensor_parallel_size) is int and parallel.tensor_parallel_size == 4
-            and isinstance(layers, (list, tuple)) and bool(layers) and set(layers) == {"full_attention"}
-            and getattr(hf, "use_sliding_window", False) is False
-            and getattr(hf, "sliding_window", None) is None)
+    dense = (
+        type(window_size) is int
+        and window_size == 32768
+        and getattr(speculative, "method", None) == "dflash"
+        and type(parallel.tensor_parallel_size) is int
+        and parallel.tensor_parallel_size == 4
+        and isinstance(layers, (list, tuple))
+        and bool(layers)
+        and set(layers) == {"full_attention"}
+        and getattr(hf, "use_sliding_window", False) is False
+        and getattr(hf, "sliding_window", None) is None
+    )
     if not dense or type(parallel.data_parallel_size) is not int:
         return False
     if parallel.data_parallel_size == 2:
@@ -138,9 +162,13 @@ def _dense_dp_graph_window_review(vllm_config: Any, window_size: Any) -> bool:
     # provider and the proposal boundary validates actual=1/padded=1.
     from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import resolve_draft_graph_review_limit
 
-    return resolve_draft_graph_review_limit(
-        vllm_config, experimental_graph_review=True,
-    ) == "full8_local_active_at_most_one"
+    return (
+        resolve_draft_graph_review_limit(
+            vllm_config,
+            experimental_graph_review=True,
+        )
+        == "full8_local_active_at_most_one"
+    )
 
 
 def _eagle3_tp4_graph_review(vllm_config: Any) -> bool:
@@ -152,17 +180,17 @@ def _eagle3_tp4_graph_review(vllm_config: Any) -> bool:
     """
     speculative = vllm_config.speculative_config
     hf = getattr(getattr(speculative, "draft_model_config", None), "hf_config", None)
-    expected = dict(hidden_size=2048, num_hidden_layers=1, head_dim=256,
-                    num_attention_heads=16, num_key_value_heads=2)
-    return (getattr(speculative, "method", None) == "eagle3"
-            and type(vllm_config.parallel_config.tensor_parallel_size) is int
-            and vllm_config.parallel_config.tensor_parallel_size == 4
-            and getattr(hf, "architectures", None) == ["LlamaForCausalLMEagle3"]
-            and all(type(getattr(hf, key, None)) is int and getattr(hf, key) == value
-                    for key, value in expected.items())
-            and getattr(hf, "fc_norm", None) is True
-            and getattr(hf, "use_sliding_window", False) is False
-            and getattr(hf, "sliding_window", None) is None)
+    expected = dict(hidden_size=2048, num_hidden_layers=1, head_dim=256, num_attention_heads=16, num_key_value_heads=2)
+    return (
+        getattr(speculative, "method", None) == "eagle3"
+        and type(vllm_config.parallel_config.tensor_parallel_size) is int
+        and vllm_config.parallel_config.tensor_parallel_size == 4
+        and getattr(hf, "architectures", None) == ["LlamaForCausalLMEagle3"]
+        and all(type(getattr(hf, key, None)) is int and getattr(hf, key) == value for key, value in expected.items())
+        and getattr(hf, "fc_norm", None) is True
+        and getattr(hf, "use_sliding_window", False) is False
+        and getattr(hf, "sliding_window", None) is None
+    )
 
 
 def validate_draft_window_replicated_tp_review(vllm_config: Any) -> bool:
@@ -181,37 +209,55 @@ def validate_draft_window_replicated_tp_review(vllm_config: Any) -> bool:
     if envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH_OBSERVE:
         raise ValueError("replicated TP Graph review requires observer OFF; shared-file observer is not rank isolated")
     speculative = vllm_config.speculative_config
-    native_swa_window = _native_swa_graph_window_review(speculative,additional.get("draft_window_size"))
+    native_swa_window = _native_swa_graph_window_review(speculative, additional.get("draft_window_size"))
     dense_dp_window = _dense_dp_graph_window_review(vllm_config, additional.get("draft_window_size"))
-    if (speculative is None or speculative.method not in ("dspark", "dflash", "eagle3") or speculative.enforce_eager
-            or speculative.uses_dynamic_speculative_decoding()
-            or not (additional.get("draft_window_size") == 1024 or native_swa_window or dense_dp_window)):
-        raise ValueError("replicated TP Graph review requires static parallel Draft Graph or named Eagle3 with W1024, a contained native SWA band, or the dense DFlash TP4/DP2 W32768 control or qualified Full8 single-request DP1 review")
+    if (
+        speculative is None
+        or speculative.method not in ("dspark", "dflash", "eagle3")
+        or speculative.enforce_eager
+        or speculative.uses_dynamic_speculative_decoding()
+        or not (additional.get("draft_window_size") == 1024 or native_swa_window or dense_dp_window)
+    ):
+        raise ValueError(
+            "replicated TP Graph review requires static parallel Draft Graph or named Eagle3 with W1024, "
+            "a contained native SWA band, or the dense DFlash TP4/DP2 W32768 control "
+            "or qualified Full8 single-request DP1 review"
+        )
     draft_parallel = speculative.draft_parallel_config
     tp = vllm_config.parallel_config.tensor_parallel_size
-    if (type(tp) is not int or tp not in (2, 4, 16) or draft_parallel is None
-            or type(draft_parallel.tensor_parallel_size) is not int or draft_parallel.tensor_parallel_size != tp):
+    if (
+        type(tp) is not int
+        or tp not in (2, 4, 16)
+        or draft_parallel is None
+        or type(draft_parallel.tensor_parallel_size) is not int
+        or draft_parallel.tensor_parallel_size != tp
+    ):
         raise ValueError("replicated TP Graph review requires matching actual Target/Draft TP in (2, 4, 16)")
     if native_swa_window and tp != 4:
         raise ValueError("native SWA Graph review first requires actual TP4")
     if speculative.method == "eagle3" and (
-            not (tp == 2 or _eagle3_tp4_graph_review(vllm_config))
-            or type(getattr(speculative, "num_speculative_tokens", None)) is not int
-            or speculative.num_speculative_tokens != 3):
+        not (tp == 2 or _eagle3_tp4_graph_review(vllm_config))
+        or type(getattr(speculative, "num_speculative_tokens", None)) is not int
+        or speculative.num_speculative_tokens != 3
+    ):
         raise ValueError("Eagle3 replicated Graph review requires static K3 and TP2 or the named dense TP4 geometry")
     dp = getattr(vllm_config.parallel_config, "data_parallel_size", 1)
     if type(dp) is not int or dp not in (1, 2):
         raise ValueError("replicated Graph review requires integer DP1 or the explicit DFlash TP4/DP2 route")
     if dp == 2 and (
-            speculative.method != "dflash" or tp != 4
-            # Pinned SpeculativeConfig.create_draft_parallel_config builds a
-            # TP-only model descriptor with DP1. The actual two replicas live
-            # in the parent engine/groups, retained by the runtime fingerprint.
-            # Requiring descriptor DP2 rejects the official DP2 constructor.
-            or type(getattr(draft_parallel, "data_parallel_size", None)) is not int
-            or draft_parallel.data_parallel_size != 1
-            or getattr(vllm_config.parallel_config, "enable_expert_parallel", False) is not True):
-        raise ValueError("DP2 Graph review requires actual DFlash TP4/DP2, the pinned TP-only Draft descriptor and expert parallel")
+        speculative.method != "dflash"
+        or tp != 4
+        # Pinned SpeculativeConfig.create_draft_parallel_config builds a
+        # TP-only model descriptor with DP1. The actual two replicas live
+        # in the parent engine/groups, retained by the runtime fingerprint.
+        # Requiring descriptor DP2 rejects the official DP2 constructor.
+        or type(getattr(draft_parallel, "data_parallel_size", None)) is not int
+        or draft_parallel.data_parallel_size != 1
+        or getattr(vllm_config.parallel_config, "enable_expert_parallel", False) is not True
+    ):
+        raise ValueError(
+            "DP2 Graph review requires actual DFlash TP4/DP2, the pinned TP-only Draft descriptor and expert parallel"
+        )
     if getattr(vllm_config.compilation_config.cudagraph_mode, "name", None) != "FULL_DECODE_ONLY":
         raise ValueError("replicated TP Graph review requires FULL_DECODE_ONLY")
     return True
@@ -228,31 +274,44 @@ def validate_draft_window_parallel_eager_review(vllm_config: Any) -> bool:
         return False
     from vllm_ascend import envs
 
-    if (not envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH
-            or envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH_OBSERVE):
+    if not envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH or envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH_OBSERVE:
         raise ValueError("parallel eager review requires the experimental gate and observer OFF")
     speculative = vllm_config.speculative_config
-    if (speculative is None or speculative.method not in ("dspark", "dflash", "eagle3")
-            or speculative.enforce_eager is not True
-            or speculative.uses_dynamic_speculative_decoding()):
+    if (
+        speculative is None
+        or speculative.method not in ("dspark", "dflash", "eagle3")
+        or speculative.enforce_eager is not True
+        or speculative.uses_dynamic_speculative_decoding()
+    ):
         raise ValueError("parallel eager review requires static DSpark/DFlash or named Eagle3 Draft eager")
     parallel = vllm_config.parallel_config
     draft_parallel = speculative.draft_parallel_config
     tp = parallel.tensor_parallel_size
-    if (type(tp) is not int or tp not in (2, 4, 16) or draft_parallel is None
-            or type(draft_parallel.tensor_parallel_size) is not int
-            or draft_parallel.tensor_parallel_size != tp):
+    if (
+        type(tp) is not int
+        or tp not in (2, 4, 16)
+        or draft_parallel is None
+        or type(draft_parallel.tensor_parallel_size) is not int
+        or draft_parallel.tensor_parallel_size != tp
+    ):
         raise ValueError("parallel eager review requires matching actual Target/Draft TP in (2, 4, 16)")
     if speculative.method == "eagle3" and (
-            not _eagle3_tp4_graph_review(vllm_config)
-            or type(getattr(speculative, "num_speculative_tokens", None)) is not int
-            or speculative.num_speculative_tokens != 3):
+        not _eagle3_tp4_graph_review(vllm_config)
+        or type(getattr(speculative, "num_speculative_tokens", None)) is not int
+        or speculative.num_speculative_tokens != 3
+    ):
         raise ValueError("parallel Eagle3 eager review requires the named dense TP4 static K3 geometry")
     dp = parallel.data_parallel_size
     rank_local_dp = speculative.method == "dflash" and tp == 4 and type(dp) is int and dp == 2
-    if (type(dp) is not int or dp != 1 and not rank_local_dp
-            or any(getattr(parallel, name, None) != 1 for name in (
-                "pipeline_parallel_size", "prefill_context_parallel_size", "decode_context_parallel_size"))):
+    if (
+        type(dp) is not int
+        or dp != 1
+        and not rank_local_dp
+        or any(
+            getattr(parallel, name, None) != 1
+            for name in ("pipeline_parallel_size", "prefill_context_parallel_size", "decode_context_parallel_size")
+        )
+    ):
         raise ValueError("parallel eager review requires DP1 or rank-local DFlash TP4/DP2, and PP=PCP=DCP=1")
     window = additional.get("draft_window_size")
     if type(window) is not int or window not in ((1024, 32768) if rank_local_dp else (1024,)):
@@ -2178,9 +2237,13 @@ def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
     validate_draft_window_eagle_pinned_h2d_review(vllm_config)
     if new_config.draft_window_graph_eagle_single_request_review:
         from vllm_ascend import envs
-        from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import validate_eagle_single_request_review_config
+        from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import (
+            validate_eagle_single_request_review_config,
+        )
+
         validate_eagle_single_request_review_config(
-            vllm_config, experimental_graph_review=envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH,
+            vllm_config,
+            experimental_graph_review=envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH,
         )
         logger.warning_once(
             "Controlled Eagle Draft Graph review: single actual request, prompt257/2051, "
@@ -2188,10 +2251,15 @@ def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
         )
     if new_config.draft_window_graph_single_metadata:
         speculative = vllm_config.speculative_config
-        if (speculative is None or speculative.method not in ("dspark", "dflash")
-                or speculative.enforce_eager or new_config.draft_window_size != 1024):
+        if (
+            speculative is None
+            or speculative.method not in ("dspark", "dflash")
+            or speculative.enforce_eager
+            or new_config.draft_window_size != 1024
+        ):
             raise ValueError("single Graph metadata requires parallel Draft Graph and draft_window_size=1024")
         from vllm_ascend import envs
+
         if not envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH:
             raise ValueError("single Graph metadata requires the default-off experimental Graph gate")
         if getattr(vllm_config.compilation_config.cudagraph_mode, "name", None) not in ("FULL", "FULL_DECODE_ONLY"):
@@ -2199,42 +2267,62 @@ def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
     if new_config.draft_window_graph_validation_memo:
         speculative = vllm_config.speculative_config
         from vllm_ascend import envs
-        if (speculative is None or speculative.method not in ("dspark", "dflash", "eagle3")
-                or speculative.enforce_eager or new_config.draft_window_size != 1024
-                or not envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH
-                or getattr(vllm_config.compilation_config.cudagraph_mode, "name", None) != "FULL_DECODE_ONLY"):
-            raise ValueError("Graph validation memo requires experimental static Draft Graph, W1024 and FULL_DECODE_ONLY")
+
+        if (
+            speculative is None
+            or speculative.method not in ("dspark", "dflash", "eagle3")
+            or speculative.enforce_eager
+            or new_config.draft_window_size != 1024
+            or not envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH
+            or getattr(vllm_config.compilation_config.cudagraph_mode, "name", None) != "FULL_DECODE_ONLY"
+        ):
+            raise ValueError(
+                "Graph validation memo requires experimental static Draft Graph, W1024 and FULL_DECODE_ONLY"
+            )
     if new_config.draft_window_graph_numeric_diagnostic:
         speculative = vllm_config.speculative_config
         if (
             speculative is None
             or speculative.method not in ("dspark", "dflash", "eagle3")
-            or not (new_config.draft_window_size == 1024
-                    or _native_swa_graph_window_review(speculative,new_config.draft_window_size)
-                    or _dense_dp_graph_window_review(vllm_config,new_config.draft_window_size))
+            or not (
+                new_config.draft_window_size == 1024
+                or _native_swa_graph_window_review(speculative, new_config.draft_window_size)
+                or _dense_dp_graph_window_review(vllm_config, new_config.draft_window_size)
+            )
         ):
-            raise ValueError("numeric Graph diagnostic requires DSpark/DFlash/Eagle3 and W1024, a contained native SWA band, or the dense TP4 W32768 review")
+            raise ValueError(
+                "numeric Graph diagnostic requires DSpark/DFlash/Eagle3 and W1024, "
+                "a contained native SWA band, or the dense TP4 W32768 review"
+            )
     if new_config.draft_window_graph_numeric_owned_output:
         speculative = vllm_config.speculative_config
-        hf = getattr(getattr(speculative, 'draft_model_config', None), 'hf_config', None)
-        layers = getattr(hf, 'layer_types', None)
+        hf = getattr(getattr(speculative, "draft_model_config", None), "hf_config", None)
+        layers = getattr(hf, "layer_types", None)
         # An owned first-reader diagnostic is also needed for the existing
         # dense DFlash TP4 review. It changes diagnostics only; the actual
         # noncausal reader and source inventory are checked during capture.
         dense_dflash = (
-            getattr(speculative, 'method', None) == 'dflash'
-            and (new_config.draft_window_size == 1024
-                 or _dense_dp_graph_window_review(vllm_config, new_config.draft_window_size))
+            getattr(speculative, "method", None) == "dflash"
+            and (
+                new_config.draft_window_size == 1024
+                or _dense_dp_graph_window_review(vllm_config, new_config.draft_window_size)
+            )
             and vllm_config.parallel_config.tensor_parallel_size == 4
-            and isinstance(layers, (list, tuple)) and bool(layers)
-            and set(layers) == {'full_attention'}
-            and getattr(hf, 'use_sliding_window', False) is not True
+            and isinstance(layers, (list, tuple))
+            and bool(layers)
+            and set(layers) == {"full_attention"}
+            and getattr(hf, "use_sliding_window", False) is not True
         )
-        if (not new_config.draft_window_graph_numeric_diagnostic
-                or not (dense_dflash or _native_swa_graph_window_review(speculative,new_config.draft_window_size))
-                or not new_config.draft_window_graph_replicated_tp_review
-                or vllm_config.parallel_config.data_parallel_size != 1):
-            raise ValueError("owned numeric output requires the reviewed TP4/DP1 dense DFlash or contained native SWA Graph diagnostic")
+        if (
+            not new_config.draft_window_graph_numeric_diagnostic
+            or not (dense_dflash or _native_swa_graph_window_review(speculative, new_config.draft_window_size))
+            or not new_config.draft_window_graph_replicated_tp_review
+            or vllm_config.parallel_config.data_parallel_size != 1
+        ):
+            raise ValueError(
+                "owned numeric output requires the reviewed TP4/DP1 dense DFlash "
+                "or contained native SWA Graph diagnostic"
+            )
     new_config.derive_and_validate(vllm_config)
     new_config.rl_config.apply(new_config)
     new_config.finegrained_tp_config._validate_preconditions(vllm_config)

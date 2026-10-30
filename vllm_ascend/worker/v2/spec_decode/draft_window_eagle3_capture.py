@@ -60,8 +60,7 @@ def build_eagle3_graph_source(owner: Any) -> tuple[Any, Any]:
         raise NotImplementedError("Eagle3 TP4 Graph review does not include DSA-CP")
     source_context = replace(context, graph_mode="NONE")
     if reviewed_tp4:
-        source_context = replace(source_context, async_scheduling=False,
-                                 sequence_parallel=False, flashcomm=False)
+        source_context = replace(source_context, async_scheduling=False, sequence_parallel=False, flashcomm=False)
     capability = _build_draft_window_source_capability_for_context(
         policy=owner._draft_window_policy,
         runtime_route="eagle3",
@@ -83,14 +82,18 @@ def build_eagle3_graph_source(owner: Any) -> tuple[Any, Any]:
         capability.full_source.validate_owner_bindings()
         if topology.prefix_caching is not True:
             raise RuntimeError("Eagle3 prefix Graph source lost the actual caching identity")
-    capability = replace(capability, eager_topology_fingerprint=replace(
-        topology, graph_mode=context.graph_mode,
-        async_scheduling=context.async_scheduling,
-        sequence_parallel=context.sequence_parallel,
-        dsa_context_parallel=context.dsa_context_parallel,
-        flashcomm=context.flashcomm,
-        prefix_caching=context.prefix_caching,
-    ))
+    capability = replace(
+        capability,
+        eager_topology_fingerprint=replace(
+            topology,
+            graph_mode=context.graph_mode,
+            async_scheduling=context.async_scheduling,
+            sequence_parallel=context.sequence_parallel,
+            dsa_context_parallel=context.dsa_context_parallel,
+            flashcomm=context.flashcomm,
+            prefix_caching=context.prefix_caching,
+        ),
+    )
     return capability, context
 
 
@@ -108,9 +111,9 @@ class Eagle3GraphSession:
         self.owner = owner
         self.context = context
         self.provider = install_draft_window_graph_binding_provider(owner)
-        self.controller = Eagle3GraphStagingOwner(owner._draft_window_runtime_state,
-                                                  self.provider,
-                                                  static_k=owner.num_speculative_steps)
+        self.controller = Eagle3GraphStagingOwner(
+            owner._draft_window_runtime_state, self.provider, static_k=owner.num_speculative_steps
+        )
         self._captures: dict[tuple[DraftWindowGraphRoute, int, int, int], DraftWindowGraphCaptureIdentity] = {}
         self._capture_call: tuple[DraftWindowGraphRoute, int, int] | None = None
         self._capture_ordinal = 0
@@ -162,9 +165,9 @@ class Eagle3GraphSession:
                         key = route, n, desc.num_tokens, ordinal
                         if key in self._captures:
                             raise RuntimeError("ambiguous Eagle3 capture bank (including unsupported LoRA variants)")
-                        self._captures[key] = self.provider.register_capture_identity(fingerprint=fingerprint,
-                                                                                      execution_lane=0,
-                                                                                      consumer_ordinal=ordinal)
+                        self._captures[key] = self.provider.register_capture_identity(
+                            fingerprint=fingerprint, execution_lane=0, consumer_ordinal=ordinal
+                        )
                         # Seed dummy contents before any GLOBAL capture.
                         # Synchronous H2D is forbidden inside the callback.
                         read = self.provider.startup_capture_read_inputs(self._captures[key])
@@ -177,6 +180,7 @@ class Eagle3GraphSession:
 
     def initialize_numeric_capture(self) -> None:
         from vllm_ascend.ascend_config import validate_additional_config_bool
+
         enabled = validate_additional_config_bool(
             self.owner.vllm_config.additional_config.get("draft_window_graph_numeric_diagnostic", False),
             "additional_config.draft_window_graph_numeric_diagnostic",
@@ -185,6 +189,7 @@ class Eagle3GraphSession:
             if self.numeric_snapshots is not None:
                 raise RuntimeError("Eagle3 numeric capture is already initialized")
             from vllm_ascend.worker.v2.spec_decode.draft_window_eagle3_diagnostics import Eagle3CaptureSnapshots
+
             self.numeric_snapshots = Eagle3CaptureSnapshots(self.owner, self._captures)
 
     def validate_for_provider(self, provider: Any) -> None:
@@ -223,8 +228,9 @@ class Eagle3GraphSession:
         read = self.provider.startup_capture_read_inputs(identity)
         # Persistent dummy banks were initialized before GLOBAL capture.
         # No CPU->device copy, fill or reset is allowed in this callback.
-        capacity = min(self.owner.max_model_len,
-                       identity.fingerprint.window_size + identity.fingerprint.block_span_tokens - 1)
+        capacity = min(
+            self.owner.max_model_len, identity.fingerprint.window_size + identity.fingerprint.block_span_tokens - 1
+        )
         private = _isolate_draft_metadata_from_target(metadata, metadata)
         result = {}
         for name, layer in private.items():
@@ -249,7 +255,7 @@ class Eagle3GraphSession:
             query = self.owner.input_buffers.query_start_loc
             if query.dtype != torch.int32 or query.ndim != 1 or query.numel() < n + 1:
                 raise RuntimeError("Eagle3 capture requires its owned int32 Full input query")
-            layer.query_start_loc = query[:n + 1]
+            layer.query_start_loc = query[: n + 1]
             result[name] = layer
         return result, identity
 
@@ -265,9 +271,9 @@ class Eagle3GraphSession:
         if fp.route is DraftWindowGraphRoute.EAGLE3_AR_STEP:
             state = AscendAttentionState.DecodeOnly
         return DraftWindowGraphWriteSideReference(
-            slot_mapping=self.owner.block_tables.slot_mappings[fp.global_group_id, :fp.padded_token_count],
-            positions=self.owner.input_buffers.positions[:fp.padded_token_count],
-            query_start_loc=self.owner.input_buffers.query_start_loc[:fp.padded_request_count + 1],
+            slot_mapping=self.owner.block_tables.slot_mappings[fp.global_group_id, : fp.padded_token_count],
+            positions=self.owner.input_buffers.positions[: fp.padded_token_count],
+            query_start_loc=self.owner.input_buffers.query_start_loc[: fp.padded_request_count + 1],
             actual_seq_lengths_q=tuple((i + 1) * fp.query_width for i in range(fp.padded_request_count)),
             attn_state=state,
             num_actual_tokens=fp.padded_token_count,
@@ -275,9 +281,17 @@ class Eagle3GraphSession:
         )
 
     def stage(self, inputs: Any, *, first: bool, n: int, tokens: int, ordinal: int) -> None:
-        from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import validate_eagle_single_request_graph_stage
+        from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import (
+            validate_eagle_single_request_graph_stage,
+        )
+
         validate_eagle_single_request_graph_stage(
-            self.owner, inputs, first=first, n=n, tokens=tokens, ordinal=ordinal,
+            self.owner,
+            inputs,
+            first=first,
+            n=n,
+            tokens=tokens,
+            ordinal=ordinal,
         )
         identity = self.resolve(first=first, n=n, tokens=tokens, ordinal=ordinal)
         owner = self.owner
@@ -303,7 +317,11 @@ class Eagle3GraphSession:
                 layer = copy(layer)
                 layer.slot_mapping, layer.query_start_loc = write.slot_mapping, write.query_start_loc
                 layer.actual_seq_lengths_q = list(write.actual_seq_lengths_q)
-                layer.attn_state, layer.num_actual_tokens, layer.causal = write.attn_state, write.num_actual_tokens, True
+                layer.attn_state, layer.num_actual_tokens, layer.causal = (
+                    write.attn_state,
+                    write.num_actual_tokens,
+                    True,
+                )
                 if hasattr(layer, "positions"):
                     layer.positions = write.positions
                 final[name] = layer

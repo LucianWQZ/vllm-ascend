@@ -153,11 +153,13 @@ class Eagle3DraftWindowMixin:
         staging = additional.get("draft_window_graph_eagle_pinned_h2d_review", False)
         if staging is not False:
             from vllm_ascend.ascend_config import validate_additional_config_bool
+
             staging = validate_additional_config_bool(
                 staging, "additional_config.draft_window_graph_eagle_pinned_h2d_review"
             )
         if staging:
             from vllm_ascend.ascend_config import validate_draft_window_eagle_pinned_h2d_review
+
             validate_draft_window_eagle_pinned_h2d_review(self.vllm_config)
             self._draft_window_runtime_state.workspace.configure_pinned_h2d_staging_review(True)
         # Fused decode builds metadata once and mutates it for later steps.
@@ -183,9 +185,7 @@ class Eagle3DraftWindowMixin:
             yield
             return
 
-        expected_steps = _eagle3_graph_scheduled_consumers(
-            self._eagle3_window_static_k, num_speculative_tokens
-        )
+        expected_steps = _eagle3_graph_scheduled_consumers(self._eagle3_window_static_k, num_speculative_tokens)
         graph_session = getattr(self, "_eagle3_graph_session", None)
         if graph_session is not None:
             graph_session.controller.require_reusable()
@@ -234,8 +234,11 @@ class Eagle3DraftWindowMixin:
         finally:
             live_inputs = self._eagle3_window_live_inputs
             try:
-                if (live_inputs is not None and live_inputs.lease.state is not DraftWindowLeaseState.RETIRED
-                        and not (graph_session is not None and graph_session.controller.quarantined)):
+                if (
+                    live_inputs is not None
+                    and live_inputs.lease.state is not DraftWindowLeaseState.RETIRED
+                    and not (graph_session is not None and graph_session.controller.quarantined)
+                ):
                     self._draft_window_runtime_state.abort_generation(live_inputs.identity)
             finally:
                 self._eagle3_window_proposal_context = None
@@ -276,13 +279,20 @@ class Eagle3DraftWindowMixin:
             padded_request_count=num_reqs_padded,
             name="proposal L0",
         )
-        from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import validate_eagle_single_request_review_exact
+        from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import (
+            validate_eagle_single_request_review_exact,
+        )
+
         validate_eagle_single_request_review_exact(
-            self, input_batch, cpu_l0, num_reqs=num_reqs, padded=num_reqs_padded, step=0,
+            self,
+            input_batch,
+            cpu_l0,
+            num_reqs=num_reqs,
+            padded=num_reqs_padded,
+            step=0,
         )
         cpu_upper = _copy_padded_cpu_upper(
             input_batch.seq_lens_cpu_upper_bound,
-
             actual_request_count=num_reqs,
             padded_request_count=num_reqs_padded,
             increment=0,
@@ -401,9 +411,17 @@ class Eagle3DraftWindowMixin:
                 out=cpu_exact[:num_reqs],
             )
             cpu_exact[:num_reqs].clamp_(max=self.max_model_len)
-        from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import validate_eagle_single_request_review_exact
+        from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import (
+            validate_eagle_single_request_review_exact,
+        )
+
         validate_eagle_single_request_review_exact(
-            self, input_batch, cpu_exact, num_reqs=num_reqs, padded=num_reqs_padded, step=step,
+            self,
+            input_batch,
+            cpu_exact,
+            num_reqs=num_reqs,
+            padded=num_reqs_padded,
+            step=step,
         )
         cpu_upper = _copy_padded_cpu_upper(
             seq_lens_cpu_upper_bound,

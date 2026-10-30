@@ -91,8 +91,12 @@ class Eagle3GraphStagingOwner:
         return tuple(self._transfers)
 
     def begin(
-        self, mapping_epoch: int, ordered_request_ids: tuple[str, ...], *,
-        first_pass_is_graph: bool = True, num_speculative_tokens: int | None = None
+        self,
+        mapping_epoch: int,
+        ordered_request_ids: tuple[str, ...],
+        *,
+        first_pass_is_graph: bool = True,
+        num_speculative_tokens: int | None = None,
     ) -> None:
         from vllm_ascend.worker.v2.spec_decode.draft_window_eagle3 import _eagle3_graph_scheduled_consumers
 

@@ -46,10 +46,10 @@ from vllm_ascend.device.hardware_profile import (
 )
 
 if TYPE_CHECKING:
-    from vllm_ascend.worker.v2.spec_decode.draft_window_swa_graph import NativeSWAGraphPlan
     from vllm_ascend.worker.v2.spec_decode.draft_window_eager_capability import (
         P7EagerTopologyFingerprint,
     )
+    from vllm_ascend.worker.v2.spec_decode.draft_window_swa_graph import NativeSWAGraphPlan
 
 
 class DraftWindowPolicyState(Enum):
@@ -976,17 +976,27 @@ def _runtime_capability_failures(
         ("PCP", runtime_context.prefill_context_parallel_size),
         ("DCP", runtime_context.decode_context_parallel_size),
     )
-    failures.extend(f"gid=none backend=none layout=runtime reason={name}={size} is not verified in P2"
-                    for name, size in topology
-                    if size != 1 and not (
-                        name == "TP" and type(size) is int and size in (2, 4, 16)
-                        and allow_replicated_tp_graph_source
-                        or name == "DP" and type(size) is int and size == 2
-                        and runtime_context.tensor_parallel_size == 4
-                        and allow_replicated_tp_graph_source and allow_parallel_dp_graph_source))
+    failures.extend(
+        f"gid=none backend=none layout=runtime reason={name}={size} is not verified in P2"
+        for name, size in topology
+        if size != 1
+        and not (
+            name == "TP"
+            and type(size) is int
+            and size in (2, 4, 16)
+            and allow_replicated_tp_graph_source
+            or name == "DP"
+            and type(size) is int
+            and size == 2
+            and runtime_context.tensor_parallel_size == 4
+            and allow_replicated_tp_graph_source
+            and allow_parallel_dp_graph_source
+        )
+    )
     if allow_replicated_tp_graph_source and (
-            type(runtime_context.tensor_parallel_rank) is not int
-            or not 0 <= runtime_context.tensor_parallel_rank < runtime_context.tensor_parallel_size):
+        type(runtime_context.tensor_parallel_rank) is not int
+        or not 0 <= runtime_context.tensor_parallel_rank < runtime_context.tensor_parallel_size
+    ):
         failures.append("gid=none backend=none layout=runtime reason=replicated TP source requires a real integer rank")
     if runtime_context.sequence_parallel:
         failures.append("gid=none backend=none layout=runtime reason=sequence parallel is not verified in P2")
@@ -1021,13 +1031,17 @@ def build_draft_window_inventory(
     if type(allow_parallel_dp_graph_source) is not bool:
         raise TypeError("parallel DP Graph source allowance must be an explicit boolean")
     if allow_parallel_dp_graph_source and (
-            runtime_route != "dflash" or not allow_replicated_tp_graph_source
-            or runtime_context.tensor_parallel_size != 4 or runtime_context.data_parallel_size != 2):
+        runtime_route != "dflash"
+        or not allow_replicated_tp_graph_source
+        or runtime_context.tensor_parallel_size != 4
+        or runtime_context.data_parallel_size != 2
+    ):
         raise NotImplementedError("parallel DP source requires the reviewed rank-local DFlash TP4/DP2 route")
     if type(allow_parallel_prefix_graph_source) is not bool:
         raise TypeError("parallel prefix source allowance must be an explicit boolean")
     eagle_tp4_prefix = (
-        runtime_route == "eagle3" and allow_replicated_tp_graph_source
+        runtime_route == "eagle3"
+        and allow_replicated_tp_graph_source
         and runtime_context.tensor_parallel_size == 4
         and runtime_context.data_parallel_size == 1
     )
@@ -1036,10 +1050,12 @@ def build_draft_window_inventory(
     num_global_groups = len(attn_groups)
     block_sizes = tuple(block_tables.block_sizes)
     kernel_block_sizes = tuple(block_tables.kernel_block_sizes)
-    failures = _runtime_capability_failures(runtime_context,
-                                            allow_replicated_tp_graph_source=allow_replicated_tp_graph_source,
-                                            allow_parallel_prefix_graph_source=allow_parallel_prefix_graph_source,
-                                            allow_parallel_dp_graph_source=allow_parallel_dp_graph_source)
+    failures = _runtime_capability_failures(
+        runtime_context,
+        allow_replicated_tp_graph_source=allow_replicated_tp_graph_source,
+        allow_parallel_prefix_graph_source=allow_parallel_prefix_graph_source,
+        allow_parallel_dp_graph_source=allow_parallel_dp_graph_source,
+    )
     if len(block_sizes) != num_global_groups:
         failures.append(
             "gid=none backend=none layout=source reason="
@@ -1426,9 +1442,7 @@ def build_draft_window_runtime_context(
     # rejected option as active.  A DSA-CP request auto-enables FlashComm
     # before the model-specific DSA gate is resolved, so that request still
     # contributes when SP itself is effective.
-    flashcomm = sequence_parallel and (
-        flashcomm_explicitly_enabled or dsa_context_parallel_requested
-    )
+    flashcomm = sequence_parallel and (flashcomm_explicitly_enabled or dsa_context_parallel_requested)
     return DraftWindowRuntimeContext(
         attention_backend_family=get_current_hardware_profile().attention_backend_family,
         graph_mode=mode_name,
@@ -1497,8 +1511,12 @@ def build_draft_window_source_capability(
     )
     if validate_draft_window_parallel_eager_review(vllm_config):
         return _build_parallel_eager_review_source(
-            policy=policy, runtime_route=runtime_route, attn_groups=attn_groups,
-            block_tables=block_tables, causal=causal, vllm_config=vllm_config,
+            policy=policy,
+            runtime_route=runtime_route,
+            attn_groups=attn_groups,
+            block_tables=block_tables,
+            causal=causal,
+            vllm_config=vllm_config,
             runtime_context=runtime_context,
         )
     return _build_draft_window_source_capability_for_context(
@@ -1530,37 +1548,55 @@ def _build_parallel_eager_review_source(
     dimension is restored before P3 or the existing Async completion-lane pool
     is created; no Target metadata or public non-Graph gate is changed.
     """
-    if (runtime_context.attention_backend_family is not AttentionBackendFamily.STANDARD
-            or runtime_context.graph_mode != "NONE"
-            or runtime_route not in {"dspark", "dflash", "eagle3"}
-            or runtime_route != policy.normalized_method):
+    if (
+        runtime_context.attention_backend_family is not AttentionBackendFamily.STANDARD
+        or runtime_context.graph_mode != "NONE"
+        or runtime_route not in {"dspark", "dflash", "eagle3"}
+        or runtime_route != policy.normalized_method
+    ):
         raise NotImplementedError("parallel eager review requires an actual STANDARD parallel Draft eager route")
     # Eagle's matching control retains its proposal/step P4b owner. Async
     # output delivery and the Target's SP/FlashComm do not shard this separately
     # inventoried dense Draft cache. Keep the actual flags in the returned
     # topology; the generic P2/non-Graph gates below remain closed elsewhere.
     if runtime_route == "eagle3" and (
-            runtime_context.tensor_parallel_size != 4 or causal is not True
-            or runtime_context.dsa_context_parallel):
+        runtime_context.tensor_parallel_size != 4 or causal is not True or runtime_context.dsa_context_parallel
+    ):
         raise NotImplementedError("Eagle3 eager review requires the named causal TP4 context without DSA-CP")
     parallel = vllm_config.parallel_config
-    rank_local_dp = (runtime_route == "dflash" and runtime_context.tensor_parallel_size == 4
-                     and runtime_context.data_parallel_size == 2)
-    if (runtime_context.tensor_parallel_size != parallel.tensor_parallel_size
-            or runtime_context.data_parallel_size != parallel.data_parallel_size
-            or (runtime_context.data_parallel_size, runtime_context.pipeline_parallel_size,
-                runtime_context.prefill_context_parallel_size, runtime_context.decode_context_parallel_size)
-            != (2 if rank_local_dp else 1, 1, 1, 1)):
+    rank_local_dp = (
+        runtime_route == "dflash"
+        and runtime_context.tensor_parallel_size == 4
+        and runtime_context.data_parallel_size == 2
+    )
+    if (
+        runtime_context.tensor_parallel_size != parallel.tensor_parallel_size
+        or runtime_context.data_parallel_size != parallel.data_parallel_size
+        or (
+            runtime_context.data_parallel_size,
+            runtime_context.pipeline_parallel_size,
+            runtime_context.prefill_context_parallel_size,
+            runtime_context.decode_context_parallel_size,
+        )
+        != (2 if rank_local_dp else 1, 1, 1, 1)
+    ):
         raise NotImplementedError("parallel eager source topology differs from the reviewed executor")
-    if (policy.effective_window_size != vllm_config.additional_config.get("draft_window_size")
-            or policy.effective_window_size not in ((1024, 32768) if rank_local_dp else (1024,))):
+    if policy.effective_window_size != vllm_config.additional_config.get(
+        "draft_window_size"
+    ) or policy.effective_window_size not in ((1024, 32768) if rank_local_dp else (1024,)):
         raise NotImplementedError("parallel eager source Window differs from the reviewed configured policy")
-    source_context = replace(runtime_context, async_scheduling=False, sequence_parallel=False,
-                             dsa_context_parallel=False, flashcomm=False)
+    source_context = replace(
+        runtime_context, async_scheduling=False, sequence_parallel=False, dsa_context_parallel=False, flashcomm=False
+    )
     capability = _build_draft_window_source_capability_for_context(
-        policy=policy, runtime_route=runtime_route, attn_groups=attn_groups,
-        block_tables=block_tables, causal=causal, vllm_config=vllm_config,
-        runtime_context=source_context, allow_replicated_tp_graph_source=True,
+        policy=policy,
+        runtime_route=runtime_route,
+        attn_groups=attn_groups,
+        block_tables=block_tables,
+        causal=causal,
+        vllm_config=vllm_config,
+        runtime_context=source_context,
+        allow_replicated_tp_graph_source=True,
         allow_parallel_prefix_graph_source=runtime_context.prefix_caching,
         allow_parallel_dp_graph_source=rank_local_dp,
     )
@@ -1571,11 +1607,16 @@ def _build_parallel_eager_review_source(
     topology = capability.eager_topology_fingerprint
     if topology is None:
         raise RuntimeError("parallel eager source has no immutable topology")
-    return replace(capability, eager_topology_fingerprint=replace(
-        topology, async_scheduling=runtime_context.async_scheduling,
-        sequence_parallel=runtime_context.sequence_parallel,
-        dsa_context_parallel=runtime_context.dsa_context_parallel, flashcomm=runtime_context.flashcomm,
-    ))
+    return replace(
+        capability,
+        eager_topology_fingerprint=replace(
+            topology,
+            async_scheduling=runtime_context.async_scheduling,
+            sequence_parallel=runtime_context.sequence_parallel,
+            dsa_context_parallel=runtime_context.dsa_context_parallel,
+            flashcomm=runtime_context.flashcomm,
+        ),
+    )
 
 
 def _build_draft_window_source_capability_for_context(
@@ -1824,10 +1865,17 @@ class DraftWindowWorkspace:
         return dict(
             enabled=self._pinned_h2d_staging_review,
             submitted_copies=self._pinned_h2d_submissions,
-            pending_sources=[dict(generation=identity.generation_id, epoch=identity.mapping_epoch,
-                                  shape=list(tensor.shape), dtype=str(tensor.dtype), device=str(tensor.device),
-                                  data_ptr=tensor.data_ptr())
-                             for identity, tensor in self._pending_pinned_h2d_sources],
+            pending_sources=[
+                dict(
+                    generation=identity.generation_id,
+                    epoch=identity.mapping_epoch,
+                    shape=list(tensor.shape),
+                    dtype=str(tensor.dtype),
+                    device=str(tensor.device),
+                    data_ptr=tensor.data_ptr(),
+                )
+                for identity, tensor in self._pending_pinned_h2d_sources
+            ],
             successful_source_owner="FRAMEWORK_PINNED_ALLOCATOR_STREAM_RECORD",
             completion="NOT_INFERRED_FROM_COPY_RETURN",
         )

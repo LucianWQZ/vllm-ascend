@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Real builder Host counterexamples; no device kernels or Graph emulation."""
+
 import gc
+import weakref
 from types import SimpleNamespace
 from unittest.mock import patch
-import weakref
 
 import pytest
 import torch
@@ -25,15 +26,16 @@ def builder():
 def prepare(owner, *, rows=4, value=0, draft_index=None):
     n = rows * 9
     starts = torch.arange(rows + 1, dtype=torch.int32) * 9
-    common = SimpleNamespace(num_reqs=rows, num_input_tokens=n, num_actual_tokens=n,
-                             query_start_loc=starts)
+    common = SimpleNamespace(num_reqs=rows, num_input_tokens=n, num_actual_tokens=n, query_start_loc=starts)
     rope = torch.full((n, 1, 1, 64), float(value))
     slots = torch.arange(n, dtype=torch.int64) + value * 100
-    with patch("vllm_ascend.attention.context_parallel.sfa_cp.get_tp_group",
-               return_value=SimpleNamespace(world_size=16, rank_in_group=2)):
+    with patch(
+        "vllm_ascend.attention.context_parallel.sfa_cp.get_tp_group",
+        return_value=SimpleNamespace(world_size=16, rank_in_group=2),
+    ):
         result = owner._prepare_parallel_metadata(
-            common, rope, rope + 1, slots, starts[1:],
-            torch.full((rows,), 1024, dtype=torch.int32), draft_index)
+            common, rope, rope + 1, slots, starts[1:], torch.full((rows,), 1024, dtype=torch.int32), draft_index
+        )
     return result
 
 
@@ -96,8 +98,9 @@ def test_changed_bank_layout_is_rejected_without_replacing_captured_storage():
     captured = prepare(owner)[2]
     original = captured.untyped_storage().data_ptr()
     with pytest.raises(RuntimeError, match="layout changed"):
-        owner._padded_metadata_inputs(torch.zeros(36, 1, 1, 32), torch.zeros(36, 1, 1, 32),
-                                      torch.arange(36, dtype=torch.int64), 48, None)
+        owner._padded_metadata_inputs(
+            torch.zeros(36, 1, 1, 32), torch.zeros(36, 1, 1, 32), torch.arange(36, dtype=torch.int64), 48, None
+        )
     assert captured.untyped_storage().data_ptr() == original
 
 

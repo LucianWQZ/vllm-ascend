@@ -415,8 +415,11 @@ class DraftWindowEagerAsyncPool:
     def quarantine_reader(self, handle: DraftWindowEagerAsyncHandle) -> None:
         """Retain all possible reader backing; no device operation or recovery."""
         self._require_active(handle)
-        if handle.state not in (DraftWindowEagerAsyncState.ACQUIRED,
-                                DraftWindowEagerAsyncState.MATERIALIZED, DraftWindowEagerAsyncState.BOUND):
+        if handle.state not in (
+            DraftWindowEagerAsyncState.ACQUIRED,
+            DraftWindowEagerAsyncState.MATERIALIZED,
+            DraftWindowEagerAsyncState.BOUND,
+        ):
             raise RuntimeError("possible native preparation or reader requires an owned operation")
         inputs = handle.inputs
         self._quarantined_reader = handle
@@ -512,10 +515,11 @@ class DraftWindowEagerAsyncPool:
             handle.abort_requested = True
             handle.state = DraftWindowEagerAsyncState.RETIRED
             return
-        if handle.state in (DraftWindowEagerAsyncState.ACQUIRED,
-                            DraftWindowEagerAsyncState.MATERIALIZED, DraftWindowEagerAsyncState.BOUND) and (
-            handle.consumer_started or handle.preparation_started
-        ):
+        if handle.state in (
+            DraftWindowEagerAsyncState.ACQUIRED,
+            DraftWindowEagerAsyncState.MATERIALIZED,
+            DraftWindowEagerAsyncState.BOUND,
+        ) and (handle.consumer_started or handle.preparation_started):
             handle.abort_requested = True
             self.quarantine_reader(handle)
             return

@@ -352,8 +352,10 @@ def evaluate_p7x_nongraph_capability(
     if type(allow_parallel_dp_graph_source) is not bool:
         raise TypeError("parallel DP source allowance must be an explicit boolean")
     if allow_parallel_dp_graph_source and (
-            inventory.runtime_route != "dflash" or runtime_context.tensor_parallel_size != 4
-            or runtime_context.data_parallel_size != 2):
+        inventory.runtime_route != "dflash"
+        or runtime_context.tensor_parallel_size != 4
+        or runtime_context.data_parallel_size != 2
+    ):
         raise ValueError("parallel DP source allowance is limited to reviewed rank-local DFlash TP4/DP2")
     fingerprint = _build_topology_fingerprint(
         inventory=inventory,

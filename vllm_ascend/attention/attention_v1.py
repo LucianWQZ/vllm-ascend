@@ -744,6 +744,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         # Window binding/ownership validation also runs with observation off.
         callback = None
         if getattr(attn_metadata, "_draft_window_graph_capture_operand_context", None) is not None:
+
             def callback(task, stream):
                 from vllm_ascend.worker.v2.spec_decode.draft_window_graph_characterization import (
                     record_parallel_graph_capture_operator_operand,

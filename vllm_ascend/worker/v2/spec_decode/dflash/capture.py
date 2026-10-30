@@ -374,7 +374,7 @@ def ascend_prepare_dflash_inputs_to_capture(
         dcp_local_seq_lens=dcp_local_seq_lens,
     )
     attn_metadata = build_attn_metadata(
-        attn_groups=attn_groups if native_swa is None else native_swa.filter_groups(attn_groups,native=False),
+        attn_groups=attn_groups if native_swa is None else native_swa.filter_groups(attn_groups, native=False),
         num_reqs=num_reqs,
         num_tokens=num_tokens,
         query_start_loc_gpu=input_batch.query_start_loc,
@@ -398,16 +398,24 @@ def ascend_prepare_dflash_inputs_to_capture(
         # Its captured canonical table remains the baseline stable owner;
         # every group's original full write slots and causality are retained.
         native_metadata = build_attn_metadata(
-            attn_groups=native_swa.filter_groups(attn_groups,native=True),
-            num_reqs=num_reqs,num_tokens=num_tokens,query_start_loc_gpu=input_batch.query_start_loc,
-            query_start_loc_cpu=query_start_loc_cpu,max_query_len=num_tokens//num_reqs,
-            seq_lens=input_batch.seq_lens,dcp_local_seq_lens=None,max_seq_len=max_model_len,
-            block_tables=input_block_tables,slot_mappings=slot_mappings,kv_cache_config=kv_cache_config,
-            for_cudagraph_capture=True,causal=causal,
+            attn_groups=native_swa.filter_groups(attn_groups, native=True),
+            num_reqs=num_reqs,
+            num_tokens=num_tokens,
+            query_start_loc_gpu=input_batch.query_start_loc,
+            query_start_loc_cpu=query_start_loc_cpu,
+            max_query_len=num_tokens // num_reqs,
+            seq_lens=input_batch.seq_lens,
+            dcp_local_seq_lens=None,
+            max_seq_len=max_model_len,
+            block_tables=input_block_tables,
+            slot_mappings=slot_mappings,
+            kv_cache_config=kv_cache_config,
+            for_cudagraph_capture=True,
+            causal=causal,
         )
         if set(native_metadata) != set(native_swa.native_layers) or set(window_metadata) != set(native_swa.full_layers):
             raise RuntimeError("native SWA capture metadata does not cover the admitted readers")
-        attn_metadata = {**native_metadata,**window_metadata}
+        attn_metadata = {**native_metadata, **window_metadata}
     # Optional, bounded G1/G3/G4 evidence.  The recorder exists only when the
     # strict characterization flag installed an instance-owned provider.
     from vllm_ascend.worker.v2.spec_decode.draft_window_graph_characterization import (
