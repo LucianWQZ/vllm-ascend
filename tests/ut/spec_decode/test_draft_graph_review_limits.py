@@ -201,9 +201,50 @@ class ReviewBoundaryControls(unittest.TestCase):
             self.config.speculative_config.enforce_eager = True
             self.assertIsNone(self.resolve(self.config))
 
+    def test_eagle_finite_ordinary_entry_stays_closed_on_unqualified_pair(self):
+        self.config.speculative_config.method = "eagle3"
+        self.config.speculative_config.num_speculative_tokens = 3
+        self.config.parallel_config.all2all_backend = "allgather_reducescatter"
+        self.config.parallel_config.use_sequence_parallel_moe = True
+        self.config.additional_config = dict(
+            draft_window_size=1024,
+            draft_window_graph_replicated_tp_review=True,
+            draft_window_graph_eagle_single_request_review=True,
+        )
+        module = ModuleType(MODULE)
+        module.resolve_draft_graph_review_limit = self.resolve
+        ascend = ModuleType("vllm_ascend")
+        ascend.envs = NS(VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH=True)
+        calls = []
+        factory = actual_function(
+            SPEC / "__init__.py",
+            "init_speculator",
+            {
+                "_resolve_window_policy": lambda config: None,
+                "_use_graph_window_owner": lambda config, policy: False,
+                "_init_speculator": lambda *args: calls.append("construct"),
+            },
+        )
+        with self.identified("_EAGLE_CONFIG"):
+            with self.assertRaisesRegex(ValueError, "experimental Graph gate"):
+                self.resolve(self.config, experimental_graph_review=False)
+            with self.assertRaisesRegex(NotImplementedError, "PR017/vLLM544 pair is incomplete"):
+                self.resolve(self.config, experimental_graph_review=True)
+            with (
+                patch.dict(sys.modules, {MODULE: module, "vllm_ascend": ascend}),
+                self.assertRaisesRegex(NotImplementedError, "PR017/vLLM544 pair is incomplete"),
+            ):
+                factory(self.config, None)
+            self.assertEqual(calls, [])
+
     def test_explicit_existing_numeric_diagnostic_retains_original_interface(self):
-        for checkpoint in ("_SWA6_CONFIG", "_FULL8_CONFIG"):
+        for method, checkpoint in (
+            ("dflash", "_SWA6_CONFIG"),
+            ("dflash", "_FULL8_CONFIG"),
+            ("eagle3", "_EAGLE_CONFIG"),
+        ):
             with self.subTest(checkpoint=checkpoint), self.identified(checkpoint):
+                self.config.speculative_config.method = method
                 self.config.additional_config["draft_window_graph_numeric_diagnostic"] = True
                 with self.assertRaises(NotImplementedError):
                     self.resolve(self.config)

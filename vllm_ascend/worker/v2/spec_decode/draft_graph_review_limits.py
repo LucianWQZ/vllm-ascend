@@ -306,9 +306,11 @@ def resolve_draft_graph_review_limit(vllm_config, *, experimental_graph_review=F
     if finite_review:
         if speculative.method != "eagle3" or digest != _EAGLE_CONFIG:
             raise NotImplementedError("Eagle single-request review requires its fixed checkpoint configuration")
-        return validate_eagle_single_request_review_config(
-            vllm_config,
-            experimental_graph_review=experimental_graph_review,
+        raise NotImplementedError(
+            "This Eagle3 checkpoint's ordinary single-request Draft Graph qualification "
+            "on the PR017/vLLM544 pair is incomplete, so this entry is not open. "
+            "The explicit private numerical diagnostic and independently supported "
+            "typed Draft eager route remain available; no fallback is selected."
         )
     diagnostic = additional.get("draft_window_graph_numeric_diagnostic", False)
     if type(diagnostic) is not bool:
