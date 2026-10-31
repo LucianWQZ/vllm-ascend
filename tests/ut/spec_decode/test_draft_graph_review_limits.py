@@ -194,6 +194,56 @@ class ReviewBoundaryControls(unittest.TestCase):
         with patch.dict(sys.modules, {MODULE: module}):
             self.assertFalse(dense(self.config, 32768))
 
+    def test_replicated_off_startup_requires_the_actual_named_single_scope(self):
+        config_path = SOURCE / "vllm_ascend/ascend_config.py"
+        namespace = {"validate_additional_config_bool": lambda value, path: TypeAdapter(bool).validate_python(value)}
+        for name in (
+            "_native_swa_graph_window_review",
+            "_dense_dp_graph_window_review",
+            "_eagle3_tp4_graph_review",
+            "_single_request_graph_off_review",
+            "validate_draft_window_replicated_tp_review",
+        ):
+            actual_function(config_path, name, namespace)
+        startup = namespace["validate_draft_window_replicated_tp_review"]
+        package = ModuleType("vllm_ascend")
+        package.envs = NS(
+            VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH=True,
+            VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH_OBSERVE=False,
+        )
+        module = ModuleType(MODULE)
+        module.resolve_draft_graph_review_limit = self.resolve
+        module.EagleSingleRequestReviewScope = GUARD["EagleSingleRequestReviewScope"]
+        self.config.additional_config = dict(
+            draft_window_graph_full8_single_request_review=True,
+            draft_window_graph_replicated_tp_review=True,
+        )
+        self.config.compilation_config.cudagraph_capture_sizes = [8]
+        with patch.dict(sys.modules, {"vllm_ascend": package, MODULE: module}), self.identified("_FULL8_CONFIG"):
+            self.assertTrue(startup(self.config))
+            # A flag is not a checkpoint or method capability. None is the
+            # only new Window value, and the original Graph gate stays on.
+            with (
+                patch.dict(self.resolve.__globals__, {"_FULL8_CONFIG": "0" * 64}),
+                self.assertRaises(NotImplementedError),
+            ):
+                startup(self.config)
+            self.config.additional_config["draft_window_size"] = 2048
+            with self.assertRaises(ValueError):
+                startup(self.config)
+            del self.config.additional_config["draft_window_size"]
+            self.config.additional_config["draft_window_graph_full8_single_request_review"] = False
+            with self.assertRaises(ValueError):
+                startup(self.config)
+            self.config.additional_config["draft_window_graph_full8_single_request_review"] = True
+            self.config.speculative_config.method = "mtp"
+            with self.assertRaises(NotImplementedError):
+                startup(self.config)
+            self.config.speculative_config.method = "dflash"
+            package.envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH = False
+            with self.assertRaises(ValueError):
+                startup(self.config)
+
     def test_invalid_active_counts_do_not_coerce_or_disable_guard(self):
         owner = NS(
             _draft_graph_review_limit="full8_local_active_at_most_one",

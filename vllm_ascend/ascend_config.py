@@ -193,6 +193,40 @@ def _eagle3_tp4_graph_review(vllm_config: Any) -> bool:
     )
 
 
+def _single_request_graph_off_review(vllm_config: Any) -> bool:
+    """Keep the named finite Graph guards when no extra window is requested.
+
+    This is startup admission only. Resolve the same checkpoint, topology,
+    capacity and capture contract used by the ordinary execution owner; a
+    review flag by itself must not open the replicated Graph route.
+    """
+    additional = getattr(vllm_config, "additional_config", None) or {}
+    if additional.get("draft_window_size") is not None or vllm_config.speculative_config is None:
+        return False
+    enabled = any(
+        validate_additional_config_bool(additional.get(name, False), "additional_config." + name)
+        for name in (
+            "draft_window_graph_full8_single_request_review",
+            "draft_window_graph_eagle_single_request_review",
+        )
+    )
+    if not enabled:
+        return False
+    # Circular dependency: the shared resolver imports this module's bool
+    # validator. It also checks the exact local checkpoint configuration.
+    from vllm_ascend import envs
+    from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import (
+        EagleSingleRequestReviewScope,
+        resolve_draft_graph_review_limit,
+    )
+
+    limit = resolve_draft_graph_review_limit(
+        vllm_config,
+        experimental_graph_review=envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH,
+    )
+    return limit == "full8_local_active_at_most_one" or isinstance(limit, EagleSingleRequestReviewScope)
+
+
 def validate_draft_window_replicated_tp_review(vllm_config: Any) -> bool:
     """Admit explicit replicated TP review profiles without changing public defaults."""
     additional = getattr(vllm_config, "additional_config", None) or {}
@@ -211,17 +245,20 @@ def validate_draft_window_replicated_tp_review(vllm_config: Any) -> bool:
     speculative = vllm_config.speculative_config
     native_swa_window = _native_swa_graph_window_review(speculative, additional.get("draft_window_size"))
     dense_dp_window = _dense_dp_graph_window_review(vllm_config, additional.get("draft_window_size"))
+    single_request_off = _single_request_graph_off_review(vllm_config)
     if (
         speculative is None
         or speculative.method not in ("dspark", "dflash", "eagle3")
         or speculative.enforce_eager
         or speculative.uses_dynamic_speculative_decoding()
-        or not (additional.get("draft_window_size") == 1024 or native_swa_window or dense_dp_window)
+        or not (
+            additional.get("draft_window_size") == 1024 or native_swa_window or dense_dp_window or single_request_off
+        )
     ):
         raise ValueError(
             "replicated TP Graph review requires static parallel Draft Graph or named Eagle3 with W1024, "
             "a contained native SWA band, or the dense DFlash TP4/DP2 W32768 control "
-            "or qualified Full8 single-request DP1 review"
+            "or qualified Full8/Eagle single-request Window OFF review"
         )
     draft_parallel = speculative.draft_parallel_config
     tp = vllm_config.parallel_config.tensor_parallel_size
@@ -2249,7 +2286,8 @@ def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
         )
         logger.warning_once(
             "Controlled Full8 Draft Graph qualification: exact checkpoint, TP4/DP1, "
-            "K7/W32768, actual1/padded1 and capture[8] only; not a device PASS or release qualification."
+            "static K7, Window OFF or W32768, actual1/padded1 and capture[8] only; "
+            "not a device PASS or release qualification."
         )
     if new_config.draft_window_graph_eagle_single_request_review:
         from vllm_ascend import envs
@@ -2262,8 +2300,9 @@ def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
             experimental_graph_review=envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH,
         )
         logger.warning_once(
-            "Controlled Eagle Draft Graph review: single actual request, prompt257/2051, "
-            "output32, TP4/DP1 K3/W1024 only; this flag is not a numerical or release qualification."
+            "Controlled Eagle Draft Graph review: capacity-bounded single actual request, "
+            "TP4/DP1 static K3, Window OFF or W1024 only; "
+            "this flag is not a numerical or release qualification."
         )
     if new_config.draft_window_graph_single_metadata:
         speculative = vllm_config.speculative_config
