@@ -41,15 +41,22 @@ class DraftNativeAttentionLoggingTests(unittest.TestCase):
     def actual_ar_logger(self, name):
         tree = ast.parse(AR.read_text())
         imports = [node for node in tree.body if isinstance(node, ast.ImportFrom) and node.module == "vllm.logger"]
-        self.assertTrue(any(alias.name == "init_logger" for node in imports for alias in node.names))
-        assignment = next(
-            node
-            for node in tree.body
-            if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "logger" for t in node.targets)
+        self.assertTrue(any(alias.name == "logger" for node in imports for alias in node.names))
+        self.assertFalse(
+            any(
+                isinstance(node, ast.Assign)
+                and any(isinstance(target, ast.Name) and target.id == "logger" for target in node.targets)
+                for node in tree.body
+            )
         )
-        namespace = {"__name__": name, "init_logger": vllm_logging.init_logger}
-        exec(compile(ast.Module(body=[assignment], type_ignores=[]), str(AR), "exec"), namespace)
-        return namespace["logger"]
+        namespace = {}
+        exec(compile(ast.Module(body=imports, type_ignores=[]), str(AR), "exec"), namespace)
+        self.assertIs(namespace["logger"], vllm_logging.logger)
+        # Keep each case's handler and once-key independent while exercising
+        # the same installed adapter class as the shared production logger.
+        logger = vllm_logging.init_logger(name)
+        self.assertIs(type(logger), type(namespace["logger"]))
+        return logger
 
     def test_transformers_stdlib_scope_fails_and_actual_ar_adapter_accepts(self):
         logger, records = self.logger()
