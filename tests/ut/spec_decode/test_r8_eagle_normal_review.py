@@ -293,6 +293,97 @@ class Controls(unittest.TestCase):
         self.assertFalse(hasattr(untouched, "_draft_graph_review_preempted_request_ids"))
 
 
+def actual_ar_replay_method():
+    """Use the real manager entry, replacing no framework/device implementation."""
+    path = SOURCE / "vllm_ascend/worker/v2/spec_decode/target_dependent_ar/aclgraph.py"
+    tree = ast.parse(path.read_text())
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "AutoRegressiveAclGraphManager")
+    method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "run_fullgraph")
+    scope = dict(logger=N(info_once=lambda *args: None), use_updatable_graph=lambda backend: False)
+    body = [ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), method]
+    exec(compile(ast.fix_missing_locations(ast.Module(body=body, type_ignores=[])), str(path), "exec"), scope)
+    return scope["run_fullgraph"]
+
+
+class ActualGraphDescriptorControls(unittest.TestCase):
+    def manager(self, owner, *, first=False, session=None):
+        seen = []
+        owner.attn_backend = "actual-test-backend"
+        owner.draft_vllm_config = object()
+        owner.build_draft_attn_metadatas = lambda *args: (seen.append(("metadata", args)), {})[1]
+        if session is not None:
+            owner._eagle3_graph_session = session
+            owner._eagle3_window_is_active = lambda: True
+        manager = N(
+            speculator=owner,
+            is_draft_model_prefill=first,
+            update_stream=object(),
+            _graph_replay=lambda *args: (seen.append(("replay", args)), "legacy-result")[1],
+            _run_eagle_window_fullgraph=lambda *args: (seen.append(("window", args)), "window-result")[1],
+        )
+        return manager, seen
+
+    def run_actual(self, manager, desc):
+        from unittest.mock import patch
+
+        with patch.dict(sys.modules, {"vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits": M}):
+            return actual_ar_replay_method()(manager, desc)
+
+    def test_off_padded_ar_rejected_before_metadata_and_replay(self):
+        owner, _ = objects()
+        manager, seen = self.manager(owner)
+        for n, tokens in ((4, 4), (1, 4), (2, 2)):
+            with self.subTest(n=n, tokens=tokens), self.assertRaisesRegex(NotImplementedError, "padded1"):
+                self.run_actual(manager, N(num_reqs=n, num_tokens=tokens))
+            self.assertEqual(seen, [])
+        self.assertEqual(self.run_actual(manager, N(num_reqs=1, num_tokens=1)), "legacy-result")
+        self.assertEqual([v[0] for v in seen], ["metadata", "replay"])
+        self.assertFalse(hasattr(owner, "_draft_window_runtime_state"))
+        self.assertFalse(hasattr(owner, "_draft_window_runtime"))
+
+    def test_first_q4_and_existing_on_identity_checks(self):
+        owner, _ = objects()
+        manager, seen = self.manager(owner, first=True)
+        self.assertEqual(self.run_actual(manager, N(num_reqs=1, num_tokens=4)), "legacy-result")
+        seen.clear()
+        with self.assertRaisesRegex(NotImplementedError, "first Q4"):
+            self.run_actual(manager, N(num_reqs=4, num_tokens=4))
+        self.assertEqual(seen, [])
+        for first, step, ordinal, tokens in ((True, 0, 0, 4), (False, 1, 0, 1), (False, 2, 1, 1)):
+            inputs = N(actual_request_count=1, padded_request_count=1, identity=N(step=step))
+            M.validate_eagle_single_request_graph_stage(owner, inputs, first=first, n=1, tokens=tokens, ordinal=ordinal)
+            inputs.identity.step = 7
+            with self.assertRaises(NotImplementedError):
+                M.validate_eagle_single_request_graph_stage(
+                    owner, inputs, first=first, n=1, tokens=tokens, ordinal=ordinal
+                )
+
+    def test_window_session_stays_on_its_existing_stronger_stage_path(self):
+        owner, _ = objects()
+        manager, seen = self.manager(owner, session=object())
+        self.assertEqual(self.run_actual(manager, N(num_reqs=1, num_tokens=1)), "window-result")
+        self.assertEqual([v[0] for v in seen], ["window"])
+
+    def test_unscoped_and_real_source_dummy_keep_legacy_behavior(self):
+        for owner in (
+            N(),
+            N(
+                _draft_graph_review_limit=M.EagleSingleRequestReviewScope(max_model_len=4096),
+                input_batch=N(is_dummy=True),
+            ),
+        ):
+            manager, seen = self.manager(owner)
+            self.assertEqual(self.run_actual(manager, N(num_reqs=4, num_tokens=4)), "legacy-result")
+            self.assertEqual([v[0] for v in seen], ["metadata", "replay"])
+        owner, batch = objects()
+        batch.is_dummy = False
+        batch.num_reqs = 2
+        manager, seen = self.manager(owner)
+        with self.assertRaises(NotImplementedError):
+            self.run_actual(manager, N(num_reqs=1, num_tokens=1))
+        self.assertEqual(seen, [])
+
+
 def eagle_graph_protocol():
     """Execute actual Source ownership methods with no framework/device import."""
     import dataclasses

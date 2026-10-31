@@ -163,6 +163,18 @@ class AutoRegressiveAclGraphManager(SpeculatorCudaGraphManager):
         session = getattr(self.speculator, "_eagle3_graph_session", None)
         if session is not None and self.speculator._eagle3_window_is_active():
             return self._run_eagle_window_fullgraph(desc, session)
+        # Without a Window session the ordinary graph still needs the finite
+        # review's real consumer shape. Target input padding alone does not
+        # constrain the AR graph bucket selected by the fixed core dispatcher.
+        # Source-created dummy/profile batches retain their original behavior.
+        if getattr(getattr(self.speculator, "input_batch", None), "is_dummy", False) is not True:
+            from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import (
+                validate_eagle_single_request_graph_descriptor,
+            )
+
+            validate_eagle_single_request_graph_descriptor(
+                self.speculator, first=self.is_draft_model_prefill, n=desc.num_reqs, tokens=desc.num_tokens
+            )
         num_tokens = desc.num_tokens
         logger.info_once(
             "ACL graph replay is active for the V2 draft model (%s, logged once per phase).",

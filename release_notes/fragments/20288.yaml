@@ -14,3 +14,5 @@ entries:
     text: Replaced the controlled single-request Eagle Graph review entry's fixed prompt and output whitelist with model-capacity checks for Window OFF and W1024. Checkpoint, topology, actual-row and capture-shape protections remain in effect; device qualification is reported separately.
   - category: bugfix
     text: Replaced the Full8 single-request Graph review's exact prompt/output whitelist with checked model and allocated-capacity bounds for additional Window OFF or W32768 ON. Static TP4/DP1, actual1/padded1/Q8 and preemption/identity protections remain; new lengths require separate qualification and multiple-request failures stay blocked.
+  - category: bugfix
+    text: Reject unsupported padded Eagle3 Graph consumer descriptors before replay in the explicit single-request review, including Window OFF.

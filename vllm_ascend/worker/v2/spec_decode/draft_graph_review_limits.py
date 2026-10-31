@@ -229,16 +229,26 @@ def validate_eagle_single_request_review_exact(owner, input_batch, exact, *, num
         raise NotImplementedError("Eagle consumer exact length is outside its request and model capacity")
 
 
-def validate_eagle_single_request_graph_stage(owner, inputs, *, first, n, tokens, ordinal):
+def validate_eagle_single_request_graph_descriptor(owner, *, first, n, tokens):
+    """Check the executed Graph shape, including Window OFF consumers."""
     scope = getattr(owner, "_draft_graph_review_limit", None)
     if not isinstance(scope, EagleSingleRequestReviewScope):
         return
     _eagle_single_request_row(owner, owner.input_batch)
+    if type(first) is not bool or type(n) is not int or type(tokens) is not int:
+        raise TypeError("Eagle review requires exact Graph descriptor types")
+    if n != 1 or tokens != (4 if first else 1):
+        raise NotImplementedError("Eagle review Graph requires padded1 first Q4 or AR Q1 before replay")
+
+
+def validate_eagle_single_request_graph_stage(owner, inputs, *, first, n, tokens, ordinal):
+    scope = getattr(owner, "_draft_graph_review_limit", None)
+    if not isinstance(scope, EagleSingleRequestReviewScope):
+        return
+    validate_eagle_single_request_graph_descriptor(owner, first=first, n=n, tokens=tokens)
     if (
         inputs.actual_request_count != 1
         or inputs.padded_request_count != 1
-        or n != 1
-        or tokens != (4 if first else 1)
         or ordinal not in ((0,) if first else (0, 1))
         or inputs.identity.step != (0 if first else ordinal + 1)
     ):
