@@ -381,5 +381,11 @@ def report_owner_draft_native_attention(owner: Any, logger: Any) -> DraftNativeA
         provider_routes=routes,
         certified_native_windows=_get(runtime, "native_swa_intersections"),
     )
-    require_known_draft_native_attention(inventory, window_size=window, graph_requested=graph_requested)
+    # Detection must not turn an original Window-OFF Graph route (for example
+    # built-in MTP) into a newly rejected configuration. Additional Window
+    # owners always need the contract; DFlash2 Graph is itself new admission
+    # in this change and needs it even when the additional Window is OFF.
+    architectures = _get(_get(_get(owner, "draft_model_config"), "hf_config"), "architectures", ()) or ()
+    new_dflash2_graph = graph_requested and tuple(architectures) == ("DFlash2DraftModel",)
+    require_known_draft_native_attention(inventory, window_size=window, graph_requested=new_dflash2_graph)
     return inventory

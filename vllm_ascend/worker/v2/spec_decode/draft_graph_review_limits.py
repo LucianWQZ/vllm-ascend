@@ -35,14 +35,13 @@ def validate_eagle_single_request_review_config(vllm_config, *, experimental_gra
     additional = vllm_config.additional_config or {}
     draft_parallel = getattr(speculative, "draft_parallel_config", None)
     mode = getattr(vllm_config.compilation_config.cudagraph_mode, "name", None)
-    # init_ascend_config validates before derive_and_validate normalizes the
-    # disabled FlashComm backend; EngineCore validates the normalized config
-    # again. Both exact phases describe the same already-qualified topology.
+    # Fixed vLLM544 ParallelConfig.use_sequence_parallel_moe also requires
+    # DP>1. This finite DP1 route therefore has SP=False both before Ascend
+    # normalization (allgather_reducescatter) and after it (flashinfer_all2allv).
+    # The old a982 mock's initial SP=True is not a legitimate 544 DP1 phase.
     target_backend = getattr(parallel, "all2all_backend", None)
     target_sp = getattr(parallel, "use_sequence_parallel_moe", None)
-    qualified_target_phase = (target_backend == "allgather_reducescatter" and target_sp is True) or (
-        target_backend == "flashinfer_all2allv" and target_sp is False
-    )
+    qualified_target_phase = target_backend in ("allgather_reducescatter", "flashinfer_all2allv") and target_sp is False
     if (
         experimental_graph_review is not True
         or speculative is None
@@ -72,7 +71,7 @@ def validate_eagle_single_request_review_config(vllm_config, *, experimental_gra
     ):
         raise ValueError(
             "Eagle single-request review requires static K3/W1024, TP4/DP1/PP1/PCP1/DCP1, "
-            "the qualified Ascend Target EP/SP topology, FULL_DECODE_ONLY, "
+            "the qualified Ascend Target EP topology with SP off, FULL_DECODE_ONLY, "
             "non-async/no-prefix/non-adaptive and the experimental Graph gate; "
             f"actual={{'gate': {experimental_graph_review!r}, 'method': {getattr(speculative, 'method', None)!r}, "
             f"'eager': {getattr(speculative, 'enforce_eager', None)!r}, "
@@ -274,7 +273,7 @@ def resolve_draft_graph_review_limit(vllm_config, *, experimental_graph_review=F
         "additional_config.draft_window_graph_eagle_single_request_review",
     )
     if finite_review:
-        validate_eagle_single_request_review_config(
+        finite_scope = validate_eagle_single_request_review_config(
             vllm_config,
             experimental_graph_review=experimental_graph_review,
         )
@@ -306,12 +305,9 @@ def resolve_draft_graph_review_limit(vllm_config, *, experimental_graph_review=F
     if finite_review:
         if speculative.method != "eagle3" or digest != _EAGLE_CONFIG:
             raise NotImplementedError("Eagle single-request review requires its fixed checkpoint configuration")
-        raise NotImplementedError(
-            "This Eagle3 checkpoint's ordinary single-request Draft Graph qualification "
-            "on the PR017/vLLM544 pair is incomplete, so this entry is not open. "
-            "The explicit private numerical diagnostic and independently supported "
-            "typed Draft eager route remain available; no fallback is selected."
-        )
+        # A bounded ordinary qualification entry, not an unrestricted product
+        # PASS. Actual request/exact/stage guards below retain this scope.
+        return finite_scope
     diagnostic = additional.get("draft_window_graph_numeric_diagnostic", False)
     if type(diagnostic) is not bool:
         raise TypeError("draft_window_graph_numeric_diagnostic must be a boolean")

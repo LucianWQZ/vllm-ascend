@@ -100,6 +100,25 @@ category is identified from normalized model configuration, including Ascend's
 V4.1 architecture normalization. This disables only the window; the original
 speculative method is still constructed.
 
+### Bounded Eagle ordinary qualification
+
+The fixed Eagle checkpoint has an explicit single-request review entry behind
+`VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH=1` and
+`draft_window_graph_eagle_single_request_review=true`. It is a qualification
+entry, not a product support or service-PASS declaration. The exact existing
+config guard remains required: TP4/DP1/PP1/PCP1/DCP1, static K3/W1024,
+FULL_DECODE_ONLY, the reviewed Target EP topology with SP off, non-async, no prefix,
+FlashComm or legacy DSA-CP. The runtime also requires actual/padded rows 1/1,
+prompt lengths 257 or 2051 and an output limit of 32, with no preemption
+resumption. Other checkpoint identities and the default ordinary entry stay
+closed; the private numerical diagnostic flag cannot admit this service entry.
+
+Ordinary service execution and normal reader completion remain to be qualified
+separately from the comparable-state numeric/Full-write and Target
+noninterference checks. Existing multiple-request failures are retained;
+this entry does not qualify multi-request shapes, business quality,
+performance, release approval or the public Graph gate.
+
 ### Canonical reads and method phases
 
 `DirectPrefixSource` borrows `AscendBlockTables.block_tables[gid].gpu` and

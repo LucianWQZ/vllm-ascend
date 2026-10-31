@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import ast
+import copy
+import importlib.util
 import runpy
 import sys
 import tempfile
@@ -201,11 +203,11 @@ class ReviewBoundaryControls(unittest.TestCase):
             self.config.speculative_config.enforce_eager = True
             self.assertIsNone(self.resolve(self.config))
 
-    def test_eagle_finite_ordinary_entry_stays_closed_on_unqualified_pair(self):
+    def test_eagle_finite_ordinary_entry_is_an_exact_qualification_scope(self):
         self.config.speculative_config.method = "eagle3"
         self.config.speculative_config.num_speculative_tokens = 3
         self.config.parallel_config.all2all_backend = "allgather_reducescatter"
-        self.config.parallel_config.use_sequence_parallel_moe = True
+        self.config.parallel_config.use_sequence_parallel_moe = False
         self.config.additional_config = dict(
             draft_window_size=1024,
             draft_window_graph_replicated_tp_review=True,
@@ -215,27 +217,112 @@ class ReviewBoundaryControls(unittest.TestCase):
         module.resolve_draft_graph_review_limit = self.resolve
         ascend = ModuleType("vllm_ascend")
         ascend.envs = NS(VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH=True)
-        calls = []
+        calls, owner = [], NS()
         factory = actual_function(
             SPEC / "__init__.py",
             "init_speculator",
             {
                 "_resolve_window_policy": lambda config: None,
                 "_use_graph_window_owner": lambda config, policy: False,
-                "_init_speculator": lambda *args: calls.append("construct"),
+                "_init_speculator": lambda *args: calls.append("construct") or owner,
             },
         )
         with self.identified("_EAGLE_CONFIG"):
             with self.assertRaisesRegex(ValueError, "experimental Graph gate"):
                 self.resolve(self.config, experimental_graph_review=False)
-            with self.assertRaisesRegex(NotImplementedError, "PR017/vLLM544 pair is incomplete"):
-                self.resolve(self.config, experimental_graph_review=True)
-            with (
-                patch.dict(sys.modules, {MODULE: module, "vllm_ascend": ascend}),
-                self.assertRaisesRegex(NotImplementedError, "PR017/vLLM544 pair is incomplete"),
+            scope = self.resolve(self.config, experimental_graph_review=True)
+            self.assertIsInstance(scope, GUARD["EagleSingleRequestReviewScope"])
+            self.assertEqual((scope.prompt_lengths, scope.output_tokens, scope.static_k), ((257, 2051), 32, 3))
+            with patch.dict(sys.modules, {MODULE: module, "vllm_ascend": ascend}):
+                self.assertIs(factory(self.config, None), owner)
+            self.assertIsInstance(owner._draft_graph_review_limit, type(scope))
+            self.assertEqual(calls, ["construct"])
+            for prompt in (257, 2051):
+                good = NS(
+                    num_reqs=1,
+                    num_reqs_after_padding=1,
+                    req_ids=["actual"],
+                    idx_mapping_np=[2],
+                    prefill_len_np=[prompt],
+                    draft_graph_review_request_rows=(("actual", 2, prompt, prompt + 32, prompt),),
+                )
+                self.validate(owner, good)
+            for prompt, output in ((513, 32), (257, 64)):
+                wrong_envelope = NS(
+                    num_reqs=1,
+                    num_reqs_after_padding=1,
+                    req_ids=["actual"],
+                    idx_mapping_np=[2],
+                    prefill_len_np=[prompt],
+                    draft_graph_review_request_rows=(("actual", 2, prompt, prompt + output, prompt),),
+                )
+                with self.assertRaisesRegex(NotImplementedError, "prompt257/2051 and max_tokens32"):
+                    self.validate(owner, wrong_envelope)
+            for active, padded in ((2, 2), (2, 4), (1, 2), (1, 4)):
+                with (
+                    self.subTest(active=active, padded=padded),
+                    self.assertRaisesRegex(NotImplementedError, "one actual"),
+                ):
+                    self.validate(owner, NS(num_reqs=active, num_reqs_after_padding=padded))
+            for obj, key, bad in (
+                (self.config.speculative_config, "num_speculative_tokens", 7),
+                (self.config.parallel_config, "tensor_parallel_size", 8),
+                (self.config.parallel_config, "data_parallel_size", 2),
+                (self.config.scheduler_config, "async_scheduling", True),
+                (self.config.cache_config, "enable_prefix_caching", True),
             ):
-                factory(self.config, None)
-            self.assertEqual(calls, [])
+                old = getattr(obj, key)
+                setattr(obj, key, bad)
+                with self.subTest(key=key), self.assertRaises(ValueError):
+                    self.resolve(self.config, experimental_graph_review=True)
+                setattr(obj, key, old)
+            for backend in ("allgather_reducescatter", "flashinfer_all2allv"):
+                self.config.parallel_config.all2all_backend = backend
+                self.assertIsInstance(self.resolve(self.config, experimental_graph_review=True), type(scope))
+                self.config.parallel_config.use_sequence_parallel_moe = True
+                with self.assertRaises(ValueError):
+                    self.resolve(self.config, experimental_graph_review=True)
+                self.config.parallel_config.use_sequence_parallel_moe = False
+            self.config.additional_config["draft_window_graph_numeric_diagnostic"] = True
+            with self.assertRaises(ValueError):
+                self.resolve(self.config, experimental_graph_review=True)
+            del self.config.additional_config["draft_window_graph_numeric_diagnostic"]
+        # Same name/configuration is insufficient without the exact checkpoint
+        # digest. The default, unflagged entry is still tested as fail closed.
+        with self.assertRaisesRegex(NotImplementedError, "fixed checkpoint"):
+            self.resolve(self.config, experimental_graph_review=True)
+
+    def test_fixed_vllm544_actual_sp_property_keeps_both_dp1_phases_off(self):
+        # Locate only; importing vLLM would defeat this guard-only protocol.
+        spec = importlib.util.find_spec("vllm")
+        if spec is None or spec.origin is None:
+            self.skipTest("actual vLLM Source is not on this Host interpreter's search path")
+        path = Path(spec.origin).parent / "config/parallel.py"
+        tree = ast.parse(path.read_text())
+        cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "ParallelConfig")
+        predicate = copy.deepcopy(
+            next(
+                node
+                for node in cls.body
+                if isinstance(node, ast.FunctionDef) and node.name == "use_sequence_parallel_moe"
+            )
+        )
+        predicate.decorator_list = []
+        namespace = {}
+        exec(
+            compile(ast.fix_missing_locations(ast.Module(body=[predicate], type_ignores=[])), str(path), "exec"),
+            namespace,
+        )
+        actual_sp = namespace["use_sequence_parallel_moe"]
+        for backend in ("allgather_reducescatter", "flashinfer_all2allv"):
+            config = NS(
+                all2all_backend=backend, enable_expert_parallel=True, tensor_parallel_size=4, data_parallel_size=1
+            )
+            self.assertIs(actual_sp(config), False)
+        # The actual DP predicate is active, not a constant stand-in.
+        config.data_parallel_size = 2
+        config.all2all_backend = "allgather_reducescatter"
+        self.assertIs(actual_sp(config), True)
 
     def test_explicit_existing_numeric_diagnostic_retains_original_interface(self):
         for method, checkpoint in (
