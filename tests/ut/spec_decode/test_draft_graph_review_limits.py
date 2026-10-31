@@ -137,11 +137,18 @@ class ReviewBoundaryControls(unittest.TestCase):
     def test_full8_shared_config_rejects_unqualified_scheduling_before_constructor(self):
         validate = GUARD["validate_full8_single_request_review_config"]
         validate(self.config)
+        self.config.scheduler_config.async_scheduling = True
+        self.config.cache_config.enable_prefix_caching = True
+        self.config.additional_config["enable_flashcomm1"] = True
+        validate(self.config)
+        self.config.scheduler_config.async_scheduling = False
+        self.config.cache_config.enable_prefix_caching = False
+        del self.config.additional_config["enable_flashcomm1"]
         cases = (
             (self.config.scheduler_config, "max_num_seqs", 2),
             (self.config.scheduler_config, "max_num_seqs", True),
-            (self.config.scheduler_config, "async_scheduling", True),
-            (self.config.cache_config, "enable_prefix_caching", True),
+            (self.config.scheduler_config, "async_scheduling", 1),
+            (self.config.cache_config, "enable_prefix_caching", 1),
             (self.config.parallel_config, "tensor_parallel_size", 8),
             (self.config.parallel_config, "data_parallel_size", 2),
             (self.config.parallel_config, "pipeline_parallel_size", 2),
@@ -157,7 +164,7 @@ class ReviewBoundaryControls(unittest.TestCase):
             with self.subTest(key=key, bad=bad), self.assertRaises(NotImplementedError):
                 validate(self.config)
             setattr(obj, key, original)
-        for key, bad in (("draft_window_size", 1024), ("enable_dsa_cp", True), ("enable_flashcomm1", True)):
+        for key, bad in (("draft_window_size", 1024), ("enable_dsa_cp", True), ("enable_flashcomm1", 1)):
             old = self.config.additional_config.copy()
             self.config.additional_config[key] = bad
             with self.subTest(key=key), self.assertRaises(NotImplementedError):
@@ -319,6 +326,16 @@ class ReviewBoundaryControls(unittest.TestCase):
             scope = self.resolve(self.config, experimental_graph_review=True)
             self.assertIsInstance(scope, GUARD["EagleSingleRequestReviewScope"])
             self.assertEqual((scope.max_model_len, scope.static_k), (4096, 3))
+            self.config.scheduler_config.async_scheduling = True
+            self.config.cache_config.enable_prefix_caching = True
+            self.config.additional_config["enable_flashcomm1"] = True
+            self.assertIsInstance(self.resolve(self.config, experimental_graph_review=True), type(scope))
+            self.config.scheduler_config.async_scheduling = False
+            self.config.cache_config.enable_prefix_caching = False
+            self.config.additional_config["enable_flashcomm1"] = 1
+            with self.assertRaises(ValueError):
+                self.resolve(self.config, experimental_graph_review=True)
+            del self.config.additional_config["enable_flashcomm1"]
             with patch.dict(sys.modules, {MODULE: module, "vllm_ascend": ascend}):
                 self.assertIs(factory(self.config, None), owner)
             self.assertIsInstance(owner._draft_graph_review_limit, type(scope))
@@ -354,8 +371,8 @@ class ReviewBoundaryControls(unittest.TestCase):
                 (self.config.speculative_config, "num_speculative_tokens", 7),
                 (self.config.parallel_config, "tensor_parallel_size", 8),
                 (self.config.parallel_config, "data_parallel_size", 2),
-                (self.config.scheduler_config, "async_scheduling", True),
-                (self.config.cache_config, "enable_prefix_caching", True),
+                (self.config.scheduler_config, "async_scheduling", 1),
+                (self.config.cache_config, "enable_prefix_caching", 1),
             ):
                 old = getattr(obj, key)
                 setattr(obj, key, bad)

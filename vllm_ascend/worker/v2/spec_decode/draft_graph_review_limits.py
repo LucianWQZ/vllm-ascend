@@ -43,6 +43,9 @@ def validate_eagle_single_request_review_config(vllm_config, *, experimental_gra
     # flashinfer backend makes it False. Accept only these two exact phases.
     # Dense Draft EP is disabled by core544's create_draft_parallel_config;
     # its captured read geometry must remain independently non-SP.
+    # Async/prefix/FlashComm are executor or resident-source dimensions, not
+    # evidence of a new Draft row shape. Their actual values remain in the
+    # Graph fingerprint; this finite entry is still separately qualified.
     target_backend = getattr(parallel, "all2all_backend", None)
     target_sp = getattr(parallel, "use_sequence_parallel_moe", None)
     qualified_target_phase = (target_backend == "allgather_reducescatter" and target_sp is True) or (
@@ -68,9 +71,9 @@ def validate_eagle_single_request_review_config(vllm_config, *, experimental_gra
         or getattr(parallel, "enable_expert_parallel", False) is not True
         or not qualified_target_phase
         or additional.get("enable_dsa_cp", False) is not False
-        or additional.get("enable_flashcomm1", False) is not False
-        or scheduler.async_scheduling is not False
-        or cache.enable_prefix_caching is not False
+        or type(additional.get("enable_flashcomm1", False)) is not bool
+        or type(scheduler.async_scheduling) is not bool
+        or type(cache.enable_prefix_caching) is not bool
         or mode != "FULL_DECODE_ONLY"
         or requested_window not in (None, 1024)
         or (requested_window is not None and type(requested_window) is not int)
@@ -84,7 +87,7 @@ def validate_eagle_single_request_review_config(vllm_config, *, experimental_gra
             "Eagle single-request review requires static K3 with Window OFF or W1024, "
             "a positive configured model capacity, TP4/DP1/PP1/PCP1/DCP1, "
             "the qualified Ascend Target EP/SP initialization phases and non-SP dense Draft, FULL_DECODE_ONLY, "
-            "non-async/no-prefix/non-adaptive and the experimental Graph gate; "
+            "boolean Async/prefix/FlashComm settings, non-adaptive and the experimental Graph gate; "
             f"actual={{'gate': {experimental_graph_review!r}, 'method': {getattr(speculative, 'method', None)!r}, "
             f"'eager': {getattr(speculative, 'enforce_eager', None)!r}, "
             f"'K': {getattr(speculative, 'num_speculative_tokens', None)!r}, "
@@ -299,6 +302,9 @@ def validate_full8_single_request_review_config(vllm_config):
     # Core544's Draft descriptor is TP-only (DP1). Actual DP2 replicas live
     # in the parent engines/groups; every replica keeps this same local n1
     # request and Q8/capture contract, including the existing idle-DP scope.
+    # The existing Graph owner serializes its current-stream bank updates;
+    # prefix rows retain canonical Full cache ownership. Enabling a feature
+    # does not broaden the actual1/padded1 descriptor or model-capacity guard.
     draft_dp = getattr(speculative.draft_parallel_config, "data_parallel_size", None)
     if (
         any(type(size) is not int for size in sizes)
@@ -311,18 +317,18 @@ def validate_full8_single_request_review_config(vllm_config):
         or speculative.uses_dynamic_speculative_decoding()
         or type(scheduler.max_num_seqs) is not int
         or scheduler.max_num_seqs != 1
-        or scheduler.async_scheduling is not False
-        or vllm_config.cache_config.enable_prefix_caching is not False
+        or type(scheduler.async_scheduling) is not bool
+        or type(vllm_config.cache_config.enable_prefix_caching) is not bool
         or additional.get("draft_window_size") not in (None, 32768)
         or additional.get("enable_dsa_cp", False) is not False
-        or additional.get("enable_flashcomm1", False) is not False
+        or type(additional.get("enable_flashcomm1", False)) is not bool
         or getattr(vllm_config.compilation_config.cudagraph_mode, "name", None) != "FULL_DECODE_ONLY"
     ):
         raise NotImplementedError(
             "This Full8 checkpoint's temporary Draft Graph review permits only static K7, Window OFF or W32768, "
             "TP4/DP1-or-2/PP1/PCP1/DCP1 with EP, one request per DP replica, "
             "max_num_seqs=1, FULL_DECODE_ONLY, "
-            "non-async/no-prefix/no-DSA-CP/no-FlashComm. Use that single-request configuration "
+            "boolean Async/prefix/FlashComm settings and no DSA-CP. Use that single-request configuration "
             "or the independently supported Draft eager route; no fallback is selected."
         )
     _full8_review_capacity(vllm_config)

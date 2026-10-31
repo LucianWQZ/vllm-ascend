@@ -19,4 +19,6 @@ entries:
   - category: bugfix
     text: Connected the identified Full8 and Eagle single-request Graph review contracts to ordinary Window OFF startup. Checkpoint, topology, capacity and capture protections still apply; the review flags do not imply device qualification.
   - category: feature
-    text: Added an explicit Full8 TP4/DP2 single-request-per-replica Graph review entry, retaining max_num_seqs=1, actual1/padded1/Q8 and the existing idle-replica protocol. Async and prefix remain blocked; device qualification is separate.
+    text: Added an explicit Full8 TP4/DP2 single-request-per-replica Graph review entry, retaining max_num_seqs=1, actual1/padded1/Q8 and the existing idle-replica protocol. Combined-feature device qualification is separate.
+  - category: feature
+    text: Connected boolean Async, prefix-cache and Target FlashComm settings to the checkpoint-scoped single-request Full8 and Eagle Graph review entries. Existing Graph ownership, resident canonical KV and actual-row/capacity protections remain; combined-feature model execution is qualified separately, without enabling DSA-CP.
