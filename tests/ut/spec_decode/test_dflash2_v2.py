@@ -313,7 +313,7 @@ def test_eager_speculator_keeps_target_compilation_and_graph_config():
     assert config.compilation_config.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY
 
 
-def test_init_cudagraph_manager_requires_enforce_eager(monkeypatch):
+def test_eager_cudagraph_manager_keeps_none_without_graph_owner(monkeypatch):
     calls: list[CUDAGraphMode] = []
     monkeypatch.setattr(
         "vllm_ascend.worker.v2.spec_decode.dflash.speculator.AscendDFlashSpeculator.init_cudagraph_manager",
@@ -326,12 +326,115 @@ def test_init_cudagraph_manager_requires_enforce_eager(monkeypatch):
     speculator.init_cudagraph_manager(CUDAGraphMode.FULL_DECODE_ONLY)
     assert calls == [CUDAGraphMode.NONE]
 
-    # Graph mode is rejected until the Ascend walk kernel is capturable, and
-    # must fail before delegating to the parent manager.
+    assert not hasattr(speculator, "_dflash2_graph_contract")
+
+
+@pytest.mark.parametrize("existing_contract", [False, True])
+def test_graph_manager_admits_real_selector_binding_and_owned_contract(monkeypatch, existing_contract):
+    import vllm.v1.worker.gpu.spec_decode.dflash2.speculator as upstream
+
+    from vllm_ascend import envs
+    from vllm_ascend.worker.v2.spec_decode import draft_window_dflash2_graph as contract_module
+
+    contract = MagicMock()
+    bind = MagicMock(return_value=contract)
+    config_check = MagicMock()
+    monkeypatch.setattr(contract_module, "validate_dflash2_graph_source", bind)
+    monkeypatch.setattr(contract_module, "validate_dflash2_graph_config", config_check)
+    monkeypatch.setattr(envs, "VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH", True)
+    monkeypatch.setattr(upstream, "_selector_walk_kernel", _selector_walk_kernel_ascend)
+    calls = []
+
+    def parent(actual, mode):
+        calls.append(mode)
+        actual.query_cudagraph_manager = SimpleNamespace(cudagraph_mode=mode)
+
+    monkeypatch.setattr(AscendDFlashSpeculator, "init_cudagraph_manager", parent)
+    speculator = AscendDFlash2Speculator.__new__(AscendDFlash2Speculator)
     speculator.speculative_config = SimpleNamespace(enforce_eager=False)
-    with pytest.raises(NotImplementedError, match="graph mode"):
+    speculator.vllm_config = object()
+    if existing_contract:
+        speculator._dflash2_graph_contract = contract
+    speculator.init_cudagraph_manager(CUDAGraphMode.FULL_DECODE_ONLY)
+    assert calls == [CUDAGraphMode.FULL_DECODE_ONLY]
+    assert speculator._dflash2_graph_contract is contract
+    config_check.assert_called_once_with(speculator.vllm_config)
+    if existing_contract:
+        contract.validate_owner.assert_called_once_with(speculator)
+        bind.assert_not_called()
+    else:
+        bind.assert_called_once_with(speculator)
+
+
+def test_graph_manager_rejects_cuda_walk_or_eager_fallback(monkeypatch):
+    import vllm.v1.worker.gpu.spec_decode.dflash2.speculator as upstream
+
+    from vllm_ascend import envs
+    from vllm_ascend.worker.v2.spec_decode import draft_window_dflash2_graph as contract_module
+
+    monkeypatch.setattr(envs, "VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH", True)
+    monkeypatch.setattr(contract_module, "validate_dflash2_graph_config", MagicMock())
+    speculator = AscendDFlash2Speculator.__new__(AscendDFlash2Speculator)
+    speculator.speculative_config = SimpleNamespace(enforce_eager=False)
+    speculator.vllm_config = object()
+    speculator._dflash2_graph_contract = MagicMock()
+    calls = []
+
+    def parent(actual, mode):
+        calls.append(mode)
+        actual.query_cudagraph_manager = SimpleNamespace(cudagraph_mode=CUDAGraphMode.NONE)
+
+    monkeypatch.setattr(AscendDFlashSpeculator, "init_cudagraph_manager", parent)
+    monkeypatch.setattr(upstream, "_selector_walk_kernel", object())
+    with pytest.raises(RuntimeError, match="selector-walk kernel binding"):
         speculator.init_cudagraph_manager(CUDAGraphMode.FULL_DECODE_ONLY)
-    assert calls == [CUDAGraphMode.NONE]
+    assert calls == []
+    monkeypatch.setattr(upstream, "_selector_walk_kernel", _selector_walk_kernel_ascend)
+    with pytest.raises(NotImplementedError, match="no eager fallback"):
+        speculator.init_cudagraph_manager(CUDAGraphMode.FULL_DECODE_ONLY)
+    assert calls == [CUDAGraphMode.FULL_DECODE_ONLY]
+
+
+@pytest.mark.parametrize("mode", [CUDAGraphMode.FULL, CUDAGraphMode.FULL_DECODE_ONLY])
+def test_window_off_graph_cannot_bypass_experimental_gate(monkeypatch, mode):
+    from vllm_ascend import envs
+
+    monkeypatch.setattr(envs, "VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH", False)
+    parent = MagicMock()
+    monkeypatch.setattr(AscendDFlashSpeculator, "init_cudagraph_manager", parent)
+    speculator = AscendDFlash2Speculator.__new__(AscendDFlash2Speculator)
+    speculator.speculative_config = SimpleNamespace(enforce_eager=False)
+    with pytest.raises(ValueError, match="including Window OFF"):
+        speculator.init_cudagraph_manager(mode)
+    parent.assert_not_called()
+
+
+@pytest.mark.parametrize("mode", [CUDAGraphMode.NONE, CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL_AND_PIECEWISE])
+def test_unqualified_graph_modes_are_not_called_supported(monkeypatch, mode):
+    from vllm_ascend import envs
+
+    monkeypatch.setattr(envs, "VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH", True)
+    parent = MagicMock()
+    monkeypatch.setattr(AscendDFlashSpeculator, "init_cudagraph_manager", parent)
+    speculator = AscendDFlash2Speculator.__new__(AscendDFlash2Speculator)
+    speculator.speculative_config = SimpleNamespace(enforce_eager=False)
+    with pytest.raises(NotImplementedError, match="first admits FULL/FULL_DECODE_ONLY"):
+        speculator.init_cudagraph_manager(mode)
+    parent.assert_not_called()
+
+
+def test_capture_delegates_virtual_dflash2_forward_and_checks_same_owner(monkeypatch):
+    speculator = AscendDFlash2Speculator.__new__(AscendDFlash2Speculator)
+    speculator._dflash2_graph_contract = MagicMock()
+    calls = []
+    monkeypatch.setattr(AscendDFlashSpeculator, "capture", lambda actual: calls.append(actual))
+    speculator.capture()
+    assert calls == [speculator]
+    assert speculator._dflash2_graph_contract.validate_owner.call_count == 2
+    assert all(
+        call.args == (speculator,) and not call.kwargs
+        for call in speculator._dflash2_graph_contract.validate_owner.call_args_list
+    )
 
 
 @pytest.mark.parametrize("selector_fails", [False, True])

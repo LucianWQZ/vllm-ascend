@@ -118,12 +118,13 @@ def _use_graph_window_owner(vllm_config: VllmConfig, policy: DraftWindowPolicyDe
     graph_requested = speculative.enforce_eager is not True
     eager_review = get_ascend_config().draft_window_parallel_eager_review
     if "DFlash2DraftModel" in speculative.draft_model_config.architectures:
-        if graph_requested or eager_review:
+        if eager_review:
             raise NotImplementedError(
-                "DFlash2 Draft Window Graph and Graph-owner eager review are not supported; "
-                "retain the certified typed Draft eager path. Target graph mode is independent."
+                "DFlash2 matching eager uses its ordinary typed Draft eager path, "
+                "not the Graph-owner eager review control. Target Graph is independent."
             )
-        return False
+        if not graph_requested:
+            return False
     if not graph_requested and not eager_review:
         return False
     from vllm_ascend import envs

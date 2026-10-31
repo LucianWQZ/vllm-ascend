@@ -20,6 +20,7 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_lifetime import (
     DraftWindowOwner,
     DraftWindowOwnerPool,
 )
+from vllm_ascend.worker.v2.spec_decode.draft_window_native_attention import report_draft_native_attention
 from vllm_ascend.worker.v2.spec_decode.draft_window_plan import (
     DraftWindowPlan,
     compute_draft_window_plan,
@@ -120,25 +121,12 @@ class DraftWindowRuntime:
         self._eagle_prompt_exact_base: tuple[Any, torch.Tensor] | None = None
         self._next_step = 0
         self._proposal_mapping: tuple[tuple[str, ...], tuple[int, ...]] | None = None
-        narrowed_native_windows = tuple(
-            sorted(
-                {
-                    native_window
-                    for native_window in self.native_swa_intersections.values()
-                    if self.window_size < native_window
-                }
-            )
+        report_draft_native_attention(
+            speculator,
+            logger=logger,
+            window_size=self.window_size,
+            certified_native_windows=self.native_swa_intersections,
         )
-        if narrowed_native_windows:
-            logger.warning_once(
-                "The Draft model contains native SWA layers with windows %s. "
-                "The additional draft_window_size=%s narrows those layers and may reduce "
-                "acceptance or throughput. Prefer the native window by default and "
-                "enable an additional window only after measuring your workload.",
-                narrowed_native_windows,
-                self.window_size,
-                scope="global",
-            )
 
     @property
     def reads_active(self) -> bool:

@@ -529,8 +529,8 @@ Top-K, selector, path walk and realized-probability cache. The final owner
 event follows these consumers; their algorithm and probability semantics
 are not replaced by ordinary DFlash. Window OFF returns before creating a
 Window policy runtime, and keeps the baseline DFlash2 dispatch and checks.
-An enabled Window rejects unknown DFlash architectures and a non-eager
-Draft during initialization. Target Graph selection remains independent.
+An enabled Window rejects unknown DFlash architectures during initialization.
+Target Graph selection remains independent.
 
 A supported DFlash2 checkpoint can explicitly declare `is_causal=False` while
 using native `SlidingWindowSpec` layers. Its attention remains symmetric SWA:
@@ -553,8 +553,44 @@ read table, but retains this necessary model-native SWA/cache correction.
 The noncausal Window provider remains restricted to native-only DFlash2 groups
 with `W + B - 1 + Q <= P`, where B is the kernel-column span and Q is the prepared
 query width. Current exact lengths, request rows and generation still certify
-each fresh read. Unknown architectures, unsupported providers and Draft Graph
-with Window ON are rejected. Target Graph remains independent.
+each fresh read. Unknown architectures and unsupported providers are rejected.
+Target Graph remains independent.
+
+### Experimental DFlash2 Draft Graph
+
+The default-off `VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH=1` review gate
+also controls DFlash2 Graph with the additional Window OFF. The first admitted
+implementation is static K7/Q8 with Target/Draft TP2, DP1, and
+`FULL`/`FULL_DECODE_ONLY` Graph modes. It excludes SP, FlashComm and CP variants
+until separately qualified. Set speculative `enforce_eager=true` for the
+ordinary typed eager implementation; no implicit eager fallback is used.
+
+The existing DFlash2 `_generate_draft` remains the captured computation: Draft
+forward and convolution, candidate Top-K, selector, Ascend path walk and
+probability-cache writes. Request preparation, metadata and CPU scheduling stay
+outside capture. Stable model, selector, sampler, mask and input addresses are
+validated before submission. The shared Graph source banks and completion
+dependencies own projected read metadata; an eager runtime is not created in
+parallel. Full KV writes, absolute positions, canonical tables and Target state
+retain their original meaning. Context-only writes retain their existing
+completion owner even when there is no proposal attention.
+
+Full-retention storage preserves the actual native attention window. The
+noncausal Graph FIA call uses the same compressed mask and symmetric P-1
+pre/next distances as the ordinary DFlash2 path. The ON provider checks its
+actual kernel-column span B and the original `W + B - 1 + Q <= P` boundary.
+Source admission and Host checks are not device qualification: consult the
+candidate's model, topology, shape and normal-service evidence before enabling
+this experimental route.
+
+At startup, both execution modes report the Draft's loaded attention structure:
+Full, native SWA, mixed, or unknown. This combines supported architecture
+semantics, normalized/raw Draft configuration and actual attention consumers;
+the Target and retained KV allocation spec do not determine the result.
+An explicitly requested Window narrowing native SWA emits one startup warning.
+Unknown or conflicting semantics reject an unqualified extra Window/Graph
+combination, without rejecting the original Window-OFF eager path. No Window
+is automatically enabled and no performance benefit is promised.
 
 The verified BF16 Qwen DFlash2 deployment has five native P2048 layers and runs
 TP2 with K7/Q8 and optional W1024. With the same 8 GiB/rank KV budget, retaining

@@ -208,6 +208,49 @@ def test_graph_workspace_and_task_preserve_fia_layout_contract(v2, use_pa):
     assert num_tokens == 3
 
 
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("native_window", [128, 2048])
+def test_dflash2_graph_preserves_noncausal_native_window(causal, native_window):
+    impl = _make_impl()
+    impl.sliding_window = native_window
+    native_mask = torch.zeros(8, 8, dtype=torch.int8)
+    impl._dflash2_native_swa_mask = native_mask
+    metadata = _make_metadata(AscendAttentionState.DecodeOnly)
+    metadata.causal = causal
+    metadata.attn_mask = torch.ones(8, 8, dtype=torch.int8)
+    backing = torch.arange(48, dtype=torch.float32).view(2, 2, 3, 1, 4)
+    impl.key_cache, impl.value_cache = backing[:, 0], backing[:, 1]
+    query = torch.zeros(3, 2, 4)
+    with (
+        patch.object(attn_module, "_EXTRA_CTX", SimpleNamespace(is_draft_model=True)),
+        patch.object(attn_module.torch_npu, "npu_fused_infer_attention_score", create=True),
+        patch.object(attn_module.torch_npu, "_npu_fused_infer_attention_score_get_max_workspace", create=True) as ws,
+        patch.object(attn_module, "get_capture_resource", side_effect=lambda _, factory, *args: factory()),
+        patch.object(attn_module, "register_task") as register,
+    ):
+        impl.full_graph_fia(query, query, query, metadata, torch.empty_like(query))
+    task_kwargs = register.call_args.args[1]
+    for kwargs in (ws.call_args.kwargs, task_kwargs):
+        assert kwargs["sparse_mode"] == 4
+        assert kwargs["atten_mask"] is (metadata.attn_mask if causal else native_mask)
+        assert kwargs["pre_tokens"] == (native_window if causal else native_window - 1)
+        assert kwargs["next_tokens"] == (0 if causal else native_window - 1)
+    # UPDATE changes only the current read operands. It must retain the same
+    # native mask and symmetric pre/next captured for this method.
+    update = register.call_args.args[2].resolve({"layer": metadata})
+    assert not {"pre_tokens", "next_tokens", "atten_mask", "sparse_mode"}.intersection(update)
+
+
+def test_dflash2_graph_rejects_mask_without_native_window():
+    impl = _make_impl()
+    impl._dflash2_native_swa_mask = torch.zeros(8, 8, dtype=torch.int8)
+    metadata = _make_metadata()
+    metadata.causal = False
+    query = torch.zeros(3, 2, 4)
+    with pytest.raises(RuntimeError, match="positive native window"):
+        impl.full_graph_fia(query, query, query, metadata, torch.empty_like(query))
+
+
 @pytest.mark.parametrize("continuing_prefill", [False, True])
 def test_c8_chunked_non_pa_prefill_receives_contiguous_kv(continuing_prefill):
     impl = _make_impl(AscendC8AttentionBackendImpl)

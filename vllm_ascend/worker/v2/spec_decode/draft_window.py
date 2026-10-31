@@ -151,6 +151,9 @@ class DraftWindowGroupInventory:
     # This value comes from the actual metadata-builder instance, not a model
     # name or backend-class guess.
     drafting_compression_ratio: int | None = None
+    # Native attention is independent of Full KV retention/direct addressing.
+    # A noncausal DFlash2 Graph source can retain a native band on this layout.
+    native_window: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,6 +167,7 @@ class DraftWindowInventory:
     groups: tuple[DraftWindowGroupInventory, ...]
     empty_global_group_ids: tuple[int, ...]
     capability_failures: tuple[str, ...]
+    dflash2_graph_source: bool = False
 
     @property
     def consumer_global_group_ids(self) -> tuple[int, ...]:
@@ -1020,6 +1024,7 @@ def build_draft_window_inventory(
     allow_replicated_tp_graph_source: bool = False,
     allow_parallel_prefix_graph_source: bool = False,
     allow_parallel_dp_graph_source: bool = False,
+    dflash2_graph_contract: Any = None,
 ) -> DraftWindowInventory:
     """Inventory every executable draft consumer in global-gid order."""
     if policy.state is not DraftWindowPolicyState.ELIGIBLE_ON:
@@ -1028,6 +1033,19 @@ def build_draft_window_inventory(
         raise AssertionError("eligible draft-window policy has no window size")
 
     runtime_route = _normalize_method(runtime_route)
+    native_windows: dict[int, int | None] = {}
+    if dflash2_graph_contract is not None:
+        from vllm_ascend.worker.v2.spec_decode.draft_window_dflash2_graph import DFlash2GraphContract
+
+        if runtime_route != "dflash2" or not isinstance(dflash2_graph_contract, DFlash2GraphContract):
+            raise TypeError("DFlash2 Graph source requires its actual typed method contract")
+        native_windows = dflash2_graph_contract.validate_source(
+            attn_groups,
+            block_tables,
+            causal,
+            policy.effective_window_size,
+            dflash2_graph_contract.query_width,
+        )
     if type(allow_parallel_dp_graph_source) is not bool:
         raise TypeError("parallel DP Graph source allowance must be an explicit boolean")
     if allow_parallel_dp_graph_source and (
@@ -1045,7 +1063,11 @@ def build_draft_window_inventory(
         and runtime_context.tensor_parallel_size == 4
         and runtime_context.data_parallel_size == 1
     )
-    if allow_parallel_prefix_graph_source and runtime_route not in {"dspark", "dflash"} and not eagle_tp4_prefix:
+    if (
+        allow_parallel_prefix_graph_source
+        and runtime_route not in {"dspark", "dflash", "dflash2"}
+        and not eagle_tp4_prefix
+    ):
         raise NotImplementedError("prefix Graph source requires parallel Draft or the reviewed Eagle3 TP4 owner")
     num_global_groups = len(attn_groups)
     block_sizes = tuple(block_tables.block_sizes)
@@ -1094,6 +1116,11 @@ def build_draft_window_inventory(
                 builder_class,
                 consumer.kv_cache_spec,
             )
+            if actual_global_group_id in native_windows:
+                # The dedicated contract checked actual Full retention,
+                # noncausal native operands and the resident Window bound.
+                # This category describes paged storage, NOT Full attention.
+                layout_category = DraftWindowLayoutCategory.DENSE_GQA_DIRECT_PREFIX
             group_failures: list[str] = []
             source_geometry_failures: list[str] = []
             if actual_global_group_id != outer_global_group_id:
@@ -1145,6 +1172,7 @@ def build_draft_window_inventory(
                     capability_failures=tuple(group_failures),
                     source_geometry_failures=tuple(source_geometry_failures),
                     drafting_compression_ratio=drafting_compression_ratio,
+                    native_window=native_windows.get(actual_global_group_id),
                 )
             )
 
@@ -1172,11 +1200,11 @@ def build_draft_window_inventory(
             f"runtime route {runtime_route!r} does not match policy method "
             f"{policy.normalized_method!r}"
         )
-    if runtime_route == "dflash2":
+    if runtime_route == "dflash2" and dflash2_graph_contract is None:
         failures.append(
             "gid=none backend=none layout=runtime reason=DFlash2 runtime Window remains gated after P2 inventory"
         )
-    elif runtime_route not in {"eagle3", "dflash", "dspark"}:
+    elif runtime_route not in {"eagle3", "dflash", "dflash2", "dspark"}:
         failures.append(f"gid=none backend=none layout=runtime reason=runtime route {runtime_route!r} is not eligible")
 
     return DraftWindowInventory(
@@ -1187,6 +1215,7 @@ def build_draft_window_inventory(
         groups=tuple(groups),
         empty_global_group_ids=tuple(empty_global_group_ids),
         capability_failures=tuple(failures),
+        dflash2_graph_source=dflash2_graph_contract is not None,
     )
 
 
@@ -1631,6 +1660,7 @@ def _build_draft_window_source_capability_for_context(
     allow_replicated_tp_graph_source: bool = False,
     allow_parallel_prefix_graph_source: bool = False,
     allow_parallel_dp_graph_source: bool = False,
+    dflash2_graph_contract: Any = None,
 ) -> DraftWindowSourceCapability:
     """Build the source plane from an already-validated runtime context.
 
@@ -1651,6 +1681,7 @@ def _build_draft_window_source_capability_for_context(
         allow_replicated_tp_graph_source=allow_replicated_tp_graph_source,
         allow_parallel_prefix_graph_source=allow_parallel_prefix_graph_source,
         allow_parallel_dp_graph_source=allow_parallel_dp_graph_source,
+        dflash2_graph_contract=dflash2_graph_contract,
     )
     uses_dynamic_k = bool(vllm_config.speculative_config.uses_dynamic_speculative_decoding())
     from vllm_ascend.worker.v2.spec_decode.draft_window_nongraph import (

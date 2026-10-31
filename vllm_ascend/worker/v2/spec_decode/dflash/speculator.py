@@ -10,6 +10,7 @@ import numpy as np
 import torch
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.config.compilation import CUDAGraphMode
+from vllm.logger import logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
@@ -184,6 +185,12 @@ def _draft_window_context_kv_scope(owner, input_batch):
 
 def _draft_window_owner_scope(owner, input_batch, dummy_run=False, is_profile=False, *, num_speculative_tokens=None):
     """Choose exactly one existing proposal owner at the Ascend boundary."""
+    dflash2_contract = getattr(owner, "_dflash2_graph_contract", None)
+    if dflash2_contract is not None:
+        # These captured sampler/selector addresses are separate from the
+        # Window bank. Check their Host descriptors before replacing state;
+        # no tensor value read or device synchronization is introduced here.
+        dflash2_contract.validate_owner(owner)
     runtime = getattr(owner, "_draft_window_runtime", None)
     graph_runtime = getattr(owner, "_draft_window_runtime_state", None)
     limit = getattr(owner, "_draft_graph_review_limit", None)
@@ -317,6 +324,7 @@ class AscendDFlashSpeculator(DraftWindowEagerMixin, LmheadTPDraftSamplingMixin, 
                 causal=self._group_causal,
                 vllm_config=self.vllm_config,
                 input_buffers=self.input_buffers,
+                dflash2_graph_contract=getattr(self, "_dflash2_graph_contract", None),
             )
         else:
             capability = build_draft_window_source_capability(
@@ -500,6 +508,12 @@ class AscendDFlashSpeculator(DraftWindowEagerMixin, LmheadTPDraftSamplingMixin, 
             self.vllm_config.cache_config.block_size,
             block_tables,
         )
+
+        from vllm_ascend.worker.v2.spec_decode.draft_window_native_attention import report_owner_draft_native_attention
+
+        # Actual Draft layers/builders now exist. This startup-only inventory
+        # creates no eager runtime and does not infer attention from KV storage.
+        report_owner_draft_native_attention(self, logger)
 
         if hasattr(self, "_draft_window_policy"):
             if hasattr(self, "draft_window_policy"):

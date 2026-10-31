@@ -688,6 +688,15 @@ class AscendAttentionBackendImpl(AttentionImpl):
         sparse_mode = 4 if self.sliding_window else 3 if attn_metadata.causal else 0
         pre_tokens = self.sliding_window or SWA_INT_MAX
         next_tokens = 0 if self.sliding_window else SWA_INT_MAX
+        native_dflash2_mask = getattr(self, "_dflash2_native_swa_mask", None)
+        if not attn_metadata.causal and native_dflash2_mask is not None:
+            # Match the existing DFlash2 eager native-SWA contract. Full KV
+            # retention does not make this attention causal or remove its P.
+            if type(self.sliding_window) is not int or self.sliding_window <= 0:
+                raise RuntimeError("DFlash2 Graph native-SWA mask has no positive native window")
+            sparse_mode = 4
+            attn_mask = native_dflash2_mask
+            pre_tokens = next_tokens = self.sliding_window - 1
         output_view = output[: attn_metadata.num_actual_tokens]
 
         extra_args = {}

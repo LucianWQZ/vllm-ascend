@@ -931,13 +931,14 @@ def build_parallel_draft_window_graph_characterization_source(
     causal: bool | Mapping[int, bool],
     vllm_config: Any,
     input_buffers: Any = None,
+    dflash2_graph_contract: Any = None,
 ) -> tuple[DraftWindowSourceCapability, DraftWindowRuntimeContext]:
     """Build P2/P3 source state only after the real Graph route is gated."""
     if not experimental_draft_window_graph_characterization_enabled():
         raise RuntimeError("internal Graph characterization flag is not enabled")
     runtime_context = build_draft_window_runtime_context(vllm_config, block_tables)
     replicated_review = validate_parallel_graph_characterization_context(runtime_context, vllm_config)
-    if runtime_route not in {"dflash", "dspark"}:
+    if runtime_route not in {"dflash", "dflash2", "dspark"}:
         raise NotImplementedError("base Graph characterization supports only DFlash and eligible DSpark")
     speculative_config = vllm_config.speculative_config
     if bool(speculative_config.uses_dynamic_speculative_decoding()):
@@ -960,14 +961,26 @@ def build_parallel_draft_window_graph_characterization_source(
     )
     from vllm_ascend.worker.v2.spec_decode.draft_window_swa_graph import partition_source
 
-    source_groups, native_swa = partition_source(
-        attn_groups=attn_groups,
-        block_tables=block_tables,
-        input_buffers=input_buffers,
-        causal=causal,
-        window_size=policy.effective_window_size,
-        query_width=int(speculative_config.num_speculative_tokens) + 1,
-    )
+    if runtime_route == "dflash2":
+        from vllm_ascend.worker.v2.spec_decode.draft_window_dflash2_graph import DFlash2GraphContract
+
+        if not isinstance(dflash2_graph_contract, DFlash2GraphContract):
+            raise NotImplementedError("DFlash2 Graph has no admitted model/selector/native reader contract")
+        # Native-only noncausal DFlash2 projects the same complete canonical
+        # source through its own resident-interval contract. It does not use
+        # the older causal Full+SWA passthrough partition or change native P.
+        source_groups, native_swa = attn_groups, None
+    else:
+        if dflash2_graph_contract is not None:
+            raise RuntimeError("DFlash2 source contract belongs to a different method")
+        source_groups, native_swa = partition_source(
+            attn_groups=attn_groups,
+            block_tables=block_tables,
+            input_buffers=input_buffers,
+            causal=causal,
+            window_size=policy.effective_window_size,
+            query_width=int(speculative_config.num_speculative_tokens) + 1,
+        )
     if native_swa is not None and (
         runtime_route != "dflash"
         or not replicated_review
@@ -990,6 +1003,7 @@ def build_parallel_draft_window_graph_characterization_source(
         allow_replicated_tp_graph_source=replicated_review,
         allow_parallel_prefix_graph_source=runtime_context.prefix_caching,
         allow_parallel_dp_graph_source=replicated_review and runtime_context.data_parallel_size == 2,
+        dflash2_graph_contract=dflash2_graph_contract,
     )
     group = capability.inventory.require_single_group_direct_prefix()
     if group.layout_category is not DraftWindowLayoutCategory.DENSE_GQA_DIRECT_PREFIX:

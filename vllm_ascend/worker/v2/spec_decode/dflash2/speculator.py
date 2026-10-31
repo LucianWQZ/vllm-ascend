@@ -111,8 +111,8 @@ class AscendDFlash2Speculator(DFlash2Speculator, AscendDFlashSpeculator):
     the NPU attention-metadata building (build_draft_attn_metadatas), the
     aclgraph manager wiring (init_cudagraph_manager), KV-cache/slot bookkeeping
     (set_attn), and the propose wrapper. Placing DFlash2Speculator first in
-    the MRO makes its ``__init__`` (selector buffers and the always-allocated
-    full-vocab draft logits) and its ``_generate_draft`` override win: the
+    the MRO makes its ``__init__`` (selector buffers and the optional persistent
+    full-vocab proposal logits) and its ``_generate_draft`` override win: the
     candidate top-k, selector scoring, sequential path walk, and draft-logits
     scatter run instead of plain DFlash drafting -- including inside the
     aclgraph capture, which captures ``self._generate_draft``.
@@ -139,22 +139,59 @@ class AscendDFlash2Speculator(DFlash2Speculator, AscendDFlashSpeculator):
         self._dflash2_full_kv_reference = True
         return model
 
+    def _initialize_draft_window_source_capability(self) -> None:
+        from vllm_ascend.worker.v2.spec_decode.draft_window_dflash2_graph import validate_dflash2_graph_source
+
+        # set_attn has already published the actual groups/model/native cache
+        # spec. Install this contract before the shared Source inventory runs.
+        self._dflash2_graph_contract = validate_dflash2_graph_source(self)
+        super()._initialize_draft_window_source_capability()
+
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
-        # V2 passes the runner's cudagraph mode to the draft speculator
-        # without consulting the spec-level enforce_eager. Honor it here:
-        # with enforce_eager the draft runs eagerly while the target keeps
-        # its own cudagraph mode (e.g. FULL_DECODE_ONLY). This also works
-        # around a dynamo fullgraph capture failure in the draft's RoPE
-        # (fake-tensor shape mismatch on the NPU meta kernels).
         if self.speculative_config.enforce_eager:
-            cudagraph_mode = CUDAGraphMode.NONE
-        else:
+            # Preserve the existing typed eager path and its independent owner.
+            super().init_cudagraph_manager(CUDAGraphMode.NONE)
+            return
+        from vllm_ascend import envs
+        from vllm_ascend.worker.v2.spec_decode.draft_window_dflash2_graph import validate_dflash2_graph_config
+
+        # Window OFF bypasses the Window factory. It must retain the same
+        # explicit experimental gate before any DFlash2 Graph is captured.
+        if not envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH:
+            raise ValueError("DFlash2 Graph requires the experimental Draft Graph gate, including Window OFF")
+        if cudagraph_mode not in (CUDAGraphMode.FULL, CUDAGraphMode.FULL_DECODE_ONLY):
             raise NotImplementedError(
-                "dflash2 does not currently support graph mode; "
-                "please enable enforce_eager. This is because the "
-                "_selector_walk_kernel_ascend operator must be reimplemented "
-                "due to NPU hardware constraints and cannot reuse the upstream "
-                "vLLM implementation. Graph mode will be supported in a future "
-                "release."
+                "DFlash2 Graph first admits FULL/FULL_DECODE_ONLY only; no implicit eager fallback"
             )
+        validate_dflash2_graph_config(self.vllm_config)
+        if cudagraph_mode.decode_mode() is CUDAGraphMode.FULL:
+            import vllm.v1.worker.gpu.spec_decode.dflash2.speculator as upstream_dflash2
+
+            from vllm_ascend.worker.v2.spec_decode.draft_window_dflash2_graph import validate_dflash2_graph_source
+
+            # Do not capture the unsupported CUDA selector accidentally. The
+            # installed Ascend patch is already used by ordinary DFlash2 eager.
+            if upstream_dflash2._selector_walk_kernel is not _selector_walk_kernel_ascend:
+                raise RuntimeError("DFlash2 Graph requires the actual Ascend selector-walk kernel binding")
+            contract = getattr(self, "_dflash2_graph_contract", None)
+            if contract is None:
+                self._dflash2_graph_contract = validate_dflash2_graph_source(self)
+            else:
+                contract.validate_owner(self)
         super().init_cudagraph_manager(cudagraph_mode)
+        if (
+            cudagraph_mode.decode_mode() is CUDAGraphMode.FULL
+            and self.query_cudagraph_manager.cudagraph_mode.decode_mode() is not CUDAGraphMode.FULL
+        ):
+            raise NotImplementedError("DFlash2 Graph backend did not admit FULL capture; no eager fallback is selected")
+
+    def capture(self) -> None:
+        contract = getattr(self, "_dflash2_graph_contract", None)
+        if contract is not None:
+            contract.validate_owner(self)
+        # The parent captures prepare_graph_forward and the virtual DFlash2
+        # _generate_draft, including its NPU conv/TopK/selector/cache kernels.
+        # Python request control, prepare inputs and metadata stay outside it.
+        super().capture()
+        if contract is not None:
+            contract.validate_owner(self)

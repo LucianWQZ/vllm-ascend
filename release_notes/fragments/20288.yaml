@@ -7,4 +7,6 @@ entries:
   - category: feature
     text: Added a global-first-rank startup warning when an additional MRV2 Draft window narrows certified native SWA groups. Supported settings remain opt-in and are not automatically disabled.
   - category: feature
-    text: Added default-off, controlled Draft Window Graph review entry points with explicit checkpoint and topology limits. Unqualified combinations remain blocked, including ordinary Full8 on the PR017/vLLM544 pair; DFlash2 retains its typed eager route.
+    text: Added default-off, controlled Draft Window Graph review entry points with explicit checkpoint and topology limits, including experimental static TP2 DFlash2 Graph plumbing that preserves its native SWA and selector semantics. Unqualified combinations remain blocked; ordinary typed DFlash2 eager remains available.
+  - category: feature
+    text: Reported loaded Draft Full, native SWA, mixed or unknown attention semantics at startup, independently of full KV retention. Unconfirmed extra-window Graph combinations are rejected explicitly.

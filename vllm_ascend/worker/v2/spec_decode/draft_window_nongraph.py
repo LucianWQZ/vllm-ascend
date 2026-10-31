@@ -391,7 +391,7 @@ def evaluate_p7x_nongraph_capability(
             fingerprint,
             kinds,
         )
-    if inventory.runtime_route == "dflash2":
+    if inventory.runtime_route == "dflash2" and not inventory.dflash2_graph_source:
         return P7XCapabilityDecision(
             P7XCapabilityStatus.SOURCE_BLOCKED,
             "DFlash2 has no verified explicit read consumer",
