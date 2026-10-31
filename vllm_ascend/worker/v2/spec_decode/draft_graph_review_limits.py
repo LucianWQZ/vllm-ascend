@@ -262,6 +262,51 @@ def validate_full8_single_request_review_config(vllm_config):
         )
 
 
+def validate_full8_single_request_review_entry(vllm_config, *, experimental_graph_review):
+    """Explicit experiment only; every TP rank checks the same fixed config."""
+    from vllm_ascend.ascend_config import validate_additional_config_bool
+
+    validate_full8_single_request_review_config(vllm_config)
+    speculative = vllm_config.speculative_config
+    additional = vllm_config.additional_config or {}
+    enabled = validate_additional_config_bool(
+        additional.get("draft_window_graph_full8_single_request_review", False),
+        "additional_config.draft_window_graph_full8_single_request_review",
+    )
+    model = getattr(speculative.draft_model_config, "model", None)
+    config_file = Path(model) / "config.json" if isinstance(model, (str, Path)) else None
+    if (
+        not enabled
+        or experimental_graph_review is not True
+        or speculative.method != "dflash"
+        or speculative.enforce_eager is not False
+        or additional.get("draft_window_graph_replicated_tp_review") is not True
+        or additional.get("draft_window_graph_numeric_diagnostic", False) is not False
+        or list(vllm_config.compilation_config.cudagraph_capture_sizes) != [8]
+        or vllm_config.model_config.max_model_len != 40960
+        or config_file is None
+        or not config_file.is_file()
+        or config_file.stat().st_size > 1 << 20
+        or hashlib.sha256(config_file.read_bytes()).hexdigest() != _FULL8_CONFIG
+    ):
+        raise NotImplementedError(
+            "Full8 ordinary review requires its exact checkpoint, explicit Full8 single-request "
+            "and experimental Graph gates, max_model_len40960 and capture[8]; "
+            "this is only a finite active1/padded1 qualification entry, not a PASS receipt."
+        )
+    return "full8_local_active_at_most_one"
+
+
+def validate_full8_single_request_graph_stage(owner, *, actual, padded, tokens):
+    """Check the real Draft descriptor before metadata/native query submission."""
+    if getattr(owner, "_draft_graph_review_limit", None) != "full8_local_active_at_most_one":
+        return
+    if type(actual) is not int or type(padded) is not int or type(tokens) is not int:
+        raise TypeError("Full8 review requires exact integer Draft descriptor counts")
+    if (actual, padded, tokens) != (1, 1, 8):
+        raise NotImplementedError("Full8 review only qualifies actual1/padded1 Draft Q8; no fallback is selected")
+
+
 def resolve_draft_graph_review_limit(vllm_config, *, experimental_graph_review=False):
     """Return a cached limit or reject the precisely identified Graph route."""
     speculative = vllm_config.speculative_config
@@ -272,6 +317,16 @@ def resolve_draft_graph_review_limit(vllm_config, *, experimental_graph_review=F
         additional.get("draft_window_graph_eagle_single_request_review", False),
         "additional_config.draft_window_graph_eagle_single_request_review",
     )
+    full8_review = validate_additional_config_bool(
+        additional.get("draft_window_graph_full8_single_request_review", False),
+        "additional_config.draft_window_graph_full8_single_request_review",
+    )
+    if full8_review and finite_review:
+        raise ValueError("Full8 and Eagle finite review entries are mutually exclusive")
+    if full8_review:
+        return validate_full8_single_request_review_entry(
+            vllm_config, experimental_graph_review=experimental_graph_review
+        )
     if finite_review:
         finite_scope = validate_eagle_single_request_review_config(
             vllm_config,

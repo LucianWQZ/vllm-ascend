@@ -255,6 +255,11 @@ def _build_graph_uniform_metadata(
     tokens = batch_desc.num_tokens if batch_desc.cg_mode == CUDAGraphMode.FULL else int(query_start_loc_np[-1])
     if batch_desc.cg_mode == CUDAGraphMode.FULL and tokens != padded_reqs * owner.num_query_per_req:
         raise RuntimeError("Draft Graph descriptor differs from its fixed padded query width")
+    from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import (
+        validate_full8_single_request_graph_stage,
+    )
+
+    validate_full8_single_request_graph_stage(owner, actual=num_reqs, padded=padded_reqs, tokens=tokens)
     full_slots = owner.block_tables.slot_mappings[:, :tokens]
     if slot_mappings is not None and (
         slot_mappings.shape != full_slots.shape

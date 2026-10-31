@@ -861,6 +861,8 @@ class AscendConfig:
     draft_window_graph_validation_memo: bool = False
     # Controlled finite Eagle single-request product review; not a PASS receipt.
     draft_window_graph_eagle_single_request_review: bool = False
+    # Controlled Full8 active1/padded1 ordinary qualification; default still closed.
+    draft_window_graph_full8_single_request_review: bool = False
     # Default-off Eagle Graph experiment: owned pinned sources for length H2D.
     draft_window_graph_eagle_pinned_h2d_review: bool = False
     # Default-off, rank-owned TP2 dense Graph review; does not open the public gate.
@@ -2235,6 +2237,20 @@ def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
     validate_draft_window_replicated_tp_review(vllm_config)
     validate_draft_window_parallel_eager_review(vllm_config)
     validate_draft_window_eagle_pinned_h2d_review(vllm_config)
+    if new_config.draft_window_graph_full8_single_request_review:
+        from vllm_ascend import envs
+        from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import (
+            validate_full8_single_request_review_entry,
+        )
+
+        validate_full8_single_request_review_entry(
+            vllm_config,
+            experimental_graph_review=envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH,
+        )
+        logger.warning_once(
+            "Controlled Full8 Draft Graph qualification: exact checkpoint, TP4/DP1, "
+            "K7/W32768, actual1/padded1 and capture[8] only; not a device PASS or release qualification."
+        )
     if new_config.draft_window_graph_eagle_single_request_review:
         from vllm_ascend import envs
         from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import (

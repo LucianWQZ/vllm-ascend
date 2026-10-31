@@ -119,6 +119,17 @@ noninterference checks. Existing multiple-request failures are retained;
 this entry does not qualify multi-request shapes, business quality,
 performance, release approval or the public Graph gate.
 
+The designated Full8 checkpoint has a separate, default-off
+`draft_window_graph_full8_single_request_review=true` qualification entry.
+It requires its exact checkpoint config, TP4/DP1, static K7/W32768,
+`max_model_len=40960`, `max_num_seqs=1` and capture size `[8]`, with Async,
+prefix, FlashComm and CP disabled. The real local request count and query
+descriptor must also be actual1/padded1/Q8 before submission. Client
+concurrency alone is not the guard. Default ordinary entry and larger shapes
+remain rejected, without an eager fallback. This entry is not a service or
+numerical PASS; its candidate-specific ordinary qualification must complete
+before that scope is described as usable.
+
 ### Canonical reads and method phases
 
 `DirectPrefixSource` borrows `AscendBlockTables.block_tables[gid].gpu` and
