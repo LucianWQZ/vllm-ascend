@@ -137,8 +137,9 @@ performance, release approval or the public Graph gate.
 The designated Full8 checkpoint has a separate, default-off
 `draft_window_graph_full8_single_request_review=true` qualification entry.
 It requires its exact checkpoint config, TP4 with parent DP1 or DP2, static K7,
-`max_num_seqs=1` per replica and capture size `[8]`, with Async, prefix,
-FlashComm and CP disabled. In DP2 the fixed vLLM creates a TP-only Draft
+`max_num_seqs=1` per replica and capture size `[8]`. Async, prefix and Target
+FlashComm settings must be booleans; each enabled combination needs its own
+execution qualification. Legacy DSA-CP remains disabled. In DP2 the fixed vLLM creates a TP-only Draft
 configuration with DP1 inside each parent replica; that descriptor does not
 collapse two actual replicas into one. Each replica retains its independent
 request mapping, KV source and captured bank. Idle replicas use the existing
@@ -164,6 +165,18 @@ Default ordinary entry and larger local batch or padding shapes
 remain rejected, without an eager fallback. This entry is not a service or
 numerical PASS; its candidate-specific ordinary qualification must complete
 before that scope is described as usable.
+
+A separate default-off `draft_window_graph_full8_two_request_review=true`
+entry admits only local actual/padded1 or actual/padded2, with
+`max_num_seqs=2` and capture sizes `[8,16]`. The two Full8 review flags are
+mutually exclusive. Each actual row must satisfy the same authoritative
+identity, capacity and preemption checks, with unique request IDs and source
+rows. The execution guard checks Q8 per row before Graph metadata or bank
+submission; active3, padded4 and other unqualified descriptors remain
+rejected. This explicit entry is for bounded qualification and does not
+convert saved numerical samples into a multi-request service PASS. Parent
+DP2 and enabled feature combinations retain their separate qualification
+requirements.
 
 ### Canonical reads and method phases
 

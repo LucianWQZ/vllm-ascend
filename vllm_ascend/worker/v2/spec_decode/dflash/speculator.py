@@ -195,7 +195,7 @@ def _draft_window_owner_scope(owner, input_batch, dummy_run=False, is_profile=Fa
     graph_runtime = getattr(owner, "_draft_window_runtime_state", None)
     limit = getattr(owner, "_draft_graph_review_limit", None)
     context_only_full8 = (
-        limit == "full8_local_active_at_most_one"
+        limit in ("full8_local_active_at_most_one", "full8_local_active_at_most_two")
         and type(num_speculative_tokens) is int
         and num_speculative_tokens == 0
     )

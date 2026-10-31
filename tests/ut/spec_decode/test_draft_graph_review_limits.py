@@ -174,6 +174,7 @@ class ReviewBoundaryControls(unittest.TestCase):
     def test_ordinary_dp1_startup_uses_the_exact_checkpoint_and_single_config_guard(self):
         module = ModuleType(MODULE)
         module.resolve_draft_graph_review_limit = self.resolve
+        module.full8_graph_review_max_requests = GUARD["full8_graph_review_max_requests"]
         dense = actual_function(
             SOURCE / "vllm_ascend/ascend_config.py",
             "_dense_dp_graph_window_review",
@@ -220,6 +221,7 @@ class ReviewBoundaryControls(unittest.TestCase):
         )
         module = ModuleType(MODULE)
         module.resolve_draft_graph_review_limit = self.resolve
+        module.full8_graph_review_max_requests = GUARD["full8_graph_review_max_requests"]
         module.EagleSingleRequestReviewScope = GUARD["EagleSingleRequestReviewScope"]
         self.config.additional_config = dict(
             draft_window_graph_full8_single_request_review=True,
@@ -308,6 +310,7 @@ class ReviewBoundaryControls(unittest.TestCase):
         )
         module = ModuleType(MODULE)
         module.resolve_draft_graph_review_limit = self.resolve
+        module.full8_graph_review_max_requests = GUARD["full8_graph_review_max_requests"]
         ascend = ModuleType("vllm_ascend")
         ascend.envs = NS(VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH=True)
         calls, owner = [], NS(max_model_len=4096)
@@ -502,6 +505,7 @@ class ReviewBoundaryControls(unittest.TestCase):
     def test_factory_rejects_before_constructor_and_binds_exact_owner(self):
         module = ModuleType(MODULE)
         module.resolve_draft_graph_review_limit = self.resolve
+        module.full8_graph_review_max_requests = GUARD["full8_graph_review_max_requests"]
         ascend = ModuleType("vllm_ascend")
         ascend.envs = NS(VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH=False)
         calls = []

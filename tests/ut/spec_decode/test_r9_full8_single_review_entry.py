@@ -203,6 +203,105 @@ class Full8FiniteEntry(unittest.TestCase):
                     with self.assertRaisesRegex(NotImplementedError, "at most 1"):
                         guard(owner, batch)
 
+    def test_two_request_entry_is_separate_and_uses_both_exact_banks(self):
+        extra = self.config.additional_config
+        extra["draft_window_graph_full8_two_request_review"] = True
+        self.config.scheduler_config.max_num_seqs = 2
+        self.config.compilation_config.cudagraph_capture_sizes = [8, 16]
+        for window in (None, 32768):
+            extra["draft_window_size"] = window
+            self.assertEqual(
+                self.resolve(self.config, experimental_graph_review=True), "full8_local_active_at_most_two"
+            )
+        for sizes in ([16], [8], [8, 16, 24], [True, 16]):
+            self.config.compilation_config.cudagraph_capture_sizes = sizes
+            with self.subTest(sizes=sizes), self.assertRaises(NotImplementedError):
+                self.resolve(self.config, experimental_graph_review=True)
+        self.config.compilation_config.cudagraph_capture_sizes = [8, 16]
+        extra["draft_window_graph_full8_single_request_review"] = True
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            self.resolve(self.config, experimental_graph_review=True)
+        del extra["draft_window_graph_full8_single_request_review"]
+        for maximum in (1, 3, 8, True):
+            self.config.scheduler_config.max_num_seqs = maximum
+            with self.subTest(maximum=maximum), self.assertRaises(NotImplementedError):
+                self.resolve(self.config, experimental_graph_review=True)
+
+    def test_two_rows_use_distinct_original_identity_and_capacity(self):
+        guard = GUARD["validate_draft_graph_review_requests"]
+        owner = NS(
+            _draft_graph_review_limit="full8_local_active_at_most_two",
+            max_model_len=40960,
+            num_query_per_req=8,
+            vllm_config=NS(model_config=NS(max_model_len=40960)),
+        )
+        batch = NS(
+            num_reqs=2,
+            num_reqs_after_padding=2,
+            req_ids=["long", "short"],
+            idx_mapping_np=[7, 2],
+            prefill_len_np=[33025, 1153],
+            draft_graph_review_request_rows=(("long", 7, 33025, 33089, 33025), ("short", 2, 1153, 1217, 1153)),
+        )
+        guard(owner, batch)
+        # A real reorder must move every authoritative row field together.
+        batch.req_ids.reverse()
+        batch.idx_mapping_np.reverse()
+        batch.prefill_len_np.reverse()
+        batch.draft_graph_review_request_rows = batch.draft_graph_review_request_rows[::-1]
+        guard(owner, batch)
+        saved = batch.draft_graph_review_request_rows
+        batch.draft_graph_review_request_rows = (saved[1], saved[0])
+        with self.assertRaisesRegex(RuntimeError, "identity/source"):
+            guard(owner, batch)
+        batch.draft_graph_review_request_rows = saved
+        batch.idx_mapping_np[1] = 2
+        batch.draft_graph_review_request_rows = (saved[0], ("long", 2, 33025, 33089, 33025))
+        with self.assertRaisesRegex(RuntimeError, "distinct"):
+            guard(owner, batch)
+        batch.idx_mapping_np[1] = 7
+        batch.draft_graph_review_request_rows = (saved[0], ("long", 7, 33025, 40953, 33025))
+        with self.assertRaisesRegex(NotImplementedError, "capacity"):
+            guard(owner, batch)
+        batch.draft_graph_review_request_rows = saved
+        owner._draft_graph_review_preempted_request_ids = {"long"}
+        with self.assertRaisesRegex(NotImplementedError, "preemption"):
+            guard(owner, batch)
+
+    def test_two_request_graph_stages_reject_unqualified_padding_and_extra_rows(self):
+        stage = GUARD["validate_full8_single_request_graph_stage"]
+        owner = NS(_draft_graph_review_limit="full8_local_active_at_most_two")
+        for counts in ((1, 1, 8), (2, 2, 16)):
+            stage(owner, actual=counts[0], padded=counts[1], tokens=counts[2])
+        for counts in ((0, 0, 0), (3, 3, 24), (8, 8, 64), (1, 2, 16), (2, 4, 32), (2, 2, 8)):
+            with self.subTest(counts=counts), self.assertRaises(NotImplementedError):
+                stage(owner, actual=counts[0], padded=counts[1], tokens=counts[2])
+        with self.assertRaises(TypeError):
+            stage(owner, actual=True, padded=1, tokens=8)
+
+    def test_two_request_context_only_still_checks_request_rows(self):
+        guard = GUARD["validate_draft_graph_review_requests"]
+        owner = NS(
+            _draft_graph_review_limit="full8_local_active_at_most_two",
+            max_model_len=40960,
+            num_query_per_req=8,
+            vllm_config=NS(model_config=NS(max_model_len=40960)),
+        )
+        batch = NS(
+            num_reqs=2,
+            num_reqs_after_padding=4,
+            req_ids=["a", "b"],
+            idx_mapping_np=[0, 1],
+            prefill_len_np=[127, 1153],
+            draft_graph_review_request_rows=(("a", 0, 127, 191, 127), ("b", 1, 1153, 1217, 1153)),
+        )
+        guard(owner, batch, context_kv_only=True)
+        with self.assertRaisesRegex(NotImplementedError, "padding"):
+            guard(owner, batch)
+        batch.req_ids[1] = "other"
+        with self.assertRaisesRegex(RuntimeError, "identity/source"):
+            guard(owner, batch, context_kv_only=True)
+
     def test_existing_dp_dummy_scope_is_not_a_business_generation(self):
         # Execute only the real Source bypass branch. No fake Graph metadata,
         # copied business generation, provider construction or device event.

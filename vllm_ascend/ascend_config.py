@@ -156,18 +156,23 @@ def _dense_dp_graph_window_review(vllm_config: Any, window_size: Any) -> bool:
     ):
         # Preserve the independent serialized canonical numerical reference.
         return True
-    # Ordinary DP1 is a separate, checkpoint-scoped single-request review.
+    # Ordinary DP1 is a separate, checkpoint-scoped bounded request review.
     # Reuse its shared config/capacity checks rather than removing the DP gate.
     # This helper only admits configuration; set_attn validates the real
-    # provider and the proposal boundary validates actual=1/padded=1.
-    from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import resolve_draft_graph_review_limit
+    # provider and the proposal boundary validates the admitted actual/padded bank.
+    from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import (
+        full8_graph_review_max_requests,
+        resolve_draft_graph_review_limit,
+    )
 
     return (
-        resolve_draft_graph_review_limit(
-            vllm_config,
-            experimental_graph_review=True,
+        full8_graph_review_max_requests(
+            resolve_draft_graph_review_limit(
+                vllm_config,
+                experimental_graph_review=True,
+            )
         )
-        == "full8_local_active_at_most_one"
+        is not None
     )
 
 
@@ -207,6 +212,7 @@ def _single_request_graph_off_review(vllm_config: Any) -> bool:
         validate_additional_config_bool(additional.get(name, False), "additional_config." + name)
         for name in (
             "draft_window_graph_full8_single_request_review",
+            "draft_window_graph_full8_two_request_review",
             "draft_window_graph_eagle_single_request_review",
         )
     )
@@ -217,6 +223,7 @@ def _single_request_graph_off_review(vllm_config: Any) -> bool:
     from vllm_ascend import envs
     from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import (
         EagleSingleRequestReviewScope,
+        full8_graph_review_max_requests,
         resolve_draft_graph_review_limit,
     )
 
@@ -224,7 +231,7 @@ def _single_request_graph_off_review(vllm_config: Any) -> bool:
         vllm_config,
         experimental_graph_review=envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH,
     )
-    return limit == "full8_local_active_at_most_one" or isinstance(limit, EagleSingleRequestReviewScope)
+    return full8_graph_review_max_requests(limit) is not None or isinstance(limit, EagleSingleRequestReviewScope)
 
 
 def validate_draft_window_replicated_tp_review(vllm_config: Any) -> bool:
@@ -900,6 +907,8 @@ class AscendConfig:
     draft_window_graph_eagle_single_request_review: bool = False
     # Controlled Full8 active1/padded1 ordinary qualification; default still closed.
     draft_window_graph_full8_single_request_review: bool = False
+    # Separate controlled Full8 actual/padded1-or-2 qualification; never opens larger batches.
+    draft_window_graph_full8_two_request_review: bool = False
     # Default-off Eagle Graph experiment: owned pinned sources for length H2D.
     draft_window_graph_eagle_pinned_h2d_review: bool = False
     # Default-off, rank-owned TP2 dense Graph review; does not open the public gate.
@@ -2274,7 +2283,10 @@ def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
     validate_draft_window_replicated_tp_review(vllm_config)
     validate_draft_window_parallel_eager_review(vllm_config)
     validate_draft_window_eagle_pinned_h2d_review(vllm_config)
-    if new_config.draft_window_graph_full8_single_request_review:
+    if (
+        new_config.draft_window_graph_full8_single_request_review
+        or new_config.draft_window_graph_full8_two_request_review
+    ):
         from vllm_ascend import envs
         from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import (
             validate_full8_single_request_review_entry,
@@ -2285,8 +2297,9 @@ def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
             experimental_graph_review=envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH,
         )
         logger.warning_once(
-            "Controlled Full8 Draft Graph qualification: exact checkpoint, TP4/DP1, "
-            "static K7, Window OFF or W32768, actual1/padded1 and capture[8] only; "
+            "Controlled Full8 Draft Graph qualification: exact checkpoint, TP4/DP1-or-2, "
+            "static K7, Window OFF or W32768, actual=padded within the explicit local row limit, "
+            "matching capture[8] or [8,16]; "
             "not a device PASS or release qualification."
         )
     if new_config.draft_window_graph_eagle_single_request_review:

@@ -19,6 +19,31 @@ _EAGLE_CONFIG = "5b9242c2e8603da59527fb9e9dd85f3b5bf1e7beae48b251563bbd442a512c6
 _FULL8_QUERY_TOKENS = 8
 
 
+def full8_graph_review_max_requests(limit):
+    """Return the explicitly admitted local row capacity, never client load."""
+    if type(limit) is str:
+        if limit == "full8_local_active_at_most_one":
+            return 1
+        if limit == "full8_local_active_at_most_two":
+            return 2
+    return None
+
+
+def _full8_requested_review_max_requests(additional):
+    from vllm_ascend.ascend_config import validate_additional_config_bool
+
+    single, pair = (
+        validate_additional_config_bool(additional.get(name, False), "additional_config." + name)
+        for name in (
+            "draft_window_graph_full8_single_request_review",
+            "draft_window_graph_full8_two_request_review",
+        )
+    )
+    if single and pair:
+        raise ValueError("Full8 single-request and two-request review entries are mutually exclusive")
+    return 2 if pair else 1 if single else None
+
+
 @dataclass(frozen=True, slots=True)
 class EagleSingleRequestReviewScope:
     """Capacity-bounded review entry; this object is not a PASS receipt."""
@@ -124,7 +149,7 @@ def note_eagle_single_request_review_lifecycle(owner, scheduler_output):
     that case. No scheduler, request state, or device object is modified.
     """
     limit = getattr(owner, "_draft_graph_review_limit", None)
-    if not isinstance(limit, EagleSingleRequestReviewScope) and limit != "full8_local_active_at_most_one":
+    if not isinstance(limit, EagleSingleRequestReviewScope) and full8_graph_review_max_requests(limit) is None:
         return
     finished = scheduler_output.finished_req_ids
     preempted = scheduler_output.preempted_req_ids or set()
@@ -145,7 +170,7 @@ def note_eagle_single_request_review_lifecycle(owner, scheduler_output):
 def eagle_single_request_review_rows(owner, req_states, req_ids, idx_mapping_np):
     """Snapshot authoritative CPU limits for the finite Eagle and Full8 entries."""
     limit = getattr(owner, "_draft_graph_review_limit", None)
-    if not isinstance(limit, EagleSingleRequestReviewScope) and limit != "full8_local_active_at_most_one":
+    if not isinstance(limit, EagleSingleRequestReviewScope) and full8_graph_review_max_requests(limit) is None:
         return None
     method = "Eagle" if isinstance(limit, EagleSingleRequestReviewScope) else "Full8"
     rows = []
@@ -281,7 +306,7 @@ def _full8_review_capacity(vllm_config):
     return capacity
 
 
-def validate_full8_single_request_review_config(vllm_config):
+def validate_full8_single_request_review_config(vllm_config, *, max_requests=1):
     """Prevent unsupported batches using the config shared by every TP rank.
 
     The execution check still validates actual local rows. Limiting capacity
@@ -300,14 +325,16 @@ def validate_full8_single_request_review_config(vllm_config):
         parallel.decode_context_parallel_size,
     )
     # Core544's Draft descriptor is TP-only (DP1). Actual DP2 replicas live
-    # in the parent engines/groups; every replica keeps this same local n1
-    # request and Q8/capture contract, including the existing idle-DP scope.
+    # in the parent engines/groups; every replica keeps its explicitly admitted local row
+    # limit and Q8-per-row capture contract, including the existing idle-DP scope.
     # The existing Graph owner serializes its current-stream bank updates;
     # prefix rows retain canonical Full cache ownership. Enabling a feature
-    # does not broaden the actual1/padded1 descriptor or model-capacity guard.
+    # does not broaden the selected actual/padded descriptor or model-capacity guard.
     draft_dp = getattr(speculative.draft_parallel_config, "data_parallel_size", None)
     if (
-        any(type(size) is not int for size in sizes)
+        type(max_requests) is not int
+        or max_requests not in (1, 2)
+        or any(type(size) is not int for size in sizes)
         or sizes not in ((4, 1, 1, 1, 1), (4, 2, 1, 1, 1))
         or (parallel.data_parallel_size == 2 and (type(draft_dp) is not int or draft_dp != 1))
         or getattr(speculative.draft_parallel_config, "tensor_parallel_size", None) != 4
@@ -316,7 +343,7 @@ def validate_full8_single_request_review_config(vllm_config):
         or getattr(parallel, "enable_expert_parallel", False) is not True
         or speculative.uses_dynamic_speculative_decoding()
         or type(scheduler.max_num_seqs) is not int
-        or scheduler.max_num_seqs != 1
+        or scheduler.max_num_seqs != max_requests
         or type(scheduler.async_scheduling) is not bool
         or type(vllm_config.cache_config.enable_prefix_caching) is not bool
         or additional.get("draft_window_size") not in (None, 32768)
@@ -326,9 +353,9 @@ def validate_full8_single_request_review_config(vllm_config):
     ):
         raise NotImplementedError(
             "This Full8 checkpoint's temporary Draft Graph review permits only static K7, Window OFF or W32768, "
-            "TP4/DP1-or-2/PP1/PCP1/DCP1 with EP, one request per DP replica, "
-            "max_num_seqs=1, FULL_DECODE_ONLY, "
-            "boolean Async/prefix/FlashComm settings and no DSA-CP. Use that single-request configuration "
+            "TP4/DP1-or-2/PP1/PCP1/DCP1 with EP and the explicitly selected one- or two-request local limit, "
+            f"matching max_num_seqs={max_requests}, FULL_DECODE_ONLY, "
+            "boolean Async/prefix/FlashComm settings and no DSA-CP. Use the matching bounded configuration "
             "or the independently supported Draft eager route; no fallback is selected."
         )
     _full8_review_capacity(vllm_config)
@@ -336,62 +363,64 @@ def validate_full8_single_request_review_config(vllm_config):
 
 def validate_full8_single_request_review_entry(vllm_config, *, experimental_graph_review):
     """Explicit experiment only; every TP rank checks the same fixed config."""
-    from vllm_ascend.ascend_config import validate_additional_config_bool
-
-    validate_full8_single_request_review_config(vllm_config)
     speculative = vllm_config.speculative_config
     additional = vllm_config.additional_config or {}
-    enabled = validate_additional_config_bool(
-        additional.get("draft_window_graph_full8_single_request_review", False),
-        "additional_config.draft_window_graph_full8_single_request_review",
-    )
+    maximum = _full8_requested_review_max_requests(additional)
+    if maximum is None:
+        raise NotImplementedError("Full8 ordinary Graph requires one explicit bounded request review entry")
+    validate_full8_single_request_review_config(vllm_config, max_requests=maximum)
+    captures = list(vllm_config.compilation_config.cudagraph_capture_sizes)
     model = getattr(speculative.draft_model_config, "model", None)
     config_file = Path(model) / "config.json" if isinstance(model, (str, Path)) else None
     if (
-        not enabled
-        or experimental_graph_review is not True
+        experimental_graph_review is not True
         or speculative.method != "dflash"
         or speculative.enforce_eager is not False
         or additional.get("draft_window_graph_replicated_tp_review") is not True
         or additional.get("draft_window_graph_numeric_diagnostic", False) is not False
-        or list(vllm_config.compilation_config.cudagraph_capture_sizes) != [8]
+        or any(type(value) is not int for value in captures)
+        or captures != [_FULL8_QUERY_TOKENS * count for count in range(1, maximum + 1)]
         or config_file is None
         or not config_file.is_file()
         or config_file.stat().st_size > 1 << 20
         or hashlib.sha256(config_file.read_bytes()).hexdigest() != _FULL8_CONFIG
     ):
         raise NotImplementedError(
-            "Full8 ordinary review requires its exact checkpoint, explicit Full8 single-request "
-            "and experimental Graph gates, validated model capacity and capture[8]; "
-            "this is only a finite active1/padded1 qualification entry, not a PASS receipt."
+            "Full8 ordinary review requires its exact checkpoint, one explicit bounded Full8 request "
+            "and experimental Graph gate, validated model capacity and capture[8] or [8,16]; "
+            "actual rows must match the admitted padded bank. This is not a PASS receipt."
         )
-    return "full8_local_active_at_most_one"
+    return "full8_local_active_at_most_one" if maximum == 1 else "full8_local_active_at_most_two"
 
 
 def validate_full8_single_request_graph_stage(owner, *, actual, padded, tokens):
     """Check the real Draft descriptor before metadata/native query submission."""
-    if getattr(owner, "_draft_graph_review_limit", None) != "full8_local_active_at_most_one":
+    maximum = full8_graph_review_max_requests(getattr(owner, "_draft_graph_review_limit", None))
+    if maximum is None:
         return
     if type(actual) is not int or type(padded) is not int or type(tokens) is not int:
         raise TypeError("Full8 review requires exact integer Draft descriptor counts")
-    if (actual, padded, tokens) != (1, 1, 8):
-        raise NotImplementedError("Full8 review only qualifies actual1/padded1 Draft Q8; no fallback is selected")
+    if not 1 <= actual <= maximum or padded != actual or tokens != padded * _FULL8_QUERY_TOKENS:
+        raise NotImplementedError(
+            "Full8 review requires actual/padded1 or explicitly admitted actual/padded2, "
+            "with eight query tokens per row; no fallback is selected"
+        )
 
 
-def _full8_single_request_row(owner, input_batch):
+def _full8_single_request_row(owner, input_batch, *, index=0):
     """Reject unqualified original requests before a Full8 owner is changed."""
     rows = getattr(input_batch, "draft_graph_review_request_rows", None)
-    if not isinstance(rows, tuple) or len(rows) != 1:
-        raise RuntimeError("Full8 review requires one authoritative prompt/output request row")
+    if not isinstance(rows, tuple) or len(rows) != input_batch.num_reqs or not 0 <= index < len(rows):
+        raise RuntimeError("Full8 review requires each authoritative prompt/output request row")
     try:
         current = (
-            input_batch.req_ids[0],
-            int(input_batch.idx_mapping_np[0]),
-            int(input_batch.prefill_len_np[0]),
+            input_batch.req_ids[index],
+            int(input_batch.idx_mapping_np[index]),
+            int(input_batch.prefill_len_np[index]),
         )
     except (AttributeError, IndexError, KeyError, TypeError, ValueError) as error:
         raise RuntimeError("Full8 review lacks its current request identity/source row") from error
-    row = rows[0]
+    row = rows[index]
     if (
         not isinstance(row, tuple)
         or len(row) != 5
@@ -401,7 +430,7 @@ def _full8_single_request_row(owner, input_batch):
     ):
         raise RuntimeError("Full8 review request identity/source row differs")
     if row[0] in getattr(owner, "_draft_graph_review_preempted_request_ids", ()):
-        raise NotImplementedError("Full8 single-request review does not qualify resumption after preemption")
+        raise NotImplementedError("Full8 bounded review does not qualify resumption after preemption")
     _, _, prompt, maximum, prefill = row
     capacity = getattr(owner, "max_model_len", None)
     configured_capacity = getattr(
@@ -421,7 +450,7 @@ def _full8_single_request_row(owner, input_batch):
         or maximum + query > capacity
     ):
         raise NotImplementedError(
-            "Full8 single-request review requires original positive prompt/output and "
+            "Full8 bounded review requires original positive prompt/output and "
             "prompt + max_tokens + Q8 within the actual allocated model capacity; "
             "resumed/preempted prompt-plus-output prefills are not qualified"
         )
@@ -438,10 +467,7 @@ def resolve_draft_graph_review_limit(vllm_config, *, experimental_graph_review=F
         additional.get("draft_window_graph_eagle_single_request_review", False),
         "additional_config.draft_window_graph_eagle_single_request_review",
     )
-    full8_review = validate_additional_config_bool(
-        additional.get("draft_window_graph_full8_single_request_review", False),
-        "additional_config.draft_window_graph_full8_single_request_review",
-    )
+    full8_review = _full8_requested_review_max_requests(additional)
     if full8_review and finite_review:
         raise ValueError("Full8 and Eagle finite review entries are mutually exclusive")
     if full8_review:
@@ -525,24 +551,28 @@ def validate_draft_graph_review_requests(
     if isinstance(limit, EagleSingleRequestReviewScope):
         _eagle_single_request_row(owner, input_batch)
         return
-    if limit != "full8_local_active_at_most_one":
+    maximum = full8_graph_review_max_requests(limit)
+    if maximum is None:
         raise RuntimeError("unknown temporary Draft Graph review boundary")
     active = input_batch.num_reqs
     if type(active) is not int or active < 0:
         raise ValueError("Draft Graph requires an exact nonnegative local active request count")
-    if active > 1:
+    if active > maximum:
         raise NotImplementedError(
-            "This Full8 Draft Graph checkpoint's temporary review boundary permits at most "
-            "1 actual request per DP replica; active=2 and greater are blocked by an "
-            "unresolved valid-output numerical counterexample. "
-            "Set max_num_seqs=1 on the qualified TP4/DP1 service; Draft eager remains independent. "
+            f"This Full8 Draft Graph review permits at most {maximum} actual "
+            f"{'request' if maximum == 1 else 'requests'} per DP replica. "
+            "Larger local batches remain protected by unresolved valid-output counterexamples. "
+            "Use the corresponding qualified service capacity; Draft eager remains independent. "
             "Graph padding capacity is not the active request count."
         )
-    if active == 1:
+    if active:
         padded = getattr(input_batch, "num_reqs_after_padding", None)
-        if not context_kv_only and (type(padded) is not int or padded != 1):
+        if not context_kv_only and (type(padded) is not int or padded != active):
             raise NotImplementedError(
-                "This Full8 checkpoint's single-request Draft Graph review requires actual=1/padded=1; "
+                "This Full8 checkpoint's bounded Draft Graph review requires actual=1/padded=1 "
+                "or explicitly admitted actual=2/padded=2; "
                 "other padding shapes are not qualified. No fallback is selected."
             )
-        _full8_single_request_row(owner, input_batch)
+        rows = [_full8_single_request_row(owner, input_batch, index=index) for index in range(active)]
+        if len({row[0] for row in rows}) != active or len({row[1] for row in rows}) != active:
+            raise RuntimeError("Full8 review requires distinct original request IDs and source rows")

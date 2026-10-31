@@ -22,3 +22,5 @@ entries:
     text: Added an explicit Full8 TP4/DP2 single-request-per-replica Graph review entry, retaining max_num_seqs=1, actual1/padded1/Q8 and the existing idle-replica protocol. Combined-feature device qualification is separate.
   - category: feature
     text: Connected boolean Async, prefix-cache and Target FlashComm settings to the checkpoint-scoped single-request Full8 and Eagle Graph review entries. Existing Graph ownership, resident canonical KV and actual-row/capacity protections remain; combined-feature model execution is qualified separately, without enabling DSA-CP.
+  - category: feature
+    text: Added a separate default-off Full8 two-request Graph review with exact local active/padded one-or-two banks, independent original request identities and capacity checks. The single-request entry and larger-batch protections remain intact; ordinary two-request device qualification is separate.
