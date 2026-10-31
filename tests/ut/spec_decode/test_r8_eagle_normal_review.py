@@ -37,7 +37,9 @@ def config():
             num_speculative_tokens=3,
             uses_dynamic_speculative_decoding=lambda: False,
             enable_adaptive_verification=False,
-            draft_parallel_config=N(tensor_parallel_size=4),
+            draft_parallel_config=N(
+                tensor_parallel_size=4, enable_expert_parallel=False, use_sequence_parallel_moe=False
+            ),
         ),
         parallel_config=N(
             tensor_parallel_size=4,
@@ -50,21 +52,22 @@ def config():
             use_sequence_parallel_moe=True,
         ),
         scheduler_config=N(async_scheduling=False),
+        model_config=N(max_model_len=4096),
         cache_config=N(enable_prefix_caching=False),
         compilation_config=N(cudagraph_mode=N(name="FULL_DECODE_ONLY")),
         additional_config=dict(draft_window_size=1024, draft_window_graph_replicated_tp_review=True),
     )
 
 
-def objects(prompt=257):
-    owner = N(_draft_graph_review_limit=M.EagleSingleRequestReviewScope())
+def objects(prompt=257, output=32, capacity=4096):
+    owner = N(_draft_graph_review_limit=M.EagleSingleRequestReviewScope(max_model_len=capacity), max_model_len=capacity)
     batch = N(
         num_reqs=1,
         num_reqs_after_padding=1,
         req_ids=["actual-A"],
         idx_mapping_np=[7],
         prefill_len_np=[prompt],
-        draft_graph_review_request_rows=(("actual-A", 7, prompt, prompt + 32, prompt),),
+        draft_graph_review_request_rows=(("actual-A", 7, prompt, prompt + output, prompt),),
     )
     owner.input_batch = batch
     return owner, batch
@@ -83,30 +86,45 @@ class Controls(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             M.eagle_single_request_review_rows(owner, states, ["actual-A"], [7])
 
-    def test_valid_finite_requests_and_guarded_maximum(self):
-        for prompt in (257, 2051):
-            owner, batch = objects(prompt)
+    def test_valid_capacity_requests_and_guarded_maximum(self):
+        for prompt, output in ((1, 1), (257, 32), (1021, 128), (2051, 128), (3965, 128), (4092, 1)):
+            owner, batch = objects(prompt, output)
             M.validate_draft_graph_review_requests(owner, batch)
-            for value in (prompt, prompt + 32 + 3):
+            upper = min(prompt + output + 3, owner.max_model_len)
+            for value in (prompt, upper):
                 M.validate_eagle_single_request_review_exact(owner, batch, Vector(value), num_reqs=1, padded=1, step=0)
-            for value in (prompt - 1, prompt + 36):
+            for value in (prompt - 1, upper + 1):
                 with self.assertRaises(NotImplementedError):
                     M.validate_eagle_single_request_review_exact(
                         owner, batch, Vector(value), num_reqs=1, padded=1, step=1
                     )
 
-    def test_reject_wrong_count_padding_prompt_output_resume(self):
-        for change in ("active", "padded", "prompt", "output", "resume", "stale-id", "stale-index"):
+    def test_reject_wrong_count_padding_capacity_resume(self):
+        for change in (
+            "active",
+            "padded",
+            "prompt",
+            "output",
+            "over-capacity",
+            "owner-capacity",
+            "resume",
+            "stale-id",
+            "stale-index",
+        ):
             owner, batch = objects()
             if change == "active":
                 batch.num_reqs = 2
             elif change == "padded":
                 batch.num_reqs_after_padding = 2
             elif change == "prompt":
-                batch.draft_graph_review_request_rows = (("actual-A", 7, 258, 290, 258),)
-                batch.prefill_len_np = [258]
+                batch.draft_graph_review_request_rows = (("actual-A", 7, 0, 32, 0),)
+                batch.prefill_len_np = [0]
             elif change == "output":
-                batch.draft_graph_review_request_rows = (("actual-A", 7, 257, 290, 257),)
+                batch.draft_graph_review_request_rows = (("actual-A", 7, 257, 257, 257),)
+            elif change == "over-capacity":
+                batch.draft_graph_review_request_rows = (("actual-A", 7, 257, 4094, 257),)
+            elif change == "owner-capacity":
+                owner.max_model_len = 8192
             elif change == "resume":
                 batch.draft_graph_review_request_rows = (("actual-A", 7, 257, 289, 258),)
                 batch.prefill_len_np = [258]
@@ -150,6 +168,20 @@ class Controls(unittest.TestCase):
             M.validate_eagle_single_request_review_config(c, experimental_graph_review=True),
             M.EagleSingleRequestReviewScope,
         )
+        c.additional_config.pop("draft_window_size")
+        self.assertEqual(
+            M.validate_eagle_single_request_review_config(c, experimental_graph_review=True).max_model_len, 4096
+        )
+        for capacity in (None, True, 0, 3, "4096"):
+            c = config()
+            c.model_config.max_model_len = capacity
+            with self.subTest(capacity=capacity), self.assertRaises(ValueError):
+                M.validate_eagle_single_request_review_config(c, experimental_graph_review=True)
+        for window in (0, True, 1024.0, 1023, "1024"):
+            c = config()
+            c.additional_config["draft_window_size"] = window
+            with self.subTest(window=window), self.assertRaises(ValueError):
+                M.validate_eagle_single_request_review_config(c, experimental_graph_review=True)
         c = config()
         c.parallel_config.all2all_backend = "flashinfer_all2allv"
         c.parallel_config.use_sequence_parallel_moe = False

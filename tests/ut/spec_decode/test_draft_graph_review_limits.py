@@ -216,6 +216,7 @@ class ReviewBoundaryControls(unittest.TestCase):
             self.assertIsNone(self.resolve(self.config))
 
     def test_eagle_finite_ordinary_entry_is_an_exact_qualification_scope(self):
+        self.config.model_config = NS(max_model_len=4096)
         self.config.speculative_config.method = "eagle3"
         self.config.speculative_config.num_speculative_tokens = 3
         self.config.parallel_config.all2all_backend = "allgather_reducescatter"
@@ -231,7 +232,7 @@ class ReviewBoundaryControls(unittest.TestCase):
         module.resolve_draft_graph_review_limit = self.resolve
         ascend = ModuleType("vllm_ascend")
         ascend.envs = NS(VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH=True)
-        calls, owner = [], NS()
+        calls, owner = [], NS(max_model_len=4096)
         factory = actual_function(
             SPEC / "__init__.py",
             "init_speculator",
@@ -246,12 +247,12 @@ class ReviewBoundaryControls(unittest.TestCase):
                 self.resolve(self.config, experimental_graph_review=False)
             scope = self.resolve(self.config, experimental_graph_review=True)
             self.assertIsInstance(scope, GUARD["EagleSingleRequestReviewScope"])
-            self.assertEqual((scope.prompt_lengths, scope.output_tokens, scope.static_k), ((257, 2051), 32, 3))
+            self.assertEqual((scope.max_model_len, scope.static_k), (4096, 3))
             with patch.dict(sys.modules, {MODULE: module, "vllm_ascend": ascend}):
                 self.assertIs(factory(self.config, None), owner)
             self.assertIsInstance(owner._draft_graph_review_limit, type(scope))
             self.assertEqual(calls, ["construct"])
-            for prompt in (257, 2051):
+            for prompt in (257, 513, 2051):
                 good = NS(
                     num_reqs=1,
                     num_reqs_after_padding=1,
@@ -261,7 +262,7 @@ class ReviewBoundaryControls(unittest.TestCase):
                     draft_graph_review_request_rows=(("actual", 2, prompt, prompt + 32, prompt),),
                 )
                 self.validate(owner, good)
-            for prompt, output in ((513, 32), (257, 64)):
+            for prompt, output in ((0, 32), (257, 0), (4090, 32)):
                 wrong_envelope = NS(
                     num_reqs=1,
                     num_reqs_after_padding=1,
@@ -270,7 +271,7 @@ class ReviewBoundaryControls(unittest.TestCase):
                     prefill_len_np=[prompt],
                     draft_graph_review_request_rows=(("actual", 2, prompt, prompt + output, prompt),),
                 )
-                with self.assertRaisesRegex(NotImplementedError, "prompt257/2051 and max_tokens32"):
+                with self.assertRaisesRegex(NotImplementedError, "positive prompt/max_tokens"):
                     self.validate(owner, wrong_envelope)
             for active, padded in ((2, 2), (2, 4), (1, 2), (1, 4)):
                 with (

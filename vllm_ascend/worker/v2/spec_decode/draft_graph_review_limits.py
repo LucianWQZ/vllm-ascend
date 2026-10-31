@@ -22,10 +22,9 @@ _FULL8_OUTPUT_TOKENS = 64
 
 @dataclass(frozen=True, slots=True)
 class EagleSingleRequestReviewScope:
-    """Finite controlled review entry; this object is not a PASS receipt."""
+    """Capacity-bounded review entry; this object is not a PASS receipt."""
 
-    prompt_lengths: tuple[int, ...] = (257, 2051)
-    output_tokens: int = 32
+    max_model_len: int
     static_k: int = 3
 
 
@@ -35,6 +34,8 @@ def validate_eagle_single_request_review_config(vllm_config, *, experimental_gra
     scheduler = vllm_config.scheduler_config
     cache = vllm_config.cache_config
     additional = vllm_config.additional_config or {}
+    maximum = getattr(getattr(vllm_config, "model_config", None), "max_model_len", None)
+    requested_window = additional.get("draft_window_size")
     draft_parallel = getattr(speculative, "draft_parallel_config", None)
     mode = getattr(vllm_config.compilation_config.cudagraph_mode, "name", None)
     # Ascend's actual patch_parallel_config predicate deliberately removes
@@ -72,13 +73,17 @@ def validate_eagle_single_request_review_config(vllm_config, *, experimental_gra
         or scheduler.async_scheduling is not False
         or cache.enable_prefix_caching is not False
         or mode != "FULL_DECODE_ONLY"
-        or additional.get("draft_window_size") != 1024
+        or requested_window not in (None, 1024)
+        or (requested_window is not None and type(requested_window) is not int)
+        or type(maximum) is not int
+        or maximum <= 3
         or additional.get("draft_window_graph_replicated_tp_review") is not True
         or additional.get("draft_window_graph_numeric_diagnostic", False) is not False
         or speculative.enable_adaptive_verification is not False
     ):
         raise ValueError(
-            "Eagle single-request review requires static K3/W1024, TP4/DP1/PP1/PCP1/DCP1, "
+            "Eagle single-request review requires static K3 with Window OFF or W1024, "
+            "a positive configured model capacity, TP4/DP1/PP1/PCP1/DCP1, "
             "the qualified Ascend Target EP/SP initialization phases and non-SP dense Draft, FULL_DECODE_ONLY, "
             "non-async/no-prefix/non-adaptive and the experimental Graph gate; "
             f"actual={{'gate': {experimental_graph_review!r}, 'method': {getattr(speculative, 'method', None)!r}, "
@@ -106,7 +111,7 @@ def validate_eagle_single_request_review_config(vllm_config, *, experimental_gra
             f"'numeric': {additional.get('draft_window_graph_numeric_diagnostic', False)!r}, "
             f"'adaptive': {getattr(speculative, 'enable_adaptive_verification', None)!r}}}"
         )
-    return EagleSingleRequestReviewScope()
+    return EagleSingleRequestReviewScope(max_model_len=maximum)
 
 
 def note_eagle_single_request_review_lifecycle(owner, scheduler_output):
@@ -180,6 +185,7 @@ def _eagle_single_request_row(owner, input_batch):
         or not isinstance(row[0], str)
         or any(type(value) is not int for value in row[1:])
         or row[0] != input_batch.req_ids[0]
+        or row[1] < 0
         or row[1] != int(input_batch.idx_mapping_np[0])
         or row[4] != int(input_batch.prefill_len_np[0])
     ):
@@ -187,9 +193,16 @@ def _eagle_single_request_row(owner, input_batch):
     if row[0] in getattr(owner, "_draft_graph_review_preempted_request_ids", ()):
         raise NotImplementedError("Eagle single-request review does not qualify resumption after preemption")
     _, _, prompt, maximum, prefill = row
-    if prompt not in scope.prompt_lengths or maximum != prompt + scope.output_tokens or prefill != prompt:
+    if (
+        type(getattr(owner, "max_model_len", None)) is not int
+        or owner.max_model_len != scope.max_model_len
+        or not 0 < prompt < maximum
+        or maximum + scope.static_k > scope.max_model_len
+        or prefill != prompt
+    ):
         raise NotImplementedError(
-            "Eagle single-request review permits only prompt257/2051 and max_tokens32; "
+            "Eagle single-request review requires positive prompt/max_tokens plus static-K lookahead "
+            "within configured max_model_len; "
             "resumed/preempted prompt-plus-output prefills are not qualified"
         )
     return row
@@ -213,8 +226,8 @@ def validate_eagle_single_request_review_exact(owner, input_batch, exact, *, num
     ):
         raise RuntimeError("Eagle review lost its one-row CPU exact consumer input")
     value = exact[0].item()
-    if type(value) is not int or not prompt <= value <= maximum + scope.static_k:
-        raise NotImplementedError("Eagle consumer exact length is outside its finite prompt+32+K review envelope")
+    if type(value) is not int or not prompt <= value <= min(maximum + scope.static_k, scope.max_model_len):
+        raise NotImplementedError("Eagle consumer exact length is outside its request and model capacity")
 
 
 def validate_eagle_single_request_graph_stage(owner, inputs, *, first, n, tokens, ordinal):

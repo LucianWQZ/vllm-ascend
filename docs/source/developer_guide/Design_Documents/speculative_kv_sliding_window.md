@@ -107,19 +107,30 @@ The fixed Eagle checkpoint has an explicit single-request review entry behind
 `VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH=1` and
 `draft_window_graph_eagle_single_request_review=true`. It is a qualification
 entry, not a product support or service-PASS declaration. The exact existing
-config guard remains required: TP4/DP1/PP1/PCP1/DCP1, static K3/W1024,
+config guard remains required: TP4/DP1/PP1/PCP1/DCP1, static K3,
+Window OFF (the extra-window setting omitted) or Window ON with W1024,
 FULL_DECODE_ONLY, the reviewed Target EP topology with the exact pre-normalization
 pair (`allgather_reducescatter`, SP on) or normalized pair
 (`flashinfer_all2allv`, SP off). The independent dense Draft keeps SP off.
 Async, prefix, FlashComm and legacy DSA-CP remain disabled.
-The runtime also requires actual/padded rows 1/1,
-prompt lengths 257 or 2051 and an output limit of 32, with no preemption
-resumption. Other checkpoint identities and the default ordinary entry stay
+The runtime requires actual/padded rows 1/1, positive original prompt and
+output lengths whose sum plus static-K lookahead fits the configured model
+capacity, and no preemption resumption. The capacity is frozen when the entry is constructed;
+an owner with a different capacity is rejected. Reserving K positions also
+keeps the last first-pass Q4 write grid within the configured Full capacity.
+Each Window consumer's exact
+length must fit both the request's static-K horizon and that model capacity.
+The actual capture descriptor must still match first Q4 or either AR Q1
+consumer. Prompt length is not a Graph capture bucket.
+Other checkpoint identities and the default ordinary entry stay
 closed; the private numerical diagnostic flag cannot admit this service entry.
 
-Ordinary service execution and normal reader completion remain to be qualified
-separately from the comparable-state numeric/Full-write and Target
-noninterference checks. Existing multiple-request failures are retained;
+The earlier prompt257/2051, output32 qualification remains evidence only for
+those actual executions. A capacity check does not itself establish device
+qualification for a different length, output budget, cache capacity or mode.
+Ordinary service execution and normal reader completion are qualified
+separately from comparable-state numeric/Full-write and Target noninterference
+checks. Existing multiple-request failures are retained;
 this entry does not qualify multi-request shapes, business quality,
 performance, release approval or the public Graph gate.
 
