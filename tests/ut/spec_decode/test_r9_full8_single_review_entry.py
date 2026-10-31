@@ -106,13 +106,20 @@ class Full8FiniteEntry(unittest.TestCase):
 
     def test_wrong_topology_mode_capture_and_bool_rejected(self):
         self.config.additional_config["draft_window_graph_full8_single_request_review"] = True
+        self.config.scheduler_config.async_scheduling = True
+        self.config.cache_config.enable_prefix_caching = True
+        self.config.additional_config["enable_flashcomm1"] = True
+        self.assertEqual(self.resolve(self.config, experimental_graph_review=True), "full8_local_active_at_most_one")
+        self.config.scheduler_config.async_scheduling = False
+        self.config.cache_config.enable_prefix_caching = False
+        del self.config.additional_config["enable_flashcomm1"]
         for obj, key, value in [
             # This fixture lacks the mandatory TP-only Draft DP1 descriptor.
             (self.config.parallel_config, "data_parallel_size", 2),
             (self.config.parallel_config, "tensor_parallel_size", 2),
             (self.config.scheduler_config, "max_num_seqs", 2),
-            (self.config.scheduler_config, "async_scheduling", True),
-            (self.config.cache_config, "enable_prefix_caching", True),
+            (self.config.scheduler_config, "async_scheduling", 1),
+            (self.config.cache_config, "enable_prefix_caching", "true"),
             (self.config.compilation_config, "cudagraph_capture_sizes", [8, 16]),
             (self.config.model_config, "max_model_len", 262145),
             (self.config.speculative_config, "enforce_eager", True),
@@ -145,6 +152,15 @@ class Full8FiniteEntry(unittest.TestCase):
             self.assertEqual(
                 self.resolve(self.config, experimental_graph_review=True), "full8_local_active_at_most_one"
             )
+            self.config.scheduler_config.async_scheduling = True
+            self.config.cache_config.enable_prefix_caching = True
+            self.config.additional_config["enable_flashcomm1"] = True
+            self.assertEqual(
+                self.resolve(self.config, experimental_graph_review=True), "full8_local_active_at_most_one"
+            )
+            self.config.scheduler_config.async_scheduling = False
+            self.config.cache_config.enable_prefix_caching = False
+            del self.config.additional_config["enable_flashcomm1"]
         for value in (None, True, 0, 2, "1"):
             draft.data_parallel_size = value
             with self.subTest(draft_dp=value), self.assertRaises(NotImplementedError):
@@ -155,8 +171,8 @@ class Full8FiniteEntry(unittest.TestCase):
             (self.config.parallel_config, "data_parallel_size", True),
             (self.config.parallel_config, "enable_expert_parallel", False),
             (self.config.scheduler_config, "max_num_seqs", 2),
-            (self.config.scheduler_config, "async_scheduling", True),
-            (self.config.cache_config, "enable_prefix_caching", True),
+            (self.config.scheduler_config, "async_scheduling", 1),
+            (self.config.cache_config, "enable_prefix_caching", "true"),
             (self.config.compilation_config, "cudagraph_capture_sizes", [8, 16]),
         ):
             old = getattr(obj, key)
