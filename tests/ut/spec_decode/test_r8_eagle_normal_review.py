@@ -221,7 +221,12 @@ class Controls(unittest.TestCase):
     def test_shared_and_eager_paths_remain_unchanged_when_no_scope(self):
         M.validate_draft_graph_review_requests(N(), N())
         M.validate_eagle_single_request_graph_stage(N(), None, first=None, n=None, tokens=None, ordinal=None)
-        full = N(_draft_graph_review_limit="full8_local_active_at_most_one")
+        full = N(
+            _draft_graph_review_limit="full8_local_active_at_most_one",
+            max_model_len=40960,
+            num_query_per_req=8,
+            vllm_config=N(model_config=N(max_model_len=40960)),
+        )
         M.validate_draft_graph_review_requests(
             full,
             N(
