@@ -367,10 +367,11 @@ A few important things to consider when using DFlash2 draft models:
       --speculative-config '{"method": "dflash", "model": "z-lab/Qwen3.8-27B-DFlash2", "num_speculative_tokens": 8, "enforce_eager": true}'
     ```
 
-2. **Model runner V2 requires an eager draft**: DFlash2 on model runner V2
-   does not yet support graph mode for the draft. Set `"enforce_eager": true`
-   in `speculative_config`; the target model keeps its own graph mode (e.g.
-   `FULL_DECODE_ONLY`).
+2. **Model runner V2 defaults to an eager draft**: use `"enforce_eager": true`
+   in `speculative_config` for the default DFlash2 entry. The limited,
+   default-off experimental route is described in
+   [Experimental DFlash2 Draft Graph](../../developer_guide/Design_Documents/speculative_kv_sliding_window.md#experimental-dflash2-draft-graph).
+   The target model keeps its own graph mode (e.g. `FULL_DECODE_ONLY`).
 
 3. **Graph capture sizes**: each decode step runs `(1 + K)` tokens per
    request, so every capture size must be `n * (num_speculative_tokens + 1)`
@@ -529,10 +530,13 @@ options.
   MRV2 Eagle3 additionally requires `draft_window_size >= 2 * K + 1`, where
   `K` is the static number of speculative tokens, to cover first-pass queries
   and the frozen proposal horizon through rejection.
-- MRV2 requires an eager draft (`speculative_config.enforce_eager=true`).
-  The target retains its configured graph mode. Draft Window graph execution
-  is not implemented. Actual draft backend and KV-group compatibility are
-  checked after attention setup; unsupported read layouts fail explicitly.
+- MRV2's default entry requires an eager draft
+  (`speculative_config.enforce_eager=true`). The target retains its configured
+  graph mode. Limited, default-off Draft Window Graph routes have separate
+  review gates and model/topology/shape restrictions described in the
+  [design document](../../developer_guide/Design_Documents/speculative_kv_sliding_window.md).
+  Actual draft backend and KV-group compatibility are checked after attention
+  setup; unsupported read layouts fail explicitly.
 - For `mtp` the window is ignored (force-disabled): MTP reuses the target
   model's own layers, so windowing it would change the target's computation.
 - MRV2 also force-disables the window for the dedicated built-in DeepSeek V4
@@ -544,7 +548,8 @@ options.
   read view changes. Native SWA layers intersect their native readable band
   with the extra window, including drafts with only native SWA layers.
   Plain Eagle and dynamic speculative length remain unsupported with a
-  window. DFlash2 requires an eager Draft; this does not disable Target Graph.
+  window. DFlash2 requires an eager Draft in the default entry; this does not
+  disable Target Graph.
   A supported native-only non-causal DFlash2 draft keeps symmetric native SWA,
   including when the extra window is OFF. ON intersects it with the added
   read window; it does not make the model causal. The provider requires

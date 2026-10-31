@@ -597,11 +597,14 @@ ordinary typed eager implementation; no implicit eager fallback is used.
 
 The existing DFlash2 `_generate_draft` remains the captured computation: Draft
 forward and convolution, candidate Top-K, selector, Ascend path walk and
-probability-cache writes. Request preparation, metadata and CPU scheduling stay
-outside capture. Stable model, selector, sampler, mask and input addresses are
-validated before submission. The shared Graph source banks and completion
-dependencies own projected read metadata; an eager runtime is not created in
-parallel. Full KV writes, absolute positions, canonical tables and Target state
+probability-cache writes. Capture also includes the `prepare_forward` steps that
+combine staged features, prepare the context anchor and store Full context K/V,
+plus any device metadata updates supported by the model. CPU request/metadata
+construction, runtime UPDATE parameter resolution and scheduling remain outside
+capture. Stable model, selector, sampler, mask and input addresses are validated
+before submission. The shared Graph source banks and completion dependencies
+own projected read metadata; an eager runtime is not created in parallel. Full KV
+writes, absolute positions, canonical tables and Target state
 retain their original meaning. Context-only writes retain their existing
 completion owner even when there is no proposal attention.
 
