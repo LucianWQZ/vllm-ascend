@@ -50,6 +50,7 @@ class EagleSingleRequestReviewScope:
 
     max_model_len: int
     static_k: int = 3
+    max_requests: int = 1
 
 
 def validate_eagle_single_request_review_config(vllm_config, *, experimental_graph_review):
@@ -141,6 +142,33 @@ def validate_eagle_single_request_review_config(vllm_config, *, experimental_gra
     return EagleSingleRequestReviewScope(max_model_len=maximum)
 
 
+def validate_eagle_two_request_review_config(vllm_config, *, experimental_graph_review):
+    """Separate default-off n1/n2 entry; numerical evidence is not service qualification."""
+    scope = validate_eagle_single_request_review_config(
+        vllm_config, experimental_graph_review=experimental_graph_review
+    )
+    additional = vllm_config.additional_config or {}
+    compilation = vllm_config.compilation_config
+    sizes = compilation.cudagraph_capture_sizes
+    maximum = compilation.max_cudagraph_capture_size
+    if (
+        additional.get("draft_window_graph_eagle_two_request_review") is not True
+        or additional.get("draft_window_graph_eagle_single_request_review", False) is not False
+        or type(vllm_config.scheduler_config.max_num_seqs) is not int
+        or vllm_config.scheduler_config.max_num_seqs != 2
+        or type(maximum) is not int
+        or maximum < 8
+        or not sizes
+        or any(type(size) is not int or size <= 0 for size in sizes)
+        or not {4, 8}.issubset(sizes)
+    ):
+        raise ValueError(
+            "Eagle two-request review requires its separate flag, max_num_seqs=2 and legal first Q4 n1/n2 buckets; "
+            "the single flag and larger request shapes remain separate"
+        )
+    return EagleSingleRequestReviewScope(max_model_len=scope.max_model_len, max_requests=2)
+
+
 def note_eagle_single_request_review_lifecycle(owner, scheduler_output):
     """Keep only authoritative preemption IDs until real request completion.
 
@@ -194,45 +222,66 @@ def eagle_single_request_review_rows(owner, req_states, req_ids, idx_mapping_np)
     return tuple(rows)
 
 
-def _eagle_single_request_row(owner, input_batch):
+def _eagle_review_request_rows(owner, input_batch):
     scope = owner._draft_graph_review_limit
     rows = getattr(input_batch, "draft_graph_review_request_rows", None)
+    active = input_batch.num_reqs
+    padded = input_batch.num_reqs_after_padding
     if (
-        type(input_batch.num_reqs) is not int
-        or input_batch.num_reqs != 1
-        or input_batch.num_reqs_after_padding != 1
+        type(scope.max_requests) is not int
+        or scope.max_requests not in (1, 2)
+        or type(active) is not int
+        or not 1 <= active <= scope.max_requests
+        or type(padded) is not int
+        or padded != active
         or not isinstance(rows, tuple)
-        or len(rows) != 1
+        or len(rows) != active
+        or len(input_batch.req_ids) != active
+        or len(set(input_batch.req_ids)) != active
+        or len(input_batch.idx_mapping_np) < active
+        or len(input_batch.prefill_len_np) < active
     ):
+        raise NotImplementedError("Eagle review requires admitted actual request counts with identical padded rows")
+    indices = []
+    for position, row in enumerate(rows):
+        if (
+            not isinstance(row, tuple)
+            or len(row) != 5
+            or not isinstance(row[0], str)
+            or not row[0]
+            or any(type(value) is not int for value in row[1:])
+            or row[0] != input_batch.req_ids[position]
+            or row[1] < 0
+            or row[1] != int(input_batch.idx_mapping_np[position])
+            or row[4] != int(input_batch.prefill_len_np[position])
+        ):
+            raise RuntimeError("Eagle review request identity/source row differs")
+        if row[0] in getattr(owner, "_draft_graph_review_preempted_request_ids", ()):
+            raise NotImplementedError("Eagle request review does not qualify resumption after preemption")
+        _, index, prompt, maximum, prefill = row
+        if (
+            type(getattr(owner, "max_model_len", None)) is not int
+            or owner.max_model_len != scope.max_model_len
+            or not 0 < prompt < maximum
+            or maximum + scope.static_k > scope.max_model_len
+            or prefill != prompt
+        ):
+            raise NotImplementedError(
+                "Eagle request review requires each original positive prompt/max_tokens plus static-K lookahead "
+                "within configured max_model_len; resumed/preempted prompt-plus-output prefills are not qualified"
+            )
+        indices.append(index)
+    if len(set(indices)) != active:
+        raise RuntimeError("Eagle review request rows alias the same authoritative request index")
+    return rows
+
+
+def _eagle_single_request_row(owner, input_batch):
+    """Keep the existing internal single-row API and its default scope unchanged."""
+    rows = _eagle_review_request_rows(owner, input_batch)
+    if len(rows) != 1:
         raise NotImplementedError("Eagle single-request review requires one actual request and one padded row")
-    row = rows[0]
-    if (
-        not isinstance(row, tuple)
-        or len(row) != 5
-        or not isinstance(row[0], str)
-        or any(type(value) is not int for value in row[1:])
-        or row[0] != input_batch.req_ids[0]
-        or row[1] < 0
-        or row[1] != int(input_batch.idx_mapping_np[0])
-        or row[4] != int(input_batch.prefill_len_np[0])
-    ):
-        raise RuntimeError("Eagle review request identity/source row differs")
-    if row[0] in getattr(owner, "_draft_graph_review_preempted_request_ids", ()):
-        raise NotImplementedError("Eagle single-request review does not qualify resumption after preemption")
-    _, _, prompt, maximum, prefill = row
-    if (
-        type(getattr(owner, "max_model_len", None)) is not int
-        or owner.max_model_len != scope.max_model_len
-        or not 0 < prompt < maximum
-        or maximum + scope.static_k > scope.max_model_len
-        or prefill != prompt
-    ):
-        raise NotImplementedError(
-            "Eagle single-request review requires positive prompt/max_tokens plus static-K lookahead "
-            "within configured max_model_len; "
-            "resumed/preempted prompt-plus-output prefills are not qualified"
-        )
-    return row
+    return rows[0]
 
 
 def validate_eagle_single_request_review_exact(owner, input_batch, exact, *, num_reqs, padded, step):
@@ -240,21 +289,24 @@ def validate_eagle_single_request_review_exact(owner, input_batch, exact, *, num
     scope = getattr(owner, "_draft_graph_review_limit", None)
     if not isinstance(scope, EagleSingleRequestReviewScope):
         return
-    _, _, prompt, maximum, _ = _eagle_single_request_row(owner, input_batch)
+    rows = _eagle_review_request_rows(owner, input_batch)
     if (
-        num_reqs != 1
-        or padded != 1
+        type(num_reqs) is not int
+        or num_reqs != len(rows)
+        or type(padded) is not int
+        or padded != len(rows)
         or type(step) is not int
         or not 0 <= step < scope.static_k
         or exact.device.type != "cpu"
         or exact.ndim != 1
-        or exact.shape[0] != 1
+        or exact.shape[0] != len(rows)
         or str(exact.dtype) != "torch.int32"
     ):
-        raise RuntimeError("Eagle review lost its one-row CPU exact consumer input")
-    value = exact[0].item()
-    if type(value) is not int or not prompt <= value <= min(maximum + scope.static_k, scope.max_model_len):
-        raise NotImplementedError("Eagle consumer exact length is outside its request and model capacity")
+        raise RuntimeError("Eagle review lost its exact admitted-row CPU consumer input")
+    for position, (_, _, prompt, maximum, _) in enumerate(rows):
+        value = exact[position].item()
+        if type(value) is not int or not prompt <= value <= min(maximum + scope.static_k, scope.max_model_len):
+            raise NotImplementedError("Eagle consumer exact length is outside its request and model capacity")
 
 
 def validate_eagle_single_request_graph_descriptor(owner, *, first, n, tokens):
@@ -262,11 +314,13 @@ def validate_eagle_single_request_graph_descriptor(owner, *, first, n, tokens):
     scope = getattr(owner, "_draft_graph_review_limit", None)
     if not isinstance(scope, EagleSingleRequestReviewScope):
         return
-    _eagle_single_request_row(owner, owner.input_batch)
+    rows = _eagle_review_request_rows(owner, owner.input_batch)
     if type(first) is not bool or type(n) is not int or type(tokens) is not int:
         raise TypeError("Eagle review requires exact Graph descriptor types")
-    if n != 1 or tokens != (4 if first else 1):
-        raise NotImplementedError("Eagle review Graph requires padded1 first Q4 or AR Q1 before replay")
+    if n != len(rows) or tokens != n * (scope.static_k + 1 if first else 1):
+        raise NotImplementedError(
+            "Eagle review Graph requires padded1 or explicitly admitted padded2, first Q4 or AR Q1 before replay"
+        )
 
 
 def validate_eagle_single_request_graph_stage(owner, inputs, *, first, n, tokens, ordinal):
@@ -275,12 +329,13 @@ def validate_eagle_single_request_graph_stage(owner, inputs, *, first, n, tokens
         return
     validate_eagle_single_request_graph_descriptor(owner, first=first, n=n, tokens=tokens)
     if (
-        inputs.actual_request_count != 1
-        or inputs.padded_request_count != 1
+        inputs.actual_request_count != n
+        or inputs.padded_request_count != n
+        or type(ordinal) is not int
         or ordinal not in ((0,) if first else (0, 1))
         or inputs.identity.step != (0 if first else ordinal + 1)
     ):
-        raise NotImplementedError("Eagle review Graph must use first Q4 and exactly two AR Q1 consumers, padded1")
+        raise NotImplementedError("Eagle review Graph must use first Q4 and exactly two AR Q1 consumers per request")
 
 
 def _full8_review_capacity(vllm_config):
@@ -467,18 +522,29 @@ def resolve_draft_graph_review_limit(vllm_config, *, experimental_graph_review=F
         additional.get("draft_window_graph_eagle_single_request_review", False),
         "additional_config.draft_window_graph_eagle_single_request_review",
     )
+    pair_review = validate_additional_config_bool(
+        additional.get("draft_window_graph_eagle_two_request_review", False),
+        "additional_config.draft_window_graph_eagle_two_request_review",
+    )
+    if finite_review and pair_review:
+        raise ValueError("Eagle single- and two-request review entries are mutually exclusive")
     full8_review = _full8_requested_review_max_requests(additional)
-    if full8_review and finite_review:
+    if full8_review and (finite_review or pair_review):
         raise ValueError("Full8 and Eagle finite review entries are mutually exclusive")
     if full8_review:
         return validate_full8_single_request_review_entry(
             vllm_config, experimental_graph_review=experimental_graph_review
         )
-    if finite_review:
+    if pair_review:
+        finite_scope = validate_eagle_two_request_review_config(
+            vllm_config, experimental_graph_review=experimental_graph_review
+        )
+    elif finite_review:
         finite_scope = validate_eagle_single_request_review_config(
             vllm_config,
             experimental_graph_review=experimental_graph_review,
         )
+    finite_review = finite_review or pair_review
     if speculative.method not in ("dflash", "eagle3") or speculative.enforce_eager is True:
         return None
     compilation = getattr(vllm_config, "compilation_config", None)
@@ -549,7 +615,7 @@ def validate_draft_graph_review_requests(
     if limit is None or dummy_run or is_profile or getattr(input_batch, "is_dummy", False):
         return
     if isinstance(limit, EagleSingleRequestReviewScope):
-        _eagle_single_request_row(owner, input_batch)
+        _eagle_review_request_rows(owner, input_batch)
         return
     maximum = full8_graph_review_max_requests(limit)
     if maximum is None:

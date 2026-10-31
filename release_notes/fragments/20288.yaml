@@ -26,3 +26,5 @@ entries:
     text: Added a separate default-off Full8 two-request Graph review with exact local active/padded one-or-two banks, independent original request identities and capacity checks. The single-request entry and larger-batch protections remain intact; ordinary two-request device qualification is separate.
   - category: bugfix
     text: Kept the admitted dense Eagle AR capture descriptor independent of Target SP-aligned capture sizes. The Q1 AR buckets are derived from legal Q4 first-pass request buckets without changing Target SP, Draft topology or default Graph behavior; device qualification remains separate.
+  - category: feature
+    text: Added a separate default-off TP4/DP1 Eagle two-request Graph review with max_num_seqs=2, independent request identities and exact n1/n2 first-Q4 and AR-Q1 descriptors. Existing single-request behavior and larger-batch protections remain; ordinary service qualification is separate from the paired numerical check.

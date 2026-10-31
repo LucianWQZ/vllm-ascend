@@ -111,8 +111,11 @@ config guard remains required: TP4/DP1/PP1/PCP1/DCP1, static K3,
 Window OFF (the extra-window setting omitted) or Window ON with W1024,
 FULL_DECODE_ONLY, the reviewed Target EP topology with the exact pre-normalization
 pair (`allgather_reducescatter`, SP on) or normalized pair
-(`flashinfer_all2allv`, SP off). The independent dense Draft keeps SP off.
-Async, prefix, FlashComm and legacy DSA-CP remain disabled.
+(`flashinfer_all2allv`, SP off). The independent dense Draft descriptor has
+EP/SP off; the Target-derived runtime clone's flags are a separate fact and
+do not prove how every loaded Draft module executes. Boolean Async, prefix
+and Target FlashComm settings remain in the Graph fingerprint; legacy DSA-CP
+stays disabled.
 The runtime requires actual/padded rows 1/1, positive original prompt and
 output lengths whose sum plus static-K lookahead fits the configured model
 capacity, and no preemption resumption. The capacity is frozen when the entry is constructed;
@@ -133,6 +136,20 @@ separately from comparable-state numeric/Full-write and Target noninterference
 checks. Existing multiple-request failures are retained;
 this entry does not qualify multi-request shapes, business quality,
 performance, release approval or the public Graph gate.
+
+A separate default-off `draft_window_graph_eagle_two_request_review=true`
+entry keeps that same checkpoint, TP4/DP1 and static-K3 contract, with
+`max_num_seqs=2` and legal first-pass capture token sizes 4 and 8. It is
+mutually exclusive with the single-request flag and the private numerical
+diagnostic. Only actual/padded1 or actual/padded2 is admitted: each request
+retains its own authoritative identity, capacity and CPU exact length; first
+consumers use Q4 per request and both later AR consumers use Q1 per request.
+The AR manager derives its 1/2-token buckets from those legal first-pass
+request buckets without changing Target SP alignment. Finish, preemption
+and persistent-bank completion protections remain in place. This entry
+requires separate ordinary-service qualification; the existing paired
+numerical result does not open unqualified multi-request service. Actual3,
+padded4, DP2 and the historical TP2 four-request route remain excluded.
 
 The designated Full8 checkpoint has a separate, default-off
 `draft_window_graph_full8_single_request_review=true` qualification entry.

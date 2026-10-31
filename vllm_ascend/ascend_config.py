@@ -214,6 +214,7 @@ def _single_request_graph_off_review(vllm_config: Any) -> bool:
             "draft_window_graph_full8_single_request_review",
             "draft_window_graph_full8_two_request_review",
             "draft_window_graph_eagle_single_request_review",
+            "draft_window_graph_eagle_two_request_review",
         )
     )
     if not enabled:
@@ -905,6 +906,8 @@ class AscendConfig:
     draft_window_graph_validation_memo: bool = False
     # Controlled finite Eagle single-request product review; not a PASS receipt.
     draft_window_graph_eagle_single_request_review: bool = False
+    # Separate default-off exact n1/n2 Eagle ordinary qualification entry.
+    draft_window_graph_eagle_two_request_review: bool = False
     # Controlled Full8 active1/padded1 ordinary qualification; default still closed.
     draft_window_graph_full8_single_request_review: bool = False
     # Separate controlled Full8 actual/padded1-or-2 qualification; never opens larger batches.
@@ -2316,6 +2319,21 @@ def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
             "Controlled Eagle Draft Graph review: capacity-bounded single actual request, "
             "TP4/DP1 static K3, Window OFF or W1024 only; "
             "this flag is not a numerical or release qualification."
+        )
+    if new_config.draft_window_graph_eagle_two_request_review:
+        from vllm_ascend import envs
+        from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import (
+            resolve_draft_graph_review_limit,
+        )
+
+        resolve_draft_graph_review_limit(
+            vllm_config,
+            experimental_graph_review=envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH,
+        )
+        logger.warning_once(
+            "Controlled Eagle two-request Draft Graph qualification: exact checkpoint, TP4/DP1, static K3, "
+            "max_num_seqs=2, Window OFF or W1024, exact n1/n2 first Q4 and AR Q1 banks only; "
+            "ordinary device qualification is separate."
         )
     if new_config.draft_window_graph_single_metadata:
         speculative = vllm_config.speculative_config
