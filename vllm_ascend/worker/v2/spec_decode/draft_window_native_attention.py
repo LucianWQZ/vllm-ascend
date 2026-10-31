@@ -8,11 +8,12 @@ This inventory neither creates a Window owner nor enables a read provider.
 """
 
 import json
-import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+import regex as re
 
 _MISSING = object()
 _MAX_DRAFT_CONFIG_BYTES = 1024 * 1024
