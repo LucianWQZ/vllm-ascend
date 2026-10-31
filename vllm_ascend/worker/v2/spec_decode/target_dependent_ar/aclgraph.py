@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
 from collections.abc import Callable
+from copy import copy
 from typing import Any
 
 import torch
@@ -46,6 +47,84 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
 from vllm_ascend.worker.v2.utils import communicator_switch
 
 
+def _eagle_ar_capture_config(vllm_config: VllmConfig, cudagraph_mode: CUDAGraphMode, decode_query_len: int):
+    """Keep Target SP alignment out of the admitted dense Eagle AR buckets.
+
+    Ascend filters the shared Target capture sizes to multiples of TP. K3
+    first passes use Q4, so their valid request buckets survive that filter;
+    the same sizes cannot represent Q1 AR for those requests. Only this
+    default-off TP4 Eagle review gets an independent compilation descriptor.
+    Target/first-pass configs, topology and computation remain unchanged.
+    """
+    speculative = vllm_config.speculative_config
+    if (
+        decode_query_len != 1
+        or speculative is None
+        or not isinstance(cudagraph_mode, CUDAGraphMode)
+        or cudagraph_mode.decode_mode() != CUDAGraphMode.FULL
+        or speculative.method != "eagle3"
+        or speculative.enforce_eager
+        or speculative.num_speculative_tokens != 3
+        or speculative.uses_dynamic_speculative_decoding()
+        or (vllm_config.additional_config or {}).get("draft_window_graph_replicated_tp_review") is not True
+        or vllm_config.parallel_config.use_sequence_parallel_moe is not True
+        or any(
+            getattr(vllm_config.parallel_config, name) != 1
+            for name in (
+                "data_parallel_size",
+                "pipeline_parallel_size",
+                "prefill_context_parallel_size",
+                "decode_context_parallel_size",
+            )
+        )
+    ):
+        return vllm_config
+    from vllm_ascend import envs
+    from vllm_ascend.ascend_config import _eagle3_tp4_graph_review
+
+    if not envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH or not _eagle3_tp4_graph_review(vllm_config):
+        return vllm_config
+    draft_parallel = speculative.draft_parallel_config
+    if (
+        draft_parallel is None
+        or draft_parallel.use_sequence_parallel_moe is not False
+        or draft_parallel.enable_expert_parallel is not False
+    ):
+        raise NotImplementedError("Eagle AR capture adaptation requires the independent non-SP dense Draft descriptor")
+    compilation = vllm_config.compilation_config
+    maximum = vllm_config.scheduler_config.max_num_seqs
+    first_query = speculative.num_speculative_tokens + 1
+    sizes = compilation.cudagraph_capture_sizes
+    if (
+        type(maximum) is not int
+        or maximum <= 0
+        or type(compilation.max_cudagraph_capture_size) is not int
+        or compilation.max_cudagraph_capture_size <= 0
+        or not sizes
+        or any(type(size) is not int or size <= 0 for size in sizes)
+    ):
+        raise ValueError("Eagle AR capture requires typed positive Target first-pass bucket inputs")
+    # This matches the already legal first Q4 FULL descriptors, not arbitrary
+    # new request counts or a guessed minimum bucket. Do not call platform
+    # normalization on the private descriptor: it would apply Target SP again.
+    requests = sorted(
+        {
+            size // first_query
+            for size in sizes
+            if size % first_query == 0
+            and size <= compilation.max_cudagraph_capture_size
+            and 0 < size // first_query <= maximum
+        }
+    )
+    if not requests:
+        raise NotImplementedError("Eagle AR capture has no admitted first-pass request bucket to preserve")
+    draft_config = copy(vllm_config)
+    draft_config.compilation_config = copy(compilation)
+    draft_config.compilation_config.cudagraph_capture_sizes = requests
+    draft_config.compilation_config.max_cudagraph_capture_size = max(requests)
+    return draft_config
+
+
 class AutoRegressiveAclGraphManager(SpeculatorCudaGraphManager):
     """ACL graph manager for autoregressive speculative decoding."""
 
@@ -57,6 +136,7 @@ class AutoRegressiveAclGraphManager(SpeculatorCudaGraphManager):
         decode_query_len: int,
         lora_capture_cases: list[int] | None = None,
     ):
+        vllm_config = _eagle_ar_capture_config(vllm_config, cudagraph_mode, decode_query_len)
         super().__init__(
             vllm_config,
             device,
