@@ -207,7 +207,9 @@ class ReviewBoundaryControls(unittest.TestCase):
         self.config.speculative_config.method = "eagle3"
         self.config.speculative_config.num_speculative_tokens = 3
         self.config.parallel_config.all2all_backend = "allgather_reducescatter"
-        self.config.parallel_config.use_sequence_parallel_moe = False
+        self.config.parallel_config.use_sequence_parallel_moe = True
+        self.config.speculative_config.draft_parallel_config.enable_expert_parallel = False
+        self.config.speculative_config.draft_parallel_config.use_sequence_parallel_moe = False
         self.config.additional_config = dict(
             draft_window_size=1024,
             draft_window_graph_replicated_tp_review=True,
@@ -276,13 +278,24 @@ class ReviewBoundaryControls(unittest.TestCase):
                 with self.subTest(key=key), self.assertRaises(ValueError):
                     self.resolve(self.config, experimental_graph_review=True)
                 setattr(obj, key, old)
-            for backend in ("allgather_reducescatter", "flashinfer_all2allv"):
+            for backend, sp in (("allgather_reducescatter", True), ("flashinfer_all2allv", False)):
                 self.config.parallel_config.all2all_backend = backend
+                self.config.parallel_config.use_sequence_parallel_moe = sp
                 self.assertIsInstance(self.resolve(self.config, experimental_graph_review=True), type(scope))
-                self.config.parallel_config.use_sequence_parallel_moe = True
+                self.config.parallel_config.use_sequence_parallel_moe = not sp
                 with self.assertRaises(ValueError):
                     self.resolve(self.config, experimental_graph_review=True)
-                self.config.parallel_config.use_sequence_parallel_moe = False
+                self.config.parallel_config.use_sequence_parallel_moe = sp
+            for obj, key, bad in (
+                (self.config.parallel_config, "all2all_backend", "deepep_low_latency"),
+                (self.config.speculative_config.draft_parallel_config, "use_sequence_parallel_moe", True),
+                (self.config.speculative_config.draft_parallel_config, "enable_expert_parallel", True),
+            ):
+                old = getattr(obj, key)
+                setattr(obj, key, bad)
+                with self.subTest(key=key), self.assertRaises(ValueError):
+                    self.resolve(self.config, experimental_graph_review=True)
+                setattr(obj, key, old)
             self.config.additional_config["draft_window_graph_numeric_diagnostic"] = True
             with self.assertRaises(ValueError):
                 self.resolve(self.config, experimental_graph_review=True)
@@ -292,8 +305,8 @@ class ReviewBoundaryControls(unittest.TestCase):
         with self.assertRaisesRegex(NotImplementedError, "fixed checkpoint"):
             self.resolve(self.config, experimental_graph_review=True)
 
-    def test_fixed_vllm544_actual_sp_property_keeps_both_dp1_phases_off(self):
-        # Locate only; importing vLLM would defeat this guard-only protocol.
+    def test_fixed544_and_actual_ascend_patch_have_distinct_dp1_predicates(self):
+        # The plugin, not core544's unpatched AST, is the execution authority.
         spec = importlib.util.find_spec("vllm")
         if spec is None or spec.origin is None:
             self.skipTest("actual vLLM Source is not on this Host interpreter's search path")
@@ -313,16 +326,50 @@ class ReviewBoundaryControls(unittest.TestCase):
             compile(ast.fix_missing_locations(ast.Module(body=[predicate], type_ignores=[])), str(path), "exec"),
             namespace,
         )
-        actual_sp = namespace["use_sequence_parallel_moe"]
-        for backend in ("allgather_reducescatter", "flashinfer_all2allv"):
-            config = NS(
-                all2all_backend=backend, enable_expert_parallel=True, tensor_parallel_size=4, data_parallel_size=1
+        core_sp = namespace["use_sequence_parallel_moe"]
+        patch_path = SOURCE / "vllm_ascend/patch/platform/patch_parallel_config.py"
+        plugin_sp = actual_function(patch_path, "_use_sequence_parallel_moe", {})
+        config = NS(
+            all2all_backend="allgather_reducescatter",
+            enable_expert_parallel=True,
+            tensor_parallel_size=4,
+            data_parallel_size=1,
+        )
+        self.assertIs(core_sp(config), False)
+        self.assertIs(plugin_sp(config), True)
+        config.all2all_backend = "flashinfer_all2allv"
+        self.assertIs(core_sp(config), False)
+        self.assertIs(plugin_sp(config), False)
+        # Actual fixed544 dense-Draft construction must not inherit Target EP.
+        speculative_path = Path(spec.origin).parent / "config/speculative.py"
+        tree = ast.parse(speculative_path.read_text())
+        cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "SpeculativeConfig")
+        create = copy.deepcopy(
+            next(
+                node
+                for node in cls.body
+                if isinstance(node, ast.FunctionDef) and node.name == "create_draft_parallel_config"
             )
-            self.assertIs(actual_sp(config), False)
-        # The actual DP predicate is active, not a constant stand-in.
-        config.data_parallel_size = 2
-        config.all2all_backend = "allgather_reducescatter"
-        self.assertIs(actual_sp(config), True)
+        )
+        create.decorator_list = []
+        namespace = {"ParallelConfig": lambda **kwargs: NS(**kwargs)}
+        create_tree = ast.Module(
+            body=[
+                ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0),
+                create,
+            ],
+            type_ignores=[],
+        )
+        exec(compile(ast.fix_missing_locations(create_tree), str(speculative_path), "exec"), namespace)
+        config.distributed_executor_backend = "mp"
+        config.max_parallel_loading_workers = None
+        config.disable_custom_all_reduce = False
+        config.ray_workers_use_nsight = False
+        config.placement_group = None
+        draft = namespace["create_draft_parallel_config"](config, 4, NS(is_moe=False))
+        self.assertIs(draft.enable_expert_parallel, False)
+        draft.all2all_backend = "allgather_reducescatter"
+        self.assertIs(plugin_sp(draft), False)
 
     def test_explicit_existing_numeric_diagnostic_retains_original_interface(self):
         for method, checkpoint in (

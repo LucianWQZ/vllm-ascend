@@ -35,13 +35,17 @@ def validate_eagle_single_request_review_config(vllm_config, *, experimental_gra
     additional = vllm_config.additional_config or {}
     draft_parallel = getattr(speculative, "draft_parallel_config", None)
     mode = getattr(vllm_config.compilation_config.cudagraph_mode, "name", None)
-    # Fixed vLLM544 ParallelConfig.use_sequence_parallel_moe also requires
-    # DP>1. This finite DP1 route therefore has SP=False both before Ascend
-    # normalization (allgather_reducescatter) and after it (flashinfer_all2allv).
-    # The old a982 mock's initial SP=True is not a legitimate 544 DP1 phase.
+    # Ascend's actual patch_parallel_config predicate deliberately removes
+    # core544's DP>1 restriction. Before AscendConfig normalizes disabled
+    # FlashComm, Target TP4/EP therefore has allgather/SP=True; afterward the
+    # flashinfer backend makes it False. Accept only these two exact phases.
+    # Dense Draft EP is disabled by core544's create_draft_parallel_config;
+    # its captured read geometry must remain independently non-SP.
     target_backend = getattr(parallel, "all2all_backend", None)
     target_sp = getattr(parallel, "use_sequence_parallel_moe", None)
-    qualified_target_phase = target_backend in ("allgather_reducescatter", "flashinfer_all2allv") and target_sp is False
+    qualified_target_phase = (target_backend == "allgather_reducescatter" and target_sp is True) or (
+        target_backend == "flashinfer_all2allv" and target_sp is False
+    )
     if (
         experimental_graph_review is not True
         or speculative is None
@@ -50,6 +54,8 @@ def validate_eagle_single_request_review_config(vllm_config, *, experimental_gra
         or speculative.uses_dynamic_speculative_decoding()
         or speculative.num_speculative_tokens != 3
         or getattr(draft_parallel, "tensor_parallel_size", None) != 4
+        or getattr(draft_parallel, "use_sequence_parallel_moe", None) is not False
+        or getattr(draft_parallel, "enable_expert_parallel", None) is not False
         or parallel.tensor_parallel_size != 4
         or parallel.data_parallel_size != 1
         or parallel.pipeline_parallel_size != 1
@@ -71,12 +77,14 @@ def validate_eagle_single_request_review_config(vllm_config, *, experimental_gra
     ):
         raise ValueError(
             "Eagle single-request review requires static K3/W1024, TP4/DP1/PP1/PCP1/DCP1, "
-            "the qualified Ascend Target EP topology with SP off, FULL_DECODE_ONLY, "
+            "the qualified Ascend Target EP/SP initialization phases and non-SP dense Draft, FULL_DECODE_ONLY, "
             "non-async/no-prefix/non-adaptive and the experimental Graph gate; "
             f"actual={{'gate': {experimental_graph_review!r}, 'method': {getattr(speculative, 'method', None)!r}, "
             f"'eager': {getattr(speculative, 'enforce_eager', None)!r}, "
             f"'K': {getattr(speculative, 'num_speculative_tokens', None)!r}, "
             f"'draft_tp': {getattr(draft_parallel, 'tensor_parallel_size', None)!r}, "
+            f"'draft_EP': {getattr(draft_parallel, 'enable_expert_parallel', None)!r}, "
+            f"'draft_SP': {getattr(draft_parallel, 'use_sequence_parallel_moe', None)!r}, "
             f"""'tp_dp_pp_pcp_dcp': {
                 (
                     parallel.tensor_parallel_size,
