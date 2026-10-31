@@ -824,7 +824,7 @@ class NPUModelRunner(GPUModelRunner):
             )
 
     def finish_requests(self, scheduler_output):
-        # The controlled Eagle review rejects every known preempted request,
+        # The finite Eagle/Full8 reviews reject every known preempted request,
         # even before its first output token; a982 v2 resumes it as a new row.
         owner = getattr(self, "speculator", None)
         if getattr(owner, "_draft_graph_review_limit", None) is not None:
@@ -1084,7 +1084,7 @@ class NPUModelRunner(GPUModelRunner):
             seq_lens_np=self.input_buffers.seq_lens_np,
             attn_state=attn_state,
         )
-        # The finite Eagle review needs original prompt/max-output limits.
+        # The finite Eagle/Full8 reviews need original prompt/max-output limits.
         # prefill_len may include generated tokens after preemption and is not
         # an original prompt-length substitute. This reads existing CPU state.
         if getattr(self.speculator, "_draft_graph_review_limit", None) is not None:

@@ -200,13 +200,19 @@ def _draft_window_owner_scope(owner, input_batch, dummy_run=False, is_profile=Fa
         and type(num_speculative_tokens) is int
         and num_speculative_tokens == 0
     )
-    if limit is not None and not context_only_full8:
+    if limit is not None:
         from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import validate_draft_graph_review_requests
 
-        # This boundary certifies Draft query shapes. Core544's explicit zero
-        # branch writes context K/V and returns before query/Graph dispatch;
-        # its Target padding is not evidence of a Draft query being executed.
-        validate_draft_graph_review_requests(owner, input_batch, dummy_run=dummy_run, is_profile=is_profile)
+        # Original request limits apply before either owner is changed.
+        # Core544's int0 branch writes only context K/V, so its Target padding
+        # is not a Draft query shape. The real request identity is still checked.
+        validate_draft_graph_review_requests(
+            owner,
+            input_batch,
+            dummy_run=dummy_run,
+            is_profile=is_profile,
+            context_kv_only=context_only_full8,
+        )
     if runtime is not None and graph_runtime is not None:
         raise RuntimeError("Draft Window eager and Graph owners cannot share one proposal")
     if graph_runtime is not None:

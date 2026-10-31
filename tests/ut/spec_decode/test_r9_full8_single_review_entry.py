@@ -18,6 +18,17 @@ SPEC = ROOT / "vllm_ascend/worker/v2/spec_decode"
 GUARD = runpy.run_path(str(SPEC / "draft_graph_review_limits.py"))
 
 
+def request_batch(prompt=33025, output=64, padded=1):
+    return NS(
+        num_reqs=1,
+        num_reqs_after_padding=padded,
+        req_ids=["full8-A"],
+        idx_mapping_np=[7],
+        prefill_len_np=[prompt],
+        draft_graph_review_request_rows=(("full8-A", 7, prompt, prompt + output, prompt),),
+    )
+
+
 def actual_function(path, name, namespace):
     node = next(n for n in ast.parse(path.read_text()).body if isinstance(n, ast.FunctionDef) and n.name == name)
     exec(
@@ -188,11 +199,121 @@ class Full8FiniteEntry(unittest.TestCase):
             )
             owner._draft_window_runtime_state = NS()
             owner.num_speculative_steps = 7
-            with scope(owner, NS(num_reqs=1, num_reqs_after_padding=2), num_speculative_tokens=0):
+            with scope(owner, request_batch(padded=2), num_speculative_tokens=0):
                 pass
             self.assertEqual(seen, ["context-only"])
             with self.assertRaises(NotImplementedError):
-                scope(owner, NS(num_reqs=1, num_reqs_after_padding=2), num_speculative_tokens=7)
+                scope(owner, request_batch(padded=2), num_speculative_tokens=7)
+
+    def test_authoritative_snapshot_and_finite_request_limits(self):
+        owner = NS(_draft_graph_review_limit="full8_local_active_at_most_one")
+        states = NS(
+            req_id_to_index={"full8-A": 7},
+            prompt_len=NS(np={7: 33025}),
+            max_seq_len={7: 33089},
+            prefill_len=NS(np={7: 33025}),
+        )
+        snapshot = GUARD["eagle_single_request_review_rows"]
+        batch = request_batch()
+        self.assertEqual(
+            snapshot(owner, states, batch.req_ids, batch.idx_mapping_np), batch.draft_graph_review_request_rows
+        )
+        GUARD["validate_draft_graph_review_requests"](owner, batch)
+        states.req_id_to_index["full8-A"] = 8
+        with self.assertRaisesRegex(RuntimeError, "mapping changed"):
+            snapshot(owner, states, batch.req_ids, batch.idx_mapping_np)
+        for prompt, output in ((33024, 64), (33026, 64), (33025, 63), (33025, 65)):
+            with self.subTest(prompt=prompt, output=output), self.assertRaisesRegex(NotImplementedError, "prompt33025"):
+                GUARD["validate_draft_graph_review_requests"](owner, request_batch(prompt, output))
+
+    def test_missing_conflicting_or_reordered_request_evidence_is_rejected(self):
+        owner = NS(_draft_graph_review_limit="full8_local_active_at_most_one")
+        for change in ("missing", "extra-row", "wrong-id", "wrong-index", "wrong-prefill", "bad-row-type"):
+            batch = request_batch()
+            if change == "missing":
+                del batch.draft_graph_review_request_rows
+            elif change == "extra-row":
+                batch.draft_graph_review_request_rows *= 2
+            elif change == "wrong-id":
+                batch.req_ids = ["previous-B"]
+            elif change == "wrong-index":
+                batch.idx_mapping_np = [8]
+            elif change == "wrong-prefill":
+                batch.prefill_len_np = [33026]
+            else:
+                batch.draft_graph_review_request_rows = (("full8-A", True, 33025, 33089, 33025),)
+            with self.subTest(change=change), self.assertRaisesRegex(RuntimeError, "Full8 review"):
+                GUARD["validate_draft_graph_review_requests"](owner, batch)
+
+    def test_preemption_and_context_only_do_not_bypass_original_request(self):
+        owner = NS(_draft_graph_review_limit="full8_local_active_at_most_one", num_speculative_steps=7)
+        owner._draft_window_runtime_state = NS()
+        module = ModuleType("vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits")
+        module.validate_draft_graph_review_requests = GUARD["validate_draft_graph_review_requests"]
+        seen = []
+        scope = actual_function(
+            SPEC / "dflash/speculator.py",
+            "_draft_window_owner_scope",
+            {
+                "nullcontext": nullcontext,
+                "_draft_window_context_kv_scope": lambda o, b: (seen.append("context-only"), nullcontext())[1],
+            },
+        )
+        with patch.dict(sys.modules, {module.__name__: module}):
+            with self.assertRaisesRegex(NotImplementedError, "prompt33025"):
+                scope(owner, request_batch(prompt=33024, padded=4), num_speculative_tokens=0)
+            self.assertEqual(seen, [])
+            with scope(owner, request_batch(padded=4), num_speculative_tokens=0):
+                pass
+            self.assertEqual(seen, ["context-only"])
+            GUARD["note_eagle_single_request_review_lifecycle"](
+                owner, NS(finished_req_ids=set(), preempted_req_ids={"full8-A"})
+            )
+            with self.assertRaisesRegex(NotImplementedError, "preemption"):
+                scope(owner, request_batch(padded=4), num_speculative_tokens=0)
+
+    def test_actual_propose_refuses_bad_request_before_owner_or_body(self):
+        module = ModuleType("vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits")
+        module.validate_draft_graph_review_requests = GUARD["validate_draft_graph_review_requests"]
+        scope = actual_function(
+            SPEC / "dflash/speculator.py", "_draft_window_owner_scope", {"nullcontext": nullcontext}
+        )
+        cls = next(
+            n
+            for n in ast.parse((SPEC / "dflash/speculator.py").read_text()).body
+            if isinstance(n, ast.ClassDef) and n.name == "AscendDFlashSpeculator"
+        )
+        fn = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "propose")
+        calls = []
+        namespace = {
+            "_draft_window_owner_scope": scope,
+            "build_attn_metadata_wrapper": nullcontext,
+            "super": lambda: NS(propose=lambda *args, **kwargs: calls.append((args, kwargs))),
+        }
+        exec(
+            compile(
+                ast.fix_missing_locations(
+                    ast.Module(
+                        body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), fn],
+                        type_ignores=[],
+                    )
+                ),
+                str(SPEC / "dflash/speculator.py"),
+                "exec",
+            ),
+            namespace,
+        )
+        owner = NS(_draft_graph_review_limit="full8_local_active_at_most_one", input_batch="previous-owner")
+        with patch.dict(sys.modules, {module.__name__: module}):
+            for batch in (request_batch(prompt=33024), request_batch(output=63)):
+                with self.assertRaises(NotImplementedError):
+                    namespace["propose"](owner, batch, *([None] * 10))
+                self.assertEqual(owner.input_batch, "previous-owner")
+                self.assertEqual(calls, [])
+            batch = request_batch()
+            namespace["propose"](owner, batch, *([None] * 10))
+            self.assertIs(owner.input_batch, batch)
+            self.assertEqual(len(calls), 1)
 
 
 if __name__ == "__main__":

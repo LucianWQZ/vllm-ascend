@@ -190,7 +190,17 @@ class Controls(unittest.TestCase):
         M.validate_draft_graph_review_requests(N(), N())
         M.validate_eagle_single_request_graph_stage(N(), None, first=None, n=None, tokens=None, ordinal=None)
         full = N(_draft_graph_review_limit="full8_local_active_at_most_one")
-        M.validate_draft_graph_review_requests(full, N(num_reqs=1, num_reqs_after_padding=1))
+        M.validate_draft_graph_review_requests(
+            full,
+            N(
+                num_reqs=1,
+                num_reqs_after_padding=1,
+                req_ids=["full8-A"],
+                idx_mapping_np=[7],
+                prefill_len_np=[33025],
+                draft_graph_review_request_rows=(("full8-A", 7, 33025, 33089, 33025),),
+            ),
+        )
         with self.assertRaises(NotImplementedError):
             M.validate_draft_graph_review_requests(full, N(num_reqs=2, num_reqs_after_padding=2))
 

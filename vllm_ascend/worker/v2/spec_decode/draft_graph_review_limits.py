@@ -16,6 +16,8 @@ from pathlib import Path
 _FULL8_CONFIG = "d2be70579f0b8e7b109e776dbf14bd88ac5be115d2dabbb20e6373988939f410"
 _SWA6_CONFIG = "20784b063040f7871efec4bf63342e5cb941907925943540176dfbb8aaf186dc"
 _EAGLE_CONFIG = "5b9242c2e8603da59527fb9e9dd85f3b5bf1e7beae48b251563bbd442a512c65"
+_FULL8_PROMPT_LENGTH = 33025
+_FULL8_OUTPUT_TOKENS = 64
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,7 +116,8 @@ def note_eagle_single_request_review_lifecycle(owner, scheduler_output):
     where no output token exists yet. prefill_len==prompt_len cannot detect
     that case. No scheduler, request state, or device object is modified.
     """
-    if not isinstance(getattr(owner, "_draft_graph_review_limit", None), EagleSingleRequestReviewScope):
+    limit = getattr(owner, "_draft_graph_review_limit", None)
+    if not isinstance(limit, EagleSingleRequestReviewScope) and limit != "full8_local_active_at_most_one":
         return
     finished = scheduler_output.finished_req_ids
     preempted = scheduler_output.preempted_req_ids or set()
@@ -133,16 +136,18 @@ def note_eagle_single_request_review_lifecycle(owner, scheduler_output):
 
 
 def eagle_single_request_review_rows(owner, req_states, req_ids, idx_mapping_np):
-    """Snapshot authoritative CPU request limits in this exact batch order."""
-    if not isinstance(getattr(owner, "_draft_graph_review_limit", None), EagleSingleRequestReviewScope):
+    """Snapshot authoritative CPU limits for the finite Eagle and Full8 entries."""
+    limit = getattr(owner, "_draft_graph_review_limit", None)
+    if not isinstance(limit, EagleSingleRequestReviewScope) and limit != "full8_local_active_at_most_one":
         return None
+    method = "Eagle" if isinstance(limit, EagleSingleRequestReviewScope) else "Full8"
     rows = []
     for req_id, raw_index in zip(req_ids, idx_mapping_np):
         if req_id in getattr(owner, "_draft_graph_review_preempted_request_ids", ()):
-            raise NotImplementedError("Eagle single-request review does not qualify resumption after preemption")
+            raise NotImplementedError(f"{method} single-request review does not qualify resumption after preemption")
         index = int(raw_index)
         if req_states.req_id_to_index.get(req_id) != index:
-            raise RuntimeError("Eagle review request mapping changed during input preparation")
+            raise RuntimeError(f"{method} review request mapping changed during input preparation")
         rows.append(
             (
                 req_id,
@@ -153,7 +158,7 @@ def eagle_single_request_review_rows(owner, req_states, req_ids, idx_mapping_np)
             )
         )
     if len(rows) != len(req_ids):
-        raise RuntimeError("Eagle review lacks complete authoritative request rows")
+        raise RuntimeError(f"{method} review lacks complete authoritative request rows")
     return tuple(rows)
 
 
@@ -315,6 +320,39 @@ def validate_full8_single_request_graph_stage(owner, *, actual, padded, tokens):
         raise NotImplementedError("Full8 review only qualifies actual1/padded1 Draft Q8; no fallback is selected")
 
 
+def _full8_single_request_row(owner, input_batch):
+    """Reject unqualified original requests before a Full8 owner is changed."""
+    rows = getattr(input_batch, "draft_graph_review_request_rows", None)
+    if not isinstance(rows, tuple) or len(rows) != 1:
+        raise RuntimeError("Full8 review requires one authoritative prompt/output request row")
+    try:
+        current = (
+            input_batch.req_ids[0],
+            int(input_batch.idx_mapping_np[0]),
+            int(input_batch.prefill_len_np[0]),
+        )
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError) as error:
+        raise RuntimeError("Full8 review lacks its current request identity/source row") from error
+    row = rows[0]
+    if (
+        not isinstance(row, tuple)
+        or len(row) != 5
+        or not isinstance(row[0], str)
+        or any(type(value) is not int for value in row[1:])
+        or (row[0], row[1], row[4]) != current
+    ):
+        raise RuntimeError("Full8 review request identity/source row differs")
+    if row[0] in getattr(owner, "_draft_graph_review_preempted_request_ids", ()):
+        raise NotImplementedError("Full8 single-request review does not qualify resumption after preemption")
+    _, _, prompt, maximum, prefill = row
+    if prompt != _FULL8_PROMPT_LENGTH or maximum != prompt + _FULL8_OUTPUT_TOKENS or prefill != prompt:
+        raise NotImplementedError(
+            "Full8 single-request review permits only prompt33025 and max_tokens64; "
+            "resumed/preempted prompt-plus-output prefills are not qualified"
+        )
+    return row
+
+
 def resolve_draft_graph_review_limit(vllm_config, *, experimental_graph_review=False):
     """Return a cached limit or reject the precisely identified Graph route."""
     speculative = vllm_config.speculative_config
@@ -402,7 +440,9 @@ def resolve_draft_graph_review_limit(vllm_config, *, experimental_graph_review=F
     return None
 
 
-def validate_draft_graph_review_requests(owner, input_batch, *, dummy_run=False, is_profile=False):
+def validate_draft_graph_review_requests(
+    owner, input_batch, *, dummy_run=False, is_profile=False, context_kv_only=False
+):
     """Check real local DP rows, not padded graph capacity or client load."""
     limit = getattr(owner, "_draft_graph_review_limit", None)
     if limit is None or dummy_run or is_profile or getattr(input_batch, "is_dummy", False):
@@ -425,8 +465,9 @@ def validate_draft_graph_review_requests(owner, input_batch, *, dummy_run=False,
         )
     if active == 1:
         padded = getattr(input_batch, "num_reqs_after_padding", None)
-        if type(padded) is not int or padded != 1:
+        if not context_kv_only and (type(padded) is not int or padded != 1):
             raise NotImplementedError(
                 "This Full8 checkpoint's single-request Draft Graph review requires actual=1/padded=1; "
                 "other padding shapes are not qualified. No fallback is selected."
             )
+        _full8_single_request_row(owner, input_batch)

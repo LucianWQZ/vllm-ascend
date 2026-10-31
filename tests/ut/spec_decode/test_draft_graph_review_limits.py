@@ -97,7 +97,19 @@ class ReviewBoundaryControls(unittest.TestCase):
         # checks do not by themselves admit the ordinary checkpoint service.
         owner = NS(_draft_graph_review_limit="full8_local_active_at_most_one")
         self.validate(owner, NS(num_reqs=0, num_reqs_after_padding=1))
-        self.validate(owner, NS(num_reqs=1, num_reqs_after_padding=1, global_num_reqs=1, client_concurrency=64))
+        self.validate(
+            owner,
+            NS(
+                num_reqs=1,
+                num_reqs_after_padding=1,
+                req_ids=["full8-A"],
+                idx_mapping_np=[7],
+                prefill_len_np=[33025],
+                draft_graph_review_request_rows=(("full8-A", 7, 33025, 33089, 33025),),
+                global_num_reqs=1,
+                client_concurrency=64,
+            ),
+        )
         for padded in (None, 0, 2, 4, 8, True, "1"):
             with self.subTest(padded=padded), self.assertRaisesRegex(NotImplementedError, "actual=1/padded=1"):
                 self.validate(owner, NS(num_reqs=1, num_reqs_after_padding=padded))
@@ -453,7 +465,17 @@ class ReviewBoundaryControls(unittest.TestCase):
             for active in (2, 3, 4, 8):
                 with self.assertRaises(NotImplementedError):
                     scope(owner, NS(num_reqs=active, num_reqs_after_padding=4))
-            with scope(owner, NS(num_reqs=1, num_reqs_after_padding=1)):
+            with scope(
+                owner,
+                NS(
+                    num_reqs=1,
+                    num_reqs_after_padding=1,
+                    req_ids=["full8-A"],
+                    idx_mapping_np=[7],
+                    prefill_len_np=[33025],
+                    draft_graph_review_request_rows=(("full8-A", 7, 33025, 33089, 33025),),
+                ),
+            ):
                 pass
             with scope(owner, NS(num_reqs=16), True, False):
                 pass
