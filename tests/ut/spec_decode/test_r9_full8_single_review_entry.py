@@ -7,7 +7,7 @@ import runpy
 import sys
 import tempfile
 import unittest
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from types import ModuleType
 from types import SimpleNamespace as NS
@@ -107,6 +107,7 @@ class Full8FiniteEntry(unittest.TestCase):
     def test_wrong_topology_mode_capture_and_bool_rejected(self):
         self.config.additional_config["draft_window_graph_full8_single_request_review"] = True
         for obj, key, value in [
+            # This fixture lacks the mandatory TP-only Draft DP1 descriptor.
             (self.config.parallel_config, "data_parallel_size", 2),
             (self.config.parallel_config, "tensor_parallel_size", 2),
             (self.config.scheduler_config, "max_num_seqs", 2),
@@ -133,6 +134,95 @@ class Full8FiniteEntry(unittest.TestCase):
                 self.config.additional_config.pop(key)
             else:
                 self.config.additional_config[key] = before
+
+    def test_dp2_single_entry_retains_real_tp_only_draft_descriptor(self):
+        self.config.additional_config["draft_window_graph_full8_single_request_review"] = True
+        self.config.parallel_config.data_parallel_size = 2
+        draft = self.config.speculative_config.draft_parallel_config
+        draft.data_parallel_size = 1
+        for window in (None, 32768):
+            self.config.additional_config["draft_window_size"] = window
+            self.assertEqual(
+                self.resolve(self.config, experimental_graph_review=True), "full8_local_active_at_most_one"
+            )
+        for value in (None, True, 0, 2, "1"):
+            draft.data_parallel_size = value
+            with self.subTest(draft_dp=value), self.assertRaises(NotImplementedError):
+                self.resolve(self.config, experimental_graph_review=True)
+        draft.data_parallel_size = 1
+        for obj, key, value in (
+            (self.config.parallel_config, "data_parallel_size", 3),
+            (self.config.parallel_config, "data_parallel_size", True),
+            (self.config.parallel_config, "enable_expert_parallel", False),
+            (self.config.scheduler_config, "max_num_seqs", 2),
+            (self.config.scheduler_config, "async_scheduling", True),
+            (self.config.cache_config, "enable_prefix_caching", True),
+            (self.config.compilation_config, "cudagraph_capture_sizes", [8, 16]),
+        ):
+            old = getattr(obj, key)
+            setattr(obj, key, value)
+            with self.subTest(key=key, value=value), self.assertRaises(NotImplementedError):
+                self.resolve(self.config, experimental_graph_review=True)
+            setattr(obj, key, old)
+
+    def test_dp2_replicas_keep_independent_request_rows_and_local_multirow_rejection(self):
+        guard = GUARD["validate_draft_graph_review_requests"]
+        for dp in range(2):
+            for tp in range(4):
+                owner = NS(
+                    _draft_graph_review_limit="full8_local_active_at_most_one",
+                    max_model_len=40960,
+                    num_query_per_req=8,
+                    vllm_config=NS(model_config=NS(max_model_len=40960)),
+                )
+                batch = request_batch()
+                batch.req_ids = [f"full8-dp{dp}"]
+                batch.draft_graph_review_request_rows = ((batch.req_ids[0], 7, 33025, 33089, 33025),)
+                with self.subTest(dp=dp, tp=tp):
+                    guard(owner, batch)
+                    batch.draft_graph_review_request_rows = ((f"full8-dp{1 - dp}", 7, 33025, 33089, 33025),)
+                    with self.assertRaisesRegex(RuntimeError, "identity/source"):
+                        guard(owner, batch)
+                    batch.num_reqs = 2
+                    with self.assertRaisesRegex(NotImplementedError, "at most 1"):
+                        guard(owner, batch)
+
+    def test_existing_dp_dummy_scope_is_not_a_business_generation(self):
+        # Execute only the real Source bypass branch. No fake Graph metadata,
+        # copied business generation, provider construction or device event.
+        tree = ast.parse((SPEC / "draft_window_eager.py").read_text())
+        cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "DraftWindowEagerMixin")
+        node = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "_draft_window_proposal_scope")
+        namespace = {"contextmanager": contextmanager}
+        module = ast.Module(
+            body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), node],
+            type_ignores=[],
+        )
+        exec(compile(ast.fix_missing_locations(module), str(SPEC / "draft_window_eager.py"), "exec"), namespace)
+        scope = namespace["_draft_window_proposal_scope"]
+        owner = NS(
+            _draft_window_epoch_source=object(),
+            _draft_window_async_pool=None,
+            _draft_window_runtime_state=NS(quarantined_identity=None),
+            _draft_window_bypass_active=False,
+            _draft_window_proposal_context=None,
+            _draft_window_graph_characterization=object(),
+            dp_size=2,
+        )
+        with scope(owner, NS(is_dummy=True), dummy_run=True, is_profile=False):
+            self.assertTrue(owner._draft_window_bypass_active)
+            self.assertTrue(owner._draft_window_dp_dummy_active)
+            self.assertFalse(owner._draft_window_prefill_bypass_active)
+            self.assertIsNone(owner._draft_window_proposal_context)
+        self.assertFalse(owner._draft_window_dp_dummy_active)
+        self.assertFalse(owner._draft_window_bypass_active)
+        with self.assertRaisesRegex(ValueError, "actual submission"):
+            with scope(owner, NS(is_dummy=True), dummy_run=True, is_profile=False):
+                raise ValueError("actual submission")
+        self.assertTrue(owner._draft_window_graph_submission_uncertain)
+        with self.assertRaisesRegex(RuntimeError, "quarantined"):
+            with scope(owner, NS(is_dummy=True), dummy_run=True, is_profile=False):
+                self.fail("uncertain dummy must not re-enter")
 
     def test_all4_ranks_refuse_actual_multirow_before_any_body(self):
         guard = GUARD["validate_draft_graph_review_requests"]

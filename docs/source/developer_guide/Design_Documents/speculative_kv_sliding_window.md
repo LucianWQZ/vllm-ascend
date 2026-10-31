@@ -136,8 +136,15 @@ performance, release approval or the public Graph gate.
 
 The designated Full8 checkpoint has a separate, default-off
 `draft_window_graph_full8_single_request_review=true` qualification entry.
-It requires its exact checkpoint config, TP4/DP1, static K7, `max_num_seqs=1`
-and capture size `[8]`, with Async, prefix, FlashComm and CP disabled. Additional
+It requires its exact checkpoint config, TP4 with parent DP1 or DP2, static K7,
+`max_num_seqs=1` per replica and capture size `[8]`, with Async, prefix,
+FlashComm and CP disabled. In DP2 the fixed vLLM creates a TP-only Draft
+configuration with DP1 inside each parent replica; that descriptor does not
+collapse two actual replicas into one. Each replica retains its independent
+request mapping, KV source and captured bank. Idle replicas use the existing
+explicit dummy Graph scope without creating a business Window generation.
+This DP2 configuration entry still requires separate eight-worker device
+qualification; it does not enable local active2 or larger batches. Additional
 Window OFF retains the original Draft Graph; Window ON uses W32768. Both arms
 keep the same request guard and Target Graph remains independently configured.
 The real local request count and query descriptor must be actual1/padded1/Q8
@@ -153,7 +160,7 @@ Missing or changed request identity and resumption after preemption remain
 rejected before owner handoff. Context-only prefill writes keep their Target
 padding and the same identity/capacity limits in both arms; OFF creates no
 additional Window owner. Unresolved multiple-request failures remain blocked.
-Default ordinary entry and larger shapes
+Default ordinary entry and larger local batch or padding shapes
 remain rejected, without an eager fallback. This entry is not a service or
 numerical PASS; its candidate-specific ordinary qualification must complete
 before that scope is described as usable.

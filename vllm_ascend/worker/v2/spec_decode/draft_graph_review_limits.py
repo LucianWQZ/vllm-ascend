@@ -296,8 +296,14 @@ def validate_full8_single_request_review_config(vllm_config):
         parallel.prefill_context_parallel_size,
         parallel.decode_context_parallel_size,
     )
+    # Core544's Draft descriptor is TP-only (DP1). Actual DP2 replicas live
+    # in the parent engines/groups; every replica keeps this same local n1
+    # request and Q8/capture contract, including the existing idle-DP scope.
+    draft_dp = getattr(speculative.draft_parallel_config, "data_parallel_size", None)
     if (
-        sizes != (4, 1, 1, 1, 1)
+        any(type(size) is not int for size in sizes)
+        or sizes not in ((4, 1, 1, 1, 1), (4, 2, 1, 1, 1))
+        or (parallel.data_parallel_size == 2 and (type(draft_dp) is not int or draft_dp != 1))
         or getattr(speculative.draft_parallel_config, "tensor_parallel_size", None) != 4
         or speculative.num_speculative_tokens != 7
         or speculative.enable_adaptive_verification is not False
@@ -314,7 +320,8 @@ def validate_full8_single_request_review_config(vllm_config):
     ):
         raise NotImplementedError(
             "This Full8 checkpoint's temporary Draft Graph review permits only static K7, Window OFF or W32768, "
-            "TP4/DP1/PP1/PCP1/DCP1 with EP, max_num_seqs=1, FULL_DECODE_ONLY, "
+            "TP4/DP1-or-2/PP1/PCP1/DCP1 with EP, one request per DP replica, "
+            "max_num_seqs=1, FULL_DECODE_ONLY, "
             "non-async/no-prefix/no-DSA-CP/no-FlashComm. Use that single-request configuration "
             "or the independently supported Draft eager route; no fallback is selected."
         )
