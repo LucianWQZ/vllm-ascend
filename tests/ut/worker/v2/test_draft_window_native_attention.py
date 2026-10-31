@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Host-only native attention inventory; no framework or device imports."""
 
+import copy
 import importlib.util
 import json
 import sys
@@ -85,6 +86,83 @@ class NativeAttentionTests(unittest.TestCase):
         raw["max_window_layers"] = 0
         raw.pop("sliding_window")
         self.assertEqual(native.configured_native_windows(raw, raw_config=True), (4096,) * 30)
+
+    def test_legacy_dspark_wrapper_uses_nested_layer_declarations(self):
+        # The deployed GLM DSpark config has this training-format wrapper;
+        # core544 selects the Qwen3DSparkModel loader from the nested Qwen3 config.
+        for kinds, windows, expected in (
+            (["full_attention"] * 2, [None, None], "FULL"),
+            (["sliding_attention"] * 2, [2048, 2048], "SWA"),
+            (["full_attention", "sliding_attention"], [None, 2048], "MIXED"),
+        ):
+            nested = config(kinds=kinds, architecture="Qwen3DSparkModel")
+            nested.pop("architectures")
+            nested.update(model_type="qwen3", use_sliding_window=expected != "FULL")
+            raw = dict(
+                architectures=["DSparkDraftModel"], speculators_model_type="dspark", transformer_layer_config=nested
+            )
+            normalized = dict(nested, architectures=["Qwen3DSparkModel"])
+            self.assertEqual(native.configured_native_windows(raw, raw_config=True), tuple(windows))
+            result = native.inspect_draft_native_attention(loaded(normalized, windows), raw_config=raw)
+            self.assertEqual(result.kind, expected)
+            self.assertTrue(result.actual_complete)
+
+    def test_legacy_dspark_unknown_wrapper_or_missing_layer_config_stays_unknown(self):
+        raw = dict(
+            architectures=["DSparkDraftModel"],
+            speculators_model_type="dspark",
+            transformer_layer_config=dict(
+                model_type="qwen3",
+                num_hidden_layers=2,
+                layer_types=["full_attention"] * 2,
+                use_sliding_window=False,
+                sliding_window=None,
+            ),
+        )
+        damaged = []
+        for key, value in (
+            ("architectures", ["UnknownDSparkDraft"]),
+            ("speculators_model_type", "unknown"),
+            ("transformer_layer_config", None),
+        ):
+            row = copy.deepcopy(raw)
+            row[key] = value
+            damaged.append(row)
+        for key, value in (("model_type", "unknown"), ("num_hidden_layers", None)):
+            row = copy.deepcopy(raw)
+            row["transformer_layer_config"][key] = value
+            damaged.append(row)
+        for row in damaged:
+            with self.subTest(row=row):
+                self.assertIsNone(native.configured_native_windows(row, raw_config=True))
+
+    def test_legacy_dspark_outer_conflicts_and_actual_disagreement_rejected(self):
+        nested = dict(
+            model_type="qwen3",
+            num_hidden_layers=2,
+            layer_types=["sliding_attention"] * 2,
+            use_sliding_window=True,
+            sliding_window=2048,
+        )
+        raw = dict(architectures=["DSparkDraftModel"], speculators_model_type="dspark", transformer_layer_config=nested)
+        for key, value in (
+            ("model_type", "other"),
+            ("num_hidden_layers", 3),
+            ("layer_types", ["full_attention"] * 2),
+            ("use_sliding_window", False),
+            ("sliding_window", 1024),
+        ):
+            row = copy.deepcopy(raw)
+            row[key] = value
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, "wrapper.*disagree"):
+                native.configured_native_windows(row, raw_config=True)
+        normalized = dict(nested, architectures=["Qwen3DSparkModel"])
+        # Matching duplicate fields are harmless; conflicting loaded readers are not.
+        raw["num_hidden_layers"] = 2
+        self.assertEqual(native.configured_native_windows(raw, raw_config=True), (2048, 2048))
+        result = native.inspect_draft_native_attention(loaded(normalized, [None, None]), raw_config=raw)
+        self.assertEqual(result.kind, "UNKNOWN")
+        self.assertIn("actual Draft consumers and configured native attention inventory disagree", result.issues)
 
     def test_designated_llama_eagle3_actual_defaults(self):
         cfg = config(architecture="LlamaForCausalLMEagle3", count=1)

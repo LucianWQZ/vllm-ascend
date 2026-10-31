@@ -51,12 +51,40 @@ def configured_native_windows(config: Any, *, raw_config: bool = False) -> tuple
 
     DFlash/DSpark's Qwen backbone resolves dflash_config.use_swa and
     swa_window_size before the per-layer declarations. A bare sliding_window
-    field does not enable SWA. GLM DSpark uses its explicit dense MLA model.
+    field does not enable SWA. The named GLM MLA architecture is explicitly
+    dense. Training-format DSpark wrappers use their own Qwen3 layer config.
     Unknown architectures deliberately have no implicit Full default.
     """
     if config is None:
         return None
     architectures = set(_get(config, "architectures", ()) or ())
+    if raw_config and architectures == {"DSparkDraftModel"}:
+        # Fixed core544 SpeculatorsConfig.build_vllm_speculative_config takes
+        # transformer_layer_config, then update_dspark selects Qwen3DSparkModel
+        # for this legacy training name. The outer wrapper is not a layer config.
+        nested = _get(config, "transformer_layer_config")
+        if (
+            _get(config, "speculators_model_type") != "dspark"
+            or not isinstance(nested, Mapping)
+            or nested.get("model_type") != "qwen3"
+        ):
+            return None
+        # The loader reads these declarations from the nested config only.
+        # Do not silently accept contradictory or misplaced outer declarations.
+        for key in (
+            "model_type",
+            "num_hidden_layers",
+            "layer_types",
+            "sliding_window",
+            "use_sliding_window",
+            "max_window_layers",
+            "dflash_config",
+        ):
+            outer = _get(config, key, _MISSING)
+            if outer is not _MISSING and outer != nested.get(key, _MISSING):
+                raise ValueError(f"DSpark wrapper and transformer_layer_config disagree on {key}")
+        config = dict(nested, architectures=["Qwen3DSparkModel"])
+        architectures = {"Qwen3DSparkModel"}
     count = _get(config, "num_hidden_layers")
     if type(count) is not int or count <= 0:
         return None
