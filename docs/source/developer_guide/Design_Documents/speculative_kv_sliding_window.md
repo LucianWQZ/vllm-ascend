@@ -17,8 +17,9 @@ at 32k, up to +381% end-to-end throughput in the original evaluation).
 ## Configuration
 
 The window is enabled through `additional_config` for supported
-EAGLE3 / DFlash / DSpark draft consumers. MRV2 requires an explicitly eager
-Draft model; Target Graph selection remains independent. See the MRV2
+EAGLE3 / DFlash / DSpark draft consumers. The MRV2 default entry requires an
+explicitly eager Draft model; limited, default-off Graph review routes are
+described below. Target Graph selection remains independent. See the MRV2
 consumer and validation limits below before choosing a configuration.
 
 ```json
@@ -107,8 +108,11 @@ The fixed Eagle checkpoint has an explicit single-request review entry behind
 `draft_window_graph_eagle_single_request_review=true`. It is a qualification
 entry, not a product support or service-PASS declaration. The exact existing
 config guard remains required: TP4/DP1/PP1/PCP1/DCP1, static K3/W1024,
-FULL_DECODE_ONLY, the reviewed Target EP topology with SP off, non-async, no prefix,
-FlashComm or legacy DSA-CP. The runtime also requires actual/padded rows 1/1,
+FULL_DECODE_ONLY, the reviewed Target EP topology with the exact pre-normalization
+pair (`allgather_reducescatter`, SP on) or normalized pair
+(`flashinfer_all2allv`, SP off). The independent dense Draft keeps SP off.
+Async, prefix, FlashComm and legacy DSA-CP remain disabled.
+The runtime also requires actual/padded rows 1/1,
 prompt lengths 257 or 2051 and an output limit of 32, with no preemption
 resumption. Other checkpoint identities and the default ordinary entry stay
 closed; the private numerical diagnostic flag cannot admit this service entry.
