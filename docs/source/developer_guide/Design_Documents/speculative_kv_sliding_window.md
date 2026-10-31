@@ -136,14 +136,23 @@ performance, release approval or the public Graph gate.
 
 The designated Full8 checkpoint has a separate, default-off
 `draft_window_graph_full8_single_request_review=true` qualification entry.
-It requires its exact checkpoint config, TP4/DP1, static K7/W32768,
-`max_model_len=40960`, `max_num_seqs=1` and capture size `[8]`, with Async,
-prefix, FlashComm and CP disabled. The real local request count and query
-descriptor must also be actual1/padded1/Q8 before submission. Client
-concurrency alone is not the guard. Authoritative request state must identify
-an original 33025-token prompt and `max_tokens=64`; missing or changed request
-identity and resumption after preemption are rejected before owner handoff.
-Context-only prefill writes keep their Target padding and the same request limits.
+It requires its exact checkpoint config, TP4/DP1, static K7, `max_num_seqs=1`
+and capture size `[8]`, with Async, prefix, FlashComm and CP disabled. Additional
+Window OFF retains the original Draft Graph; Window ON uses W32768. Both arms
+keep the same request guard and Target Graph remains independently configured.
+The real local request count and query descriptor must be actual1/padded1/Q8
+before submission. Client concurrency alone is not the guard. Configured
+`max_model_len` must fit both Target and Draft model position ceilings; the
+runtime capacity must still equal that allocating configuration. Authoritative
+original request state must satisfy positive prompt and output lengths,
+`prefill_len == prompt_len`, and `prompt_len + max_tokens + Q8 <= max_model_len`.
+The previous prompt33025/output64 pair is a tested point, not an operator
+capacity limit. New lengths still require candidate-specific numerical and
+ordinary-service qualification; this capacity entry is not a PASS receipt.
+Missing or changed request identity and resumption after preemption remain
+rejected before owner handoff. Context-only prefill writes keep their Target
+padding and the same identity/capacity limits in both arms; OFF creates no
+additional Window owner. Unresolved multiple-request failures remain blocked.
 Default ordinary entry and larger shapes
 remain rejected, without an eager fallback. This entry is not a service or
 numerical PASS; its candidate-specific ordinary qualification must complete

@@ -48,7 +48,12 @@ class ReviewBoundaryControls(unittest.TestCase):
                 enforce_eager=False,
                 draft_model_config=NS(
                     model=str(self.model),
-                    hf_config=NS(layer_types=["full_attention"] * 8, use_sliding_window=False, sliding_window=None),
+                    hf_config=NS(
+                        layer_types=["full_attention"] * 8,
+                        use_sliding_window=False,
+                        sliding_window=None,
+                        max_position_embeddings=262144,
+                    ),
                 ),
                 num_speculative_tokens=7,
                 enable_adaptive_verification=False,
@@ -63,6 +68,7 @@ class ReviewBoundaryControls(unittest.TestCase):
                 decode_context_parallel_size=1,
                 enable_expert_parallel=True,
             ),
+            model_config=NS(max_model_len=40960, hf_config=NS(max_position_embeddings=262144)),
             scheduler_config=NS(max_num_seqs=1, async_scheduling=False),
             cache_config=NS(enable_prefix_caching=False),
             additional_config={"draft_window_size": 32768},
@@ -95,7 +101,12 @@ class ReviewBoundaryControls(unittest.TestCase):
                     self.resolve(self.config, experimental_graph_review=gate)
         # Keep the internal row guard for a later qualified entry; its shape
         # checks do not by themselves admit the ordinary checkpoint service.
-        owner = NS(_draft_graph_review_limit="full8_local_active_at_most_one")
+        owner = NS(
+            _draft_graph_review_limit="full8_local_active_at_most_one",
+            max_model_len=40960,
+            num_query_per_req=8,
+            vllm_config=NS(model_config=NS(max_model_len=40960)),
+        )
         self.validate(owner, NS(num_reqs=0, num_reqs_after_padding=1))
         self.validate(
             owner,
@@ -184,13 +195,23 @@ class ReviewBoundaryControls(unittest.TestCase):
             self.assertFalse(dense(self.config, 32768))
 
     def test_invalid_active_counts_do_not_coerce_or_disable_guard(self):
-        owner = NS(_draft_graph_review_limit="full8_local_active_at_most_one")
+        owner = NS(
+            _draft_graph_review_limit="full8_local_active_at_most_one",
+            max_model_len=40960,
+            num_query_per_req=8,
+            vllm_config=NS(model_config=NS(max_model_len=40960)),
+        )
         for active in (-1, True, 3.0, "3"):
             with self.assertRaises(ValueError):
                 self.validate(owner, NS(num_reqs=active))
 
     def test_dummy_profile_and_capture_capacity_are_not_business_rows(self):
-        owner = NS(_draft_graph_review_limit="full8_local_active_at_most_one")
+        owner = NS(
+            _draft_graph_review_limit="full8_local_active_at_most_one",
+            max_model_len=40960,
+            num_query_per_req=8,
+            vllm_config=NS(model_config=NS(max_model_len=40960)),
+        )
         self.validate(owner, NS(num_reqs=16), dummy_run=True)
         self.validate(owner, NS(num_reqs=16), is_profile=True)
         self.validate(owner, NS(num_reqs=16, is_dummy=True))
@@ -461,7 +482,12 @@ class ReviewBoundaryControls(unittest.TestCase):
         scope = actual_function(
             SPEC / "dflash/speculator.py", "_draft_window_owner_scope", {"nullcontext": nullcontext}
         )
-        owner = NS(_draft_graph_review_limit="full8_local_active_at_most_one")
+        owner = NS(
+            _draft_graph_review_limit="full8_local_active_at_most_one",
+            max_model_len=40960,
+            num_query_per_req=8,
+            vllm_config=NS(model_config=NS(max_model_len=40960)),
+        )
         with patch.dict(sys.modules, {MODULE: module}):
             for active in (2, 3, 4, 8):
                 with self.assertRaises(NotImplementedError):

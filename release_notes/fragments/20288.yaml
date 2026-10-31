@@ -12,3 +12,5 @@ entries:
     text: Reported loaded Draft Full, native SWA, mixed or unknown attention semantics at startup, independently of full KV retention. Unconfirmed extra-window Graph combinations are rejected explicitly.
   - category: feature
     text: Replaced the controlled single-request Eagle Graph review entry's fixed prompt and output whitelist with model-capacity checks for Window OFF and W1024. Checkpoint, topology, actual-row and capture-shape protections remain in effect; device qualification is reported separately.
+  - category: bugfix
+    text: Replaced the Full8 single-request Graph review's exact prompt/output whitelist with checked model and allocated-capacity bounds for additional Window OFF or W32768 ON. Static TP4/DP1, actual1/padded1/Q8 and preemption/identity protections remain; new lengths require separate qualification and multiple-request failures stay blocked.

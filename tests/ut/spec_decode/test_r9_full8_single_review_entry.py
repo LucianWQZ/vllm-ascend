@@ -76,7 +76,7 @@ class Full8FiniteEntry(unittest.TestCase):
                 enable_adaptive_verification=False,
                 uses_dynamic_speculative_decoding=lambda: False,
                 draft_parallel_config=NS(tensor_parallel_size=4),
-                draft_model_config=NS(model=str(model)),
+                draft_model_config=NS(model=str(model), hf_config=NS(max_position_embeddings=262144)),
             ),
             parallel_config=NS(
                 tensor_parallel_size=4,
@@ -88,7 +88,7 @@ class Full8FiniteEntry(unittest.TestCase):
             ),
             scheduler_config=NS(max_num_seqs=1, async_scheduling=False),
             cache_config=NS(enable_prefix_caching=False),
-            model_config=NS(max_model_len=40960),
+            model_config=NS(max_model_len=40960, hf_config=NS(max_position_embeddings=262144)),
             compilation_config=NS(cudagraph_mode=NS(name="FULL_DECODE_ONLY"), cudagraph_capture_sizes=[8]),
             additional_config=dict(draft_window_size=32768, draft_window_graph_replicated_tp_review=True),
         )
@@ -113,7 +113,7 @@ class Full8FiniteEntry(unittest.TestCase):
             (self.config.scheduler_config, "async_scheduling", True),
             (self.config.cache_config, "enable_prefix_caching", True),
             (self.config.compilation_config, "cudagraph_capture_sizes", [8, 16]),
-            (self.config.model_config, "max_model_len", 8192),
+            (self.config.model_config, "max_model_len", 262145),
             (self.config.speculative_config, "enforce_eager", True),
         ]:
             before = getattr(obj, key)
@@ -140,7 +140,12 @@ class Full8FiniteEntry(unittest.TestCase):
         for active in (2, 3, 4, 8):
             rejected = []
             for rank in range(4):
-                owner = NS(_draft_graph_review_limit="full8_local_active_at_most_one")
+                owner = NS(
+                    _draft_graph_review_limit="full8_local_active_at_most_one",
+                    max_model_len=40960,
+                    num_query_per_req=8,
+                    vllm_config=NS(model_config=NS(max_model_len=40960)),
+                )
                 try:
                     guard(owner, NS(num_reqs=active, num_reqs_after_padding=active))
                     body.append(rank)
@@ -151,13 +156,23 @@ class Full8FiniteEntry(unittest.TestCase):
         for padded in (2, 4, 8, None):
             with self.subTest(padded=padded), self.assertRaises(NotImplementedError):
                 guard(
-                    NS(_draft_graph_review_limit="full8_local_active_at_most_one"),
+                    NS(
+                        _draft_graph_review_limit="full8_local_active_at_most_one",
+                        max_model_len=40960,
+                        num_query_per_req=8,
+                        vllm_config=NS(model_config=NS(max_model_len=40960)),
+                    ),
                     NS(num_reqs=1, num_reqs_after_padding=padded),
                 )
 
     def test_real_draft_descriptor_guard_precedes_slots_and_builder(self):
         stage = GUARD["validate_full8_single_request_graph_stage"]
-        owner = NS(_draft_graph_review_limit="full8_local_active_at_most_one")
+        owner = NS(
+            _draft_graph_review_limit="full8_local_active_at_most_one",
+            max_model_len=40960,
+            num_query_per_req=8,
+            vllm_config=NS(model_config=NS(max_model_len=40960)),
+        )
         stage(owner, actual=1, padded=1, tokens=8)
         for n, p, q in ((2, 2, 16), (1, 2, 16), (1, 1, 16)):
             with self.subTest(shape=(n, p, q)), self.assertRaises(NotImplementedError):
@@ -181,7 +196,12 @@ class Full8FiniteEntry(unittest.TestCase):
         self.assertLess(stage_line, slot_line)
 
     def test_dummy_profile_and_zero_context_are_not_fake_query(self):
-        owner = NS(_draft_graph_review_limit="full8_local_active_at_most_one")
+        owner = NS(
+            _draft_graph_review_limit="full8_local_active_at_most_one",
+            max_model_len=40960,
+            num_query_per_req=8,
+            vllm_config=NS(model_config=NS(max_model_len=40960)),
+        )
         guard = GUARD["validate_draft_graph_review_requests"]
         guard(owner, NS(num_reqs=3, num_reqs_after_padding=4), dummy_run=True)
         guard(owner, NS(num_reqs=3, num_reqs_after_padding=4), is_profile=True)
@@ -206,7 +226,12 @@ class Full8FiniteEntry(unittest.TestCase):
                 scope(owner, request_batch(padded=2), num_speculative_tokens=7)
 
     def test_authoritative_snapshot_and_finite_request_limits(self):
-        owner = NS(_draft_graph_review_limit="full8_local_active_at_most_one")
+        owner = NS(
+            _draft_graph_review_limit="full8_local_active_at_most_one",
+            max_model_len=40960,
+            num_query_per_req=8,
+            vllm_config=NS(model_config=NS(max_model_len=40960)),
+        )
         states = NS(
             req_id_to_index={"full8-A": 7},
             prompt_len=NS(np={7: 33025}),
@@ -222,12 +247,20 @@ class Full8FiniteEntry(unittest.TestCase):
         states.req_id_to_index["full8-A"] = 8
         with self.assertRaisesRegex(RuntimeError, "mapping changed"):
             snapshot(owner, states, batch.req_ids, batch.idx_mapping_np)
-        for prompt, output in ((33024, 64), (33026, 64), (33025, 63), (33025, 65)):
-            with self.subTest(prompt=prompt, output=output), self.assertRaisesRegex(NotImplementedError, "prompt33025"):
+        for prompt, output in ((0, 64), (33025, 0), (40950, 3), (40825, 128)):
+            with (
+                self.subTest(prompt=prompt, output=output),
+                self.assertRaisesRegex(NotImplementedError, "actual allocated model capacity"),
+            ):
                 GUARD["validate_draft_graph_review_requests"](owner, request_batch(prompt, output))
 
     def test_missing_conflicting_or_reordered_request_evidence_is_rejected(self):
-        owner = NS(_draft_graph_review_limit="full8_local_active_at_most_one")
+        owner = NS(
+            _draft_graph_review_limit="full8_local_active_at_most_one",
+            max_model_len=40960,
+            num_query_per_req=8,
+            vllm_config=NS(model_config=NS(max_model_len=40960)),
+        )
         for change in ("missing", "extra-row", "wrong-id", "wrong-index", "wrong-prefill", "bad-row-type"):
             batch = request_batch()
             if change == "missing":
@@ -246,7 +279,13 @@ class Full8FiniteEntry(unittest.TestCase):
                 GUARD["validate_draft_graph_review_requests"](owner, batch)
 
     def test_preemption_and_context_only_do_not_bypass_original_request(self):
-        owner = NS(_draft_graph_review_limit="full8_local_active_at_most_one", num_speculative_steps=7)
+        owner = NS(
+            _draft_graph_review_limit="full8_local_active_at_most_one",
+            num_speculative_steps=7,
+            max_model_len=40960,
+            num_query_per_req=8,
+            vllm_config=NS(model_config=NS(max_model_len=40960)),
+        )
         owner._draft_window_runtime_state = NS()
         module = ModuleType("vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits")
         module.validate_draft_graph_review_requests = GUARD["validate_draft_graph_review_requests"]
@@ -260,8 +299,8 @@ class Full8FiniteEntry(unittest.TestCase):
             },
         )
         with patch.dict(sys.modules, {module.__name__: module}):
-            with self.assertRaisesRegex(NotImplementedError, "prompt33025"):
-                scope(owner, request_batch(prompt=33024, padded=4), num_speculative_tokens=0)
+            with self.assertRaisesRegex(NotImplementedError, "actual allocated model capacity"):
+                scope(owner, request_batch(prompt=40825, output=128, padded=4), num_speculative_tokens=0)
             self.assertEqual(seen, [])
             with scope(owner, request_batch(padded=4), num_speculative_tokens=0):
                 pass
@@ -271,6 +310,85 @@ class Full8FiniteEntry(unittest.TestCase):
             )
             with self.assertRaisesRegex(NotImplementedError, "preemption"):
                 scope(owner, request_batch(padded=4), num_speculative_tokens=0)
+
+    def test_capacity_cases_are_not_exact_prompt_output_allowlists(self):
+        self.config.additional_config["draft_window_graph_full8_single_request_review"] = True
+        owner = NS(
+            _draft_graph_review_limit="full8_local_active_at_most_one",
+            max_model_len=40960,
+            num_query_per_req=8,
+            vllm_config=NS(model_config=NS(max_model_len=40960)),
+        )
+        for window in (None, 32768):
+            self.config.additional_config["draft_window_size"] = window
+            self.assertEqual(
+                self.resolve(self.config, experimental_graph_review=True), "full8_local_active_at_most_one"
+            )
+            for prompt, output in ((127, 3), (32767, 3), (32769, 128), (40824, 128)):
+                with self.subTest(window=window, prompt=prompt, output=output):
+                    GUARD["validate_draft_graph_review_requests"](owner, request_batch(prompt, output))
+        self.config.model_config.max_model_len = 8192
+        self.assertEqual(self.resolve(self.config, experimental_graph_review=True), "full8_local_active_at_most_one")
+        owner.max_model_len = owner.vllm_config.model_config.max_model_len = 8192
+        GUARD["validate_draft_graph_review_requests"](owner, request_batch(8181, 3))
+        with self.assertRaisesRegex(NotImplementedError, "actual allocated model capacity"):
+            GUARD["validate_draft_graph_review_requests"](owner, request_batch(8182, 3))
+
+    def test_runtime_capacity_cannot_silently_drift_from_allocating_config(self):
+        guard = GUARD["validate_draft_graph_review_requests"]
+        for allocated, runtime in ((40960, 65536), (65536, 40960), (True, 40960)):
+            owner = NS(
+                _draft_graph_review_limit="full8_local_active_at_most_one",
+                max_model_len=runtime,
+                num_query_per_req=8,
+                vllm_config=NS(model_config=NS(max_model_len=allocated)),
+            )
+            with (
+                self.subTest(allocated=allocated, runtime=runtime),
+                self.assertRaisesRegex(NotImplementedError, "actual allocated model capacity"),
+            ):
+                guard(owner, request_batch())
+
+    def test_capacity_is_bounded_by_both_real_model_configs(self):
+        self.config.additional_config["draft_window_graph_full8_single_request_review"] = True
+        for config in (self.config.model_config, self.config.speculative_config.draft_model_config):
+            before = config.hf_config.max_position_embeddings
+            for value in (40959, None, True, "262144"):
+                config.hf_config.max_position_embeddings = value
+                with (
+                    self.subTest(config=config, ceiling=value),
+                    self.assertRaisesRegex(NotImplementedError, "both model position ceilings"),
+                ):
+                    self.resolve(self.config, experimental_graph_review=True)
+            config.hf_config.max_position_embeddings = before
+        for capacity in (None, True, "40960", 8, 262145):
+            self.config.model_config.max_model_len = capacity
+            with (
+                self.subTest(capacity=capacity),
+                self.assertRaisesRegex(NotImplementedError, "both model position ceilings"),
+            ):
+                self.resolve(self.config, experimental_graph_review=True)
+
+    def test_window_off_zero_context_keeps_guard_without_creating_window_owner(self):
+        module = ModuleType("vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits")
+        module.validate_draft_graph_review_requests = GUARD["validate_draft_graph_review_requests"]
+        scope = actual_function(
+            SPEC / "dflash/speculator.py", "_draft_window_owner_scope", {"nullcontext": nullcontext}
+        )
+        owner = NS(
+            _draft_graph_review_limit="full8_local_active_at_most_one",
+            max_model_len=40960,
+            num_query_per_req=8,
+            vllm_config=NS(model_config=NS(max_model_len=40960)),
+        )
+        with patch.dict(sys.modules, {module.__name__: module}):
+            with scope(owner, request_batch(32769, 128, padded=4), num_speculative_tokens=0):
+                pass
+            self.assertFalse(hasattr(owner, "_draft_window_runtime_state"))
+            with self.assertRaisesRegex(NotImplementedError, "actual=1/padded=1"):
+                scope(owner, request_batch(32769, 128, padded=4), num_speculative_tokens=7)
+            with self.assertRaisesRegex(NotImplementedError, "actual allocated model capacity"):
+                scope(owner, request_batch(40825, 128, padded=4), num_speculative_tokens=0)
 
     def test_actual_propose_refuses_bad_request_before_owner_or_body(self):
         module = ModuleType("vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits")
@@ -303,9 +421,15 @@ class Full8FiniteEntry(unittest.TestCase):
             ),
             namespace,
         )
-        owner = NS(_draft_graph_review_limit="full8_local_active_at_most_one", input_batch="previous-owner")
+        owner = NS(
+            _draft_graph_review_limit="full8_local_active_at_most_one",
+            input_batch="previous-owner",
+            max_model_len=40960,
+            num_query_per_req=8,
+            vllm_config=NS(model_config=NS(max_model_len=40960)),
+        )
         with patch.dict(sys.modules, {module.__name__: module}):
-            for batch in (request_batch(prompt=33024), request_batch(output=63)):
+            for batch in (request_batch(prompt=0), request_batch(prompt=40825, output=128)):
                 with self.assertRaises(NotImplementedError):
                     namespace["propose"](owner, batch, *([None] * 10))
                 self.assertEqual(owner.input_batch, "previous-owner")

@@ -16,8 +16,7 @@ from pathlib import Path
 _FULL8_CONFIG = "d2be70579f0b8e7b109e776dbf14bd88ac5be115d2dabbb20e6373988939f410"
 _SWA6_CONFIG = "20784b063040f7871efec4bf63342e5cb941907925943540176dfbb8aaf186dc"
 _EAGLE_CONFIG = "5b9242c2e8603da59527fb9e9dd85f3b5bf1e7beae48b251563bbd442a512c65"
-_FULL8_PROMPT_LENGTH = 33025
-_FULL8_OUTPUT_TOKENS = 64
+_FULL8_QUERY_TOKENS = 8
 
 
 @dataclass(frozen=True, slots=True)
@@ -246,6 +245,29 @@ def validate_eagle_single_request_graph_stage(owner, inputs, *, first, n, tokens
         raise NotImplementedError("Eagle review Graph must use first Q4 and exactly two AR Q1 consumers, padded1")
 
 
+def _full8_review_capacity(vllm_config):
+    """Use the allocated sequence capacity and both actual model ceilings."""
+    target = vllm_config.model_config
+    draft = vllm_config.speculative_config.draft_model_config
+    capacity = getattr(target, "max_model_len", None)
+    ceilings = []
+    for config in (target, draft):
+        text = getattr(config, "hf_text_config", None)
+        if text is None:
+            text = getattr(config, "hf_config", None)
+        ceilings.append(getattr(text, "max_position_embeddings", None))
+    if (
+        type(capacity) is not int
+        or capacity <= _FULL8_QUERY_TOKENS
+        or any(type(value) is not int or value <= 0 for value in ceilings)
+        or capacity > min(ceilings)
+    ):
+        raise NotImplementedError(
+            "Full8 review requires an exact positive configured capacity within both model position ceilings"
+        )
+    return capacity
+
+
 def validate_full8_single_request_review_config(vllm_config):
     """Prevent unsupported batches using the config shared by every TP rank.
 
@@ -275,17 +297,18 @@ def validate_full8_single_request_review_config(vllm_config):
         or scheduler.max_num_seqs != 1
         or scheduler.async_scheduling is not False
         or vllm_config.cache_config.enable_prefix_caching is not False
-        or additional.get("draft_window_size") != 32768
+        or additional.get("draft_window_size") not in (None, 32768)
         or additional.get("enable_dsa_cp", False) is not False
         or additional.get("enable_flashcomm1", False) is not False
         or getattr(vllm_config.compilation_config.cudagraph_mode, "name", None) != "FULL_DECODE_ONLY"
     ):
         raise NotImplementedError(
-            "This Full8 checkpoint's temporary Draft Graph review permits only static K7/W32768, "
+            "This Full8 checkpoint's temporary Draft Graph review permits only static K7, Window OFF or W32768, "
             "TP4/DP1/PP1/PCP1/DCP1 with EP, max_num_seqs=1, FULL_DECODE_ONLY, "
             "non-async/no-prefix/no-DSA-CP/no-FlashComm. Use that single-request configuration "
             "or the independently supported Draft eager route; no fallback is selected."
         )
+    _full8_review_capacity(vllm_config)
 
 
 def validate_full8_single_request_review_entry(vllm_config, *, experimental_graph_review):
@@ -309,7 +332,6 @@ def validate_full8_single_request_review_entry(vllm_config, *, experimental_grap
         or additional.get("draft_window_graph_replicated_tp_review") is not True
         or additional.get("draft_window_graph_numeric_diagnostic", False) is not False
         or list(vllm_config.compilation_config.cudagraph_capture_sizes) != [8]
-        or vllm_config.model_config.max_model_len != 40960
         or config_file is None
         or not config_file.is_file()
         or config_file.stat().st_size > 1 << 20
@@ -317,7 +339,7 @@ def validate_full8_single_request_review_entry(vllm_config, *, experimental_grap
     ):
         raise NotImplementedError(
             "Full8 ordinary review requires its exact checkpoint, explicit Full8 single-request "
-            "and experimental Graph gates, max_model_len40960 and capture[8]; "
+            "and experimental Graph gates, validated model capacity and capture[8]; "
             "this is only a finite active1/padded1 qualification entry, not a PASS receipt."
         )
     return "full8_local_active_at_most_one"
@@ -358,9 +380,26 @@ def _full8_single_request_row(owner, input_batch):
     if row[0] in getattr(owner, "_draft_graph_review_preempted_request_ids", ()):
         raise NotImplementedError("Full8 single-request review does not qualify resumption after preemption")
     _, _, prompt, maximum, prefill = row
-    if prompt != _FULL8_PROMPT_LENGTH or maximum != prompt + _FULL8_OUTPUT_TOKENS or prefill != prompt:
+    capacity = getattr(owner, "max_model_len", None)
+    configured_capacity = getattr(
+        getattr(getattr(owner, "vllm_config", None), "model_config", None), "max_model_len", None
+    )
+    query = getattr(owner, "num_query_per_req", None)
+    if (
+        type(capacity) is not int
+        or capacity <= _FULL8_QUERY_TOKENS
+        or type(configured_capacity) is not int
+        or capacity != configured_capacity
+        or type(query) is not int
+        or query != _FULL8_QUERY_TOKENS
+        or prompt <= 0
+        or maximum <= prompt
+        or prefill != prompt
+        or maximum + query > capacity
+    ):
         raise NotImplementedError(
-            "Full8 single-request review permits only prompt33025 and max_tokens64; "
+            "Full8 single-request review requires original positive prompt/output and "
+            "prompt + max_tokens + Q8 within the actual allocated model capacity; "
             "resumed/preempted prompt-plus-output prefills are not qualified"
         )
     return row
