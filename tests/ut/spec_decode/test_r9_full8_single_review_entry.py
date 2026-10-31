@@ -216,13 +216,17 @@ class Full8FiniteEntry(unittest.TestCase):
             self.assertIsNone(owner._draft_window_proposal_context)
         self.assertFalse(owner._draft_window_dp_dummy_active)
         self.assertFalse(owner._draft_window_bypass_active)
-        with self.assertRaisesRegex(ValueError, "actual submission"):
-            with scope(owner, NS(is_dummy=True), dummy_run=True, is_profile=False):
-                raise ValueError("actual submission")
+        with (
+            self.assertRaisesRegex(ValueError, "actual submission"),
+            scope(owner, NS(is_dummy=True), dummy_run=True, is_profile=False),
+        ):
+            raise ValueError("actual submission")
         self.assertTrue(owner._draft_window_graph_submission_uncertain)
-        with self.assertRaisesRegex(RuntimeError, "quarantined"):
-            with scope(owner, NS(is_dummy=True), dummy_run=True, is_profile=False):
-                self.fail("uncertain dummy must not re-enter")
+        with (
+            self.assertRaisesRegex(RuntimeError, "quarantined"),
+            scope(owner, NS(is_dummy=True), dummy_run=True, is_profile=False),
+        ):
+            self.fail("uncertain dummy must not re-enter")
 
     def test_all4_ranks_refuse_actual_multirow_before_any_body(self):
         guard = GUARD["validate_draft_graph_review_requests"]
