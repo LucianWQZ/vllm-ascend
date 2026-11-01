@@ -23,12 +23,12 @@ from vllm_ascend.worker.v2.spec_decode.draft_window import (
     _build_draft_window_source_capability_for_context,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
+    DraftWindowGraphBindingProvider,
     DraftWindowGraphCaptureIdentity,
     DraftWindowGraphCarrierState,
     DraftWindowGraphReadCarrier,
     DraftWindowGraphRoute,
     DraftWindowGraphWriteSideReference,
-    install_draft_window_graph_binding_provider,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph_metadata import copy_draft_attention_metadata
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph_runtime import (
@@ -61,7 +61,9 @@ class Eagle3GraphSession:
     def __init__(self, owner: Any) -> None:
         validate_graph_context(owner.vllm_config, owner.block_tables)
         self.owner = owner
-        self.provider = install_draft_window_graph_binding_provider(owner)
+        self.provider = owner._draft_window_graph_binding_provider
+        if not isinstance(self.provider, DraftWindowGraphBindingProvider):
+            raise TypeError("Eagle3 Graph requires its initialized source owner")
         self._carriers: list[DraftWindowGraphReadCarrier] = []
         self._captures: dict[
             tuple[DraftWindowGraphRoute, BatchExecutionDescriptor, int], DraftWindowGraphCaptureIdentity
@@ -71,7 +73,7 @@ class Eagle3GraphSession:
         for first, manager in ((True, owner.prefill_cudagraph_manager), (False, owner.decode_cudagraph_manager)):
             route = DraftWindowGraphRoute.EAGLE3_FIRST_PASS if first else DraftWindowGraphRoute.EAGLE3_AR_STEP
             q = owner.num_speculative_steps + 1 if first else 1
-            group = owner._draft_window_runtime_state.capability.group
+            group = self.provider.source.group
             for descriptors in manager._capture_descs.values():
                 for desc in descriptors:
                     if desc.cg_mode.name != "FULL":
@@ -97,7 +99,9 @@ class Eagle3GraphSession:
                         # Seed dummy contents before any GLOBAL capture.
                         # Synchronous H2D is forbidden inside the callback.
                         read = self.provider.startup_capture_workspace(self._captures[key])
-                        capacity = min(owner.max_model_len, self.provider.window_size + group.table_column_span - 1)
+                        capacity = min(
+                            owner.max_model_len, self.provider.source.window_size + group.table_column_span - 1
+                        )
                         read.window_block_table.zero_()
                         read.valid_num_blocks.fill_(read.window_block_table.shape[1])
                         read.cpu_window_exact.fill_(capacity)
@@ -159,7 +163,10 @@ class Eagle3GraphSession:
         read = self.provider.startup_capture_workspace(identity)
         # Persistent dummy banks were initialized before GLOBAL capture.
         # No CPU->device copy, fill or reset is allowed in this callback.
-        capacity = min(self.owner.max_model_len, self.provider.window_size + self.provider.group.table_column_span - 1)
+        capacity = min(
+            self.owner.max_model_len,
+            self.provider.source.window_size + self.provider.source.group.table_column_span - 1,
+        )
         private = copy_draft_attention_metadata(metadata)
         result: dict[str, Any] = {}
         for name, layer in private.items():
@@ -195,7 +202,7 @@ class Eagle3GraphSession:
         if identity.route is DraftWindowGraphRoute.EAGLE3_AR_STEP:
             state = AscendAttentionState.DecodeOnly
         return DraftWindowGraphWriteSideReference(
-            slot_mapping=self.owner.block_tables.slot_mappings[self.provider.group.gid, :tokens],
+            slot_mapping=self.owner.block_tables.slot_mappings[self.provider.source.group.gid, :tokens],
             positions=self.owner.input_buffers.positions[:tokens],
             query_start_loc=self.owner.input_buffers.query_start_loc[: n + 1],
             actual_seq_lengths_q=tuple((i + 1) * query_width for i in range(n)),
@@ -270,7 +277,7 @@ class Eagle3GraphSession:
             if carrier.state is not DraftWindowGraphCarrierState.BOUND:
                 raise RuntimeError("Eagle3 consumer has no bound persistent destination")
             self.require_reusable()
-            owner._draft_window_runtime_state.retire_generation(current)
+            self.provider.retire_generation(current)
             self._carriers.append(carrier)
             owner._eagle3_window_last_identity = current
             owner._eagle3_window_next_step = current.step + 1

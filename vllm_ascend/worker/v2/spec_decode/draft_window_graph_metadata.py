@@ -153,10 +153,10 @@ def defer_parallel_graph_metadata(owner: Any, inputs: Any, *, padded_requests: i
         or selected.descriptor.num_tokens != padded_tokens
     ):
         raise RuntimeError("stale or wrong-bucket deferred Graph metadata selection")
-    runtime = owner._draft_window_runtime_state
-    if runtime._active_inputs is not inputs or owner._draft_window_live_inputs is not inputs:
+    provider = owner._draft_window_graph_binding_provider
+    if provider._active_inputs is not inputs or owner._draft_window_live_inputs is not inputs:
         raise RuntimeError("deferred Graph metadata does not own current P3 materialization")
-    if runtime._metadata is not None or getattr(owner, "_draft_window_deferred_metadata", None) is not None:
+    if inputs.metadata is not None or getattr(owner, "_draft_window_deferred_metadata", None) is not None:
         raise RuntimeError("deferred Graph metadata cannot replace an existing publication")
     owner._draft_window_deferred_metadata = identity
     return True
@@ -171,6 +171,6 @@ def validate_deferred_parallel_graph_metadata(owner: Any, inputs: Any, descripto
         or descriptor.num_reqs != selected.descriptor.num_reqs
         or descriptor.num_tokens != selected.descriptor.num_tokens
         or getattr(owner, "_draft_window_deferred_metadata", None) != inputs.identity
-        or owner._draft_window_runtime_state._metadata is not None
+        or inputs.metadata is not None
     ):
         raise RuntimeError("deferred FULL replay does not match the current unconsumed generation")

@@ -25,7 +25,6 @@ from vllm_ascend.worker.v2.attn_utils import build_attn_metadata_factory, build_
 from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftMetadataInputs,
     DraftWindowPolicyDecision,
-    DraftWindowRuntimeState,
     DraftWindowSourceCapability,
     DraftWindowWorkspace,
     _build_draft_window_source_capability_for_context,
@@ -41,7 +40,6 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
     DraftWindowGraphRoute,
     DraftWindowGraphWriteSideReference,
     _tensor_identity,
-    install_draft_window_graph_binding_provider,
     resolve_parallel_draft_window_graph_route,
 )
 
@@ -130,15 +128,14 @@ def install_parallel_graph(owner: Any) -> DraftWindowGraphSession:
     """Install one provider and register every real startup capture bucket."""
     if hasattr(owner, "_draft_window_graph_session"):
         raise RuntimeError("Draft Window Graph is already installed on this speculator")
-    runtime_state = getattr(owner, "_draft_window_runtime_state", None)
-    if not isinstance(runtime_state, DraftWindowRuntimeState):
-        raise RuntimeError("Draft Window Graph requires initialized P3 runtime state")
+    provider = getattr(owner, "_draft_window_graph_binding_provider", None)
+    if not isinstance(provider, DraftWindowGraphBindingProvider):
+        raise RuntimeError("Draft Window Graph requires its initialized source owner")
     manager = getattr(owner, "query_cudagraph_manager", None)
     capture_descs = getattr(manager, "_capture_descs", None)
     if not isinstance(capture_descs, Mapping) or not capture_descs:
         raise RuntimeError("Draft Window Graph requires real manager capture descriptors")
 
-    provider = install_draft_window_graph_binding_provider(owner)
     route = resolve_parallel_draft_window_graph_route(owner)
     if route not in (DraftWindowGraphRoute.DFLASH, DraftWindowGraphRoute.DSPARK):
         raise RuntimeError("Draft Window Graph has no parallel Draft route")
@@ -277,7 +274,7 @@ def _build_private_graph_metadata(
         actual_request_count=actual_request_count,
         padded_request_count=workspace.max_num_reqs,
         block_tables=owner.block_tables.input_block_tables,
-        global_group_id=owner._draft_window_graph_binding_provider.group.gid,
+        global_group_id=owner._draft_window_graph_binding_provider.source.group.gid,
     )
     with ExitStack() as stack:
         stack.enter_context(build_attn_metadata_wrapper())
@@ -306,7 +303,7 @@ def _build_private_graph_metadata(
     from vllm_ascend.worker.v2.spec_decode.draft_window_graph_metadata import copy_draft_attention_metadata
 
     metadata = copy_draft_attention_metadata(metadata)
-    window_layers = owner._draft_window_runtime_state.capability.group.layers
+    window_layers = owner._draft_window_graph_binding_provider.source.group.layers
     bound_metadata_ids: set[int] = set()
     for layer_name in window_layers:
         layer_metadata = metadata.get(layer_name)
@@ -335,7 +332,7 @@ def _build_write_side_reference(
     capture_identity: DraftWindowGraphCaptureIdentity,
     target_metadata: Mapping[Any, Any],
 ) -> DraftWindowGraphWriteSideReference:
-    gid = owner._draft_window_graph_binding_provider.group.gid
+    gid = owner._draft_window_graph_binding_provider.source.group.gid
     token_count = capture_identity.descriptor.num_tokens
     request_count = capture_identity.descriptor.num_reqs
     query_width = capture_identity.descriptor.num_tokens // capture_identity.descriptor.num_reqs

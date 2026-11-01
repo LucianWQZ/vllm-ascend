@@ -9,7 +9,6 @@ Full write tables and Target state remain owned by the existing runner.
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -23,7 +22,6 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_backends import (
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_plan import (
     DraftWindowPlan,
-    compute_draft_window_plan,
     project_draft_window_interval,
     window_capacity_tokens,
 )
@@ -34,6 +32,7 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_policy import (
 
 if TYPE_CHECKING:
     from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowProposalContext
+    from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphBindingProvider
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,17 +127,9 @@ class DraftWindowSourceCapability:
         )
         if not dense and not native_dflash2:
             raise NotImplementedError(
-                f"Draft Graph source cannot read gid={self.group.gid} "
-                f"layout={self.group.status.value}: {self.group.reason}"
+                f"Draft Graph source cannot read gid={self.group.gid} layout={self.group.status.value}"
             )
         _require_nonnegative_python_int(self.expected_future_offset, "expected future offset")
-        expected_offset = resolve_static_future_offset(
-            normalized_method=self.policy.normalized_method,
-            configured_k=self.expected_future_offset,
-            uses_dynamic_k=False,
-        )
-        if expected_offset != self.expected_future_offset:
-            raise ValueError("configured future offset does not match method semantics")
         self.full_source.validate_owner_bindings()
         _validate_source_geometry(
             group=self.group,
@@ -151,19 +142,8 @@ class DraftWindowSourceCapability:
         capacity_tokens = window_capacity_tokens(window, span)
         object.__setattr__(self, "capacity_columns", (capacity_tokens + span - 1) // span)
 
-    def _validate_plan(self, plan: DraftWindowPlan) -> None:
-        expected = compute_draft_window_plan(
-            full_exact_end=plan.full_exact_end,
-            future_offset=self.expected_future_offset,
-            window_size=self.window_size,
-            block_span_tokens=self.group.table_column_span,
-        )
-        if plan != expected:
-            raise ValueError("scalar plan does not match the canonical method horizon, anchor and capacity")
-
     def describe(self, plan: DraftWindowPlan, *, valid_num_blocks: int) -> DraftWindowReadDescriptor:
         """Project the shared scalar plan onto the canonical batch-sorted table."""
-        self._validate_plan(plan)
         return self._describe_interval(
             window_start=plan.window_start,
             window_visible_length=plan.window_visible_length,
@@ -180,7 +160,6 @@ class DraftWindowSourceCapability:
         """Advance Eagle's actual end while retaining its proposal-frozen anchor."""
         if self.policy.normalized_method != "eagle3":
             raise ValueError("frozen per-step projection is defined only for Eagle3")
-        self._validate_plan(proposal_plan)
         step_plan = proposal_plan.at_exact_end(full_exact_end)
         return self._describe_interval(
             window_start=step_plan.window_start,
@@ -510,13 +489,6 @@ def _build_draft_window_source_capability_for_context(
     )
 
 
-class DraftWindowExecutionPhase(Enum):
-    """Typed identity for a future live/capture binding point."""
-
-    PROPOSAL = "proposal"
-    STEP = "step"
-
-
 @dataclass(frozen=True, slots=True, eq=False)
 class DraftWindowGenerationIdentity:
     """A fresh consumer handle retaining its real proposal and selected shape.
@@ -530,7 +502,6 @@ class DraftWindowGenerationIdentity:
     padded_request_count: int
     read_descriptors: tuple[DraftWindowReadDescriptor, ...]
     idx_mapping_ptr: int
-    phase: DraftWindowExecutionPhase
     step: int
 
     def __post_init__(self) -> None:
@@ -545,8 +516,6 @@ class DraftWindowGenerationIdentity:
             raise ValueError("padded request count must be at least the actual request count")
         if len(self.read_descriptors) != actual:
             raise ValueError("read descriptors must match the actual request count")
-        if not isinstance(self.phase, DraftWindowExecutionPhase):
-            raise TypeError("phase must be a DraftWindowExecutionPhase")
 
 
 class DraftWindowWorkspace:
@@ -720,11 +689,6 @@ class DraftWindowWorkspace:
                 self._zero_all()
             raise
 
-    def build_inputs(
-        self, owner: "DraftWindowRuntimeState", identity: DraftWindowGenerationIdentity
-    ) -> "DraftMetadataInputs":
-        return DraftMetadataInputs(identity=identity, workspace=self, _owner=owner)
-
     def assert_bound(self, expected_identity: DraftWindowGenerationIdentity) -> None:
         if self._bound_identity != expected_identity:
             raise RuntimeError("workspace generation identity does not match the expected generation")
@@ -761,7 +725,8 @@ class DraftMetadataInputs:
 
     identity: DraftWindowGenerationIdentity
     workspace: DraftWindowWorkspace = field(repr=False, compare=False)
-    _owner: "DraftWindowRuntimeState" = field(repr=False, compare=False)
+    _owner: "DraftWindowGraphBindingProvider" = field(repr=False, compare=False)
+    metadata: Mapping[str, Any] | None = field(init=False, default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         self.workspace.assert_bound(self.identity)
@@ -775,309 +740,24 @@ class DraftMetadataInputs:
             raise RuntimeError("typed inputs generation identity does not match the expected generation")
         if self.retired:
             raise RuntimeError("cannot use retired Draft inputs")
+        if self._owner.quarantined_identity is not None:
+            raise RuntimeError("cannot use quarantined Draft inputs")
         self.workspace.assert_bound(expected_identity)
 
-
-class DraftWindowRuntimeState:
-    """The single speculator-owned P3 lifecycle and retirement owner."""
-
-    def __init__(
-        self,
-        *,
-        capability: DraftWindowSourceCapability,
-        workspace: DraftWindowWorkspace | None = None,
-    ) -> None:
-        self.capability = capability
-        self._workspace = workspace
-        self._source = capability.full_source
-        self._metadata: Any = None
-        self._current_workspace: DraftWindowWorkspace | None = None
-        self._quarantine_on_failure = False
-        self._active_inputs: DraftMetadataInputs | None = None
-        self._last_mapping_epoch = -1
-        self._last_retired_identity: DraftWindowGenerationIdentity | None = None
-        self._quarantined_identity: DraftWindowGenerationIdentity | None = None
-
-    @property
-    def workspace(self) -> DraftWindowWorkspace:
-        # Non-FULL consumers need a temporary read buffer; FULL Graph writes
-        # directly to its capture bank and never allocates this scratch.
-        if self._workspace is None:
-            self._workspace = self.new_workspace()
-        return self._workspace
-
-    def new_workspace(self, num_reqs: int | None = None) -> DraftWindowWorkspace:
-        capability = self.capability
-        gid = capability.group.gid
-        table = capability.full_source._input_block_tables[gid]
-        return DraftWindowWorkspace(
-            max_num_reqs=table.shape[0] if num_reqs is None else num_reqs,
-            table_capacity_columns=capability.workspace_capacity_columns or capability.capacity_columns,
-            table_template=table,
-            valid_count_template=capability.full_source._block_tables_owner.num_blocks.gpu[gid],
-        )
-
-    @property
-    def quarantined_identity(self) -> DraftWindowGenerationIdentity | None:
-        return self._quarantined_identity
-
-    def quarantine_generation(self, expected_identity: DraftWindowGenerationIdentity) -> None:
-        """Keep possibly submitted Draft backing intact until process isolation.
-
-        Unknown native partial submission cannot justify another device write
-        or a completion claim. The live input handle intentionally blocks reuse.
-        """
-        inputs = self._active_inputs
-        if inputs is None:
-            raise RuntimeError("cannot quarantine a generation without live inputs")
-        inputs.validate_for(expected_identity)
-        self._metadata = None
-        self._quarantined_identity = expected_identity
-
-    def materialize(
-        self,
-        *,
-        proposal: "DraftWindowProposalContext",
-        idx_mapping: torch.Tensor,
-        read_descriptors: Sequence[DraftWindowReadDescriptor],
-        cpu_window_exact: torch.Tensor,
-        cpu_window_upper: torch.Tensor,
-        cpu_valid_num_blocks: torch.Tensor,
-        num_reqs_padded: int,
-        phase: DraftWindowExecutionPhase,
-        step: int,
-        quarantine_on_failure: bool = False,
-        output_workspace: DraftWindowWorkspace | None = None,
-    ) -> DraftMetadataInputs:
-        """Materialize one consumer under the caller's actual proposal owner."""
-        if self._quarantined_identity is not None:
-            raise RuntimeError("draft-window backing is quarantined after uncertain Graph submission")
-        _validate_idx_mapping(idx_mapping)
-        identity = DraftWindowGenerationIdentity(
-            proposal=proposal,
-            padded_request_count=num_reqs_padded,
-            read_descriptors=tuple(read_descriptors),
-            idx_mapping_ptr=idx_mapping.data_ptr(),
-            phase=phase,
-            step=step,
-        )
-        if proposal.mapping_epoch <= self._last_mapping_epoch:
-            raise ValueError(
-                f"mapping epoch must strictly increase: current={proposal.mapping_epoch} "
-                f"previous={self._last_mapping_epoch}"
-            )
-        self._last_retired_identity = None
-        return self._materialize_identity(
-            identity=identity,
-            cpu_window_exact=cpu_window_exact,
-            cpu_window_upper=cpu_window_upper,
-            cpu_valid_num_blocks=cpu_valid_num_blocks,
-            quarantine_on_failure=quarantine_on_failure,
-            output_workspace=output_workspace,
-        )
-
-    def materialize_serialized_step(
-        self,
-        *,
-        previous_identity: DraftWindowGenerationIdentity,
-        proposal: "DraftWindowProposalContext",
-        idx_mapping: torch.Tensor,
-        read_descriptors: Sequence[DraftWindowReadDescriptor],
-        cpu_window_exact: torch.Tensor,
-        cpu_window_upper: torch.Tensor,
-        cpu_valid_num_blocks: torch.Tensor,
-        num_reqs_padded: int,
-        step: int,
-        quarantine_on_failure: bool = False,
-        output_workspace: DraftWindowWorkspace | None = None,
-    ) -> DraftMetadataInputs:
-        """Continue the same real proposal, only after its preceding reader retires."""
-        if self._active_inputs is not None:
-            raise RuntimeError("cannot refresh a Draft Window while the previous reader is active")
-        if self._last_retired_identity is not previous_identity:
-            raise RuntimeError("serialized step does not continue the most recently retired generation")
-        if proposal is not previous_identity.proposal or proposal.mapping_epoch != self._last_mapping_epoch:
-            raise RuntimeError("serialized step proposal or request mapping changed")
-        if self.capability.policy.normalized_method != "eagle3":
-            raise RuntimeError("serialized per-step continuation is supported only for Eagle3")
-        if step != previous_identity.step + 1:
-            raise RuntimeError(
-                "serialized Draft Window steps must strictly advance by one: "
-                f"previous={previous_identity.step} current={step}"
-            )
-        _validate_idx_mapping(idx_mapping)
-        if (
-            self.capability.full_source is not self._source
-            or idx_mapping.data_ptr() != previous_identity.idx_mapping_ptr
-        ):
-            raise RuntimeError("serialized step FullSource or request mapping changed within one proposal")
-        identity = DraftWindowGenerationIdentity(
-            proposal=proposal,
-            padded_request_count=num_reqs_padded,
-            read_descriptors=tuple(read_descriptors),
-            idx_mapping_ptr=idx_mapping.data_ptr(),
-            phase=DraftWindowExecutionPhase.STEP,
-            step=step,
-        )
-        workspace = self.workspace if output_workspace is None else output_workspace
-        if identity.padded_request_count > workspace.max_num_reqs:
-            raise RuntimeError("serialized step padded request capacity exceeded")
-        self._last_retired_identity = None
-        return self._materialize_identity(
-            identity=identity,
-            cpu_window_exact=cpu_window_exact,
-            cpu_window_upper=cpu_window_upper,
-            cpu_valid_num_blocks=cpu_valid_num_blocks,
-            quarantine_on_failure=quarantine_on_failure,
-            output_workspace=output_workspace,
-        )
-
-    def _materialize_identity(
-        self,
-        *,
-        identity: DraftWindowGenerationIdentity,
-        cpu_window_exact: torch.Tensor,
-        cpu_window_upper: torch.Tensor,
-        cpu_valid_num_blocks: torch.Tensor,
-        quarantine_on_failure: bool = False,
-        output_workspace: DraftWindowWorkspace | None = None,
-    ) -> DraftMetadataInputs:
-        """Acquire and populate the one serialized backing for an identity."""
-        if self._current_workspace is not None:
-            raise RuntimeError("draft-window runtime still owns an active read bank")
-        if self.capability.full_source is not self._source:
-            raise RuntimeError("draft-window canonical source changed after runtime initialization")
-        workspace = self.workspace if output_workspace is None else output_workspace
-        self._current_workspace = workspace
-        self._quarantine_on_failure = quarantine_on_failure
-        self._last_mapping_epoch = max(self._last_mapping_epoch, identity.proposal.mapping_epoch)
+    def publish(self, metadata: Mapping[str, Any], *, target_metadata: Any) -> None:
+        """Publish once on this actual generation, without a second owner store."""
         try:
-            workspace.materialize(
-                identity=identity,
-                full_source=self._source,
-                global_group_id=self.capability.group.gid,
-                cpu_window_exact=cpu_window_exact,
-                cpu_window_upper=cpu_window_upper,
-                cpu_valid_num_blocks=cpu_valid_num_blocks,
-                preserve_on_failure=quarantine_on_failure,
-            )
-            inputs = workspace.build_inputs(self, identity)
-            self._active_inputs = inputs
-            return inputs
-        except BaseException:
-            if quarantine_on_failure:
-                # A native write may have been submitted before raising, even
-                # though no typed inputs exist yet. Keep the workspace and
-                # backing; only Host state may be changed before child isolation.
-                self._quarantined_identity = identity
-                raise
-            self._finish_generation(identity)
-            self._active_inputs = None
-            raise
-
-    def publish_metadata(
-        self,
-        inputs: DraftMetadataInputs,
-        metadata: Any,
-        *,
-        target_metadata: Any,
-    ) -> None:
-        try:
-            self._require_active_inputs(inputs)
-            if self._metadata is not None:
+            self.validate_for(self.identity)
+            if self.metadata is not None:
                 raise RuntimeError("cannot overwrite active draft metadata")
             from vllm_ascend.worker.v2.spec_decode.draft_window_graph_metadata import validate_draft_metadata_isolation
 
             validate_draft_metadata_isolation(metadata, target_metadata=target_metadata)
-            self._metadata = metadata
+            object.__setattr__(self, "metadata", metadata)
         except BaseException:
-            if self._active_inputs is inputs:
-                self._handle_active_failure(inputs)
+            if self._owner._active_inputs is self and self._owner.quarantined_identity is None:
+                self._owner._handle_active_failure(self)
             raise
-
-    def read_metadata(self, expected_identity: DraftWindowGenerationIdentity) -> Any:
-        if self._active_inputs is None or self._metadata is None:
-            raise RuntimeError("no active draft metadata")
-        self._active_inputs.validate_for(expected_identity)
-        return self._metadata
-
-    def _handle_active_failure(self, inputs: DraftMetadataInputs) -> None:
-        if self._quarantine_on_failure:
-            self.quarantine_generation(inputs.identity)
-        else:
-            self._abort_active(inputs.identity)
-
-    def retire_generation(self, expected_identity: DraftWindowGenerationIdentity) -> None:
-        if self._quarantined_identity is not None:
-            raise RuntimeError("cannot retire quarantined draft-window backing")
-        inputs = self._active_inputs
-        if inputs is None:
-            raise RuntimeError("cannot use retired Draft inputs")
-        inputs.validate_for(expected_identity)
-        self._finish_generation(expected_identity)
-        self._last_retired_identity = expected_identity
-
-    def abort_generation(self, expected_identity: DraftWindowGenerationIdentity) -> None:
-        if self._quarantined_identity is not None:
-            raise RuntimeError("cannot abort quarantined draft-window backing")
-        inputs = self._active_inputs
-        if inputs is None:
-            raise RuntimeError("cannot use retired Draft inputs")
-        inputs.validate_for(expected_identity)
-        self._abort_active(expected_identity)
-
-    def _abort_active(self, identity: DraftWindowGenerationIdentity) -> None:
-        if self._quarantined_identity is not None:
-            raise RuntimeError("cannot clean up quarantined draft-window backing")
-        inputs = self._active_inputs
-        if inputs is None:
-            return
-        inputs.validate_for(identity)
-        self._finish_generation(identity)
-        self._last_retired_identity = None
-
-    def _finish_generation(self, identity: DraftWindowGenerationIdentity) -> None:
-        # Graph bank lifetime belongs to capture, not this Host generation.
-        # Clear only at the next same-stream prepare, after the existing tail
-        # dependency. Non-FULL scratch follows its serialized current stream.
-        workspace = self._current_workspace
-        assert workspace is not None
-        workspace.reset(identity, clear_buffers=workspace is self._workspace)
-        self._metadata = None
-        self._active_inputs = None
-        self._current_workspace = None
-
-    def _require_active_inputs(self, inputs: DraftMetadataInputs) -> None:
-        if self._active_inputs is not inputs:
-            raise RuntimeError("typed inputs are not the active runtime generation")
-        inputs.validate_for(inputs.identity)
-
-
-def build_draft_window_runtime_state(
-    capability: DraftWindowSourceCapability,
-) -> DraftWindowRuntimeState:
-    """Allocate P3 state only after P2 has closed all capability gates."""
-    group = capability.group
-    capability.full_source.validate_owner_bindings()
-    source_table = capability.full_source._input_block_tables[group.gid]
-    persistent_counts = capability.full_source._block_tables_owner.num_blocks.gpu[group.gid]
-    if source_table.dtype != torch.int32 or persistent_counts.dtype != torch.int32:
-        raise TypeError("P3 direct-prefix source tables and valid counts must use int32")
-    if source_table.device != persistent_counts.device:
-        raise ValueError("P3 source table and valid counts must share a device")
-    table_capacity_columns = (
-        capability.capacity_columns
-        if capability.workspace_capacity_columns is None
-        else capability.workspace_capacity_columns
-    )
-    if table_capacity_columns < capability.capacity_columns:
-        raise ValueError("configured workspace capacity is smaller than the provider capacity")
-    if table_capacity_columns > source_table.shape[1]:
-        raise ValueError("configured workspace capacity exceeds the canonical source row width")
-    return DraftWindowRuntimeState(
-        capability=capability,
-        workspace=None,
-    )
 
 
 def _validate_window_length_input(

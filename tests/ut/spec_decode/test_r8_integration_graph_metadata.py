@@ -11,7 +11,6 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
 from unittest.mock import Mock
 
 import pytest
@@ -108,13 +107,9 @@ def source_contract():
 
     parallel = SimpleNamespace(tensor_parallel_size=16)
     capability = SimpleNamespace(parallel_config=parallel, tensor_parallel_rank=7)
-    owner = SimpleNamespace(
-        _runtime_state=SimpleNamespace(capability=capability),
-        _capability=capability,
-        _parallel_config=parallel,
-        _tp_identity=(16, 7),
-    )
-    owner._capture_topology = lambda: DraftWindowGraphBindingProvider._capture_topology(owner)
+    owner = object.__new__(DraftWindowGraphBindingProvider)
+    owner._source = capability
+    owner._tp_identity = (16, 7)
     return owner, DraftWindowGraphBindingProvider
 
 
@@ -134,11 +129,11 @@ def source_contract():
 def test_graph_capture_requires_real_explicit_world_and_rank(source_contract, field, value):
     owner, methods = source_contract
     if field == "parallel_config":
-        owner._capability.parallel_config = value
+        owner._source.parallel_config = value
     elif field == "tensor_parallel_size":
-        owner._capability.parallel_config.tensor_parallel_size = value
+        owner._source.parallel_config.tensor_parallel_size = value
     elif field is not None:
-        owner._capability.tensor_parallel_rank = value
+        owner._source.tensor_parallel_rank = value
     if field is None:
         assert methods._capture_topology(owner) == (16, 7)
     else:
@@ -146,19 +141,15 @@ def test_graph_capture_requires_real_explicit_world_and_rank(source_contract, fi
             methods._capture_topology(owner)
 
 
-@pytest.mark.parametrize("replacement", [None, "capability", "parallel", "rank-drift"])
+@pytest.mark.parametrize("replacement", [None, "rank-drift"])
 def test_graph_source_guard_keeps_actual_capability_parallel_object_and_rank(source_contract, replacement):
     owner, methods = source_contract
-    if replacement == "capability":
-        owner._runtime_state.capability = SimpleNamespace(**vars(owner._capability))
-    elif replacement == "parallel":
-        owner._capability.parallel_config = SimpleNamespace(**vars(owner._parallel_config))
-    elif replacement == "rank-drift":
-        owner._capability.tensor_parallel_rank = 8
+    if replacement == "rank-drift":
+        owner._source.tensor_parallel_rank = 8
     if replacement is None:
         methods._validate_source_contract(owner)
     else:
-        with pytest.raises(RuntimeError, match="capability changed|parallel configuration or TP rank changed"):
+        with pytest.raises(RuntimeError, match="parallel configuration or TP rank changed"):
             methods._validate_source_contract(owner)
 
 
@@ -550,20 +541,15 @@ def full_metadata_dispatch():
 
     proposal = SimpleNamespace(mapping_epoch=7, ordered_request_ids=("req-a", "req-b"))
     identity = SimpleNamespace(proposal=proposal, padded_request_count=2)
-    inputs = SimpleNamespace(identity=identity)
+    inputs = SimpleNamespace(identity=identity, metadata=None)
     inputs.validate_for = lambda expected: None if expected is identity else (_ for _ in ()).throw(ValueError("stale"))
-    runtime: Any = SimpleNamespace(
-        _active_inputs=inputs,
-        _metadata=None,
-        capability=SimpleNamespace(policy=SimpleNamespace(normalized_method="dflash")),
-    )
     provider = object.__new__(DraftWindowGraphBindingProvider)
-    provider._runtime_state = runtime
+    provider._active_inputs = inputs
+    provider._source = SimpleNamespace(policy=SimpleNamespace(normalized_method="dflash"))
     owner = SimpleNamespace(
         _draft_window_proposal_context=proposal,
         _draft_window_graph_binding_provider=provider,
         num_query_per_req=8,
-        _draft_window_runtime_state=runtime,
         _draft_window_live_inputs=inputs,
         _draft_window_deferred_metadata=None,
     )
@@ -629,7 +615,7 @@ def test_eager_dispatch_keeps_ordinary_metadata_build(full_metadata_dispatch):
 def test_full_metadata_dispatch_does_not_replace_published_metadata(full_metadata_dispatch):
     c = full_metadata_dispatch
     c.select_parallel_graph_metadata(c.owner, c.descriptor)
-    c.owner._draft_window_runtime_state._metadata = object()
+    c.inputs.metadata = object()
     with pytest.raises(RuntimeError, match="existing publication"):
         c.defer_parallel_graph_metadata(c.owner, c.inputs, padded_requests=2, padded_tokens=16)
 

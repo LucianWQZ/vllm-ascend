@@ -108,9 +108,7 @@ def _build_capture_context(
     keys = set()
     for descriptor in descriptors:
         num_reqs = descriptor.num_reqs
-        matches = [
-            identity for identity in identities if identity.descriptor == descriptor
-        ]
+        matches = [identity for identity in identities if identity.descriptor == descriptor]
         if len(matches) != 1:
             raise RuntimeError("Draft Window capture descriptor does not resolve exactly one registered carrier")
         key = (num_reqs, descriptor.num_tokens, descriptor.cg_mode)
@@ -154,7 +152,7 @@ def _seed_capture_workspace(
     max_model_len: int,
     provider: DraftWindowGraphBindingProvider,
 ) -> int:
-    gid = provider.group.gid
+    gid = provider.source.group.gid
     if not 0 <= gid < len(input_block_tables):
         raise RuntimeError("Draft Window capture gid is absent from dummy full tables")
     source = input_block_tables[gid]
@@ -168,9 +166,11 @@ def _seed_capture_workspace(
 
     capture_upper = min(
         max_model_len,
-        provider.window_size + provider.group.table_column_span - 1,
+        provider.source.window_size + provider.source.group.table_column_span - 1,
     )
-    valid_num_blocks = (capture_upper + provider.group.table_column_span - 1) // provider.group.table_column_span
+    valid_num_blocks = (
+        capture_upper + provider.source.group.table_column_span - 1
+    ) // provider.source.group.table_column_span
     if valid_num_blocks > source.shape[1] or valid_num_blocks > destination.shape[1]:
         raise RuntimeError("Draft Window capture table cannot cover the Window capacity")
 
@@ -237,7 +237,7 @@ def ascend_prepare_dflash_inputs_to_capture(
             num_reqs_padded=input_batch.num_reqs_after_padding,
         )
     read_block_tables = list(input_block_tables)
-    read_block_tables[context.provider.group.gid] = workspace.window_block_table
+    read_block_tables[context.provider.source.group.gid] = workspace.window_block_table
     from vllm_ascend.worker.v2.spec_decode.draft_window_eager import AscendDraftAttentionReadInputs
 
     graph_read_inputs = AscendDraftAttentionReadInputs(
