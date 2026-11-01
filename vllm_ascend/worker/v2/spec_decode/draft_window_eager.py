@@ -34,6 +34,7 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_nongraph import (
     build_phase_aware_materialization_plan,
     classify_draft_window_batch_phase,
 )
+from vllm_ascend.worker.v2.spec_decode.draft_window_read import DraftReadView
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,30 +73,6 @@ class AscendDraftAttentionReadInputs:
         if self.seq_lens_cpu_exact.shape != self.seq_lens_cpu_upper_bound.shape:
             raise ValueError("Draft attention CPU exact and upper lengths must have the same shape")
 
-    def validate_builder_sources(
-        self,
-        *,
-        num_reqs,
-        block_tables,
-        seq_lens,
-        seq_lens_cpu,
-        seq_lens_cpu_upper_bound,
-        max_seq_len,
-    ) -> None:
-        """Authorize only this build's existing exact/read owners."""
-        if num_reqs != self.seq_lens.shape[0] or max_seq_len != self.max_seq_len:
-            raise ValueError("Graph metadata read geometry differs from current inputs")
-        if (
-            seq_lens is not self.seq_lens
-            or seq_lens_cpu is not self.seq_lens_cpu_exact
-            or seq_lens_cpu_upper_bound is not self.seq_lens_cpu_upper_bound
-        ):
-            raise ValueError("Graph metadata exact/upper owners differ from current inputs")
-        if len(block_tables) != len(self.block_tables) or any(
-            actual is not expected for actual, expected in zip(block_tables, self.block_tables)
-        ):
-            raise ValueError("Graph metadata tables differ from current read owners")
-
     def certify_common_metadata(self, gid: int, common: Any) -> None:
         """Certify a fresh per-group object; never project or clone read data."""
         if not 0 <= gid < len(self.block_tables):
@@ -104,6 +81,7 @@ class AscendDraftAttentionReadInputs:
             raise ValueError("Graph metadata already has a read projection owner")
         if (
             common.num_reqs != self.seq_lens.shape[0]
+            or common.max_seq_len != self.max_seq_len
             or common.block_table_tensor is not self.block_tables[gid]
             or common.seq_lens_cpu is not self.seq_lens_cpu_exact
             or common.seq_lens_cpu_upper_bound is not self.seq_lens_cpu_upper_bound
@@ -118,26 +96,15 @@ class AscendDraftAttentionReadInputs:
         # explicit owner for the certificate; no data is copied or projected.
         common.seq_lens = self.seq_lens
         common._seq_lens_cpu = self.seq_lens_cpu_exact
-        common._draft_window_read = _AscendDraftAttentionReadCertificate(self, gid)
-
-
-@dataclass(frozen=True, slots=True)
-class _AscendDraftAttentionReadCertificate:
-    inputs: AscendDraftAttentionReadInputs
-    group_id: int
-
-    def exact_cpu_for(self, common: Any) -> torch.Tensor:
-        read = self.inputs
-        if (
-            common.seq_lens is not read.seq_lens
-            or common.seq_lens_cpu is not read.seq_lens_cpu_exact
-            or common._seq_lens_cpu is not read.seq_lens_cpu_exact
-            or common.seq_lens_cpu_upper_bound is not read.seq_lens_cpu_upper_bound
-            or common.block_table_tensor is not read.block_tables[self.group_id]
-            or common.num_reqs != read.seq_lens.shape[0]
-        ):
-            raise ValueError("Graph read operands were replaced after exact certification")
-        return read.seq_lens_cpu_exact
+        common._draft_window_read = DraftReadView(
+            block_table=self.block_tables[gid],
+            seq_lens=self.seq_lens,
+            seq_lens_cpu=self.seq_lens_cpu_exact,
+            seq_lens_cpu_upper_bound=self.seq_lens_cpu_upper_bound,
+            starts_cpu=None,
+            max_seq_len=self.max_seq_len,
+            num_reqs=common.num_reqs,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,6 +116,21 @@ class DraftWindowProposalContext:
     ordered_request_ids: tuple[str, ...]
     idx_mapping_fingerprint: tuple[int, ...]
     phase_plan: DraftWindowBatchPhasePlan
+
+    def __post_init__(self) -> None:
+        if type(self.mapping_epoch) is not int or self.mapping_epoch < 0:
+            raise ValueError("proposal mapping epoch must be a nonnegative Python int")
+        requests = self.ordered_request_ids
+        if (
+            not requests
+            or any(not isinstance(request, str) or not request for request in requests)
+            or len(set(requests)) != len(requests)
+        ):
+            raise ValueError("proposal requires unique nonempty ordered request IDs")
+        if len(self.idx_mapping_fingerprint) != len(requests):
+            raise ValueError("proposal CPU mapping must match its ordered request count")
+        if self.phase_plan.ordered_request_fingerprint != requests:
+            raise ValueError("proposal row phases belong to another ordered request mapping")
 
 
 class DraftWindowProposalEpochSource:
@@ -336,7 +318,6 @@ class DraftWindowGraphInputMixin:
             kv_cache_config=self.kv_cache_config,
             causal=self._group_causal,
             vllm_config=self.vllm_config,
-            input_buffers=self.input_buffers,
             dflash2_graph_contract=getattr(self, "_dflash2_graph_contract", None),
         )
         runtime_state = build_draft_window_runtime_state(capability)
@@ -499,13 +480,13 @@ class DraftWindowGraphInputMixin:
         capability = self._draft_window_source_capability
         valid_num_blocks = gather_valid_num_blocks_cpu(
             capability.full_source,
-            global_group_id=capability.provider.global_group_id,
+            global_group_id=capability.group.gid,
             idx_mapping_np=input_batch.idx_mapping_np,
             num_reqs=num_reqs,
             num_reqs_padded=num_reqs_padded,
         )
         plan = build_phase_aware_materialization_plan(
-            provider=capability.provider,
+            source=capability,
             phase_plan=context.phase_plan,
             cpu_full_exact=cpu_full_exact,
             cpu_apply_time_full_upper=cpu_apply_time_full_upper,
@@ -516,8 +497,7 @@ class DraftWindowGraphInputMixin:
         # Recheck freshness after the controlled length snapshot and host plan.
         self._draft_window_epoch_source.validate(context, input_batch)
         inputs = self._draft_window_runtime_state.materialize(
-            mapping_epoch=context.mapping_epoch,
-            ordered_request_ids=context.ordered_request_ids,
+            proposal=context,
             idx_mapping=input_batch.idx_mapping,
             read_descriptors=plan.read_descriptors,
             cpu_window_exact=plan.cpu_window_exact,
@@ -526,7 +506,6 @@ class DraftWindowGraphInputMixin:
             num_reqs_padded=num_reqs_padded,
             phase=DraftWindowExecutionPhase.PROPOSAL,
             step=0,
-            row_phase_fingerprint=plan.row_phase_fingerprint,
             quarantine_on_failure=hasattr(self, "_draft_window_graph_session"),
             output_workspace=output_workspace,
         )
@@ -541,10 +520,10 @@ class DraftWindowGraphInputMixin:
         inputs.validate_for(expected_identity)
         return draft_window_read_inputs(
             inputs.workspace,
-            actual_request_count=expected_identity.actual_request_count,
+            actual_request_count=len(expected_identity.proposal.ordered_request_ids),
             padded_request_count=expected_identity.padded_request_count,
             block_tables=self.block_tables.input_block_tables,
-            global_group_id=inputs._owner.capability.provider.global_group_id,
+            global_group_id=inputs._owner.capability.group.gid,
         )
 
     def _build_draft_attn_metadata(

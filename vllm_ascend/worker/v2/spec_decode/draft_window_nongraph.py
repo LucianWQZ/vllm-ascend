@@ -11,7 +11,7 @@ import torch
 
 from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftWindowReadDescriptor,
-    SingleGroupDirectPrefixProvider,
+    DraftWindowSourceCapability,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_plan import DraftWindowPlan, compute_draft_window_plan
 from vllm_ascend.worker.v2.spec_decode.draft_window_runtime import continuing_prefill_rows
@@ -59,7 +59,6 @@ class DraftWindowPhaseAwareMaterializationPlan:
     cpu_window_exact: torch.Tensor
     cpu_window_upper: torch.Tensor
     cpu_valid_num_blocks: torch.Tensor
-    row_phase_fingerprint: tuple[str, ...]
 
 
 def classify_draft_window_batch_phase(input_batch: Any) -> DraftWindowBatchPhasePlan:
@@ -108,7 +107,7 @@ def classify_draft_window_batch_phase(input_batch: Any) -> DraftWindowBatchPhase
 
 def build_phase_aware_materialization_plan(
     *,
-    provider: SingleGroupDirectPrefixProvider,
+    source: DraftWindowSourceCapability,
     phase_plan: DraftWindowBatchPhasePlan,
     cpu_full_exact: torch.Tensor,
     cpu_apply_time_full_upper: torch.Tensor,
@@ -134,8 +133,8 @@ def build_phase_aware_materialization_plan(
     exact = torch.zeros(padded_request_count, dtype=torch.int32)
     upper = torch.zeros(padded_request_count, dtype=torch.int32)
     descriptors: list[DraftWindowReadDescriptor] = []
-    span = provider.block_span_tokens
-    source_width = provider.full_source.input_block_table_row_width(provider.global_group_id)
+    span = source.group.table_column_span
+    source_width = source.full_source.input_block_table_row_width(source.group.gid)
     for row, phase in enumerate(phase_plan.row_phases):
         full_exact = int(cpu_full_exact[row])
         full_upper = int(cpu_apply_time_full_upper[row])
@@ -149,7 +148,7 @@ def build_phase_aware_materialization_plan(
             if safe_extent < full_exact:
                 raise RuntimeError("continuing-prefill full read exceeds its resident source")
             descriptor = DraftWindowReadDescriptor(
-                global_group_id=provider.global_group_id,
+                global_group_id=source.group.gid,
                 source_start_column=0,
                 first_token_offset=0,
                 required_columns=valid,
@@ -163,13 +162,13 @@ def build_phase_aware_materialization_plan(
             if frozen_row_plans is None:
                 scalar = compute_draft_window_plan(
                     full_exact_end=full_exact,
-                    window_size=provider.inventory.window_size,
-                    block_span_tokens=provider.legacy_block_size,
+                    window_size=source.window_size,
+                    block_span_tokens=source.group.table_column_span,
                 )
-                descriptor = provider.describe(scalar, valid_num_blocks=valid)
+                descriptor = source.describe(scalar, valid_num_blocks=valid)
             else:
                 scalar = frozen_row_plans[row]
-                descriptor = provider.describe_frozen_step(scalar, full_exact_end=full_exact, valid_num_blocks=valid)
+                descriptor = source.describe_frozen_step(scalar, full_exact_end=full_exact, valid_num_blocks=valid)
             visible = full_exact - scalar.window_start
             visible_upper = min(
                 max(full_upper - scalar.window_start, visible),
@@ -185,5 +184,4 @@ def build_phase_aware_materialization_plan(
         cpu_window_exact=exact,
         cpu_window_upper=upper,
         cpu_valid_num_blocks=cpu_valid_num_blocks,
-        row_phase_fingerprint=phase_plan.row_phase_fingerprint,
     )

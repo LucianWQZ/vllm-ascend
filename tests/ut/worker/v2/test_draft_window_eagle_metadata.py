@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
 """Shared query construction and Eagle's real eager-reader boundary."""
 
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -140,7 +141,7 @@ def proposal():
     owner.method, owner.num_speculative_steps = "eagle3", 3
     owner.speculative_config = SimpleNamespace(uses_dynamic_speculative_decoding=lambda: False)
     owner._draft_window_source_capability = SimpleNamespace(
-        inventory=SimpleNamespace(method="eagle3"), provider=SimpleNamespace(expected_future_offset=3)
+        policy=SimpleNamespace(normalized_method="eagle3"), expected_future_offset=3
     )
     runtime: Any = SimpleNamespace(_active_inputs=None, quarantined_identity=None, _last_retired_identity=None)
 
@@ -174,9 +175,7 @@ def proposal():
 
     def inputs(step, **changes):
         context = owner._require_eagle3_window_context()
-        values = dict(
-            mapping_epoch=context.mapping_epoch, ordered_request_fingerprint=context.ordered_request_ids, step=step
-        )
+        values = dict(proposal=context, step=step)
         values.update(changes)
         identity = SimpleNamespace(**values)
         current = SimpleNamespace(identity=identity, retired=False)
@@ -213,7 +212,9 @@ def test_real_proposal_keeps_each_submitted_consumer_until_update(proposal):
     assert not getattr(owner, "_draft_window_graph_submission_uncertain", False)
 
 
-@pytest.mark.parametrize("damage", ["missing_reader", "missing_update", "wrong_request", "wrong_step", "wrong_ordinal"])
+@pytest.mark.parametrize(
+    "damage", ["missing_reader", "missing_update", "wrong_request", "cloned_proposal", "wrong_step", "wrong_ordinal"]
+)
 def test_real_proposal_rejects_unconsumed_or_misattributed_reader(proposal, damage):
     owner, batch, session, runtime, inputs = proposal
     with (
@@ -221,10 +222,19 @@ def test_real_proposal_rejects_unconsumed_or_misattributed_reader(proposal, dama
         owner._eagle3_draft_window_proposal_scope(batch, dummy_run=False, is_profile=False, num_speculative_tokens=0),
     ):
         if damage != "missing_reader":
-            changes = {"ordered_request_fingerprint": ("stale",)} if damage == "wrong_request" else {}
+            context = owner._require_eagle3_window_context()
+            changes = {}
+            if damage == "wrong_request":
+                changes["proposal"] = replace(
+                    context,
+                    ordered_request_ids=("stale",),
+                    phase_plan=replace(context.phase_plan, ordered_request_fingerprint=("stale",)),
+                )
+            elif damage == "cloned_proposal":
+                changes["proposal"] = replace(context)
             current = inputs(1 if damage == "wrong_step" else 0, **changes)
             session.stage(current, first=True, n=1, tokens=4, ordinal=1 if damage == "wrong_ordinal" else 0)
     assert owner._draft_window_graph_submission_uncertain
     assert owner._eagle3_window_proposal_context is None
-    if damage in ("wrong_request", "wrong_step", "wrong_ordinal"):
+    if damage in ("wrong_request", "cloned_proposal", "wrong_step", "wrong_ordinal"):
         assert runtime.quarantined_identity is current.identity

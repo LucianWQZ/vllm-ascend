@@ -191,6 +191,7 @@ def bridge():
     read = AscendDraftAttentionReadInputs(tables, device, exact, upper, 1040)
     common = SimpleNamespace(
         num_reqs=4,
+        max_seq_len=1040,
         seq_lens=device.view(-1),
         seq_lens_cpu=exact,
         seq_lens_cpu_upper_bound=upper,
@@ -198,19 +199,10 @@ def bridge():
         slot_mapping=object(),
         positions=object(),
     )
-    kwargs = dict(
-        num_reqs=4,
-        block_tables=list(read.block_tables),
-        seq_lens=device,
-        seq_lens_cpu=exact,
-        seq_lens_cpu_upper_bound=upper,
-        max_seq_len=1040,
-    )
-    return SimpleNamespace(read=read, common=common, kwargs=kwargs)
+    return SimpleNamespace(read=read, common=common)
 
 
 def test_current_exact_pair_is_certified_without_reprojection_or_write_mutation(bridge):
-    bridge.read.validate_builder_sources(**bridge.kwargs)
     slots, positions = bridge.common.slot_mapping, bridge.common.positions
     bridge.read.certify_common_metadata(0, bridge.common)
     certificate = bridge.common._draft_window_read
@@ -220,38 +212,34 @@ def test_current_exact_pair_is_certified_without_reprojection_or_write_mutation(
     assert bridge.common.slot_mapping is slots and bridge.common.positions is positions
 
 
-@pytest.mark.parametrize("field", ["seq_lens", "seq_lens_cpu", "seq_lens_cpu_upper_bound"])
-def test_same_values_from_another_owner_are_rejected(bridge, field):
-    original = bridge.kwargs[field]
-    bridge.kwargs[field] = original.clone()
-    with pytest.raises(ValueError, match="owners differ"):
-        bridge.read.validate_builder_sources(**bridge.kwargs)
+@pytest.mark.parametrize("field", ["seq_lens", "seq_lens_cpu", "seq_lens_cpu_upper_bound", "block_table_tensor"])
+def test_same_values_from_another_owner_are_rejected_at_actual_handoff(bridge, field):
+    setattr(bridge.common, field, getattr(bridge.common, field).clone())
+    with pytest.raises(ValueError, match="lost its current read owners"):
+        bridge.read.certify_common_metadata(0, bridge.common)
 
 
-def test_upper_cannot_be_substituted_for_exact(bridge):
-    bridge.kwargs["seq_lens_cpu"] = bridge.read.seq_lens_cpu_upper_bound
-    with pytest.raises(ValueError, match="owners differ"):
-        bridge.read.validate_builder_sources(**bridge.kwargs)
+def test_upper_cannot_be_substituted_for_exact_at_actual_handoff(bridge):
+    bridge.common.seq_lens_cpu = bridge.read.seq_lens_cpu_upper_bound
+    with pytest.raises(ValueError, match="lost its current read owners"):
+        bridge.read.certify_common_metadata(0, bridge.common)
 
 
-def test_wrong_group_table_and_geometry_are_rejected(bridge):
-    bridge.kwargs["block_tables"] = list(reversed(bridge.read.block_tables))
-    with pytest.raises(ValueError, match="tables differ"):
-        bridge.read.validate_builder_sources(**bridge.kwargs)
-    bridge.kwargs["block_tables"] = bridge.read.block_tables
-    bridge.kwargs["num_reqs"] = 3
-    with pytest.raises(ValueError, match="geometry differs"):
-        bridge.read.validate_builder_sources(**bridge.kwargs)
+@pytest.mark.parametrize("field,value", [("num_reqs", 3), ("max_seq_len", 1025)])
+def test_wrong_actual_handoff_geometry_is_rejected(bridge, field, value):
+    setattr(bridge.common, field, value)
+    with pytest.raises(ValueError, match="lost its current read owners"):
+        bridge.read.certify_common_metadata(0, bridge.common)
 
 
 @pytest.mark.parametrize(
-    "field", ["seq_lens", "seq_lens_cpu", "_seq_lens_cpu", "seq_lens_cpu_upper_bound", "block_table_tensor"]
+    "field", ["seq_lens", "seq_lens_cpu", "_seq_lens_cpu", "seq_lens_cpu_upper_bound", "block_table_tensor", "num_reqs"]
 )
 def test_replaced_read_operand_invalidates_certificate(bridge, field):
     bridge.read.certify_common_metadata(0, bridge.common)
     certificate = bridge.common._draft_window_read
     setattr(bridge.common, field, object())
-    with pytest.raises(ValueError, match="replaced after exact certification"):
+    with pytest.raises(ValueError, match="replaced after projection"):
         certificate.exact_cpu_for(bridge.common)
 
 

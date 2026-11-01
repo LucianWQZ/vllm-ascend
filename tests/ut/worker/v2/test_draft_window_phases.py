@@ -10,7 +10,7 @@ import pytest
 import torch
 
 from vllm_ascend.worker.v2.spec_decode.draft_window import (
-    SingleGroupDirectPrefixProvider,
+    DraftWindowSourceCapability,
     build_full_draft_kv_source,
     gather_valid_num_blocks_cpu,
 )
@@ -81,12 +81,6 @@ def full_source():
         scheduler_block_size=4,
         table_column_span=4,
     )
-    inventory: Any = SimpleNamespace(
-        method="dflash",
-        target_model_type="qwen",
-        runtime_route="graph",
-        require_single_group_direct_prefix=lambda: group,
-    )
     counts = torch.tensor([[4, 3]], dtype=torch.int32)
     owner = SimpleNamespace(
         input_block_tables=[torch.arange(8, dtype=torch.int32).reshape(2, 4)],
@@ -94,7 +88,7 @@ def full_source():
         block_sizes=[4],
         kernel_block_sizes=[4],
     )
-    return build_full_draft_kv_source(inventory=inventory, block_tables=owner)
+    return build_full_draft_kv_source(group=group, block_tables=owner)
 
 
 def test_canonical_cpu_counts_keep_mapping_order_padding_and_source(full_source):
@@ -117,11 +111,11 @@ def test_canonical_count_gather_rejects_invalid_mapping(full_source, mapping):
 
 @pytest.mark.parametrize("count", [-1, 5])
 def test_phase_materialization_rejects_counts_outside_canonical_row(full_source, count):
-    provider: Any = SimpleNamespace(block_span_tokens=4, full_source=full_source, global_group_id=0)
+    source: Any = SimpleNamespace(group=SimpleNamespace(table_column_span=4, gid=0), full_source=full_source)
     phase = classify_draft_window_batch_phase(_batch([(0, 8, 2)]))
     with pytest.raises(RuntimeError, match="valid-block count"):
         build_phase_aware_materialization_plan(
-            provider=provider,
+            source=source,
             phase_plan=phase,
             cpu_full_exact=torch.tensor([2], dtype=torch.int32),
             cpu_apply_time_full_upper=torch.tensor([2], dtype=torch.int32),
@@ -145,23 +139,21 @@ def test_shared_row_projection_keeps_eagle_anchor_and_full_prefill(full_source, 
         scheduler_block_size=4,
         table_column_span=4,
     )
-    inventory: Any = SimpleNamespace(
-        method="eagle3",
-        target_model_type="qwen",
-        runtime_route="graph",
-        window_size=8,
-        require_single_group_direct_prefix=lambda: group,
+    from vllm_ascend.worker.v2.spec_decode.draft_window_policy import resolve_draft_window_policy
+
+    policy = resolve_draft_window_policy(requested_window_size=8, method="eagle3")
+    source = DraftWindowSourceCapability(
+        policy=policy, runtime_route="eagle3", group=group, full_source=full_source, expected_future_offset=3
     )
-    provider = SingleGroupDirectPrefixProvider(inventory, full_source, legacy_block_size=4, expected_future_offset=3)
     frozen = build_eagle3_frozen_proposal_plan(
-        provider=provider,
+        source=source,
         cpu_proposal_l0=torch.tensor([14, 2, 0], dtype=torch.int32),
         actual_request_count=2,
         padded_request_count=3,
     )
     phases = classify_draft_window_batch_phase(_batch([(8, 8, 1), (0, 8, 2)]))
     result = build_eagle3_step_materialization_plan(
-        provider=provider,
+        source=source,
         proposal=frozen,
         step=step,
         phase_plan=phases,

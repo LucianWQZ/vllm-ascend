@@ -784,7 +784,7 @@ class EagleMixedRequestControls(unittest.TestCase):
 
 
 def idle_owner():
-    provider = NS(inventory_method="eagle3")
+    provider = NS(method="eagle3")
     session = NS(provider=provider, _capture_call=None)
     batch = NS(is_dummy=True, num_reqs=1, num_reqs_after_padding=1)
     owner = NS(

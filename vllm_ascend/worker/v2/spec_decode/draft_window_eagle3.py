@@ -21,7 +21,6 @@ from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftWindowGenerationIdentity,
     DraftWindowRuntimeState,
     DraftWindowSourceCapability,
-    SingleGroupDirectPrefixProvider,
     gather_valid_num_blocks_cpu,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_eager import (
@@ -110,12 +109,12 @@ class Eagle3DraftWindowMixin:
         if hasattr(self, "_eagle3_window_epoch_source"):
             raise RuntimeError("P4b Eagle3 Draft Window state is already initialized")
         capability = self._draft_window_source_capability
-        if self.method != "eagle3" or capability.inventory.method != "eagle3":
+        if self.method != "eagle3" or capability.policy.normalized_method != "eagle3":
             raise RuntimeError("P4b Draft Window state is restricted to normalized Eagle3")
         static_k = self.num_speculative_steps
         if static_k <= 0:
             raise ValueError("Eagle3 static K must be greater than 0")
-        if capability.provider.expected_future_offset != static_k:
+        if capability.expected_future_offset != static_k:
             raise RuntimeError("configured Eagle3 K does not match the P2 provider")
 
         self._eagle3_window_epoch_source = DraftWindowProposalEpochSource()
@@ -273,13 +272,13 @@ class Eagle3DraftWindowMixin:
             num_reqs_padded=num_reqs_padded,
         )
         proposal = build_eagle3_frozen_proposal_plan(
-            provider=capability.provider,
+            source=capability,
             cpu_proposal_l0=cpu_l0,
             actual_request_count=num_reqs,
             padded_request_count=num_reqs_padded,
         )
         step_plan = build_eagle3_step_materialization_plan(
-            provider=capability.provider,
+            source=capability,
             proposal=proposal,
             cpu_full_exact=cpu_l0,
             cpu_apply_time_full_upper=cpu_upper,
@@ -289,8 +288,7 @@ class Eagle3DraftWindowMixin:
         )
         self._eagle3_window_epoch_source.validate(context, input_batch)
         inputs = self._draft_window_runtime_state.materialize(
-            mapping_epoch=context.mapping_epoch,
-            ordered_request_ids=context.ordered_request_ids,
+            proposal=context,
             idx_mapping=input_batch.idx_mapping,
             read_descriptors=step_plan.read_descriptors,
             cpu_window_exact=step_plan.cpu_window_exact,
@@ -299,7 +297,6 @@ class Eagle3DraftWindowMixin:
             num_reqs_padded=num_reqs_padded,
             phase=DraftWindowExecutionPhase.PROPOSAL,
             step=0,
-            row_phase_fingerprint=step_plan.row_phase_fingerprint,
             quarantine_on_failure=hasattr(self, "_eagle3_graph_session"),
             output_workspace=output_workspace,
         )
@@ -404,7 +401,7 @@ class Eagle3DraftWindowMixin:
             num_reqs_padded=num_reqs_padded,
         )
         step_plan = build_eagle3_step_materialization_plan(
-            provider=self._draft_window_source_capability.provider,
+            source=self._draft_window_source_capability,
             proposal=proposal,
             cpu_full_exact=cpu_exact,
             cpu_apply_time_full_upper=cpu_upper,
@@ -416,7 +413,7 @@ class Eagle3DraftWindowMixin:
         self._eagle3_window_epoch_source.validate(context, input_batch)
         inputs = self._draft_window_runtime_state.materialize_serialized_step(
             previous_identity=previous_identity,
-            ordered_request_ids=context.ordered_request_ids,
+            proposal=context,
             idx_mapping=input_batch.idx_mapping,
             read_descriptors=step_plan.read_descriptors,
             cpu_window_exact=step_plan.cpu_window_exact,
@@ -448,10 +445,10 @@ class Eagle3DraftWindowMixin:
         inputs.validate_for(expected_identity)
         return draft_window_read_inputs(
             inputs.workspace,
-            actual_request_count=expected_identity.actual_request_count,
+            actual_request_count=len(expected_identity.proposal.ordered_request_ids),
             padded_request_count=expected_identity.padded_request_count,
             block_tables=self.block_tables.input_block_tables,
-            global_group_id=inputs._owner.capability.provider.global_group_id,
+            global_group_id=inputs._owner.capability.group.gid,
         )
 
     def _finish_eagle3_window_step(
@@ -515,7 +512,7 @@ class Eagle3DraftWindowMixin:
         capability = self._draft_window_source_capability
         return gather_valid_num_blocks_cpu(
             capability.full_source,
-            global_group_id=capability.provider.global_group_id,
+            global_group_id=capability.group.gid,
             idx_mapping_np=self.input_batch.idx_mapping_np,
             num_reqs=num_reqs,
             num_reqs_padded=num_reqs_padded,
@@ -524,7 +521,7 @@ class Eagle3DraftWindowMixin:
 
 def build_eagle3_frozen_proposal_plan(
     *,
-    provider: SingleGroupDirectPrefixProvider,
+    source: DraftWindowSourceCapability,
     cpu_proposal_l0: torch.Tensor,
     actual_request_count: int,
     padded_request_count: int,
@@ -536,9 +533,9 @@ def build_eagle3_frozen_proposal_plan(
         name="proposal L0",
         padded_request_count=padded_request_count,
     )
-    if provider.inventory.method != "eagle3":
+    if source.policy.normalized_method != "eagle3":
         raise ValueError("Eagle3 proposal planning requires an Eagle3 provider")
-    static_k = provider.expected_future_offset
+    static_k = source.expected_future_offset
     if static_k <= 0:
         raise ValueError("Eagle3 proposal planning requires a positive configured static K")
 
@@ -549,8 +546,8 @@ def build_eagle3_frozen_proposal_plan(
             compute_draft_window_plan(
                 full_exact_end=l0,
                 future_offset=static_k,
-                window_size=provider.inventory.window_size,
-                block_span_tokens=provider.legacy_block_size,
+                window_size=source.window_size,
+                block_span_tokens=source.group.table_column_span,
             )
         )
     return Eagle3FrozenProposalPlan(
@@ -563,7 +560,7 @@ def build_eagle3_frozen_proposal_plan(
 
 def build_eagle3_step_materialization_plan(
     *,
-    provider: SingleGroupDirectPrefixProvider,
+    source: DraftWindowSourceCapability,
     proposal: Eagle3FrozenProposalPlan,
     cpu_full_exact: torch.Tensor,
     cpu_apply_time_full_upper: torch.Tensor,
@@ -577,7 +574,7 @@ def build_eagle3_step_materialization_plan(
         raise TypeError("Eagle3 proposal step must be a Python int")
     if not 0 <= step < proposal.static_k:
         raise ValueError(f"Eagle3 proposal step is outside configured static K: step={step} K={proposal.static_k}")
-    if provider.expected_future_offset != proposal.static_k:
+    if source.expected_future_offset != proposal.static_k:
         raise RuntimeError("Eagle3 proposal K no longer matches the provider")
     # L0/H/S and logical request ownership are proposal state. Padding belongs
     # to this consumer: a Q4 first pass may use pad2 while merged Q1 AR uses
@@ -589,7 +586,7 @@ def build_eagle3_step_materialization_plan(
     if step == 0 and padded != proposal.padded_request_count:
         raise ValueError("first-pass consumer padding must match its frozen proposal layout")
     result = build_phase_aware_materialization_plan(
-        provider=provider,
+        source=source,
         phase_plan=phase_plan,
         cpu_full_exact=cpu_full_exact,
         cpu_apply_time_full_upper=cpu_apply_time_full_upper,

@@ -33,7 +33,7 @@ def _validate_eagle_dp_dummy(owner, session):
         or getattr(owner, "_draft_window_graph_submission_uncertain", False) is not False
         or session._capture_call is not None
         or provider is not session.provider
-        or getattr(provider, "inventory_method", None) != "eagle3"
+        or getattr(provider, "method", None) != "eagle3"
     ):
         raise RuntimeError("Eagle DP dummy requires its explicit local1 no-business-generation Full scope")
 

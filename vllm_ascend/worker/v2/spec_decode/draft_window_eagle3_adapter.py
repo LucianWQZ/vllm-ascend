@@ -485,7 +485,7 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentA
             actual_request_count=kwargs["num_reqs"],
             padded_request_count=kwargs["num_reqs_padded"],
             block_tables=self.block_tables.input_block_tables,
-            global_group_id=kwargs["inputs"]._owner.capability.provider.global_group_id,
+            global_group_id=kwargs["inputs"]._owner.capability.group.gid,
         )
         metadata = self._build_eagle3_private_attn_metadata(**kwargs, read_inputs_override=view, publish=False)
         # The normal nonparallel FIA builder deliberately prefers its CPU

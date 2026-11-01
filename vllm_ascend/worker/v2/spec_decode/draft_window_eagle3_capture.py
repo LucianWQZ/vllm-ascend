@@ -42,11 +42,8 @@ def build_eagle3_graph_source(owner: Any) -> tuple[Any, Any]:
     """Account for Graph explicitly before using the existing P2 inventory."""
     if not draft_window_graph_enabled():
         raise RuntimeError("Eagle3 Graph Window requires the default-off experimental gate")
-    from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import eagle_dp2_graph_review_enabled
-
     context = build_draft_window_runtime_context(owner.vllm_config, owner.block_tables)
-    rank_local_dp = eagle_dp2_graph_review_enabled(owner)
-    replicated_review = validate_graph_context(context, owner.vllm_config)
+    validate_graph_context(context, owner.vllm_config)
     if context.graph_mode != "FULL_DECODE_ONLY":
         raise NotImplementedError("Eagle3 Graph first implementation requires FULL_DECODE_ONLY")
     if owner.method != "eagle3" or owner.speculative_config.uses_dynamic_speculative_decoding():
@@ -64,9 +61,6 @@ def build_eagle3_graph_source(owner: Any) -> tuple[Any, Any]:
         causal=True,
         vllm_config=owner.vllm_config,
         runtime_context=context,
-        allow_replicated_tp_graph_source=replicated_review,
-        allow_parallel_prefix_graph_source=context.prefix_caching,
-        allow_parallel_dp_graph_source=rank_local_dp,
     )
     topology = capability.runtime_context
     if topology is None:
@@ -97,7 +91,7 @@ class Eagle3GraphSession:
         for first, manager in ((True, owner.prefill_cudagraph_manager), (False, owner.decode_cudagraph_manager)):
             route = DraftWindowGraphRoute.EAGLE3_FIRST_PASS if first else DraftWindowGraphRoute.EAGLE3_AR_STEP
             q = owner.num_speculative_steps + 1 if first else 1
-            group = owner._draft_window_runtime_state.capability.inventory.require_single_group_direct_prefix()
+            group = owner._draft_window_runtime_state.capability.group
             for descriptors in manager._capture_descs.values():
                 for desc in descriptors:
                     if desc.cg_mode.name != "FULL":
@@ -250,7 +244,7 @@ class Eagle3GraphSession:
             private = owner._build_eagle3_graph_metadata(
                 inputs=inputs,
                 workspace=workspace,
-                num_reqs=inputs.identity.actual_request_count,
+                num_reqs=len(inputs.identity.proposal.ordered_request_ids),
                 num_reqs_padded=n,
                 num_tokens_padded=tokens,
                 query_start_loc_np=owner.input_batch.query_start_loc_np if first else None,
@@ -277,8 +271,7 @@ class Eagle3GraphSession:
             inputs.validate_for(current)
             context = owner._require_eagle3_window_context()
             if (
-                current.mapping_epoch != context.mapping_epoch
-                or current.ordered_request_fingerprint != context.ordered_request_ids
+                current.proposal is not context
                 or current.step != owner._eagle3_window_next_step
                 or current.step >= owner._eagle3_window_expected_steps
                 or first is not (current.step == 0)
