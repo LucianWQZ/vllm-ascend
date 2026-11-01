@@ -61,33 +61,6 @@ def validate_additional_config_bool(value: Any, path: str) -> bool:
         raise ValueError(f"{path} must be a boolean, got {value!r}.") from exc
 
 
-def _native_swa_graph_window_review(speculative: Any, window_size: Any) -> bool:
-    """Configuration eligibility only; actual groups/owners are checked at set_attn.
-
-    The extra Window must contain the earliest of K+1 causal native query
-    bands. This is a passthrough eligibility bound, not a substitute length.
-    """
-    if speculative is None or getattr(speculative, "method", None) != "dflash":
-        return False
-    hf = getattr(getattr(speculative, "draft_model_config", None), "hf_config", None)
-    native = getattr(hf, "sliding_window", None)
-    k = getattr(speculative, "num_speculative_tokens", None)
-    layers = getattr(hf, "layer_types", None)
-    return (
-        type(window_size) is int
-        and type(native) is int
-        and type(k) is int
-        and native > 0
-        and k > 0
-        and window_size >= native + k
-        and getattr(hf, "use_sliding_window", False) is True
-        and isinstance(layers, (list, tuple))
-        and layers.count("full_attention") == 1
-        and "sliding_attention" in layers
-        and set(layers) == {"full_attention", "sliding_attention"}
-    )
-
-
 def _eagle3_tp4_graph_review(vllm_config: Any) -> bool:
     """Use the qualified actual Eagle consumer geometry, not an architecture name."""
     from vllm_ascend import envs
@@ -110,26 +83,17 @@ def validate_draft_window_graph_config(vllm_config: Any, *, support: Any = ...) 
 
     if support is ...:
         support = resolve_draft_graph_review_limit(vllm_config, experimental_graph_review=True)
+    # The qualified consumer contract already validates its exact topology,
+    # buckets, static K and OFF/ON window. Do not parse/check it a second time.
+    if support is not None:
+        return True
     additional = vllm_config.additional_config or {}
-    native_swa_window = _native_swa_graph_window_review(speculative, additional.get("draft_window_size"))
-    dense_dp_window = (
-        support is not None and support.method == "dflash" and additional.get("draft_window_size") in (None, 32768)
-    )
-    single_request_off = additional.get("draft_window_size") is None and support is not None
     if (
-        speculative is None
-        or speculative.method not in ("dspark", "dflash", "eagle3")
-        or speculative.enforce_eager
+        speculative.method not in ("dspark", "dflash", "eagle3")
         or speculative.uses_dynamic_speculative_decoding()
-        or not (
-            additional.get("draft_window_size") == 1024 or native_swa_window or dense_dp_window or single_request_off
-        )
+        or additional.get("draft_window_size") != 1024
     ):
-        raise ValueError(
-            "replicated TP Graph review requires static parallel Draft Graph or named Eagle3 with W1024, "
-            "a contained native SWA band, or the dense DFlash TP4/DP2 W32768 control "
-            "or qualified Full8/Eagle single-request Window OFF review"
-        )
+        raise ValueError("Draft Window Graph requires a supported static method and W1024")
     draft_parallel = speculative.draft_parallel_config
     tp = vllm_config.parallel_config.tensor_parallel_size
     if (
@@ -140,11 +104,8 @@ def validate_draft_window_graph_config(vllm_config: Any, *, support: Any = ...) 
         or draft_parallel.tensor_parallel_size != tp
     ):
         raise ValueError("replicated TP Graph review requires matching actual Target/Draft TP in (2, 4, 16)")
-    if native_swa_window and tp != 4:
-        raise ValueError("native SWA Graph review first requires actual TP4")
-    eagle_tp4 = tp == 4 and support is not None and support.method == "eagle3"
     if speculative.method == "eagle3" and (
-        not (tp == 2 or eagle_tp4)
+        tp != 2
         or type(getattr(speculative, "num_speculative_tokens", None)) is not int
         or speculative.num_speculative_tokens != 3
     ):
@@ -152,9 +113,8 @@ def validate_draft_window_graph_config(vllm_config: Any, *, support: Any = ...) 
     dp = getattr(vllm_config.parallel_config, "data_parallel_size", 1)
     if type(dp) is not int or dp not in (1, 2):
         raise ValueError("replicated Graph review requires integer DP1 or the explicit DFlash TP4/DP2 route")
-    eagle_dp2 = dp == 2 and eagle_tp4
     if dp == 2 and (
-        (speculative.method != "dflash" and not eagle_dp2)
+        speculative.method != "dflash"
         or tp != 4
         # Pinned SpeculativeConfig.create_draft_parallel_config builds a
         # TP-only model descriptor with DP1. The actual two replicas live
@@ -2064,22 +2024,6 @@ def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
     # vllm_config run here, explicitly, before the instance is usable. This is
     # the single legitimate entry point — bypassing the factory leaves derived
     # fields at their sentinel defaults.
-    from vllm_ascend import envs
-    from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import resolve_draft_graph_review_limit
-
-    support = resolve_draft_graph_review_limit(
-        vllm_config, experimental_graph_review=envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH
-    )
-    if support is not None:
-        logger.info_once(
-            "Draft Graph support: %s, TP4/DP%d, local request capacity %d, static K%d, "
-            "configured model capacity %d; actual request/padded shapes are checked before execution.",
-            support.method,
-            support.data_parallel_size,
-            support.max_requests,
-            support.static_k,
-            support.max_model_len,
-        )
     new_config.derive_and_validate(vllm_config)
     new_config.rl_config.apply(new_config)
     new_config.finegrained_tp_config._validate_preconditions(vllm_config)

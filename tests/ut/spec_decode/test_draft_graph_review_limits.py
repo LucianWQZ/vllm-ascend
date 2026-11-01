@@ -12,7 +12,7 @@ from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace as NS
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 MODULE_PATH = Path(__file__).resolve().parents[3] / "vllm_ascend/worker/v2/spec_decode/draft_graph_review_limits.py"
 spec = importlib.util.spec_from_file_location("draft_graph_support_test", MODULE_PATH)
@@ -247,8 +247,8 @@ class DraftGraphSupportTest(unittest.TestCase):
         policy = NS(enabled=True, state="on")
         namespace = {
             "_resolve_window_policy": lambda _: policy,
-            "_init_speculator": lambda *_: NS(),
-            "_configure_graph_window_owner": lambda *_: None,
+            "_init_speculator": lambda *_: NS(_initialize_draft_window_source_capability=lambda: None),
+            "logger": Mock(),
             "DraftWindowPolicyState": NS(FORCED_OFF="forced"),
         }
         factory_path = MODULE_PATH.with_name("__init__.py")
@@ -277,6 +277,8 @@ class DraftGraphSupportTest(unittest.TestCase):
             owner = factory(config, None)
             self.assertEqual(resolve.call_count, 1)
         self.assertEqual(observed, [owner._draft_graph_review_limit])
+        self.assertIs(owner._draft_window_policy, policy)
+        self.assertFalse(hasattr(owner, "draft_window_policy"))
         self.assertEqual(vars(config), before)
 
     def test_real_consumer_overrides_and_normalized_positions_stay_protected(self):
