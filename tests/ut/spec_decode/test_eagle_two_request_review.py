@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Exact n1/n2 ordinary Eagle guards; CPU Source contracts, no framework imports."""
 
+import ast
 import copy
 import hashlib
 import runpy
@@ -59,6 +60,107 @@ def objects(active=2):
 
 
 class EagleTwoRequestControls(unittest.TestCase):
+    def test_mixed_chunked_prefill_uses_canonical_progress_for_each_consumer(self):
+        # C333 ordinary g0 failed with these saved SchedulerOutput counters:
+        # long prompt 1537: 1152 computed + 128 scheduled = 1280; short prompt
+        # 513: 384 + 129 = 513. These are Source-reconstructed lengths, not a
+        # saved device/guard exact snapshot. Execute the actual Ascend CPU
+        # length constructor on that state, without importing the model runner.
+        path = ROOT / "vllm_ascend/worker/v2/model_runner.py"
+        module = ast.parse(path.read_text())
+        runner = next(node for node in module.body if isinstance(node, ast.ClassDef) and node.name == "NPUModelRunner")
+        function = next(
+            node for node in runner.body if isinstance(node, ast.FunctionDef) and node.name == "_update_seq_lens_cpu"
+        )
+        namespace = {}
+        code = ast.Module(
+            body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), function],
+            type_ignores=[],
+        )
+        exec(compile(ast.fix_missing_locations(code), str(path), "exec"), namespace)
+        owner, batch = objects()
+        ids = batch.req_ids
+        cpu_lengths = [0, 0]
+        snapshots = {7: 1152, 3: 384}
+        runner = NS(
+            speculator=object(),
+            sync_spec_pp_cpu_counts=False,
+            _can_skip_spec_cpu_length_sync=lambda: False,
+            num_computed_tokens_event=NS(synchronize=lambda: None),
+            num_computed_tokens_cpu=snapshots.copy(),
+            req_states=NS(req_id_to_index=dict(zip(ids, batch.idx_mapping_np)), num_computed_tokens_cpu={}),
+            input_buffers=NS(seq_lens_cpu=cpu_lengths),
+        )
+        scheduler = NS(
+            # Scheduled-token dict order differs from request/source order.
+            num_scheduled_tokens={ids[1]: 129, ids[0]: 128},
+            scheduled_cached_reqs=NS(req_ids=ids),
+        )
+        namespace["_update_seq_lens_cpu"](runner, scheduler, ids)
+        self.assertEqual(cpu_lengths, [1280, 513])
+        batch.num_computed_prefill_tokens_np = [1152, 384]
+        batch.num_scheduled_tokens = [128, 129]
+        owner._eagle3_window_proposal_context = NS(phase_plan=NS(baseline_only_rows=(0,)))
+        for step in (0, 1, 2):
+            M.validate_eagle_single_request_review_exact(
+                owner, batch, Vector([1280 + step, 513 + step]), num_reqs=2, padded=2, step=step
+            )
+            for values in ([1279 + step, 513 + step], [1281 + step, 513 + step], [1280 + step, 512]):
+                with self.subTest(step=step, values=values), self.assertRaises(NotImplementedError):
+                    M.validate_eagle_single_request_review_exact(
+                        owner, batch, Vector(values), num_reqs=2, padded=2, step=step
+                    )
+        # Absent/changed phase cannot relabel a terminal/decode row as continuing.
+        owner._eagle3_window_proposal_context = NS(phase_plan=NS(baseline_only_rows=()))
+        with self.assertRaises(NotImplementedError):
+            M.validate_eagle_single_request_review_exact(
+                owner, batch, Vector(cpu_lengths), num_reqs=2, padded=2, step=0
+            )
+        owner._eagle3_window_proposal_context = NS(phase_plan=NS(baseline_only_rows=(1,)))
+        with self.assertRaises(RuntimeError):
+            M.validate_eagle_single_request_review_exact(
+                owner, batch, Vector([1537, 513]), num_reqs=2, padded=2, step=0
+            )
+
+    def test_continuing_prefill_does_not_relax_identity_capacity_or_counter_contract(self):
+        for damage in (
+            "wrong-id",
+            "bad-index",
+            "capacity",
+            "preempted",
+            "missing",
+            "fractional",
+            "negative",
+            "terminal",
+            "zero",
+        ):
+            owner, batch = objects()
+            batch.num_computed_prefill_tokens_np = [1152, 384]
+            batch.num_scheduled_tokens = [128, 129]
+            owner._eagle3_window_proposal_context = NS(phase_plan=NS(baseline_only_rows=(0,)))
+            if damage == "wrong-id":
+                batch.req_ids[0] = "different-request"
+            elif damage == "bad-index":
+                batch.idx_mapping_np[0] = 6
+            elif damage == "capacity":
+                owner.max_model_len = 2048
+            elif damage == "preempted":
+                owner._draft_graph_review_preempted_request_ids = {batch.req_ids[0]}
+            elif damage == "missing":
+                del batch.num_scheduled_tokens
+            elif damage == "fractional":
+                batch.num_scheduled_tokens[0] = 128.5
+            elif damage == "negative":
+                batch.num_computed_prefill_tokens_np[0] = -1
+            elif damage == "terminal":
+                batch.num_scheduled_tokens[0] = 385
+            else:
+                batch.num_scheduled_tokens[0] = 0
+            with self.subTest(damage=damage), self.assertRaises((RuntimeError, NotImplementedError)):
+                M.validate_eagle_single_request_review_exact(
+                    owner, batch, Vector([1280, 513]), num_reqs=2, padded=2, step=0
+                )
+
     def test_exact_config_and_default_single_remain_separate(self):
         for window in (None, 1024):
             value = config()

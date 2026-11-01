@@ -30,3 +30,5 @@ entries:
     text: Added a separate default-off TP4/DP1 Eagle two-request Graph review with max_num_seqs=2, independent request identities and exact n1/n2 first-Q4 and AR-Q1 descriptors. Existing single-request behavior and larger-batch protections remain; ordinary service qualification is separate from the paired numerical check.
   - category: feature
     text: Added a separate default-off Eagle TP4xDP2 local-one-request Graph review entry, preserving actual DP synchronization, Target SP alignment, independent first/AR capture banks and Full/PAD idle computation. Idle submission failures quarantine the owner; numerical and ordinary device qualification remain separate and unclaimed.
+  - category: bugfix
+    text: Checked continuing rows in mixed Eagle chunked prefills against their canonical prefill progress and consumer step instead of requiring the full prompt to be present. Terminal/decode capacity, request identity, preemption and Graph ownership protections remain unchanged; ordinary device requalification is separate.

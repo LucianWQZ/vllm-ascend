@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
+from operator import index
 from pathlib import Path
 
 _FULL8_CONFIG = "d2be70579f0b8e7b109e776dbf14bd88ac5be115d2dabbb20e6373988939f410"
@@ -359,10 +360,35 @@ def validate_eagle_single_request_review_exact(owner, input_batch, exact, *, num
         or str(exact.dtype) != "torch.int32"
     ):
         raise RuntimeError("Eagle review lost its exact admitted-row CPU consumer input")
-    for position, (_, _, prompt, maximum, _) in enumerate(rows):
+    context = getattr(owner, "_eagle3_window_proposal_context", None)
+    continuing_rows = context.phase_plan.baseline_only_rows if context is not None else ()
+    for position, (request_id, _, prompt, maximum, _) in enumerate(rows):
         value = exact[position].item()
-        if type(value) is not int or not prompt <= value <= min(maximum + scope.static_k, scope.max_model_len):
-            raise NotImplementedError("Eagle consumer exact length is outside its request and model capacity")
+        lower = prompt
+        upper = min(maximum + scope.static_k, scope.max_model_len)
+        if position in continuing_rows:
+            # The proposal epoch already classified and validated this row from
+            # canonical InputBatch counters. In a mixed prefill, its first
+            # consumer ends before the prompt; later Eagle AR consumers advance
+            # that end by their step, while the row remains a Full-source read.
+            try:
+                computed_value = input_batch.num_computed_prefill_tokens_np[position]
+                scheduled_value = input_batch.num_scheduled_tokens[position]
+                if type(computed_value) is bool or type(scheduled_value) is bool:
+                    raise TypeError("prefill counters must be integers, not booleans")
+                computed = index(computed_value)
+                scheduled = index(scheduled_value)
+            except (AttributeError, IndexError, TypeError) as error:
+                raise RuntimeError("Eagle continuing prefill requires its canonical row counters") from error
+            end = computed + scheduled
+            if not 0 <= computed < prompt or scheduled <= 0 or end >= prompt:
+                raise RuntimeError("Eagle continuing prefill counters disagree with its frozen row phase")
+            lower = upper = min(end + step, scope.max_model_len)
+        if type(value) is not int or not lower <= value <= upper:
+            raise NotImplementedError(
+                "Eagle consumer exact length is outside its request and model capacity: "
+                f"row={position}, request={request_id!r}, step={step}, exact={value!r}, expected=[{lower}, {upper}]"
+            )
 
 
 def validate_eagle_single_request_graph_descriptor(owner, *, first, n, tokens):
