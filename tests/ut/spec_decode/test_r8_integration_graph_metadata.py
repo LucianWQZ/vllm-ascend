@@ -121,7 +121,7 @@ def source_contract():
         for n in ast.parse(path.read_text()).body
         if isinstance(n, ast.ClassDef) and n.name == "DraftWindowGraphBindingProvider"
     )
-    methods = [
+    methods: list[ast.stmt] = [
         n
         for n in provider.body
         if isinstance(n, ast.FunctionDef) and n.name in ("_capture_topology", "_validate_source_contract")
