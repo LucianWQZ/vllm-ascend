@@ -187,10 +187,8 @@ def partition_source(
     native = [(gid, g) for gid, g in executable if getattr(g.kv_cache_spec, "sliding_window", None) is not None]
     if not native:
         return attn_groups, None
-    _require(
-        input_buffers is not None and type(causal) is not bool,
-        "native SWA Graph requires actual private inputs and per-group causality",
-    )
+    if input_buffers is None or not isinstance(causal, Mapping):
+        raise RuntimeError("native SWA Graph requires actual private inputs and per-group causality")
     full = [
         (gid, g)
         for gid, g in executable
@@ -203,7 +201,7 @@ def partition_source(
         "native SWA reviewed route requires one Full group and explicitly inventoried native groups",
     )
     all_layers = [name for _, g in executable for name in g.layer_names]
-    _require(all_layers and len(all_layers) == len(set(all_layers)), "native SWA/Full layer owners overlap")
+    _require(bool(all_layers) and len(all_layers) == len(set(all_layers)), "native SWA/Full layer owners overlap")
     for gid, g in executable:
         _require(
             g.kv_cache_group_id == gid
@@ -269,12 +267,12 @@ def build_group_metadata(owner: Any, *, read_inputs: Any, builder_kwargs: dict[s
     plan = owner._draft_window_source_capability.native_swa_graph
     snapshot = getattr(owner, "_draft_window_native_full_snapshot", None)
     inputs = owner._draft_window_live_inputs
-    _require(
-        isinstance(plan, NativeSWAGraphPlan)
-        and isinstance(snapshot, NativeSWAFullSnapshot)
-        and id(owner.input_buffers) == plan.input_owner_id,
-        "native SWA current full snapshot missing",
-    )
+    if (
+        not isinstance(plan, NativeSWAGraphPlan)
+        or not isinstance(snapshot, NativeSWAFullSnapshot)
+        or id(owner.input_buffers) != plan.input_owner_id
+    ):
+        raise RuntimeError("native SWA current full snapshot missing")
     snapshot.validate(inputs.identity, plan)
     n = inputs.identity.padded_request_count
     absolute = AscendDraftAttentionReadInputs(

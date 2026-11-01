@@ -649,7 +649,7 @@ def full_metadata_dispatch():
     identity = SimpleNamespace(mapping_epoch=7, ordered_request_fingerprint=("req-a", "req-b"), padded_request_count=2)
     inputs = SimpleNamespace(identity=identity)
     inputs.validate_for = lambda expected: None if expected is identity else (_ for _ in ()).throw(ValueError("stale"))
-    runtime = SimpleNamespace(
+    runtime: Any = SimpleNamespace(
         _active_inputs=inputs,
         _metadata=None,
         capability=SimpleNamespace(inventory=SimpleNamespace(method="dflash")),
@@ -804,3 +804,32 @@ def test_full_graph_final_metadata_rejects_one_object_for_incompatible_reader_gr
     shared = SimpleNamespace(attn_state=object())
     with pytest.raises(RuntimeError, match="one Draft metadata object spans incompatible native groups"):
         full_metadata_finalization.finalize({"full.a": shared, "swa.a": shared})
+
+
+@pytest.mark.parametrize("causal", [True, False, [], object()])
+def test_native_graph_requires_actual_per_group_causality(causal):
+    from vllm_ascend.worker.v2.spec_decode.draft_window_swa_graph import partition_source
+
+    native_group = SimpleNamespace(kv_cache_spec=SimpleNamespace(sliding_window=2048))
+    with pytest.raises(RuntimeError, match="actual private inputs and per-group causality"):
+        partition_source(
+            attn_groups=[[native_group]],
+            block_tables=object(),
+            input_buffers=object(),
+            causal=causal,
+            window_size=4096,
+            query_width=8,
+        )
+
+
+def test_native_graph_requires_a_real_owned_full_snapshot_before_metadata_build():
+    from vllm_ascend.worker.v2.spec_decode.draft_window_swa_graph import NativeSWAGraphPlan, build_group_metadata
+
+    owner = SimpleNamespace(
+        _draft_window_source_capability=SimpleNamespace(native_swa_graph=object.__new__(NativeSWAGraphPlan)),
+        _draft_window_native_full_snapshot=None,
+        _draft_window_live_inputs=object(),
+        input_buffers=object(),
+    )
+    with pytest.raises(RuntimeError, match="native SWA current full snapshot missing"):
+        build_group_metadata(owner, read_inputs=object(), builder_kwargs={})

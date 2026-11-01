@@ -11,7 +11,7 @@ untouched. The upstream vLLM checkout remains unmodified.
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -33,6 +33,9 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_nongraph import (
     build_phase_aware_materialization_plan,
     classify_draft_window_batch_phase,
 )
+
+if TYPE_CHECKING:
+    from vllm_ascend.worker.v2.spec_decode.draft_window_swa_graph import NativeSWAFullSnapshot
 
 
 @dataclass(frozen=True, slots=True)
@@ -318,7 +321,7 @@ class DraftWindowGraphInputMixin:
         self._draft_window_dp_dummy_active = False
         self._draft_window_selected_metadata = None
         self._draft_window_deferred_metadata = None
-        self._draft_window_native_full_snapshot = None
+        self._draft_window_native_full_snapshot: NativeSWAFullSnapshot | None = None
 
     @contextmanager
     def _draft_window_proposal_scope(
