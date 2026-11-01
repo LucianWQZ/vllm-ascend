@@ -26,12 +26,12 @@ from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftWindowLeaseState,
     DraftWindowRuntimeState,
     DraftWindowSourceCapability,
+    gather_valid_num_blocks_cpu,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph_metadata import copy_draft_attention_metadata
 from vllm_ascend.worker.v2.spec_decode.draft_window_nongraph import (
     DraftWindowBatchPhasePlan,
     build_phase_aware_materialization_plan,
-    build_prefix_resident_snapshot,
     classify_draft_window_batch_phase,
 )
 
@@ -461,11 +461,10 @@ class DraftWindowGraphInputMixin:
             )
             cpu_apply_time_full_upper[:num_reqs].clamp_(max=self.max_model_len)
         capability = self._draft_window_source_capability
-        resident_snapshot = build_prefix_resident_snapshot(
-            full_source=capability.full_source,
+        valid_num_blocks = gather_valid_num_blocks_cpu(
+            capability.full_source,
             global_group_id=capability.provider.global_group_id,
             idx_mapping_np=input_batch.idx_mapping_np,
-            ordered_request_ids=context.ordered_request_ids,
             num_reqs=num_reqs,
             num_reqs_padded=num_reqs_padded,
         )
@@ -474,7 +473,7 @@ class DraftWindowGraphInputMixin:
             phase_plan=context.phase_plan,
             cpu_full_exact=cpu_full_exact,
             cpu_apply_time_full_upper=cpu_apply_time_full_upper,
-            cpu_valid_num_blocks=resident_snapshot.valid_num_blocks,
+            cpu_valid_num_blocks=valid_num_blocks,
             actual_request_count=num_reqs,
             padded_request_count=num_reqs_padded,
         )

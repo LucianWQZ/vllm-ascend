@@ -2,7 +2,6 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 """Request phases and source-owned projections used by the Graph read bank."""
 
-from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
@@ -12,9 +11,7 @@ import torch
 
 from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftWindowReadDescriptor,
-    FullDraftKVSource,
     SingleGroupDirectPrefixProvider,
-    gather_valid_num_blocks_cpu,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_plan import compute_draft_window_plan
 from vllm_ascend.worker.v2.spec_decode.draft_window_runtime import continuing_prefill_rows
@@ -28,17 +25,9 @@ class DraftWindowRowPhase(Enum):
     PREFILL_TERMINAL = "prefill_terminal"
 
 
-class DraftWindowBatchPhase(Enum):
-    PURE_DECODE = "pure_decode"
-    PURE_PREFILL_CONTINUING = "pure_prefill_continuing"
-    PURE_PREFILL_TERMINAL = "pure_prefill_terminal"
-    MIXED = "mixed"
-
-
 @dataclass(frozen=True, slots=True)
 class DraftWindowBatchPhasePlan:
     row_phases: tuple[DraftWindowRowPhase, ...]
-    batch_phase: DraftWindowBatchPhase
     ordered_request_fingerprint: tuple[str, ...]
 
     def __post_init__(self) -> None:
@@ -58,14 +47,10 @@ class DraftWindowBatchPhasePlan:
         )
 
     @property
-    def window_rows(self) -> tuple[int, ...]:
-        return tuple(
-            row for row, phase in enumerate(self.row_phases) if phase is not DraftWindowRowPhase.PREFILL_CONTINUING
-        )
-
-    @property
     def bypass_entire_batch(self) -> bool:
-        return bool(self.row_phases) and not self.window_rows
+        return bool(self.row_phases) and all(
+            phase is DraftWindowRowPhase.PREFILL_CONTINUING for phase in self.row_phases
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,17 +60,6 @@ class DraftWindowPhaseAwareMaterializationPlan:
     cpu_window_upper: torch.Tensor
     cpu_valid_num_blocks: torch.Tensor
     row_phase_fingerprint: tuple[str, ...]
-
-
-@dataclass(frozen=True, slots=True, eq=False)
-class DraftWindowResidentSetSnapshot:
-    """Canonical prefix/residency evidence in current batch-row order."""
-
-    global_group_id: int
-    ordered_request_fingerprint: tuple[str, ...]
-    mapping_fingerprint: tuple[int, ...]
-    source_identity: Any
-    valid_num_blocks: torch.Tensor
 
 
 def classify_draft_window_batch_phase(input_batch: Any) -> DraftWindowBatchPhasePlan:
@@ -126,50 +100,9 @@ def classify_draft_window_batch_phase(input_batch: Any) -> DraftWindowBatchPhase
             phases.append(DraftWindowRowPhase.PREFILL_CONTINUING)
         else:
             phases.append(DraftWindowRowPhase.PREFILL_TERMINAL)
-    unique = set(phases)
-    if not phases or unique == {DraftWindowRowPhase.PURE_DECODE}:
-        batch_phase = DraftWindowBatchPhase.PURE_DECODE
-    elif unique == {DraftWindowRowPhase.PREFILL_CONTINUING}:
-        batch_phase = DraftWindowBatchPhase.PURE_PREFILL_CONTINUING
-    elif unique == {DraftWindowRowPhase.PREFILL_TERMINAL}:
-        batch_phase = DraftWindowBatchPhase.PURE_PREFILL_TERMINAL
-    else:
-        batch_phase = DraftWindowBatchPhase.MIXED
     return DraftWindowBatchPhasePlan(
         row_phases=tuple(phases),
-        batch_phase=batch_phase,
         ordered_request_fingerprint=request_ids,
-    )
-
-
-def build_prefix_resident_snapshot(
-    *,
-    full_source: FullDraftKVSource,
-    global_group_id: int,
-    idx_mapping_np: np.ndarray,
-    ordered_request_ids: Sequence[str],
-    num_reqs: int,
-    num_reqs_padded: int,
-) -> DraftWindowResidentSetSnapshot:
-    request_ids = tuple(ordered_request_ids)
-    if len(request_ids) != num_reqs:
-        raise ValueError("resident snapshot request IDs must match active rows")
-    mapping = np.asarray(idx_mapping_np)
-    if mapping.ndim != 1 or mapping.shape[0] < num_reqs:
-        raise ValueError("resident snapshot mapping does not cover active rows")
-    counts = gather_valid_num_blocks_cpu(
-        full_source,
-        global_group_id=global_group_id,
-        idx_mapping_np=mapping,
-        num_reqs=num_reqs,
-        num_reqs_padded=num_reqs_padded,
-    )
-    return DraftWindowResidentSetSnapshot(
-        global_group_id=global_group_id,
-        ordered_request_fingerprint=request_ids,
-        mapping_fingerprint=tuple(int(value) for value in mapping[:num_reqs]),
-        source_identity=full_source.source_identity,
-        valid_num_blocks=counts,
     )
 
 

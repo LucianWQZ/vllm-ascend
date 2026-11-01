@@ -24,6 +24,7 @@ from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftWindowRuntimeState,
     DraftWindowSourceCapability,
     SingleGroupDirectPrefixProvider,
+    gather_valid_num_blocks_cpu,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_eager import (
     AscendDraftAttentionReadInputs,
@@ -34,7 +35,6 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_eager import (
 from vllm_ascend.worker.v2.spec_decode.draft_window_nongraph import (
     DraftWindowBatchPhasePlan,
     DraftWindowRowPhase,
-    build_prefix_resident_snapshot,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_plan import DraftWindowPlan, compute_draft_window_plan
 
@@ -531,15 +531,13 @@ class Eagle3DraftWindowMixin:
         num_reqs_padded: int,
     ) -> torch.Tensor:
         capability = self._draft_window_source_capability
-        context = self._require_eagle3_window_context()
-        return build_prefix_resident_snapshot(
-            full_source=capability.full_source,
+        return gather_valid_num_blocks_cpu(
+            capability.full_source,
             global_group_id=capability.provider.global_group_id,
             idx_mapping_np=self.input_batch.idx_mapping_np,
-            ordered_request_ids=context.ordered_request_ids,
             num_reqs=num_reqs,
             num_reqs_padded=num_reqs_padded,
-        ).valid_num_blocks
+        )
 
 
 def build_eagle3_frozen_proposal_plan(
