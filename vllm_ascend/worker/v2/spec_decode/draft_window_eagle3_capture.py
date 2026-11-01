@@ -21,7 +21,6 @@ from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftWindowWorkspace,
     _build_draft_window_source_capability_for_context,
-    build_draft_window_runtime_context,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
     DraftWindowGraphCaptureIdentity,
@@ -38,21 +37,14 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_graph_runtime import (
 )
 
 
-def build_eagle3_graph_source(owner: Any) -> tuple[Any, Any]:
-    """Account for Graph explicitly before using the existing P2 inventory."""
+def build_eagle3_graph_source(owner: Any):
+    """Bind the actual consumer Source after normal Graph configuration."""
     if not draft_window_graph_enabled():
         raise RuntimeError("Eagle3 Graph Window requires the default-off experimental gate")
-    context = build_draft_window_runtime_context(owner.vllm_config, owner.block_tables)
-    validate_graph_context(context, owner.vllm_config)
-    if context.graph_mode != "FULL_DECODE_ONLY":
-        raise NotImplementedError("Eagle3 Graph first implementation requires FULL_DECODE_ONLY")
+    validate_graph_context(owner.vllm_config, owner.block_tables)
     if owner.method != "eagle3" or owner.speculative_config.uses_dynamic_speculative_decoding():
         raise NotImplementedError("Eagle3 Graph requires normalized Eagle3 and static K")
-    # Executor features and the rank-local Draft consumer are validated
-    # separately, while the source retains the actual runtime identity.
-    if context.dsa_context_parallel:
-        raise NotImplementedError("Eagle3 Draft Graph does not support DSA-CP")
-    capability = _build_draft_window_source_capability_for_context(
+    return _build_draft_window_source_capability_for_context(
         policy=owner._draft_window_policy,
         runtime_route="eagle3",
         attn_groups=owner.attn_groups,
@@ -60,27 +52,15 @@ def build_eagle3_graph_source(owner: Any) -> tuple[Any, Any]:
         kv_cache_config=owner.kv_cache_config,
         causal=True,
         vllm_config=owner.vllm_config,
-        runtime_context=context,
     )
-    topology = capability.runtime_context
-    if topology is None:
-        raise RuntimeError("Eagle3 Graph has no installed-runtime topology identity")
-    if context.prefix_caching:
-        capability.full_source.validate_owner_bindings()
-        if topology.prefix_caching is not True:
-            raise RuntimeError("Eagle3 prefix Graph source lost the actual caching identity")
-    return capability, context
 
 
 class Eagle3GraphSession:
     """Separate persistent bank per descriptor x real AR consumer ordinal."""
 
-    def __init__(self, owner: Any, context: Any) -> None:
-        validate_graph_context(context, getattr(owner, "vllm_config", None))
-        if context.graph_mode != "FULL_DECODE_ONLY":
-            raise NotImplementedError("Eagle3 Graph session requires FULL_DECODE_ONLY")
+    def __init__(self, owner: Any) -> None:
+        validate_graph_context(owner.vllm_config, owner.block_tables)
         self.owner = owner
-        self.context = context
         self.provider = install_draft_window_graph_binding_provider(owner)
         self._carriers: list[DraftWindowGraphReadCarrier] = []
         self._captures: dict[

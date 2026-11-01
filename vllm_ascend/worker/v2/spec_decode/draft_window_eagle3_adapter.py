@@ -56,13 +56,12 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentA
             raise RuntimeError("draft-window runtime ownership is already initialized")
         from vllm_ascend.worker.v2.spec_decode.draft_window_eagle3_capture import build_eagle3_graph_source
 
-        capability, graph_context = build_eagle3_graph_source(self)
+        capability = build_eagle3_graph_source(self)
         runtime_state = build_draft_window_runtime_state(capability)
         self._draft_window_source_capability = capability
         self._draft_window_runtime_state = runtime_state
         try:
             self._initialize_eagle3_draft_window_state()
-            self._eagle3_graph_runtime_context = graph_context
         except BaseException:
             del self._draft_window_source_capability
             del self._draft_window_runtime_state
@@ -81,11 +80,10 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentA
 
     def init_cudagraph_manager(self, cudagraph_mode):
         result = super().init_cudagraph_manager(cudagraph_mode)
-        context = getattr(self, "_eagle3_graph_runtime_context", None)
-        if context is not None:
+        if hasattr(self, "_draft_window_runtime_state"):
             from vllm_ascend.worker.v2.spec_decode.draft_window_eagle3_capture import Eagle3GraphSession
 
-            self._eagle3_graph_session = Eagle3GraphSession(self, context)
+            self._eagle3_graph_session = Eagle3GraphSession(self)
         return result
 
     def propose(

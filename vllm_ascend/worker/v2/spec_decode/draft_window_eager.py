@@ -121,9 +121,8 @@ class DraftWindowProposalContext:
         if type(self.mapping_epoch) is not int or self.mapping_epoch < 0:
             raise ValueError("proposal mapping epoch must be a nonnegative Python int")
         requests = self.ordered_request_ids
-        if (
-            any(not isinstance(request, str) or not request for request in requests)
-            or len(set(requests)) != len(requests)
+        if any(not isinstance(request, str) or not request for request in requests) or len(set(requests)) != len(
+            requests
         ):
             raise ValueError("proposal requires unique nonempty ordered request IDs")
         if len(self.idx_mapping_fingerprint) != len(requests):
@@ -309,7 +308,7 @@ class DraftWindowGraphInputMixin:
             raise RuntimeError("Graph Window cannot replace the typed eager runtime")
         from vllm_ascend.worker.v2.spec_decode.draft_window_graph_runtime import build_parallel_graph_source
 
-        capability, graph_context = build_parallel_graph_source(
+        capability = build_parallel_graph_source(
             policy=policy,
             runtime_route=self._speculator_name.lower(),
             attn_groups=self.attn_groups,
@@ -323,7 +322,6 @@ class DraftWindowGraphInputMixin:
         self._draft_window_source_capability = capability
         self._draft_window_runtime_state = runtime_state
         self._initialize_draft_window_graph_inputs()
-        self._draft_window_graph_context = graph_context
 
     def _initialize_draft_window_graph_inputs(self) -> None:
         if not hasattr(self, "_draft_window_runtime_state"):

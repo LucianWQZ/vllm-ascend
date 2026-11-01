@@ -158,11 +158,10 @@ class AscendDSparkSpeculator(DraftWindowGraphInputMixin, LmheadTPDraftSamplingMi
         # It needs this speculator to update full-graph params, so set it here.
         self.query_cudagraph_manager.speculator = self
         self.query_cudagraph_manager.update_stream = self.update_stream
-        graph_context = getattr(self, "_draft_window_graph_context", None)
-        if graph_context is not None:
+        if hasattr(self, "_draft_window_runtime_state"):
             if not draft_window_graph_enabled():
                 raise RuntimeError("Draft Graph configuration changed during initialization")
-            install_parallel_graph(self, runtime_context=graph_context)
+            install_parallel_graph(self)
 
     @torch.inference_mode()
     def get_draft_context_group_layout(self) -> tuple[tuple[int, ...], tuple[int, ...], dict[int, int]]:
