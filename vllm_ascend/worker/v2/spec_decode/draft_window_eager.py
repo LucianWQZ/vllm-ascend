@@ -402,7 +402,6 @@ class DraftWindowGraphInputMixin:
             ordered_request_ids=context.ordered_request_ids,
             idx_mapping=input_batch.idx_mapping,
             read_descriptors=plan.read_descriptors,
-            device_window_exact=None,
             cpu_window_exact=plan.cpu_window_exact,
             cpu_window_upper=plan.cpu_window_upper,
             cpu_valid_num_blocks=plan.cpu_valid_num_blocks,

@@ -123,27 +123,19 @@ def _group_diagnostic_context(
 
 @dataclass(frozen=True, slots=True)
 class DraftWindowSourceIdentity:
-    """Stable P2 owner identity; batch freshness is intentionally not encoded.
-
-    ``idx_mapping_ptr`` identifies one tensor allocation only. An in-place
-    rewrite keeps the same pointer, so P3 must add a caller-owned monotonic
-    batch/generation identity before a bound source can outlive one batch.
-    """
+    """Stable canonical owner identity, independent of request generations."""
 
     block_tables_owner_id: int
     input_block_table_ptrs: tuple[int, ...]
     persistent_num_blocks_ptr: int
-    idx_mapping_ptr: int | None
 
 
 @dataclass(frozen=True, slots=True)
 class FullDraftKVSource:
     """Borrowed, read-only references to canonical full BlockTables state.
 
-    Tensor references stay private because PyTorch has no immutable tensor
-    view. Public methods expose identity and geometry only; the sole P2 tensor
-    operation, :func:`gather_valid_num_blocks`, reads these references and
-    writes only caller-owned output.
+    Canonical tables are already gathered into batch order by BlockTables.
+    The Window owner reads them without changing Full write state.
     """
 
     logical_block_sizes: tuple[int, ...]
@@ -155,7 +147,6 @@ class FullDraftKVSource:
         compare=False,
     )
     _persistent_num_blocks_cpu: torch.Tensor = field(repr=False, compare=False)
-    _idx_mapping: torch.Tensor | None = field(repr=False, compare=False)
 
     @property
     def num_groups(self) -> int:
@@ -173,32 +164,6 @@ class FullDraftKVSource:
             self._block_tables_owner.num_blocks.gpu,
         )
         return any(draft_window_tensors_share_storage(tensor, canonical) for canonical in canonical_tensors)
-
-    def bind_batch(self, idx_mapping: torch.Tensor) -> "FullDraftKVSource":
-        """Return a view bound to the exact mapping used for this batch.
-
-        DFlash and DSpark consume ``input_batch.idx_mapping`` directly instead
-        of populating ``DraftModelSpeculator.idx_mapping``. Binding is therefore
-        explicit and per batch; no mapping is copied or guessed at set-attn
-        time. The returned view is valid only for the caller-defined current
-        batch. P2 cannot detect an in-place rewrite of the mapping tensor and
-        callers must not cache this view across batch/proposal generations.
-        """
-        _validate_idx_mapping(idx_mapping)
-        return FullDraftKVSource(
-            logical_block_sizes=self.logical_block_sizes,
-            kernel_block_sizes=self.kernel_block_sizes,
-            source_identity=DraftWindowSourceIdentity(
-                block_tables_owner_id=self.source_identity.block_tables_owner_id,
-                input_block_table_ptrs=self.source_identity.input_block_table_ptrs,
-                persistent_num_blocks_ptr=self.source_identity.persistent_num_blocks_ptr,
-                idx_mapping_ptr=idx_mapping.data_ptr(),
-            ),
-            _block_tables_owner=self._block_tables_owner,
-            _input_block_tables=self._input_block_tables,
-            _persistent_num_blocks_cpu=self._persistent_num_blocks_cpu,
-            _idx_mapping=idx_mapping,
-        )
 
     def validate_owner_bindings(self) -> None:
         """Reject replacement of a canonical owner tensor after P2 binding."""
@@ -708,7 +673,6 @@ def build_full_draft_kv_source(
     *,
     inventory: DraftWindowInventory,
     block_tables: Any,
-    idx_mapping: torch.Tensor | None = None,
 ) -> FullDraftKVSource:
     """Bind, but never copy or mutate, canonical full BlockTables tensors."""
     group = inventory.require_single_group_direct_prefix()
@@ -743,8 +707,6 @@ def build_full_draft_kv_source(
         kernel_block_sizes=kernel_block_sizes,
         num_groups=num_groups,
     )
-    if idx_mapping is not None:
-        _validate_idx_mapping(idx_mapping)
     for global_group_id, table in enumerate(input_block_tables):
         if table.ndim != 2:
             raise RuntimeError(f"{context}; reason=input_block_tables[{global_group_id}] must be two-dimensional")
@@ -763,64 +725,11 @@ def build_full_draft_kv_source(
             # UvaBackedTensor rotates its accelerator view. The CPU source of
             # truth is the stable owner; its pointer belongs in source identity.
             persistent_num_blocks_ptr=persistent_num_blocks_cpu.data_ptr(),
-            idx_mapping_ptr=(None if idx_mapping is None else idx_mapping.data_ptr()),
         ),
         _block_tables_owner=block_tables,
         _input_block_tables=input_block_tables,
         _persistent_num_blocks_cpu=persistent_num_blocks_cpu,
-        _idx_mapping=idx_mapping,
     )
-
-
-def gather_valid_num_blocks(
-    full_source: FullDraftKVSource,
-    *,
-    global_group_id: int,
-    num_reqs: int,
-    num_reqs_padded: int,
-    out: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Gather persistent valid counts with the canonical batch mapping."""
-    full_source.validate_owner_bindings()
-    full_source._validate_global_group_id(global_group_id)
-    if num_reqs < 0:
-        raise ValueError("num_reqs must be greater than or equal to 0")
-    if num_reqs_padded < num_reqs:
-        raise ValueError("num_reqs_padded must be at least num_reqs")
-    if full_source._idx_mapping is None:
-        raise RuntimeError("FullSource must bind the current batch idx_mapping before gathering valid counts")
-    if num_reqs > full_source._idx_mapping.shape[0]:
-        raise ValueError("num_reqs exceeds idx_mapping capacity")
-    persistent_counts = full_source._block_tables_owner.num_blocks.gpu[global_group_id]
-    idx_mapping = full_source._idx_mapping[:num_reqs]
-    if idx_mapping.device != persistent_counts.device:
-        raise ValueError("idx_mapping and persistent num_blocks must share a device")
-    if out is None:
-        out = persistent_counts.new_zeros(num_reqs_padded)
-    else:
-        if out.ndim != 1 or out.shape[0] < num_reqs_padded:
-            raise ValueError("valid-count output is too small for padded requests")
-        if out.dtype != persistent_counts.dtype:
-            raise TypeError("valid-count output dtype must match num_blocks.gpu")
-        if out.device != persistent_counts.device:
-            raise ValueError("valid-count output device must match num_blocks.gpu")
-        borrowed_tensors = (
-            *full_source._input_block_tables,
-            full_source._block_tables_owner.num_blocks.gpu,
-            full_source._persistent_num_blocks_cpu,
-            full_source._idx_mapping,
-        )
-        if any(borrowed is not None and _shares_storage(out, borrowed) for borrowed in borrowed_tensors):
-            raise ValueError("valid-count output must not alias borrowed FullSource storage")
-        out.zero_()
-    if num_reqs:
-        torch.index_select(
-            persistent_counts,
-            0,
-            idx_mapping,
-            out=out[:num_reqs],
-        )
-    return out[:num_reqs_padded]
 
 
 def gather_valid_num_blocks_cpu(
@@ -1088,8 +997,8 @@ class DraftWindowGenerationIdentity:
     """Immutable freshness identity for one materialized Draft read state.
 
     ``mapping_epoch`` belongs to the caller.  Pointer and Python-object
-    identity are deliberately only part of ``source_identity`` diagnostics;
-    neither substitutes for the epoch or ordered stable request IDs.
+    identity are allocation guards only; neither substitutes for the epoch
+    or ordered stable request IDs.
     """
 
     mapping_epoch: int
@@ -1102,6 +1011,7 @@ class DraftWindowGenerationIdentity:
     provider_id: int
     provider_version: int
     source_identity: DraftWindowSourceIdentity
+    idx_mapping_ptr: int
     execution_lane: int
     phase: DraftWindowExecutionPhase
     step: int
@@ -1194,10 +1104,9 @@ class DraftWindowWorkspace:
         identity: DraftWindowGenerationIdentity,
         full_source: FullDraftKVSource,
         read_descriptors: Sequence[DraftWindowReadDescriptor],
-        device_window_exact: torch.Tensor | None,
         cpu_window_exact: torch.Tensor,
         cpu_window_upper: torch.Tensor,
-        cpu_valid_num_blocks: torch.Tensor | None = None,
+        cpu_valid_num_blocks: torch.Tensor,
         preserve_on_failure: bool = False,
     ) -> None:
         """Rewrite all active and inert state from the canonical full source."""
@@ -1211,26 +1120,18 @@ class DraftWindowWorkspace:
             raise ValueError("read descriptor count must match the actual request count")
         if tuple(read_descriptors) != identity.read_descriptor_fingerprint:
             raise RuntimeError("read descriptors do not match the generation fingerprint")
-        if device_window_exact is not None:
-            _validate_window_length_input(
-                device_window_exact,
-                name="device Window exact",
-                padded_request_count=padded,
-                expected_device=self.device_window_exact.device,
-            )
         _validate_window_length_input(
             cpu_window_exact,
             name="CPU Window exact",
             padded_request_count=padded,
             expected_device=torch.device("cpu"),
         )
-        if cpu_valid_num_blocks is not None:
-            _validate_window_length_input(
-                cpu_valid_num_blocks,
-                name="CPU valid block counts",
-                padded_request_count=padded,
-                expected_device=torch.device("cpu"),
-            )
+        _validate_window_length_input(
+            cpu_valid_num_blocks,
+            name="CPU valid block counts",
+            padded_request_count=padded,
+            expected_device=torch.device("cpu"),
+        )
         _validate_window_length_input(
             cpu_window_upper,
             name="CPU Window upper",
@@ -1249,7 +1150,6 @@ class DraftWindowWorkspace:
             for supplied in tuple(
                 tensor
                 for tensor in (
-                    device_window_exact,
                     cpu_window_exact,
                     cpu_window_upper,
                     cpu_valid_num_blocks,
@@ -1259,15 +1159,6 @@ class DraftWindowWorkspace:
             for backing in workspace_tensors
         ):
             raise ValueError("Window length inputs must not alias workspace backing")
-        if (
-            device_window_exact is not None
-            and actual
-            and not torch.equal(
-                device_window_exact[:actual].cpu(),
-                cpu_window_exact[:actual],
-            )
-        ):
-            raise ValueError("device and CPU Window exact lengths must agree for active requests")
         if actual and bool(torch.any(cpu_window_exact[:actual] < 0)):
             raise ValueError("Window exact lengths must be greater than or equal to 0")
         if actual and bool(torch.any(cpu_window_upper[:actual] < cpu_window_exact[:actual])):
@@ -1286,15 +1177,7 @@ class DraftWindowWorkspace:
         try:
             if self._needs_clear:
                 self._zero_all()
-            if cpu_valid_num_blocks is None:
-                gather_valid_num_blocks(
-                    full_source,
-                    global_group_id=identity.global_group_id,
-                    num_reqs=actual,
-                    num_reqs_padded=padded,
-                    out=self.valid_num_blocks,
-                )
-            elif actual:
+            if actual:
                 self.valid_num_blocks[:actual].copy_(cpu_valid_num_blocks[:actual])
             active_columns: list[int] = []
             for row, descriptor in enumerate(read_descriptors):
@@ -1317,9 +1200,7 @@ class DraftWindowWorkspace:
                         f"required={descriptor.required_columns} "
                         f"capacity={self.table_capacity_columns}"
                     )
-                gathered_valid = int(
-                    (self.valid_num_blocks[row] if cpu_valid_num_blocks is None else cpu_valid_num_blocks[row]).item()
-                )
+                gathered_valid = int(cpu_valid_num_blocks[row].item())
                 if gathered_valid > source_table.shape[1]:
                     raise RuntimeError("current valid block count exceeds the canonical source row width")
                 if descriptor.valid_num_blocks != gathered_valid:
@@ -1344,8 +1225,7 @@ class DraftWindowWorkspace:
                     )
                 active_columns.append(required)
             if actual:
-                device_exact_source = cpu_window_exact if device_window_exact is None else device_window_exact
-                self.device_window_exact[:actual].copy_(device_exact_source[:actual])
+                self.device_window_exact[:actual].copy_(cpu_window_exact[:actual])
                 self.cpu_window_exact[:actual].copy_(cpu_window_exact[:actual])
                 self.cpu_window_upper[:actual].copy_(cpu_window_upper[:actual])
             self._active_table_columns = tuple(active_columns)
@@ -1604,10 +1484,9 @@ class DraftWindowRuntimeState:
         ordered_request_ids: Sequence[str],
         idx_mapping: torch.Tensor,
         read_descriptors: Sequence[DraftWindowReadDescriptor],
-        device_window_exact: torch.Tensor | None,
         cpu_window_exact: torch.Tensor,
         cpu_window_upper: torch.Tensor,
-        cpu_valid_num_blocks: torch.Tensor | None = None,
+        cpu_valid_num_blocks: torch.Tensor,
         num_reqs_padded: int,
         phase: DraftWindowExecutionPhase,
         step: int,
@@ -1638,7 +1517,8 @@ class DraftWindowRuntimeState:
         request_fingerprint = tuple(ordered_request_ids)
         descriptor_fingerprint = tuple(read_descriptors)
         actual_request_count = len(request_fingerprint)
-        bound_source = self.capability.full_source.bind_batch(idx_mapping)
+        _validate_idx_mapping(idx_mapping)
+        bound_source = self.capability.full_source
         identity = DraftWindowGenerationIdentity(
             mapping_epoch=mapping_epoch,
             ordered_request_fingerprint=request_fingerprint,
@@ -1650,6 +1530,7 @@ class DraftWindowRuntimeState:
             provider_id=id(self.capability.provider),
             provider_version=self.PROVIDER_VERSION,
             source_identity=bound_source.source_identity,
+            idx_mapping_ptr=idx_mapping.data_ptr(),
             execution_lane=execution_lane,
             phase=phase,
             step=step,
@@ -1661,7 +1542,6 @@ class DraftWindowRuntimeState:
             identity=identity,
             bound_source=bound_source,
             read_descriptors=read_descriptors,
-            device_window_exact=device_window_exact,
             cpu_window_exact=cpu_window_exact,
             cpu_window_upper=cpu_window_upper,
             cpu_valid_num_blocks=cpu_valid_num_blocks,
@@ -1676,10 +1556,9 @@ class DraftWindowRuntimeState:
         ordered_request_ids: Sequence[str],
         idx_mapping: torch.Tensor,
         read_descriptors: Sequence[DraftWindowReadDescriptor],
-        device_window_exact: torch.Tensor | None,
         cpu_window_exact: torch.Tensor,
         cpu_window_upper: torch.Tensor,
-        cpu_valid_num_blocks: torch.Tensor | None = None,
+        cpu_valid_num_blocks: torch.Tensor,
         num_reqs_padded: int,
         step: int,
         execution_lane: int,
@@ -1721,7 +1600,7 @@ class DraftWindowRuntimeState:
         # Only logical requests/source/epoch are fixed across AR consumers.
         # Each consumer keeps its own padding in its generation identity.
         # The active-reader and last-retired guards above still govern scratch
-        # reuse; Graph hands scratch to distinct descriptor/ordinal banks.
+        # reuse; Graph uses distinct descriptor/ordinal banks.
         if type(num_reqs_padded) is not int or num_reqs_padded < len(request_fingerprint):
             raise ValueError("serialized step padding must be an integer covering active requests")
         if num_reqs_padded > (self.workspace if output_workspace is None else output_workspace).max_num_reqs:
@@ -1730,9 +1609,13 @@ class DraftWindowRuntimeState:
             raise RuntimeError("serialized step execution lane changed within one proposal")
 
         descriptor_fingerprint = tuple(read_descriptors)
-        bound_source = self.capability.full_source.bind_batch(idx_mapping)
-        if bound_source.source_identity != previous_identity.source_identity:
-            raise RuntimeError("serialized step FullSource identity changed within one proposal")
+        _validate_idx_mapping(idx_mapping)
+        bound_source = self.capability.full_source
+        if (
+            bound_source.source_identity != previous_identity.source_identity
+            or idx_mapping.data_ptr() != previous_identity.idx_mapping_ptr
+        ):
+            raise RuntimeError("serialized step FullSource or request mapping changed within one proposal")
         identity = DraftWindowGenerationIdentity(
             mapping_epoch=previous_identity.mapping_epoch,
             ordered_request_fingerprint=request_fingerprint,
@@ -1744,6 +1627,7 @@ class DraftWindowRuntimeState:
             provider_id=previous_identity.provider_id,
             provider_version=previous_identity.provider_version,
             source_identity=bound_source.source_identity,
+            idx_mapping_ptr=idx_mapping.data_ptr(),
             execution_lane=execution_lane,
             phase=DraftWindowExecutionPhase.STEP,
             step=step,
@@ -1755,7 +1639,6 @@ class DraftWindowRuntimeState:
             identity=identity,
             bound_source=bound_source,
             read_descriptors=read_descriptors,
-            device_window_exact=device_window_exact,
             cpu_window_exact=cpu_window_exact,
             cpu_window_upper=cpu_window_upper,
             cpu_valid_num_blocks=cpu_valid_num_blocks,
@@ -1769,10 +1652,9 @@ class DraftWindowRuntimeState:
         identity: DraftWindowGenerationIdentity,
         bound_source: FullDraftKVSource,
         read_descriptors: Sequence[DraftWindowReadDescriptor],
-        device_window_exact: torch.Tensor | None,
         cpu_window_exact: torch.Tensor,
         cpu_window_upper: torch.Tensor,
-        cpu_valid_num_blocks: torch.Tensor | None,
+        cpu_valid_num_blocks: torch.Tensor,
         quarantine_on_failure: bool = False,
         output_workspace: DraftWindowWorkspace | None = None,
     ) -> DraftMetadataInputs:
@@ -1793,7 +1675,6 @@ class DraftWindowRuntimeState:
                 identity=identity,
                 full_source=bound_source,
                 read_descriptors=read_descriptors,
-                device_window_exact=device_window_exact,
                 cpu_window_exact=cpu_window_exact,
                 cpu_window_upper=cpu_window_upper,
                 cpu_valid_num_blocks=cpu_valid_num_blocks,

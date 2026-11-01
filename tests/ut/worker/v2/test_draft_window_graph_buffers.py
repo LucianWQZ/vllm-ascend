@@ -15,6 +15,7 @@ from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftWindowRuntimeContext,
     DraftWindowSourceCapability,
     DraftWindowSourceIdentity,
+    DraftWindowWorkspace,
     FullDraftKVSource,
     SingleGroupDirectPrefixProvider,
     build_draft_window_runtime_state,
@@ -46,13 +47,10 @@ def graph_buffers():
     source = FullDraftKVSource(
         logical_block_sizes=(4,),
         kernel_block_sizes=(4,),
-        source_identity=DraftWindowSourceIdentity(
-            id(owner), (table.data_ptr(),), owner.num_blocks.cpu.data_ptr(), None
-        ),
+        source_identity=DraftWindowSourceIdentity(id(owner), (table.data_ptr(),), owner.num_blocks.cpu.data_ptr()),
         _block_tables_owner=owner,
         _input_block_tables=(table,),
         _persistent_num_blocks_cpu=owner.num_blocks.cpu,
-        _idx_mapping=None,
     )
     group = DraftWindowGroupRoute(
         gid=0,
@@ -132,9 +130,9 @@ def _materialize(case, *, epoch=0, ends=(11, 14), quarantine=False):
         ordered_request_ids=("request-a", "request-b")[: len(plans)],
         idx_mapping=case.mapping,
         read_descriptors=[case.projection.describe(plan, valid_num_blocks=4) for plan in plans],
-        device_window_exact=exact,
         cpu_window_exact=exact.clone(),
         cpu_window_upper=exact.clone(),
+        cpu_valid_num_blocks=torch.tensor([4] * len(plans) + [0] * (2 - len(plans)), dtype=torch.int32),
         num_reqs_padded=2,
         phase=DraftWindowExecutionPhase.PROPOSAL,
         step=0,
@@ -266,7 +264,7 @@ def test_same_mapping_pointer_does_not_allow_epoch_or_generation_aba(graph_buffe
     with pytest.raises(ValueError, match="mapping epoch must strictly increase"):
         _materialize(case)
     current = _materialize(case, epoch=1)
-    assert current.identity.source_identity.idx_mapping_ptr == first.identity.source_identity.idx_mapping_ptr
+    assert current.identity.idx_mapping_ptr == first.identity.idx_mapping_ptr
     with pytest.raises(RuntimeError, match="generation identity"):
         current.validate_for(first.identity)
     with pytest.raises(RuntimeError, match="generation identity"):
@@ -300,6 +298,29 @@ def test_exception_after_possible_submission_quarantines_bank_without_clearing(g
         case.runtime.retire_generation(inputs.identity)
 
 
+def test_cpu_valid_counts_are_required_before_any_bank_materialization(graph_buffers):
+    case = graph_buffers
+    bank = case.provider.prepare_workspace(case.capture)
+    before = [tensor.clone() for tensor in _bank_tensors(bank)]
+    with pytest.raises(TypeError, match="cpu_valid_num_blocks"):
+        case.runtime.materialize(
+            mapping_epoch=0,
+            ordered_request_ids=(),
+            idx_mapping=case.mapping,
+            read_descriptors=(),
+            cpu_window_exact=torch.zeros(2, dtype=torch.int32),
+            cpu_window_upper=torch.zeros(2, dtype=torch.int32),
+            num_reqs_padded=2,
+            phase=DraftWindowExecutionPhase.PROPOSAL,
+            step=0,
+            execution_lane=0,
+            output_workspace=bank,
+        )
+    assert bank.bound_identity is None
+    assert all(torch.equal(tensor, old) for tensor, old in zip(_bank_tensors(bank), before))
+    assert case.runtime._workspace is None
+
+
 def test_eagle_serialized_steps_own_distinct_banks_and_preserve_previous_consumers(graph_buffers):
     case = graph_buffers
     capability = case.runtime.capability
@@ -317,7 +338,7 @@ def test_eagle_serialized_steps_own_distinct_banks_and_preserve_previous_consume
     case.owner.slot_mappings = torch.arange(8, dtype=torch.int64).reshape(1, 8)
     proposal_plan = compute_draft_window_plan(full_exact_end=11, future_offset=3, window_size=4, block_span_tokens=4)
     previous = None
-    retained = []
+    retained: list[tuple[DraftWindowWorkspace, list[torch.Tensor]]] = []
     for step, (padded, query_width) in enumerate(((2, 4), (1, 1), (2, 1))):
         route = DraftWindowGraphRoute.EAGLE3_FIRST_PASS if step == 0 else DraftWindowGraphRoute.EAGLE3_AR_STEP
         capture = provider.register_capture_identity(
@@ -343,9 +364,9 @@ def test_eagle_serialized_steps_own_distinct_banks_and_preserve_previous_consume
             read_descriptors=[
                 projection.describe_frozen_step(proposal_plan, full_exact_end=11 + step, valid_num_blocks=4)
             ],
-            device_window_exact=exact,
             cpu_window_exact=exact.clone(),
             cpu_window_upper=exact.clone(),
+            cpu_valid_num_blocks=torch.tensor([4] + [0] * (padded - 1), dtype=torch.int32),
             num_reqs_padded=padded,
             step=step,
             execution_lane=0,
@@ -354,6 +375,14 @@ def test_eagle_serialized_steps_own_distinct_banks_and_preserve_previous_consume
         if previous is None:
             inputs = runtime.materialize(mapping_epoch=7, phase=DraftWindowExecutionPhase.PROPOSAL, **kwargs)
         else:
+            if step == 1:
+                replaced_mapping = case.mapping.clone()
+                assert replaced_mapping.data_ptr() != previous.idx_mapping_ptr
+                with pytest.raises(RuntimeError, match="request mapping changed"):
+                    runtime.materialize_serialized_step(
+                        previous_identity=previous, **{**kwargs, "idx_mapping": replaced_mapping}
+                    )
+                assert bank.bound_identity is None
             inputs = runtime.materialize_serialized_step(previous_identity=previous, **kwargs)
         current = SimpleNamespace(**{**vars(case), "runtime": runtime, "provider": provider, "capture": capture})
         carrier = _bind(current, inputs)

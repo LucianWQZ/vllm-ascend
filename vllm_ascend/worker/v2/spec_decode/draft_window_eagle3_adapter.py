@@ -40,6 +40,8 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_graph_metadata import copy_d
 
 
 class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin):
+    decode_cudagraph_manager: Any
+
     def _configure_draft_window(self, decision: DraftWindowPolicyDecision) -> None:
         """Attach the eligible P1 policy contract without enabling a window."""
         if decision.state is not DraftWindowPolicyState.ELIGIBLE_ON:
