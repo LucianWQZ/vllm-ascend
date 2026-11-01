@@ -17,7 +17,6 @@ import torch
 
 from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftMetadataInputs,
-    DraftWindowExecutionPhase,
     DraftWindowGenerationIdentity,
     DraftWindowSourceCapability,
     gather_valid_num_blocks_cpu,
@@ -294,7 +293,6 @@ class Eagle3DraftWindowMixin:
             cpu_window_upper=step_plan.cpu_window_upper,
             cpu_valid_num_blocks=step_plan.cpu_valid_num_blocks,
             num_reqs_padded=num_reqs_padded,
-            phase=DraftWindowExecutionPhase.PROPOSAL,
             step=0,
             quarantine_on_failure=hasattr(self, "_eagle3_graph_session"),
             output_workspace=output_workspace,

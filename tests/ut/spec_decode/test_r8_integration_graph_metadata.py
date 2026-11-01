@@ -28,21 +28,20 @@ def graph_source_initialization(request, monkeypatch):
     from vllm_ascend.worker.v2.spec_decode import draft_window_graph_runtime
     from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowGraphInputMixin
 
-    capability, state = object(), object()
-    build_source = Mock(return_value=capability)
-    build_state = Mock(return_value=state)
+    source, provider = object(), object()
+    build_source, build_provider = Mock(return_value=source), Mock(return_value=provider)
     monkeypatch.setattr(draft_window_graph_runtime, "build_parallel_graph_source", build_source)
     if method == "eagle3":
         from vllm_ascend.worker.v2.spec_decode import draft_window_eagle3_adapter, draft_window_eagle3_capture
 
         initialize = draft_window_eagle3_adapter.Eagle3GraphIntegrationMixin._initialize_draft_window_source_capability
         monkeypatch.setattr(draft_window_eagle3_capture, "build_eagle3_graph_source", build_source)
-        monkeypatch.setattr(draft_window_eagle3_adapter, "build_draft_window_runtime_state", build_state)
+        monkeypatch.setattr(draft_window_eagle3_adapter, "DraftWindowGraphBindingProvider", build_provider)
     else:
         from vllm_ascend.worker.v2.spec_decode import draft_window_eager
 
         initialize = DraftWindowGraphInputMixin._initialize_draft_window_source_capability
-        monkeypatch.setattr(draft_window_eager, "build_draft_window_runtime_state", build_state)
+        monkeypatch.setattr(draft_window_eager, "DraftWindowGraphBindingProvider", build_provider)
     owner = SimpleNamespace(
         _draft_window_policy=object(),
         _speculator_name=method,
@@ -51,7 +50,6 @@ def graph_source_initialization(request, monkeypatch):
         kv_cache_config=object(),
         _group_causal=False,
         vllm_config=object(),
-        input_buffers=object(),
         _initialize_draft_window_graph_inputs=Mock(),
         _initialize_eagle3_draft_window_state=Mock(),
     )
@@ -59,9 +57,9 @@ def graph_source_initialization(request, monkeypatch):
         owner=owner,
         initialize=initialize,
         build_source=build_source,
-        build_state=build_state,
-        capability=capability,
-        state=state,
+        build_provider=build_provider,
+        source=source,
+        provider=provider,
     )
 
 
@@ -69,9 +67,10 @@ def test_graph_owner_installs_only_its_admitted_source(graph_source_initializati
     c = graph_source_initialization
     c.initialize(c.owner)
     c.build_source.assert_called_once()
-    c.build_state.assert_called_once_with(c.capability)
-    assert c.owner._draft_window_source_capability is c.capability
-    assert c.owner._draft_window_runtime_state is c.state
+    c.build_provider.assert_called_once_with(source=c.source)
+    assert c.owner._draft_window_graph_binding_provider is c.provider
+    assert not hasattr(c.owner, "_draft_window_source_capability")
+    assert not hasattr(c.owner, "_draft_window_runtime_state")
     assert not hasattr(c.owner, "_draft_window_runtime")
 
 
@@ -82,14 +81,13 @@ def test_graph_source_rejection_has_no_eager_fallback_or_partial_owner(graph_sou
     with pytest.raises(NotImplementedError) as seen:
         c.initialize(c.owner)
     assert seen.value is failure
-    c.build_state.assert_not_called()
-    assert not hasattr(c.owner, "_draft_window_source_capability")
-    assert not hasattr(c.owner, "_draft_window_runtime_state")
+    c.build_provider.assert_not_called()
+    assert not hasattr(c.owner, "_draft_window_graph_binding_provider")
 
 
 def test_graph_owner_reinitialization_rejects_before_source_build(graph_source_initialization):
     c = graph_source_initialization
-    c.owner._draft_window_runtime_state = c.state
+    c.owner._draft_window_graph_binding_provider = c.provider
     with pytest.raises(RuntimeError, match="already initialized"):
         c.initialize(c.owner)
     c.build_source.assert_not_called()
@@ -100,7 +98,8 @@ def test_window_off_without_graph_policy_does_not_construct_source(graph_source_
     del c.owner._draft_window_policy
     c.initialize(c.owner)
     c.build_source.assert_not_called()
-    assert not hasattr(c.owner, "_draft_window_runtime_state")
+    c.build_provider.assert_not_called()
+    assert not hasattr(c.owner, "_draft_window_graph_binding_provider")
 
 
 @pytest.fixture

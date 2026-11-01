@@ -21,7 +21,6 @@ from vllm.v1.worker.gpu.input_batch import InputBatch
 
 from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftMetadataInputs,
-    DraftWindowExecutionPhase,
     DraftWindowGenerationIdentity,
     gather_valid_num_blocks_cpu,
 )
@@ -493,7 +492,6 @@ class DraftWindowGraphInputMixin:
             cpu_window_upper=plan.cpu_window_upper,
             cpu_valid_num_blocks=plan.cpu_valid_num_blocks,
             num_reqs_padded=num_reqs_padded,
-            phase=DraftWindowExecutionPhase.PROPOSAL,
             step=0,
             quarantine_on_failure=hasattr(self, "_draft_window_graph_session"),
             output_workspace=output_workspace,
