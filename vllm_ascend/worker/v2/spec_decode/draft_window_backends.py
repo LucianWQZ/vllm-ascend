@@ -25,20 +25,6 @@ class DraftWindowProviderStatus(str, Enum):
 
 
 @dataclass(frozen=True)
-class DraftWindowTopology:
-    """Only the coordinates used by a Draft reader, not executor diagnostics."""
-
-    prefill_context_parallel_size: int
-    decode_context_parallel_size: int
-    dsa_cp_effective: bool = False
-
-    @classmethod
-    def from_config(cls, config: Any) -> "DraftWindowTopology":
-        parallel = config.parallel_config
-        return cls(parallel.prefill_context_parallel_size, parallel.decode_context_parallel_size)
-
-
-@dataclass(frozen=True)
 class DraftWindowBackendTypes:
     """Concrete runtime classes; injected explicitly in CPU contract tests."""
 
@@ -116,7 +102,7 @@ class DraftWindowGroupRoute:
     layers: tuple[str, ...]
     scheduler_block_size: int
     table_column_span: int
-    topology: DraftWindowTopology
+    read_semantics: str
     status: DraftWindowProviderStatus
     reason: str
     native_window: int | None = None
@@ -127,7 +113,7 @@ def _select_read_provider(
     builder: Any,
     specs: Sequence[Any],
     types: DraftWindowBackendTypes,
-    topology: DraftWindowTopology,
+    parallel_config: Any,
     *,
     uncompressed: bool,
     native_window: int | None,
@@ -211,7 +197,7 @@ def _select_read_provider(
         if not uniform_windows or native_window is None or native_window <= 0:
             return missing, "Native SWA group has inconsistent windows"
         selected = status.NATIVE_SWA_CANDIDATE
-    if topology.prefill_context_parallel_size != 1 or topology.decode_context_parallel_size != 1:
+    if parallel_config.prefill_context_parallel_size != 1 or parallel_config.decode_context_parallel_size != 1:
         return missing, "Context-parallel read coordinates need a separate provider"
     return selected, ""
 
@@ -221,7 +207,7 @@ def inventory_draft_window_groups(
     attn_groups: Sequence[Sequence[Any]],
     kv_cache_config: Any,
     block_tables: Any,
-    topology: DraftWindowTopology,
+    parallel_config: Any,
     types: DraftWindowBackendTypes | None = None,
     full_retention_dflash2: bool = False,
 ) -> tuple[DraftWindowGroupRoute, ...]:
@@ -279,16 +265,15 @@ def inventory_draft_window_groups(
             # The target can enable DSA-CP while the draft is dense GQA.
             # Selection of the actual builder, not the global flag, decides
             # whether this reader uses legacy DSA-CP coordinates.
-            route_topology = replace(
-                topology,
-                dsa_cp_effective=(
-                    isinstance(builder, types.context_parallel_builders)
-                    or (
-                        types.indexer_builder is not None
-                        and isinstance(builder, types.indexer_builder)
-                        and builder.use_dsa_cp
-                    )
-                ),
+            legacy_cp = isinstance(builder, types.context_parallel_builders) or (
+                types.indexer_builder is not None and isinstance(builder, types.indexer_builder) and builder.use_dsa_cp
+            )
+            read_semantics = (
+                "dsa_cp_derived"
+                if legacy_cp
+                else "dcp_interleaved"
+                if parallel_config.decode_context_parallel_size > 1
+                else "replicated"
             )
             windows = {getattr(item, "sliding_window", None) for item in consumer_specs}
             native_window = next(iter(windows)) if len(windows) == 1 else None
@@ -297,7 +282,7 @@ def inventory_draft_window_groups(
                 builder,
                 consumer_specs,
                 types,
-                route_topology,
+                parallel_config,
                 uncompressed=ratio == 1 and storage_size == scheduler_span,
                 native_window=native_window,
                 uniform_windows=len(windows) == 1,
@@ -309,7 +294,7 @@ def inventory_draft_window_groups(
                     layers=tuple(group.layer_names),
                     scheduler_block_size=scheduler_span,
                     table_column_span=column_span,
-                    topology=route_topology,
+                    read_semantics=read_semantics,
                     status=status,
                     reason=reason,
                     native_window=native_window,
@@ -335,12 +320,11 @@ def require_draft_window_providers(routes: Sequence[DraftWindowGroupRoute]) -> N
 def describe_draft_window_routes(speculator: Any) -> tuple[DraftWindowGroupRoute, ...]:
     """Inspect initialized draft attention; never invoke from the OFF path."""
     config = speculator.attn_vllm_config
-    topology = DraftWindowTopology.from_config(config)
     routes = inventory_draft_window_groups(
         attn_groups=speculator.attn_groups,
         kv_cache_config=speculator.kv_cache_config,
         block_tables=speculator.block_tables,
-        topology=topology,
+        parallel_config=config.parallel_config,
         full_retention_dflash2=getattr(speculator, "_dflash2_full_kv_reference", False),
     )
     actual_layers = {name for route in routes for name in route.layers}

@@ -2,20 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CPU contracts for consumer identity and block-table units."""
 
-import ast
-from dataclasses import dataclass, replace
-from pathlib import Path
+from dataclasses import replace
 from types import SimpleNamespace
-from typing import Any
 
 import pytest
 
-from vllm_ascend.worker.v2.spec_decode.draft_window import _read_coordinate_semantics
 from vllm_ascend.worker.v2.spec_decode.draft_window_backends import (
     DraftWindowBackendTypes,
-    DraftWindowGroupRoute,
     DraftWindowProviderStatus,
-    DraftWindowTopology,
     inventory_draft_window_groups,
     require_compatible_direct_prefix_routes,
     require_draft_window_providers,
@@ -73,13 +67,13 @@ def types():
 
 
 @pytest.fixture
-def topology():
-    return DraftWindowTopology(1, 1)
+def parallel_config():
+    return SimpleNamespace(prefill_context_parallel_size=1, decode_context_parallel_size=1)
 
 
 def inventory(
     types,
-    topology,
+    parallel_config,
     *,
     specs=None,
     builders=None,
@@ -123,135 +117,80 @@ def inventory(
             ],
             kernel_block_sizes=spans,
         ),
-        topology=topology,
+        parallel_config=parallel_config,
         types=types,
         full_retention_dflash2=full_retention_dflash2,
     )
 
 
-def test_dflash2_reference_full_allocation_keeps_native_read_provider(types, topology):
+def test_dflash2_reference_full_allocation_keeps_native_read_provider(types, parallel_config):
     spec = FullSpec()
     spec.sliding_window = 2048
     kinds = replace(types, sliding_window_spec=SlidingSpec)
-    (original,) = inventory(kinds, topology, specs=[spec])
+    (original,) = inventory(kinds, parallel_config, specs=[spec])
     assert original.status is DraftWindowProviderStatus.DIRECT_DENSE
     assert original.native_window == 2048  # Full retention is not Full attention.
-    (reference,) = inventory(kinds, topology, specs=[spec], full_retention_dflash2=True)
+    (reference,) = inventory(kinds, parallel_config, specs=[spec], full_retention_dflash2=True)
     assert reference.status is DraftWindowProviderStatus.NATIVE_SWA_CANDIDATE
     assert reference.native_window == 2048
 
 
-def test_consumer_gid_must_match_its_canonical_source(types, topology):
+def test_consumer_gid_must_match_its_canonical_source(types, parallel_config):
     with pytest.raises(ValueError, match="consumer and canonical source geometry"):
-        inventory(types, topology, group_ids=[1])
+        inventory(types, parallel_config, group_ids=[1])
 
 
-def test_cache_and_canonical_table_scheduler_spans_must_match(types, topology):
+def test_cache_and_canonical_table_scheduler_spans_must_match(types, parallel_config):
     with pytest.raises(ValueError, match="scheduler and canonical table spans"):
-        inventory(types, topology, table_spans=[512])
+        inventory(types, parallel_config, table_spans=[512])
 
 
-def test_full_spec_with_chunked_attention_cannot_claim_dense_prefix_reads(types, topology):
+def test_full_spec_with_chunked_attention_cannot_claim_dense_prefix_reads(types, parallel_config):
     spec = FullSpec()
     spec.attention_chunk_size = 1024
-    (route,) = inventory(types, topology, specs=[spec])
+    (route,) = inventory(types, parallel_config, specs=[spec])
     assert route.status is DraftWindowProviderStatus.PROVIDER_MISSING
     with pytest.raises(NotImplementedError, match="provider missing"):
         require_draft_window_providers((route,))
 
 
-def test_missing_native_window_is_a_missing_provider_not_an_implicit_full_reader(types, topology):
+def test_missing_native_window_is_a_missing_provider_not_an_implicit_full_reader(types, parallel_config):
     spec = SlidingSpec()
     spec.sliding_window = None
-    (route,) = inventory(replace(types, sliding_window_spec=SlidingSpec), topology, specs=[spec])
+    (route,) = inventory(replace(types, sliding_window_spec=SlidingSpec), parallel_config, specs=[spec])
     assert route.status is DraftWindowProviderStatus.PROVIDER_MISSING
     with pytest.raises(NotImplementedError, match="provider missing"):
         require_draft_window_providers((route,))
 
 
-def test_target_dsa_cp_does_not_change_dense_draft_read_coordinates(types, topology):
-    (route,) = inventory(types, replace(topology, dsa_cp_effective=True))
-    assert route.topology.dsa_cp_effective is False  # Actual GQA builder, independent of Target flag.
-    assert _read_coordinate_semantics((route,)) == "replicated"
-
-
-@pytest.mark.parametrize("dsa_cp,dcp,expected", [(True, 1, "dsa_cp_derived"), (False, 2, "dcp_interleaved")])
-def test_actual_consumer_cp_coordinates_are_not_erased(types, topology, dsa_cp, dcp, expected):
-    (route,) = inventory(types, topology)
-    route = replace(route, topology=replace(route.topology, dsa_cp_effective=dsa_cp, decode_context_parallel_size=dcp))
-    assert _read_coordinate_semantics((route,)) == expected
-
-
-def test_mixed_consumer_read_coordinate_contracts_are_not_silently_combined(types, topology):
-    (route,) = inventory(types, topology)
-    cp_route = replace(route, topology=replace(route.topology, dsa_cp_effective=True))
-    with pytest.raises(NotImplementedError, match="one parallel read-coordinate contract"):
-        _read_coordinate_semantics((route, cp_route))
-
-
-@pytest.mark.parametrize(
-    "status,native_window,dflash2,allowed",
-    [
-        (DraftWindowProviderStatus.DIRECT_DENSE, None, False, True),
-        (DraftWindowProviderStatus.DIRECT_DENSE, 2048, False, False),
-        (DraftWindowProviderStatus.NATIVE_SWA_CANDIDATE, 2048, False, False),
-        (DraftWindowProviderStatus.NATIVE_SWA_CANDIDATE, 2048, True, True),
-        (DraftWindowProviderStatus.PROVIDER_MISSING, None, True, False),
-    ],
-)
-def test_graph_source_uses_shared_route_without_promoting_native_swa(
-    types, topology, status, native_window, dflash2, allowed
-):
-    path = Path(__file__).resolve().parents[4] / "vllm_ascend/worker/v2/spec_decode/draft_window.py"
-    inventory_class = next(
-        n for n in ast.parse(path.read_text()).body if isinstance(n, ast.ClassDef) and n.name == "DraftWindowInventory"
-    )
-    namespace: dict[str, Any] = dict(
-        dataclass=dataclass,
-        DraftWindowGroupRoute=DraftWindowGroupRoute,
-        DraftWindowProviderStatus=DraftWindowProviderStatus,
-    )
-    exec(compile(ast.Module(body=[inventory_class], type_ignores=[]), str(path), "exec"), namespace)
-    (route,) = inventory(types, topology)
-    route = replace(route, status=status, native_window=native_window)
-    source = namespace[inventory_class.name](
-        "dflash", "target", "dflash2" if dflash2 else "dflash", 1024, (route,), (), dflash2
-    )
-    if allowed:
-        assert source.require_single_group_direct_prefix() is route
-        assert source.groups[0].status is status
-        assert source.groups[0].native_window == native_window
-    else:
-        with pytest.raises(NotImplementedError, match="Graph source rejected"):
-            source.require_single_group_direct_prefix()
-
-
-def test_kernel_column_span_is_not_scheduler_block_size(types, topology):
-    (route,) = inventory(types, topology)
+def test_kernel_column_span_is_not_scheduler_block_size(types, parallel_config):
+    (route,) = inventory(types, parallel_config)
     assert route.scheduler_block_size == 256
     assert route.table_column_span == 128
     assert route.status is DraftWindowProviderStatus.DIRECT_DENSE
     require_draft_window_providers((route,))
 
 
-def test_same_named_unregistered_builder_cannot_gain_dense_capability(types, topology):
+def test_same_named_unregistered_builder_cannot_gain_dense_capability(types, parallel_config):
     # Strings do not certify an implementation, even when names match exactly.
     impostor = type(DenseBuilder.__name__, (), {})()
-    (route,) = inventory(types, topology, builders=[impostor])
+    (route,) = inventory(types, parallel_config, builders=[impostor])
     assert route.status is DraftWindowProviderStatus.PROVIDER_MISSING
     with pytest.raises(NotImplementedError, match="provider missing"):
         require_draft_window_providers((route,))
 
 
-def test_subclass_and_native_window_require_their_own_provider(types, topology):
-    routes = inventory(types, topology, specs=[FullSpec(), SlidingSpec()], builders=[DenseSubclass(), DenseBuilder()])
+def test_subclass_and_native_window_require_their_own_provider(types, parallel_config):
+    routes = inventory(
+        types, parallel_config, specs=[FullSpec(), SlidingSpec()], builders=[DenseSubclass(), DenseBuilder()]
+    )
     assert all(route.status is DraftWindowProviderStatus.PROVIDER_MISSING for route in routes)
 
 
-def native_swa_bundle(types, topology):
+def native_swa_bundle(types, parallel_config):
     spec = SlidingSpec()
     spec.sliding_window = 4096
-    routes = inventory(replace(types, sliding_window_spec=SlidingSpec), topology, specs=[spec, FullSpec()])
+    routes = inventory(replace(types, sliding_window_spec=SlidingSpec), parallel_config, specs=[spec, FullSpec()])
     impl = DenseBuilder()
     impl.sliding_window = 4096
     impl.sinks = None
@@ -260,15 +199,15 @@ def native_swa_bundle(types, topology):
     return routes, impl, context
 
 
-def test_native_swa_candidate_is_not_a_residency_or_read_provider(types, topology):
-    routes, _, _ = native_swa_bundle(types, topology)
+def test_native_swa_candidate_is_not_a_residency_or_read_provider(types, parallel_config):
+    routes, _, _ = native_swa_bundle(types, parallel_config)
     assert routes[0].status is DraftWindowProviderStatus.NATIVE_SWA_CANDIDATE
     with pytest.raises(NotImplementedError, match="provider missing"):
         require_draft_window_providers(routes)
 
 
-def test_covered_swa_keeps_only_full_group_projection(types, topology):
-    routes, _, context = native_swa_bundle(types, topology)
+def test_covered_swa_keeps_only_full_group_projection(types, parallel_config):
+    routes, _, context = native_swa_bundle(types, parallel_config)
     selected = select_native_swa_subset_routes(
         routes,
         window_size=32768,
@@ -282,8 +221,8 @@ def test_covered_swa_keeps_only_full_group_projection(types, topology):
     assert context["draft.layers.0"].impl.sliding_window == 4096
 
 
-def test_smaller_extra_window_selects_native_intersection(types, topology):
-    routes, _, context = native_swa_bundle(types, topology)
+def test_smaller_extra_window_selects_native_intersection(types, parallel_config):
+    routes, _, context = native_swa_bundle(types, parallel_config)
     selected = select_native_swa_subset_routes(
         routes,
         window_size=1024,
@@ -299,8 +238,8 @@ def test_smaller_extra_window_selects_native_intersection(types, topology):
 
 
 @pytest.mark.parametrize("window", [1024, 32768])
-def test_native_only_dflash2_keeps_a_typed_builder_without_a_full_group(types, topology, window):
-    routes, _, context = native_swa_bundle(types, topology)
+def test_native_only_dflash2_keeps_a_typed_builder_without_a_full_group(types, parallel_config, window):
+    routes, _, context = native_swa_bundle(types, parallel_config)
     selected = select_native_swa_subset_routes(
         routes[:1],
         window_size=window,
@@ -316,8 +255,8 @@ def test_native_only_dflash2_keeps_a_typed_builder_without_a_full_group(types, t
 
 
 @pytest.mark.parametrize("allowed,window", [(True, 1024), (False, 1024), (True, 4096)])
-def test_noncausal_native_only_dflash2_needs_explicit_resident_certificate(types, topology, allowed, window):
-    routes, _, context = native_swa_bundle(types, topology)
+def test_noncausal_native_only_dflash2_needs_explicit_resident_certificate(types, parallel_config, allowed, window):
+    routes, _, context = native_swa_bundle(types, parallel_config)
     options = dict(
         window_size=window,
         max_query_tokens=512,
@@ -350,8 +289,8 @@ def test_unmasked_rebased_read_covers_future_queries_without_fabricating_a_causa
 
 
 @pytest.mark.parametrize("change", [{"sliding_window": 1024}, {"sinks": object()}, {"use_bnsd_kv_cache": True}])
-def test_native_swa_actual_consumer_must_match_certificate(types, topology, change):
-    routes, impl, context = native_swa_bundle(types, topology)
+def test_native_swa_actual_consumer_must_match_certificate(types, parallel_config, change):
+    routes, impl, context = native_swa_bundle(types, parallel_config)
     for name, value in change.items():
         setattr(impl, name, value)
     with pytest.raises(NotImplementedError, match="coverage certificate"):
@@ -366,8 +305,8 @@ def test_native_swa_actual_consumer_must_match_certificate(types, topology, chan
 
 
 @pytest.mark.parametrize("future", [0, 7])
-def test_native_swa_coverage_against_absolute_read_sets(types, topology, future):
-    routes, _, context = native_swa_bundle(types, topology)
+def test_native_swa_coverage_against_absolute_read_sets(types, parallel_config, future):
+    routes, _, context = native_swa_bundle(types, parallel_config)
     width, native_window = 8, 4096
     window = native_window + width + future
     select_native_swa_subset_routes(
@@ -387,9 +326,9 @@ def test_native_swa_coverage_against_absolute_read_sets(types, topology, future)
 
 
 @pytest.mark.parametrize("ratio,span", [(4, 128), (128, 4096)])
-def test_compressed_layout_cannot_gain_a_direct_provider(types, topology, ratio, span):
+def test_compressed_layout_cannot_gain_a_direct_provider(types, parallel_config, ratio, span):
     (route,) = inventory(
-        types, topology, specs=[FullSpec(span * 2, ratio)], builders=[CompressedBuilder()], spans=[span]
+        types, parallel_config, specs=[FullSpec(span * 2, ratio)], builders=[CompressedBuilder()], spans=[span]
     )
     assert route.table_column_span == span
     assert route.status is DraftWindowProviderStatus.PROVIDER_MISSING
@@ -402,12 +341,12 @@ def test_compressed_layout_cannot_gain_a_direct_provider(types, topology, ratio,
         {"decode_context_parallel_size": 2},
     ],
 )
-def test_cp_needs_coordinate_provider(types, topology, parallel):
-    (route,) = inventory(types, replace(topology, **parallel))
+def test_cp_needs_coordinate_provider(types, parallel_config, parallel):
+    (route,) = inventory(types, SimpleNamespace(**dict(vars(parallel_config), **parallel)))
     assert route.status is DraftWindowProviderStatus.PROVIDER_MISSING
 
 
-def test_tp_and_effective_sp_are_separate_from_cp(types, topology):
+def test_tp_and_effective_sp_are_separate_from_cp(types, parallel_config):
     config = SimpleNamespace(
         parallel_config=SimpleNamespace(
             tensor_parallel_size=16,
@@ -417,14 +356,14 @@ def test_tp_and_effective_sp_are_separate_from_cp(types, topology):
             decode_context_parallel_size=1,
         )
     )
-    (route,) = inventory(types, DraftWindowTopology.from_config(config))
+    (route,) = inventory(types, config.parallel_config)
     assert route.status is DraftWindowProviderStatus.DIRECT_DENSE
 
 
-def test_every_active_gid_is_retained_and_missing_provider_blocks_bundle(types, topology):
+def test_every_active_gid_is_retained_and_missing_provider_blocks_bundle(types, parallel_config):
     routes = inventory(
         types,
-        topology,
+        parallel_config,
         specs=[FullSpec(), FullSpec(), FullSpec()],
         builders=[DenseBuilder(), None, CompressedBuilder()],
     )
@@ -434,8 +373,8 @@ def test_every_active_gid_is_retained_and_missing_provider_blocks_bundle(types, 
         require_draft_window_providers(routes)
 
 
-def test_uniform_wrapper_is_unwrapped_without_inventing_residency(types, topology):
-    (route,) = inventory(types, topology, specs=[UniformSpec({"a": FullSpec(), "b": FullSpec()})])
+def test_uniform_wrapper_is_unwrapped_without_inventing_residency(types, parallel_config):
+    (route,) = inventory(types, parallel_config, specs=[UniformSpec({"a": FullSpec(), "b": FullSpec()})])
     assert route.status is DraftWindowProviderStatus.DIRECT_DENSE
 
 
@@ -447,9 +386,9 @@ def test_uniform_wrapper_is_unwrapped_without_inventing_residency(types, topolog
         ([UniformSpec({"a": FullSpec(256), "b": FullSpec(512)})], [128]),
     ],
 )
-def test_invalid_geometry_is_not_zero_padded_or_repaired(types, topology, specs, spans):
+def test_invalid_geometry_is_not_zero_padded_or_repaired(types, parallel_config, specs, spans):
     with pytest.raises(ValueError, match="geometry"):
-        inventory(types, topology, specs=specs, spans=spans)
+        inventory(types, parallel_config, specs=specs, spans=spans)
 
 
 def test_empty_inventory_is_not_success():
@@ -457,23 +396,16 @@ def test_empty_inventory_is_not_success():
         require_draft_window_providers(())
 
 
-def test_requested_flag_cannot_override_actual_read_coordinates():
-    parallel = SimpleNamespace(prefill_context_parallel_size=1, decode_context_parallel_size=1)
-    config = SimpleNamespace(parallel_config=parallel, additional_config={"enable_dsa_cp": True})
-    topology = DraftWindowTopology.from_config(config)
-    assert topology == DraftWindowTopology(1, 1, False)
-
-
-def test_unknown_second_gid_is_never_ignored(types, topology):
-    routes = inventory(types, topology, specs=[FullSpec(), FullSpec()], builders=[DenseBuilder(), object()])
+def test_unknown_second_gid_is_never_ignored(types, parallel_config):
+    routes = inventory(types, parallel_config, specs=[FullSpec(), FullSpec()], builders=[DenseBuilder(), object()])
     assert len(routes) == 2
     with pytest.raises(NotImplementedError, match="gid=1"):
         require_draft_window_providers(routes)
 
 
 @pytest.mark.parametrize("anchor,second", [(256, 128), (128, 64), (128, 128)])
-def test_multi_group_projection_preserves_first_group_start(types, topology, anchor, second):
-    routes = inventory(types, topology, specs=[FullSpec(256), FullSpec(256)], spans=[anchor, second])
+def test_multi_group_projection_preserves_first_group_start(types, parallel_config, anchor, second):
+    routes = inventory(types, parallel_config, specs=[FullSpec(256), FullSpec(256)], spans=[anchor, second])
     require_compatible_direct_prefix_routes(routes)
     # The logical read start is decided once using the first group's B.
     end, window, future = 2051, 1024, 8
@@ -483,8 +415,8 @@ def test_multi_group_projection_preserves_first_group_start(types, topology, anc
     assert [route.gid for route in routes] == [0, 1]
 
 
-def test_incompatible_multi_group_alignment_rejected_before_request_arrives(types, topology):
-    routes = inventory(types, topology, specs=[FullSpec(256), FullSpec(256)], spans=[64, 128])
+def test_incompatible_multi_group_alignment_rejected_before_request_arrives(types, parallel_config):
+    routes = inventory(types, parallel_config, specs=[FullSpec(256), FullSpec(256)], spans=[64, 128])
     # S=128 happens to be representable in both groups, but S=64 is not.
     # Accepting only the first request would create a serving-time failure.
     assert [128 // route.table_column_span for route in routes] == [2, 1]
@@ -492,16 +424,10 @@ def test_incompatible_multi_group_alignment_rejected_before_request_arrives(type
         require_compatible_direct_prefix_routes(routes)
 
 
-def test_target_dsa_cp_does_not_reclassify_dense_draft(types, topology):
-    (route,) = inventory(types, replace(topology, dsa_cp_effective=True))
-    assert route.status is DraftWindowProviderStatus.DIRECT_DENSE
-    assert route.topology.dsa_cp_effective is False
-
-
-def test_actual_cp_builder_remains_missing_even_when_requested_flag_is_false(types, topology):
+def test_actual_cp_builder_remains_missing_even_when_requested_flag_is_false(types, parallel_config):
     cp_types = replace(types, context_parallel_builders=(CompressedBuilder,))
-    (route,) = inventory(cp_types, topology, builders=[CompressedBuilder()])
-    assert route.topology.dsa_cp_effective is True
+    (route,) = inventory(cp_types, parallel_config, builders=[CompressedBuilder()])
+    assert route.read_semantics == "dsa_cp_derived"
     assert route.status is DraftWindowProviderStatus.PROVIDER_MISSING
 
 
@@ -518,7 +444,7 @@ class MLASpec(FullSpec):
     non_causal_multi_token_decode = False
 
 
-def test_plain_mla_provider_requires_actual_builder_and_spec(types, topology):
+def test_plain_mla_provider_requires_actual_builder_and_spec(types, parallel_config):
     mla_types = replace(
         types,
         mla_backend=DenseBackend,
@@ -526,7 +452,7 @@ def test_plain_mla_provider_requires_actual_builder_and_spec(types, topology):
         mla_spec=MLASpec,
         context_parallel_builders=(),
     )
-    (route,) = inventory(mla_types, topology, specs=[MLASpec()], builders=[MLABuilder()])
+    (route,) = inventory(mla_types, parallel_config, specs=[MLASpec()], builders=[MLABuilder()])
     assert route.status is DraftWindowProviderStatus.DIRECT_MLA
     require_compatible_direct_prefix_routes((route,))
 
@@ -541,19 +467,19 @@ def test_plain_mla_provider_requires_actual_builder_and_spec(types, topology):
         ("indexes_kv_by_block_stride", True),
     ],
 )
-def test_mla_special_layouts_do_not_inherit_plain_read_projection(types, topology, field, value):
+def test_mla_special_layouts_do_not_inherit_plain_read_projection(types, parallel_config, field, value):
     mla_types = replace(types, mla_backend=DenseBackend, mla_builder=MLABuilder, mla_spec=MLASpec)
     spec = MLASpec()
     setattr(spec, field, value)
-    (route,) = inventory(mla_types, topology, specs=[spec], builders=[MLABuilder()])
+    (route,) = inventory(mla_types, parallel_config, specs=[spec], builders=[MLABuilder()])
     assert route.status is DraftWindowProviderStatus.PROVIDER_MISSING
 
 
-def test_flashmla_has_separate_persistent_state_contract(types, topology):
+def test_flashmla_has_separate_persistent_state_contract(types, parallel_config):
     mla_types = replace(types, mla_backend=DenseBackend, mla_builder=MLABuilder, mla_spec=MLASpec)
     builder = MLABuilder()
     builder.flashmla_state = object()
-    (route,) = inventory(mla_types, topology, specs=[MLASpec()], builders=[builder])
+    (route,) = inventory(mla_types, parallel_config, specs=[MLASpec()], builders=[builder])
     assert route.status is DraftWindowProviderStatus.PROVIDER_MISSING
     assert "FlashMLA" in route.reason
 
@@ -587,7 +513,7 @@ def sparse_types(types):
     )
 
 
-def test_mixed_uniform_group_uses_each_consumers_actual_spec(types, topology):
+def test_mixed_uniform_group_uses_each_consumers_actual_spec(types, parallel_config):
     specs = {"draft.attn": MLASpec(), "draft.indexer": IndexerSpec()}
     groups = [
         SimpleNamespace(
@@ -603,7 +529,7 @@ def test_mixed_uniform_group_uses_each_consumers_actual_spec(types, topology):
         attn_groups=[groups],
         kv_cache_config=SimpleNamespace(kv_cache_groups=[SimpleNamespace(kv_cache_spec=UniformSpec(specs))]),
         block_tables=SimpleNamespace(block_sizes=[256], kernel_block_sizes=[128]),
-        topology=topology,
+        parallel_config=parallel_config,
         types=sparse_types(types),
     )
     assert [route.status for route in routes] == [
@@ -614,34 +540,34 @@ def test_mixed_uniform_group_uses_each_consumers_actual_spec(types, topology):
     require_compatible_direct_prefix_routes(routes)
 
 
-def test_indexer_c8_quantization_keeps_token_coordinate_span(types, topology):
+def test_indexer_c8_quantization_keeps_token_coordinate_span(types, parallel_config):
     spec = IndexerSpec()
     spec.cache_sparse_li_c8 = True
-    (route,) = inventory(sparse_types(types), topology, specs=[spec], builders=[IndexerBuilder()])
+    (route,) = inventory(sparse_types(types), parallel_config, specs=[spec], builders=[IndexerBuilder()])
     assert route.status is DraftWindowProviderStatus.DIRECT_SFA_INDEXER
 
 
 @pytest.mark.parametrize("field", ["use_pcp", "use_dcp", "use_dsa_cp"])
-def test_indexer_actual_parallel_producer_requires_provider(types, topology, field):
+def test_indexer_actual_parallel_producer_requires_provider(types, parallel_config, field):
     builder = IndexerBuilder()
     setattr(builder, field, True)
-    (route,) = inventory(sparse_types(types), topology, specs=[IndexerSpec()], builders=[builder])
+    (route,) = inventory(sparse_types(types), parallel_config, specs=[IndexerSpec()], builders=[builder])
     assert route.status is DraftWindowProviderStatus.PROVIDER_MISSING
-    assert route.topology.dsa_cp_effective == (field == "use_dsa_cp")
+    assert route.read_semantics == ("dsa_cp_derived" if field == "use_dsa_cp" else "replicated")
 
 
 @pytest.mark.parametrize("field", ["non_causal_multi_token_decode", "cache_sparse_sfa_c8", "store_on_host"])
-def test_sfa_unsupported_native_semantics_are_explicit(types, topology, field):
+def test_sfa_unsupported_native_semantics_are_explicit(types, parallel_config, field):
     spec = MLASpec()
     setattr(spec, field, True)
-    (route,) = inventory(sparse_types(types), topology, specs=[spec], builders=[SFABuilder()])
+    (route,) = inventory(sparse_types(types), parallel_config, specs=[spec], builders=[SFABuilder()])
     assert route.status is DraftWindowProviderStatus.PROVIDER_MISSING
 
 
-def test_sfa_nope_state_is_not_plain_rope_provider(types, topology):
+def test_sfa_nope_state_is_not_plain_rope_provider(types, parallel_config):
     builder = SFABuilder()
     builder.nope = True
-    (route,) = inventory(sparse_types(types), topology, specs=[MLASpec()], builders=[builder])
+    (route,) = inventory(sparse_types(types), parallel_config, specs=[MLASpec()], builders=[builder])
     assert route.status is DraftWindowProviderStatus.PROVIDER_MISSING
     assert "NoPE" in route.reason
 
@@ -675,10 +601,10 @@ def dsa_types(types):
 
 
 @pytest.mark.parametrize("builder,status", [(DSABuilder(), "DIRECT_DSA"), (DSACPBuilder(), "PROVIDER_MISSING")])
-def test_uncompressed_dsa_requires_native_window_and_actual_owner(types, topology, builder, status):
-    (route,) = inventory(dsa_types(types), topology, specs=[DSASpec()], builders=[builder])
+def test_uncompressed_dsa_requires_native_window_and_actual_owner(types, parallel_config, builder, status):
+    (route,) = inventory(dsa_types(types), parallel_config, specs=[DSASpec()], builders=[builder])
     assert route.status.value == status
-    assert route.topology.dsa_cp_effective == isinstance(builder, DSACPBuilder)
+    assert route.read_semantics == ("dsa_cp_derived" if isinstance(builder, DSACPBuilder) else "replicated")
     if isinstance(builder, DSACPBuilder):
         assert "MRV2 startup contract" in route.reason
         with pytest.raises(NotImplementedError, match="Legacy DSA-CP"):
@@ -688,23 +614,23 @@ def test_uncompressed_dsa_requires_native_window_and_actual_owner(types, topolog
 @pytest.mark.parametrize(
     "field,value", [("sliding_window", 256), ("bounded_replay", True), ("model_version", "packed")]
 )
-def test_dsa_native_window_and_replay_contracts_do_not_silently_inherit_provider(types, topology, field, value):
+def test_dsa_native_window_and_replay_contracts_do_not_silently_inherit_provider(types, parallel_config, field, value):
     spec = DSASpec()
     setattr(spec, field, value)
-    (route,) = inventory(dsa_types(types), topology, specs=[spec], builders=[DSABuilder()])
+    (route,) = inventory(dsa_types(types), parallel_config, specs=[spec], builders=[DSABuilder()])
     assert route.status is DraftWindowProviderStatus.PROVIDER_MISSING
 
 
-def test_deferred_dsa_producer_requires_separate_completion_contract(types, topology):
+def test_deferred_dsa_producer_requires_separate_completion_contract(types, parallel_config):
     builder = DSABuilder()
     builder._device_metadata_enabled = True
-    (route,) = inventory(dsa_types(types), topology, specs=[DSASpec()], builders=[builder])
+    (route,) = inventory(dsa_types(types), parallel_config, specs=[DSASpec()], builders=[builder])
     assert route.status is DraftWindowProviderStatus.PROVIDER_MISSING
     assert "executor completion" in route.reason
 
 
-def test_small_window_native_intersection_gap(types, topology):
-    routes, _, context = native_swa_bundle(types, topology)
+def test_small_window_native_intersection_gap(types, parallel_config):
+    routes, _, context = native_swa_bundle(types, parallel_config)
     selected = select_native_swa_subset_routes(
         routes,
         window_size=1024,
