@@ -8,7 +8,7 @@ Unknown consumers remain missing providers instead of being silently skipped.
 """
 
 from collections.abc import Callable, Sequence
-from dataclasses import asdict, dataclass, replace
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any
 
@@ -26,56 +26,16 @@ class DraftWindowProviderStatus(str, Enum):
 
 @dataclass(frozen=True)
 class DraftWindowTopology:
-    tensor_parallel_size: int
-    data_parallel_size: int
-    pipeline_parallel_size: int
+    """Only the coordinates used by a Draft reader, not executor diagnostics."""
+
     prefill_context_parallel_size: int
     decode_context_parallel_size: int
-    cp_rank: int
-    cp_interleave: int
-    sequence_parallel: bool
-    expert_parallel: bool
-    flashcomm_requested: bool | None
-    dsa_cp_requested: bool | None
-    dsa_cp_effective: bool
-    tensor_parallel_rank: int | None = None
-    dsa_cp_config_enabled: bool | None = None
-
-    @property
-    def flashcomm_effective(self) -> bool:
-        return self.sequence_parallel
+    dsa_cp_effective: bool = False
 
     @classmethod
-    def from_config(
-        cls,
-        config: Any,
-        block_tables: Any,
-        *,
-        dsa_cp_effective: bool,
-        flashcomm_requested: bool | None = None,
-        dsa_cp_requested: bool | None = None,
-    ) -> "DraftWindowTopology":
-        """Use the reconstructed draft config, not the target model's config.
-
-        ``use_sequence_parallel_moe`` is the effective FlashComm/SP authority.
-        Requested flags are diagnostics only and may be unknown (e.g. an
-        environment request already consumed by config validation).
-        """
+    def from_config(cls, config: Any) -> "DraftWindowTopology":
         parallel = config.parallel_config
-        return cls(
-            tensor_parallel_size=parallel.tensor_parallel_size,
-            data_parallel_size=parallel.data_parallel_size,
-            pipeline_parallel_size=parallel.pipeline_parallel_size,
-            prefill_context_parallel_size=parallel.prefill_context_parallel_size,
-            decode_context_parallel_size=parallel.decode_context_parallel_size,
-            cp_rank=block_tables.cp_rank,
-            cp_interleave=block_tables.cp_interleave,
-            sequence_parallel=parallel.use_sequence_parallel_moe,
-            expert_parallel=parallel.enable_expert_parallel,
-            flashcomm_requested=flashcomm_requested,
-            dsa_cp_requested=dsa_cp_requested,
-            dsa_cp_effective=dsa_cp_effective,
-        )
+        return cls(parallel.prefill_context_parallel_size, parallel.decode_context_parallel_size)
 
 
 @dataclass(frozen=True)
@@ -169,27 +129,106 @@ class DraftWindowBackendTypes:
 class DraftWindowGroupRoute:
     gid: int
     layers: tuple[str, ...]
-    backend: str
-    builder: str
-    family: str
-    kv_specs: tuple[str, ...]
     scheduler_block_size: int
     table_column_span: int
-    physical_block_size: int
-    compression_ratio: int
     topology: DraftWindowTopology
     status: DraftWindowProviderStatus
     reason: str
     native_window: int | None = None
 
-    def as_dict(self) -> dict[str, Any]:
-        result = asdict(self)
-        result["topology"]["flashcomm_effective"] = self.topology.flashcomm_effective
-        return result
 
+def _select_read_provider(
+    backend: type,
+    builder: Any,
+    specs: Sequence[Any],
+    types: DraftWindowBackendTypes,
+    topology: DraftWindowTopology,
+    *,
+    uncompressed: bool,
+    native_window: int | None,
+    uniform_windows: bool,
+    full_retention_dflash2: bool,
+) -> tuple[DraftWindowProviderStatus, str]:
+    """Match one actual consumer, then apply its layout-specific restrictions."""
+    status = DraftWindowProviderStatus
+    missing = status.PROVIDER_MISSING
+    if not uncompressed:
+        return missing, "Compressed or packed cache geometry needs a separate read provider"
 
-def _type_name(value: type) -> str:
-    return f"{value.__module__}.{value.__qualname__}"
+    def matches(backend_type: type | None, builder_types: tuple[type | None, ...], spec_type: type | None) -> bool:
+        return (
+            backend_type is not None
+            and backend is backend_type
+            and type(builder) in builder_types
+            and all(type(item) is spec_type for item in specs)
+        )
+
+    native = matches(types.dense_backend, (types.dense_builder,), types.sliding_window_spec)
+    if matches(types.dense_backend, (types.dense_builder,), types.full_attention_spec):
+        if (
+            all(getattr(item, "attention_chunk_size", None) is None for item in specs)
+            and uniform_windows
+            and not (full_retention_dflash2 and all(getattr(item, "sliding_window", None) for item in specs))
+        ):
+            selected = status.DIRECT_DENSE
+        elif full_retention_dflash2:
+            native = True
+        else:
+            return missing, "Dense chunked or nonuniform native attention needs a separate provider"
+    elif not native:
+        selected = missing
+        if matches(types.mla_backend, (types.mla_builder,), types.mla_spec):
+            if builder.flashmla_state is not None:
+                return missing, "FlashMLA persistent derived state needs a separate provider"
+            selected = status.DIRECT_MLA
+        elif matches(types.sfa_backend, (types.sfa_builder,), types.mla_spec):
+            if builder.nope:
+                return missing, "NoPE SFA has persistent sparse-kernel state requiring its own owner"
+            if any(item.non_causal_multi_token_decode for item in specs):
+                return missing, "Ordinary SFA kernels use causal sparse_mode=3 for multi-token queries"
+            selected = status.DIRECT_SFA
+        elif matches(types.dsa_backend, (types.dsa_builder, types.dsa_cp_builder), types.dsa_spec):
+            hf = builder.model_config.hf_config
+            if type(builder) is types.dsa_cp_builder:
+                return missing, "Legacy DSA-CP is rejected by the MRV2 startup contract; no Window provider is enabled"
+            if builder.compressor_ratio != 1:
+                return missing, "Compressed DSA needs a separate provider"
+            if builder._device_metadata_enabled:
+                return missing, "Deferred DSA metadata needs an executor completion contract"
+            if getattr(hf, "vision_n_layers", 0) > 0:
+                return missing, "DSA vision ranges require absolute-to-window coordinate projection"
+            if any(
+                item.model_version is not None or item.indexes_kv_by_block_stride or item.bounded_replay
+                for item in specs
+            ):
+                return missing, "Packed, strided, or replay DSA needs a separate read provider"
+            if hf.sliding_window <= 0 or any(item.sliding_window != hf.sliding_window for item in specs):
+                return missing, "DSA native-window kernel and resident cache geometry disagree"
+            selected = status.DIRECT_DSA
+        elif matches(types.indexer_backend, (types.indexer_builder,), types.indexer_spec):
+            if builder.use_pcp or builder.use_dcp or builder.use_dsa_cp:
+                return missing, "SFA indexer rank-local read coordinates need a separate provider"
+            if any(item.cache_sparse_li_c4 or item.sfa_dcp_replicated_indexer_size != 1 for item in specs):
+                return missing, "Packed C4 or replicated indexer pages need a separate provider"
+            return status.DIRECT_SFA_INDEXER, ""
+        if selected in (status.DIRECT_MLA, status.DIRECT_SFA) and any(
+            item.model_version is not None
+            or item.cache_sparse_sfa_c8
+            or item.cache_sparse_sfa_turboquant
+            or item.store_on_host
+            or item.indexes_kv_by_block_stride
+            for item in specs
+        ):
+            return missing, "Packed, offloaded, or strided MLA/SFA caches need a separate provider"
+        if selected is missing:
+            return missing, f"No read-view provider for {backend.__name__}/{type(builder).__name__}"
+    if native:
+        if not uniform_windows or native_window is None or native_window <= 0:
+            return missing, "Native SWA group has inconsistent windows"
+        selected = status.NATIVE_SWA_CANDIDATE
+    if topology.prefill_context_parallel_size != 1 or topology.decode_context_parallel_size != 1:
+        return missing, "Context-parallel read coordinates need a separate provider"
+    return selected, ""
 
 
 def inventory_draft_window_groups(
@@ -263,156 +302,25 @@ def inventory_draft_window_groups(
                     or (family == "SFA_INDEXER" and builder.use_dsa_cp)
                 ),
             )
-            reason = "No read-view provider is registered for this consumer"
-            status = DraftWindowProviderStatus.PROVIDER_MISSING
             windows = {getattr(item, "sliding_window", None) for item in consumer_specs}
             native_window = next(iter(windows)) if len(windows) == 1 else None
-            if (
-                backend is types.dense_backend
-                and type(builder) is types.dense_builder
-                and all(type(item) is types.full_attention_spec for item in consumer_specs)
-                and all(getattr(item, "attention_chunk_size", None) is None for item in consumer_specs)
-                and len(windows) == 1
-                and not (
-                    full_retention_dflash2 and all(getattr(item, "sliding_window", None) for item in consumer_specs)
-                )
-                and ratio == 1
-                and storage_size == scheduler_span
-            ):
-                if topology.prefill_context_parallel_size != 1 or topology.decode_context_parallel_size != 1:
-                    reason = "Context-parallel read coordinates need a separate provider"
-                else:
-                    status = DraftWindowProviderStatus.DIRECT_DENSE
-                    reason = "Dense kernel-column read view; Full write/query coordinates stay unchanged"
-            elif (
-                types.sliding_window_spec is not None
-                and backend is types.dense_backend
-                and type(builder) is types.dense_builder
-                and (
-                    all(type(item) is types.sliding_window_spec for item in consumer_specs)
-                    or (
-                        full_retention_dflash2
-                        and all(type(item) is types.full_attention_spec for item in consumer_specs)
-                    )
-                )
-                and ratio == 1
-                and storage_size == scheduler_span
-            ):
-                if topology.prefill_context_parallel_size != 1 or topology.decode_context_parallel_size != 1:
-                    reason = "Native SWA context-parallel coordinates need a separate provider"
-                elif len(windows) != 1 or native_window is None or native_window <= 0:
-                    reason = "Native SWA group has inconsistent windows"
-                else:
-                    native_window = int(native_window)
-                    status = DraftWindowProviderStatus.NATIVE_SWA_CANDIDATE
-                    reason = "Native SWA may already be a subset; requires a static query/window coverage certificate"
-            elif (
-                types.mla_backend is not None
-                and backend is types.mla_backend
-                and type(builder) is types.mla_builder
-                and all(type(item) is types.mla_spec for item in consumer_specs)
-                and ratio == 1
-                and storage_size == scheduler_span
-            ):
-                if topology.prefill_context_parallel_size != 1 or topology.decode_context_parallel_size != 1:
-                    reason = "MLA context-parallel read coordinates need a separate provider"
-                elif builder.flashmla_state is not None:
-                    reason = "FlashMLA persistent derived state needs a separate provider"
-                elif any(
-                    item.model_version is not None
-                    or item.cache_sparse_sfa_c8
-                    or item.cache_sparse_sfa_turboquant
-                    or item.store_on_host
-                    or item.indexes_kv_by_block_stride
-                    for item in consumer_specs
-                ):
-                    reason = "Packed, offloaded, or strided MLA caches need a separate provider"
-                else:
-                    status = DraftWindowProviderStatus.DIRECT_MLA
-                    reason = "Uncompressed MLA read projection with proposal-owned decode RoPE"
-            elif (
-                types.dsa_backend is not None
-                and backend is types.dsa_backend
-                and type(builder) in (types.dsa_builder, types.dsa_cp_builder)
-                and all(type(item) is types.dsa_spec for item in consumer_specs)
-                and ratio == 1
-                and storage_size == scheduler_span
-                and builder.compressor_ratio == 1
-            ):
-                hf = builder.model_config.hf_config
-                if type(builder) is types.dsa_cp_builder:
-                    reason = "Legacy DSA-CP is rejected by the MRV2 startup contract; no Window provider is enabled"
-                elif topology.prefill_context_parallel_size != 1 or topology.decode_context_parallel_size != 1:
-                    reason = "DSA PCP/DCP read coordinates need a separate provider"
-                elif builder._device_metadata_enabled:
-                    reason = "Deferred DSA metadata needs an executor completion contract"
-                elif getattr(hf, "vision_n_layers", 0) > 0:
-                    reason = "DSA vision ranges require absolute-to-window coordinate projection"
-                elif any(
-                    item.model_version is not None or item.indexes_kv_by_block_stride or item.bounded_replay
-                    for item in consumer_specs
-                ):
-                    reason = "Packed, strided, or replay DSA needs a separate read provider"
-                elif hf.sliding_window <= 0 or any(item.sliding_window != hf.sliding_window for item in consumer_specs):
-                    reason = "DSA native-window kernel and resident cache geometry disagree"
-                else:
-                    status = DraftWindowProviderStatus.DIRECT_DSA
-                    reason = "Native-window intersection with proposal-owned DSA derived state"
-            elif (
-                types.sfa_backend is not None
-                and backend is types.sfa_backend
-                and type(builder) is types.sfa_builder
-                and all(type(item) is types.mla_spec for item in consumer_specs)
-                and ratio == 1
-                and storage_size == scheduler_span
-            ):
-                if topology.prefill_context_parallel_size != 1 or topology.decode_context_parallel_size != 1:
-                    reason = "SFA context-parallel read coordinates need a separate provider"
-                elif builder.nope:
-                    reason = "NoPE SFA has persistent sparse-kernel state requiring its own owner"
-                elif any(
-                    item.model_version is not None
-                    or item.cache_sparse_sfa_c8
-                    or item.cache_sparse_sfa_turboquant
-                    or item.store_on_host
-                    or item.indexes_kv_by_block_stride
-                    for item in consumer_specs
-                ):
-                    reason = "Packed, offloaded, or strided SFA caches need a separate provider"
-                elif any(item.non_causal_multi_token_decode for item in consumer_specs):
-                    reason = "Ordinary SFA kernels use causal sparse_mode=3 for multi-token queries"
-                else:
-                    status = DraftWindowProviderStatus.DIRECT_SFA
-                    reason = "SFA and its indexer select relative indices from the same logical read window"
-            elif (
-                types.indexer_backend is not None
-                and backend is types.indexer_backend
-                and type(builder) is types.indexer_builder
-                and all(type(item) is types.indexer_spec for item in consumer_specs)
-                and ratio == 1
-                and storage_size == scheduler_span
-            ):
-                if builder.use_pcp or builder.use_dcp or builder.use_dsa_cp:
-                    reason = "SFA indexer rank-local read coordinates need a separate provider"
-                elif any(
-                    item.cache_sparse_li_c4 or item.sfa_dcp_replicated_indexer_size != 1 for item in consumer_specs
-                ):
-                    reason = "Packed C4 or replicated indexer pages need a separate provider"
-                else:
-                    status = DraftWindowProviderStatus.DIRECT_SFA_INDEXER
-                    reason = "Full indexer K/scale pages use the same table-relative Window coordinates"
+            status, reason = _select_read_provider(
+                backend,
+                builder,
+                consumer_specs,
+                types,
+                route_topology,
+                uncompressed=ratio == 1 and storage_size == scheduler_span,
+                native_window=native_window,
+                uniform_windows=len(windows) == 1,
+                full_retention_dflash2=full_retention_dflash2,
+            )
             routes.append(
                 DraftWindowGroupRoute(
                     gid=gid,
                     layers=tuple(group.layer_names),
-                    backend=_type_name(backend),
-                    builder=_type_name(type(builder)),
-                    family=family,
-                    kv_specs=tuple(_type_name(type(item)) for item in consumer_specs),
                     scheduler_block_size=scheduler_span,
                     table_column_span=column_span,
-                    physical_block_size=column_span // ratio,
-                    compression_ratio=ratio,
                     topology=route_topology,
                     status=status,
                     reason=reason,
@@ -432,32 +340,14 @@ def require_draft_window_providers(routes: Sequence[DraftWindowGroupRoute]) -> N
         if route.status in (DraftWindowProviderStatus.PROVIDER_MISSING, DraftWindowProviderStatus.NATIVE_SWA_CANDIDATE)
     ]
     if missing:
-        details = "; ".join(f"gid={route.gid}, {route.builder}: {route.reason}" for route in missing)
+        details = "; ".join(f"gid={route.gid}: {route.reason}" for route in missing)
         raise NotImplementedError(f"Draft Window provider missing: {details}")
 
 
 def describe_draft_window_routes(speculator: Any) -> tuple[DraftWindowGroupRoute, ...]:
     """Inspect initialized draft attention; never invoke from the OFF path."""
-    from vllm.distributed import get_tensor_model_parallel_rank
-
-    from vllm_ascend.utils import enable_dsa_cp
-
     config = speculator.attn_vllm_config
-    requested = config.additional_config or {}
-    flashcomm = requested.get("enable_flashcomm1")
-    dsa_cp = requested.get("enable_dsa_cp")
-    topology = DraftWindowTopology.from_config(
-        config,
-        speculator.block_tables,
-        dsa_cp_effective=enable_dsa_cp(),
-        flashcomm_requested=flashcomm if isinstance(flashcomm, bool) else None,
-        dsa_cp_requested=dsa_cp if isinstance(dsa_cp, bool) else None,
-    )
-    topology = replace(
-        topology,
-        tensor_parallel_rank=get_tensor_model_parallel_rank(),
-        dsa_cp_config_enabled=topology.dsa_cp_effective,
-    )
+    topology = DraftWindowTopology.from_config(config)
     routes = inventory_draft_window_groups(
         attn_groups=speculator.attn_groups,
         kv_cache_config=speculator.kv_cache_config,
@@ -609,10 +499,3 @@ def require_direct_prefix_routes(
         validate_sfa_read_consumers(speculator.attn_vllm_config.compilation_config.static_forward_context, routes)
     require_compatible_direct_prefix_routes(routes)
     return routes
-
-
-def project_draft_window_start(start_tokens: int, route: DraftWindowGroupRoute) -> int:
-    """Project one logical start exactly; never round away a read offset."""
-    if start_tokens < 0 or start_tokens % route.table_column_span:
-        raise ValueError(f"Draft Window start {start_tokens} is not representable by KV group {route.gid}")
-    return start_tokens // route.table_column_span

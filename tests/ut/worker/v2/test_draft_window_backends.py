@@ -17,7 +17,6 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_backends import (
     DraftWindowProviderStatus,
     DraftWindowTopology,
     inventory_draft_window_groups,
-    project_draft_window_start,
     require_compatible_direct_prefix_routes,
     require_draft_window_providers,
     select_native_swa_subset_routes,
@@ -75,7 +74,7 @@ def types():
 
 @pytest.fixture
 def topology():
-    return DraftWindowTopology(1, 1, 1, 1, 1, 0, 1, False, False, None, None, False)
+    return DraftWindowTopology(1, 1)
 
 
 def inventory(
@@ -230,7 +229,7 @@ def test_graph_source_uses_shared_route_without_promoting_native_swa(
 def test_kernel_column_span_is_not_scheduler_block_size(types, topology):
     (route,) = inventory(types, topology)
     assert route.scheduler_block_size == 256
-    assert route.table_column_span == route.physical_block_size == 128
+    assert route.table_column_span == 128
     assert route.status is DraftWindowProviderStatus.DIRECT_DENSE
     require_draft_window_providers((route,))
 
@@ -392,10 +391,7 @@ def test_compressed_geometry_records_raw_and_physical_units(types, topology, rat
     (route,) = inventory(
         types, topology, specs=[FullSpec(span * 2, ratio)], builders=[CompressedBuilder()], spans=[span]
     )
-    assert route.compression_ratio == ratio
     assert route.table_column_span == span
-    assert route.physical_block_size == span // ratio
-    assert route.family == "DSA"
     assert route.status is DraftWindowProviderStatus.PROVIDER_MISSING
 
 
@@ -412,12 +408,17 @@ def test_cp_needs_coordinate_provider(types, topology, parallel):
 
 
 def test_tp_and_effective_sp_are_separate_from_cp(types, topology):
-    parallel = replace(topology, tensor_parallel_size=16, sequence_parallel=True, expert_parallel=True)
-    (route,) = inventory(types, parallel)
-    # Addressing candidate only: this does not certify asynchronous completion.
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=16,
+            use_sequence_parallel_moe=True,
+            enable_expert_parallel=True,
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=1,
+        )
+    )
+    (route,) = inventory(types, DraftWindowTopology.from_config(config))
     assert route.status is DraftWindowProviderStatus.DIRECT_DENSE
-    assert route.topology.sequence_parallel
-    assert route.topology.flashcomm_requested is None
 
 
 def test_every_active_gid_is_retained_and_missing_provider_blocks_bundle(types, topology):
@@ -435,9 +436,7 @@ def test_every_active_gid_is_retained_and_missing_provider_blocks_bundle(types, 
 
 def test_uniform_wrapper_is_unwrapped_without_inventing_residency(types, topology):
     (route,) = inventory(types, topology, specs=[UniformSpec({"a": FullSpec(), "b": FullSpec()})])
-    assert len(route.kv_specs) == 2
     assert route.status is DraftWindowProviderStatus.DIRECT_DENSE
-    assert "resident" not in route.as_dict()
 
 
 @pytest.mark.parametrize(
@@ -458,32 +457,16 @@ def test_empty_inventory_is_not_success():
         require_draft_window_providers(())
 
 
-def test_requested_flag_cannot_override_effective_config():
-    parallel = SimpleNamespace(
-        tensor_parallel_size=16,
-        data_parallel_size=1,
-        pipeline_parallel_size=1,
-        prefill_context_parallel_size=1,
-        decode_context_parallel_size=1,
-        use_sequence_parallel_moe=False,
-        enable_expert_parallel=True,
-    )
-    topology = DraftWindowTopology.from_config(
-        SimpleNamespace(parallel_config=parallel),
-        SimpleNamespace(cp_rank=0, cp_interleave=1),
-        dsa_cp_effective=False,
-        flashcomm_requested=True,
-        dsa_cp_requested=True,
-    )
-    assert topology.flashcomm_requested is True
-    assert topology.flashcomm_effective is False
-    assert topology.dsa_cp_effective is False
+def test_requested_flag_cannot_override_actual_read_coordinates():
+    parallel = SimpleNamespace(prefill_context_parallel_size=1, decode_context_parallel_size=1)
+    config = SimpleNamespace(parallel_config=parallel, additional_config={"enable_dsa_cp": True})
+    topology = DraftWindowTopology.from_config(config)
+    assert topology == DraftWindowTopology(1, 1, False)
 
 
 def test_unknown_second_gid_is_never_ignored(types, topology):
     routes = inventory(types, topology, specs=[FullSpec(), FullSpec()], builders=[DenseBuilder(), object()])
     assert len(routes) == 2
-    assert routes[1].family == "UNKNOWN"
     with pytest.raises(NotImplementedError, match="gid=1"):
         require_draft_window_providers(routes)
 
@@ -495,7 +478,7 @@ def test_multi_group_projection_preserves_first_group_start(types, topology, anc
     # The logical read start is decided once using the first group's B.
     end, window, future = 2051, 1024, 8
     start = max(end + future - window, 0) // anchor * anchor
-    columns = [project_draft_window_start(start, route) for route in routes]
+    columns = [start // route.table_column_span for route in routes]
     assert all(column * route.table_column_span == start for column, route in zip(columns, routes))
     assert [route.gid for route in routes] == [0, 1]
 
@@ -504,24 +487,14 @@ def test_incompatible_multi_group_alignment_rejected_before_request_arrives(type
     routes = inventory(types, topology, specs=[FullSpec(256), FullSpec(256)], spans=[64, 128])
     # S=128 happens to be representable in both groups, but S=64 is not.
     # Accepting only the first request would create a serving-time failure.
-    assert [project_draft_window_start(128, route) for route in routes] == [2, 1]
+    assert [128 // route.table_column_span for route in routes] == [2, 1]
     with pytest.raises(NotImplementedError, match="first group span 64"):
         require_compatible_direct_prefix_routes(routes)
-    with pytest.raises(ValueError, match="not representable"):
-        project_draft_window_start(64, routes[1])
-
-
-def test_multi_group_projection_does_not_round_or_accept_negative_offset(types, topology):
-    (route,) = inventory(types, topology)
-    for start in [-128, 1, 129]:
-        with pytest.raises(ValueError, match="not representable"):
-            project_draft_window_start(start, route)
 
 
 def test_target_dsa_cp_does_not_reclassify_dense_draft(types, topology):
-    (route,) = inventory(types, replace(topology, dsa_cp_effective=True, dsa_cp_config_enabled=True))
+    (route,) = inventory(types, replace(topology, dsa_cp_effective=True))
     assert route.status is DraftWindowProviderStatus.DIRECT_DENSE
-    assert route.topology.dsa_cp_config_enabled is True
     assert route.topology.dsa_cp_effective is False
 
 
@@ -637,7 +610,7 @@ def test_mixed_uniform_group_uses_each_consumers_actual_spec(types, topology):
         DraftWindowProviderStatus.DIRECT_SFA,
         DraftWindowProviderStatus.DIRECT_SFA_INDEXER,
     ]
-    assert all(route.gid == 0 and len(route.kv_specs) == 1 for route in routes)
+    assert all(route.gid == 0 and len(route.layers) == 1 for route in routes)
     require_compatible_direct_prefix_routes(routes)
 
 
@@ -646,7 +619,6 @@ def test_indexer_c8_quantization_keeps_token_coordinate_span(types, topology):
     spec.cache_sparse_li_c8 = True
     (route,) = inventory(sparse_types(types), topology, specs=[spec], builders=[IndexerBuilder()])
     assert route.status is DraftWindowProviderStatus.DIRECT_SFA_INDEXER
-    assert route.compression_ratio == 1
 
 
 @pytest.mark.parametrize("field", ["use_pcp", "use_dcp", "use_dsa_cp"])

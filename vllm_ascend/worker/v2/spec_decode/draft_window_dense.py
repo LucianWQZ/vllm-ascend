@@ -7,6 +7,8 @@ last valid token into masked scratch padding: masking uninitialized cache tail
 directly is unsafe because zero attention weights can still multiply NaNs.
 """
 
+from __future__ import annotations
+
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -16,6 +18,27 @@ import torch
 from vllm_ascend.worker.v2.spec_decode.draft_window_read import DirectPrefixSource
 
 DENSE_KV_ALIGNMENT = 32
+
+
+def _apply_read_metadata(read: DenseDraftRead | DenseDraftReadBatch, common: Any) -> None:
+    n = common.num_reqs
+    lengths = read.seq_lens.new_empty(n)
+    read.retain(lengths)
+    lengths.zero_()
+    lengths[: read.num_reqs] = read.seq_lens
+    common.seq_lens = lengths
+    # These are explicitly capacity/workspace bounds, never CPU exact.
+    common.seq_lens_cpu_upper_bound = torch.full((n,), read.capacity, dtype=torch.int32, device="cpu")
+    common.seq_lens_cpu = None
+    common._seq_lens_cpu = None
+    common.max_seq_len = read.capacity
+    common._draft_window_device_read = read
+
+
+def _read_capacity_cpu(read: DenseDraftRead | DenseDraftReadBatch, common: Any) -> torch.Tensor:
+    if getattr(common, "_draft_window_device_read", None) is not read:
+        raise ValueError("Dense Draft read belongs to another common metadata object")
+    return torch.full((common.num_reqs,), read.capacity, dtype=torch.int32, device="cpu")
 
 
 @dataclass(frozen=True)
@@ -42,13 +65,8 @@ class DenseDraftRead:
     def num_reqs(self) -> int:
         return self.slots.shape[0]
 
-    def apply(self, common: Any) -> None:
-        _apply_read_metadata(self, common)
-
-    def capacity_cpu(self, common: Any) -> torch.Tensor:
-        if getattr(common, "_draft_window_device_read", None) is not self:
-            raise ValueError("Dense Draft read belongs to another common metadata object")
-        return torch.full((common.num_reqs,), self.capacity, dtype=torch.int32, device="cpu")
+    apply = _apply_read_metadata
+    capacity_cpu = _read_capacity_cpu
 
 
 @dataclass(frozen=True)
@@ -79,28 +97,8 @@ class DenseDraftReadBatch:
     def num_reqs(self) -> int:
         return self.seq_lens.numel()
 
-    def apply(self, common: Any) -> None:
-        _apply_read_metadata(self, common)
-
-    def capacity_cpu(self, common: Any) -> torch.Tensor:
-        if getattr(common, "_draft_window_device_read", None) is not self:
-            raise ValueError("Dense Draft read belongs to another common metadata object")
-        return torch.full((common.num_reqs,), self.capacity, dtype=torch.int32, device="cpu")
-
-
-def _apply_read_metadata(read: DenseDraftRead | DenseDraftReadBatch, common: Any) -> None:
-    n = common.num_reqs
-    lengths = read.seq_lens.new_empty(n)
-    read.retain(lengths)
-    lengths.zero_()
-    lengths[: read.num_reqs] = read.seq_lens
-    common.seq_lens = lengths
-    # These are explicitly capacity/workspace bounds, never CPU exact.
-    common.seq_lens_cpu_upper_bound = torch.full((n,), read.capacity, dtype=torch.int32, device="cpu")
-    common.seq_lens_cpu = None
-    common._seq_lens_cpu = None
-    common.max_seq_len = read.capacity
-    common._draft_window_device_read = read
+    apply = _apply_read_metadata
+    capacity_cpu = _read_capacity_cpu
 
 
 def _copy_owned_read_tensor(

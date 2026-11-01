@@ -16,6 +16,18 @@ import numpy as np
 import torch
 
 
+def _canonical_source_fields(
+    owner: Any, gid: int, request_rows: np.ndarray
+) -> tuple[torch.Tensor, tuple[int, ...], tuple[int, ...], int]:
+    # Canonical num_blocks counts expanded kernel columns, not manager blocks.
+    rows = tuple(int(row) for row in request_rows)
+    table = owner.block_tables[gid].gpu
+    if any(row < 0 or row >= table.shape[0] for row in rows):
+        raise ValueError("Draft read source contains an inactive request row")
+    counts = tuple(int(owner.num_blocks.np[gid, row]) for row in rows)
+    return table, rows, counts, int(owner.kernel_block_sizes[gid])
+
+
 @dataclass(frozen=True)
 class DirectPrefixSource:
     """Borrowed canonical owner and a snapshot of the current request mapping.
@@ -32,24 +44,12 @@ class DirectPrefixSource:
 
     @classmethod
     def from_block_tables(cls, owner: Any, gid: int, request_rows: np.ndarray):
-        # AscendBlockTables.append_block_ids expands physical blocks into
-        # kernel columns before updating num_blocks (including on vLLM main).
-        rows = tuple(int(row) for row in request_rows)
-        table = owner.block_tables[gid].gpu
-        if any(row < 0 or row >= table.shape[0] for row in rows):
-            raise ValueError("Draft read source contains an inactive request row")
-        counts = tuple(int(owner.num_blocks.np[gid, row]) for row in rows)
-        return cls(table, rows, counts, int(owner.kernel_block_sizes[gid]))
+        return cls(*_canonical_source_fields(owner, gid, request_rows))
 
 
 @dataclass(frozen=True)
 class NativeSWASource:
-    """Canonical logical table for an unchanged causal native-SWA consumer.
-
-    Old columns may be null/evicted. Only the consumer's native band is
-    certified resident; an extra Window intersects that band, never extends it.
-    valid_columns is the logical table extent, not a resident Full prefix.
-    """
+    """Only the native band is resident; logical extent is not Full residency."""
 
     table: torch.Tensor
     request_rows: tuple[int, ...]
@@ -59,12 +59,9 @@ class NativeSWASource:
 
     @classmethod
     def from_block_tables(cls, owner: Any, gid: int, request_rows: np.ndarray, native_window: int):
-        rows = tuple(int(row) for row in request_rows)
-        table = owner.block_tables[gid].gpu
-        if native_window <= 0 or any(row < 0 or row >= table.shape[0] for row in rows):
-            raise ValueError("Native SWA requires a valid current canonical mapping and positive window")
-        counts = tuple(int(owner.num_blocks.np[gid, row]) for row in rows)
-        return cls(table, rows, counts, int(owner.kernel_block_sizes[gid]), native_window)
+        if native_window <= 0:
+            raise ValueError("Native SWA requires a positive window")
+        return cls(*_canonical_source_fields(owner, gid, request_rows), native_window)
 
 
 @dataclass(frozen=True)
