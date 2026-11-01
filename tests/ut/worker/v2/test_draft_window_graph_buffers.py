@@ -54,15 +54,9 @@ def graph_buffers():
     group = DraftWindowGroupRoute(
         gid=0,
         layers=("draft.layer",),
-        backend="dense_backend",
-        builder="dense_builder",
-        family="GQA",
-        kv_specs=("Full",),
         scheduler_block_size=4,
         table_column_span=4,
-        physical_block_size=4,
-        compression_ratio=1,
-        topology=DraftWindowTopology(1, 1, 1, 1, 1, 0, 1, False, False, False, False, False),
+        topology=DraftWindowTopology(1, 1),
         status=DraftWindowProviderStatus.DIRECT_DENSE,
         reason="direct CPU fixture",
     )
@@ -574,3 +568,57 @@ def test_runtime_group_rejects_a_descriptor_for_another_cache_group(graph_buffer
             phase=DraftWindowExecutionPhase.PROPOSAL,
             step=0,
         )
+
+
+@pytest.fixture
+def typed_update_guard(graph_buffers):
+    import torch_npu
+
+    from vllm_ascend.attention.attention_v1 import FIAParamProvider
+
+    case = graph_buffers
+    inputs = _materialize(case)
+    carrier = _bind(case, inputs)
+    metadata = case.provider.consume_metadata(route=case.capture.route, expected_consumer_count=1)[0]["draft.layer"]
+    provider = FIAParamProvider(layer_name="draft.layer", sliding_window=None, is_draft_model=True)
+    captured = SimpleNamespace(handle=object(), event=object(), provider=provider, provider_index=0)
+    task = SimpleNamespace(
+        handle=captured.handle,
+        event=captured.event,
+        provider=provider,
+        provider_index=0,
+        operation=torch_npu.npu_fused_infer_attention_score.out,
+        kwargs={
+            "block_table": metadata.block_tables,
+            "actual_seq_lengths_kv": metadata.seq_lens_list,
+            "actual_seq_lengths": metadata.actual_seq_lengths_q,
+        },
+    )
+    return SimpleNamespace(case=case, carrier=carrier, graph=SimpleNamespace(tasks=[captured]), task=task)
+
+
+def test_update_uses_actual_submitted_metadata_and_marks_only_that_bank_updated(typed_update_guard):
+    from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphCarrierState
+
+    c = typed_update_guard
+    c.case.provider.validate_update(c.graph, [c.task], route=c.case.capture.route)
+    assert c.carrier.state is DraftWindowGraphCarrierState.UPDATED
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["handle", "event", "provider_index", "operation", "block_table", "actual_seq_lengths_kv", "actual_seq_lengths"],
+)
+def test_update_rejects_stale_handles_or_replaced_operands(typed_update_guard, field):
+    from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphCarrierState
+
+    c = typed_update_guard
+    if field == "provider_index":
+        c.task.provider_index = 1
+    elif field in c.task.kwargs:
+        c.task.kwargs[field] = object()
+    else:
+        setattr(c.task, field, object())
+    with pytest.raises(RuntimeError):
+        c.case.provider.validate_update(c.graph, [c.task], route=c.case.capture.route)
+    assert c.carrier.state is DraftWindowGraphCarrierState.SUBMITTED

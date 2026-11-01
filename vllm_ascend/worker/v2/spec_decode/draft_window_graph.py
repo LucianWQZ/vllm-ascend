@@ -13,13 +13,10 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import torch
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
-
-if TYPE_CHECKING:
-    from vllm_ascend.worker.v2.spec_decode.draft_window_swa_graph import NativeSWAFullSnapshot
 
 from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftMetadataInputs,
@@ -140,23 +137,6 @@ class DraftWindowGraphReadCarrier:
     write_side_reference: DraftWindowGraphWriteSideReference | None = None
     write_side_snapshot: _DraftWindowGraphWriteSideSnapshot | None = None
     state: DraftWindowGraphCarrierState = DraftWindowGraphCarrierState.EMPTY
-    native_full_snapshot: NativeSWAFullSnapshot | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class DraftWindowGraphMetadataBuild:
-    metadata: Mapping[str, Any]
-    native_full_snapshot: NativeSWAFullSnapshot | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class DraftWindowGraphUpdateBinding:
-    """Exact submitted carrier set passed to the real backend update seam."""
-
-    provider: DraftWindowGraphBindingProvider
-    route: DraftWindowGraphRoute
-    carriers: tuple[DraftWindowGraphReadCarrier, ...]
-    metadata_object_ids: tuple[int, ...]
 
 
 _ROUTE_CONTRACTS: dict[
@@ -231,11 +211,6 @@ def _bank_snapshot(backing: Any) -> tuple[DraftWindowGraphTensorIdentity, ...]:
     )
 
 
-def _class_path(value: type[Any] | Any) -> str:
-    value_type = value if isinstance(value, type) else type(value)
-    return f"{value_type.__module__}.{value_type.__qualname__}"
-
-
 def _validate_route(
     route: DraftWindowGraphRoute,
     generation: DraftWindowGenerationIdentity,
@@ -281,7 +256,6 @@ class DraftWindowGraphBindingProvider:
             )
         ):
             raise ValueError("Draft Graph read banks require replicated reads and PP=PCP=DCP=1")
-        self._native_swa_capture_plan = getattr(runtime_state.capability, "native_swa_graph", None)
         self._carriers: dict[DraftWindowGraphCaptureIdentity, DraftWindowGraphReadCarrier] = {}
         self._submitted_carriers: tuple[DraftWindowGraphReadCarrier, ...] = ()
 
@@ -325,37 +299,6 @@ class DraftWindowGraphBindingProvider:
     def inventory_method(self) -> str:
         """Return the P2-normalized method owned by this provider."""
         return self._runtime_state.capability.inventory.method
-
-    @property
-    def native_swa_graph_plan(self):
-        plan = getattr(self._runtime_state.capability, "native_swa_graph", None)
-        if plan is not self._native_swa_capture_plan:
-            raise RuntimeError("native SWA program/source contract changed after provider installation")
-        return plan
-
-    def _window_metadata(self, metadata):
-        plan = self.native_swa_graph_plan
-        return metadata if plan is None else plan.window_metadata(metadata)
-
-    def _validate_native_metadata(self, metadata, snapshot, identity, write_side):
-        plan = self.native_swa_graph_plan
-        if plan is None:
-            if snapshot is not None:
-                raise RuntimeError("unexpected native SWA snapshot on a single-group Graph route")
-            return
-        from vllm_ascend.worker.v2.spec_decode.draft_window_swa_graph import NativeSWAFullSnapshot
-
-        if not isinstance(snapshot, NativeSWAFullSnapshot):
-            raise RuntimeError("native SWA Graph carrier has no generation-owned full snapshot")
-        if identity is None:
-            raise RuntimeError("native SWA Graph update has no active generation")
-        plan.validate_native_metadata(
-            metadata,
-            source=self._runtime_state.capability.full_source._block_tables_owner,
-            snapshot=snapshot,
-            expected=identity,
-            write_side=write_side,
-        )
 
     def register_capture_identity(
         self,
@@ -410,15 +353,20 @@ class DraftWindowGraphBindingProvider:
         carrier = self._require_registered_capture(capture_identity)
         if carrier.state in (DraftWindowGraphCarrierState.BOUND, DraftWindowGraphCarrierState.SUBMITTED):
             raise RuntimeError("cannot overwrite an active Draft Window graph read carrier")
+        self.require_reusable()
+        return carrier.workspace
+
+    def require_reusable(self) -> None:
+        """Keep every proposal on its established completion stream."""
         if self._runtime_state.quarantined_identity is not None:
             raise RuntimeError("Draft Window bank is quarantined after uncertain submission")
-        if carrier.workspace.window_block_table.device.type != "cpu":
+        source = self._capability.full_source._input_block_tables[self.group.gid]
+        if source.device.type != "cpu":
             stream = int(torch.npu.current_stream().npu_stream)
             previous = getattr(self, "_owner_stream", stream)
             if stream != previous:
                 raise RuntimeError("Draft Window bank reuse changed stream without a completion dependency")
             self._owner_stream = stream
-        return carrier.workspace
 
     def bind_read_carrier(
         self,
@@ -427,7 +375,7 @@ class DraftWindowGraphBindingProvider:
         inputs: DraftMetadataInputs,
         metadata_builder: Callable[
             [DraftWindowWorkspace],
-            Mapping[str, Any] | DraftWindowGraphMetadataBuild,
+            Mapping[str, Any],
         ],
         target_metadata: Any,
         write_side_reference: DraftWindowGraphWriteSideReference | None = None,
@@ -461,22 +409,14 @@ class DraftWindowGraphBindingProvider:
 
         if inputs.workspace is not carrier.workspace:
             raise RuntimeError("Graph generation was not materialized into its exact capture bank")
-        build_result = metadata_builder(carrier.workspace)
-        if isinstance(build_result, DraftWindowGraphMetadataBuild):
-            metadata, native_snapshot = build_result.metadata, build_result.native_full_snapshot
-        else:
-            metadata, native_snapshot = build_result, None
+        metadata = metadata_builder(carrier.workspace)
         if not isinstance(metadata, Mapping) or not metadata:
             raise RuntimeError("explicit Draft Window graph carrier produced no Draft metadata")
-        self._validate_metadata_uses_carrier(
-            self._window_metadata(metadata), carrier.workspace, write_side_reference, write_side_snapshot
-        )
-        self._validate_native_metadata(metadata, native_snapshot, generation, write_side_reference)
+        self._validate_metadata_uses_carrier(metadata, carrier.workspace, write_side_reference, write_side_snapshot)
         self._runtime_state.publish_metadata(inputs, metadata, target_metadata=target_metadata)
 
         carrier.runtime_identity = generation
         carrier.metadata = metadata
-        carrier.native_full_snapshot = native_snapshot
         carrier.write_side_reference = write_side_reference
         carrier.write_side_snapshot = write_side_snapshot
         carrier.state = DraftWindowGraphCarrierState.BOUND
@@ -554,79 +494,50 @@ class DraftWindowGraphBindingProvider:
             if graph_mode is not None and identity.descriptor.cg_mode.name != graph_mode:
                 raise RuntimeError("graph replay mode mismatch")
 
-    def prepare_update_binding(
-        self,
-        *,
-        route: DraftWindowGraphRoute,
-        draft_attn_metadatas: Sequence[Mapping[str, Any]],
-    ) -> DraftWindowGraphUpdateBinding:
-        self.assert_metadata_batch(
-            route=route,
-            draft_attn_metadatas=draft_attn_metadatas,
-        )
+    def validate_update(self, graph: Any, tasks: Sequence[Any], *, route: DraftWindowGraphRoute) -> None:
+        """Validate actual submitted operands at the normal UPDATE boundary."""
+        import torch_npu
+
+        from vllm_ascend.attention.attention_v1 import FIAParamProvider
+
         carriers = self._require_submitted_route(route)
-        return DraftWindowGraphUpdateBinding(
-            provider=self,
-            route=route,
-            carriers=carriers,
-            metadata_object_ids=tuple(id(metadata) for metadata in draft_attn_metadatas),
-        )
-
-    def validate_backend_update(
-        self,
-        binding: DraftWindowGraphUpdateBinding,
-        *,
-        attn_backend: Any,
-        impl_cls: type[Any],
-        builder_cls: type[Any],
-        draft_attn_metadatas: Sequence[Mapping[str, Any]],
-        update_function_path: str,
-    ) -> None:
-        if binding.provider is not self:
-            raise RuntimeError("graph update binding belongs to another provider")
-        carriers = self._require_submitted_route(binding.route)
-        if carriers != binding.carriers:
-            raise RuntimeError("graph update carrier set changed before backend attribution")
-        if tuple(id(metadata) for metadata in draft_attn_metadatas) != binding.metadata_object_ids:
-            raise RuntimeError("graph update metadata differs from the submitted carrier batch")
-
-        # Only this exact implementation has source-verified per-task rebinding
-        # of Draft block_tables and read lengths in P6. Subclasses/other
-        # backends must be inventoried independently instead of inheriting the
-        # classification by name.
-        from vllm_ascend.attention.attention_v1 import AscendAttentionBackendImpl
-
-        if impl_cls is not AscendAttentionBackendImpl:
-            raise RuntimeError("graph backend consumer classification is unresolved")
-        expected_update_path = "vllm_ascend.compilation.updatable_graph.UpdatableGraph.update"
-        if update_function_path != expected_update_path:
-            raise RuntimeError("graph update function identity mismatch")
-
-        if _class_path(builder_cls) != self.group.builder:
-            raise RuntimeError("Graph metadata builder differs from the actual source route")
+        metadata_batch = tuple(carrier.metadata for carrier in carriers)
         self._validate_source_contract()
-        group = self._runtime_state.capability.inventory.require_single_group_direct_prefix()
-        expected_layers = set(group.layers)
-        for metadata in draft_attn_metadatas:
-            metadata_layers = set(self._window_metadata(metadata))
-            if not metadata_layers or not metadata_layers.issubset(expected_layers):
-                raise RuntimeError("Draft graph metadata layer group does not match backend inventory")
+        if len(tasks) != len(graph.tasks) or not tasks:
+            raise RuntimeError("Draft Window UPDATE task inventory changed")
+        for captured, task in zip(graph.tasks, tasks):
+            if (
+                task.handle is not captured.handle
+                or task.event is not captured.event
+                or task.provider != captured.provider
+                or task.provider_index != captured.provider_index
+            ):
+                raise RuntimeError("Draft Window UPDATE task does not belong to this captured graph")
+            if not isinstance(task.provider, FIAParamProvider) or not task.provider.is_draft_model:
+                raise RuntimeError("Draft Window typed UPDATE requires its inventoried Draft FIA consumer")
+            if task.operation != torch_npu.npu_fused_infer_attention_score.out:
+                raise RuntimeError("Draft Window typed UPDATE operation differs from its inventoried FIA path")
+            index = task.provider_index
+            if index >= len(metadata_batch):
+                raise RuntimeError("Draft Window UPDATE consumer index exceeds its metadata batch")
+            consumer_metadata = metadata_batch[index]
+            layer_metadata = None if consumer_metadata is None else consumer_metadata.get(task.provider.layer_name)
+            if layer_metadata is None:
+                raise RuntimeError("Draft Window UPDATE lost its actual layer metadata")
+            if (
+                task.kwargs.get("block_table") is not layer_metadata.block_tables
+                or task.kwargs.get("actual_seq_lengths_kv") is not layer_metadata.seq_lens_list
+                or task.kwargs.get("actual_seq_lengths") is not layer_metadata.actual_seq_lengths_q
+            ):
+                raise RuntimeError("Draft Window UPDATE operands are not the submitted metadata operands")
         for carrier in carriers:
             self._require_registered_capture(carrier.capture_identity)
-            assert carrier.metadata is not None
+            if carrier.metadata is None or not set(carrier.metadata).issubset(self.group.layers):
+                raise RuntimeError("Draft graph metadata layer group does not match backend inventory")
             if carrier.write_side_reference is None or carrier.write_side_snapshot is None:
                 raise RuntimeError("Draft graph carrier lost its full write-side reference")
             self._validate_metadata_uses_carrier(
-                self._window_metadata(carrier.metadata),
-                carrier.workspace,
-                carrier.write_side_reference,
-                carrier.write_side_snapshot,
-            )
-            self._validate_native_metadata(
-                carrier.metadata,
-                carrier.native_full_snapshot,
-                getattr(self._runtime_state._active_inputs, "identity", None),
-                carrier.write_side_reference,
+                carrier.metadata, carrier.workspace, carrier.write_side_reference, carrier.write_side_snapshot
             )
         for carrier in carriers:
             carrier.state = DraftWindowGraphCarrierState.UPDATED
@@ -882,116 +793,4 @@ def consume_draft_window_graph_metadata(
     return provider.consume_metadata(
         route=route,
         expected_consumer_count=expected_consumer_count,
-    )
-
-
-def assert_draft_window_graph_metadata_batch(
-    owner: Any,
-    *,
-    route: DraftWindowGraphRoute,
-    draft_attn_metadatas: Sequence[Mapping[str, Any]],
-    num_reqs: int | None = None,
-    num_tokens: int | None = None,
-    graph_mode: str | None = None,
-) -> None:
-    """Defense-in-depth check immediately before replay/forward."""
-    provider = getattr(owner, "_draft_window_graph_binding_provider", None)
-    if provider is None:
-        return
-    if not isinstance(provider, DraftWindowGraphBindingProvider):
-        raise TypeError("invalid instance-owned Draft Window graph binding provider")
-    provider.assert_metadata_batch(
-        route=route,
-        draft_attn_metadatas=draft_attn_metadatas,
-        num_reqs=num_reqs,
-        num_tokens=num_tokens,
-        graph_mode=graph_mode,
-    )
-
-
-def build_draft_window_graph_update_binding(
-    owner: Any,
-    *,
-    route: DraftWindowGraphRoute,
-    draft_attn_metadatas: Sequence[Mapping[str, Any]],
-) -> DraftWindowGraphUpdateBinding | None:
-    """Build the typed binding passed through the actual UPDATE entrance."""
-    provider = getattr(owner, "_draft_window_graph_binding_provider", None)
-    if provider is None:
-        return None
-    if not isinstance(provider, DraftWindowGraphBindingProvider):
-        raise TypeError("invalid instance-owned Draft Window graph binding provider")
-    return provider.prepare_update_binding(
-        route=route,
-        draft_attn_metadatas=draft_attn_metadatas,
-    )
-
-
-def validate_draft_window_graph_backend_update(
-    binding: DraftWindowGraphUpdateBinding | None,
-    *,
-    attn_backend: Any,
-    impl_cls: type[Any],
-    builder_cls: type[Any],
-    draft_attn_metadatas: Sequence[Mapping[str, Any]] | None,
-    update_function_path: str,
-) -> None:
-    """Derive consumer identity where the real backend implementation is known."""
-    if binding is None:
-        return None
-    if not isinstance(binding, DraftWindowGraphUpdateBinding):
-        raise TypeError("invalid Draft Window graph update binding")
-    if draft_attn_metadatas is None:
-        raise RuntimeError("Draft Window graph update requires Draft-private metadata")
-    return binding.provider.validate_backend_update(
-        binding,
-        attn_backend=attn_backend,
-        impl_cls=impl_cls,
-        builder_cls=builder_cls,
-        draft_attn_metadatas=draft_attn_metadatas,
-        update_function_path=update_function_path,
-    )
-
-
-def validate_draft_window_update_tasks(graph, tasks, binding, metadata_batch, backend, num_tokens):
-    """Validate resolved Draft operands immediately before ordinary Graph UPDATE."""
-    import torch_npu
-
-    from vllm_ascend.attention.attention_v1 import FIAParamProvider
-
-    if backend is None or num_tokens is None or metadata_batch is None:
-        raise RuntimeError("Draft Window UPDATE lost its backend, token count or metadata owner")
-    if len(tasks) != len(graph.tasks) or not tasks:
-        raise RuntimeError("Draft Window UPDATE task inventory changed")
-    for captured, task in zip(graph.tasks, tasks):
-        if (
-            task.handle is not captured.handle
-            or task.event is not captured.event
-            or task.provider != captured.provider
-            or task.provider_index != captured.provider_index
-        ):
-            raise RuntimeError("Draft Window UPDATE task does not belong to this captured graph")
-        if not isinstance(task.provider, FIAParamProvider) or not task.provider.is_draft_model:
-            raise RuntimeError("Draft Window typed UPDATE requires its inventoried Draft FIA consumer")
-        if task.operation != torch_npu.npu_fused_infer_attention_score.out:
-            raise RuntimeError("Draft Window typed UPDATE operation differs from its inventoried FIA path")
-        index = task.provider_index
-        if index >= len(metadata_batch):
-            raise RuntimeError("Draft Window UPDATE consumer index exceeds its metadata batch")
-        layer_metadata = metadata_batch[index].get(task.provider.layer_name)
-        if layer_metadata is None:
-            raise RuntimeError("Draft Window UPDATE lost its actual layer metadata")
-        if (
-            task.kwargs.get("block_table") is not layer_metadata.block_tables
-            or task.kwargs.get("actual_seq_lengths_kv") is not layer_metadata.seq_lens_list
-            or task.kwargs.get("actual_seq_lengths") is not layer_metadata.actual_seq_lengths_q
-        ):
-            raise RuntimeError("Draft Window UPDATE operands are not the submitted metadata operands")
-    validate_draft_window_graph_backend_update(
-        binding,
-        attn_backend=backend,
-        impl_cls=backend.get_impl_cls(),
-        builder_cls=backend.get_builder_cls(),
-        draft_attn_metadatas=metadata_batch,
-        update_function_path="vllm_ascend.compilation.updatable_graph.UpdatableGraph.update",
     )

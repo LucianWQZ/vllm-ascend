@@ -9,9 +9,8 @@ model, numerical, capture and lifetime evidence remains separate.
 from __future__ import annotations
 
 import ast
-import sys
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock
 
@@ -26,31 +25,24 @@ SOURCE = SOURCE_ROOT / "vllm_ascend/worker/v2/spec_decode/draft_window_eager.py"
 def graph_source_initialization(request, monkeypatch):
     """Exercise actual owner initialization without loading a device model."""
     method = request.param
-    paths = {
-        "dspark": ("draft_window_eager.py", "DraftWindowGraphInputMixin"),
-        "dflash": ("draft_window_eager.py", "DraftWindowGraphInputMixin"),
-        "dflash2": ("draft_window_eager.py", "DraftWindowGraphInputMixin"),
-        "eagle3": ("draft_window_eagle3_adapter.py", "Eagle3GraphIntegrationMixin"),
-    }
-    relative, class_name = paths[method]
-    path = SOURCE.parent / relative
-    cls = next(n for n in ast.parse(path.read_text()).body if isinstance(n, ast.ClassDef) and n.name == class_name)
-    initialize = next(
-        n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "_initialize_draft_window_source_capability"
-    )
+    from vllm_ascend.worker.v2.spec_decode import draft_window_graph_runtime
+    from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowGraphInputMixin
+
     capability, context, state = object(), object(), object()
     build_source = Mock(return_value=(capability, context))
     build_state = Mock(return_value=state)
-    capture_name = "vllm_ascend.worker.v2.spec_decode.draft_window_eagle3_capture"
-    capture = ModuleType(capture_name)
-    capture.__dict__["build_eagle3_graph_source"] = build_source
-    monkeypatch.setitem(sys.modules, capture_name, capture)
-    graph_runtime_name = "vllm_ascend.worker.v2.spec_decode.draft_window_graph_runtime"
-    graph_runtime = ModuleType(graph_runtime_name)
-    graph_runtime.__dict__["build_parallel_graph_source"] = build_source
-    monkeypatch.setitem(sys.modules, graph_runtime_name, graph_runtime)
-    namespace = {"build_parallel_graph_source": build_source, "build_draft_window_runtime_state": build_state}
-    exec(compile(ast.Module(body=[initialize], type_ignores=[]), str(path), "exec"), namespace)
+    monkeypatch.setattr(draft_window_graph_runtime, "build_parallel_graph_source", build_source)
+    if method == "eagle3":
+        from vllm_ascend.worker.v2.spec_decode import draft_window_eagle3_adapter, draft_window_eagle3_capture
+
+        initialize = draft_window_eagle3_adapter.Eagle3GraphIntegrationMixin._initialize_draft_window_source_capability
+        monkeypatch.setattr(draft_window_eagle3_capture, "build_eagle3_graph_source", build_source)
+        monkeypatch.setattr(draft_window_eagle3_adapter, "build_draft_window_runtime_state", build_state)
+    else:
+        from vllm_ascend.worker.v2.spec_decode import draft_window_eager
+
+        initialize = DraftWindowGraphInputMixin._initialize_draft_window_source_capability
+        monkeypatch.setattr(draft_window_eager, "build_draft_window_runtime_state", build_state)
     owner = SimpleNamespace(
         _draft_window_policy=object(),
         _speculator_name=method,
@@ -65,7 +57,7 @@ def graph_source_initialization(request, monkeypatch):
     )
     return SimpleNamespace(
         owner=owner,
-        initialize=namespace[initialize.name],
+        initialize=initialize,
         build_source=build_source,
         build_state=build_state,
         capability=capability,
@@ -468,15 +460,15 @@ def test_typed_update_uses_manager_config_and_restores_context(relative, method_
     validation, update_call = statement.body
     assert isinstance(validation, ast.Expr) and isinstance(validation.value, ast.Call)
     assert isinstance(update_call, ast.Expr) and isinstance(update_call.value, ast.Call)
-    assert ast.unparse(validation.value.func) == "validate_draft_window_update_tasks"
+    assert isinstance(validation.value.func, ast.Attribute) and validation.value.func.attr == "validate_update"
     assert ast.unparse(update_call.value.func) == "graph.update"
     assert len(update_call.value.args) == 2 and not update_call.value.keywords
     current: ContextVar[object | None] = ContextVar("current_vllm_config", default=None)
     manager_config, ambient_config = object(), object()
     context_entries: list[object] = []
     observations: list[str] = []
-    backend, binding = object(), object()
-    metadata, resolved = [object()], object()
+    backend, route = object(), object()
+    resolved = object()
 
     @contextmanager
     def set_current_vllm_config(config):
@@ -487,10 +479,10 @@ def test_typed_update_uses_manager_config_and_restores_context(relative, method_
         finally:
             current.reset(token)
 
-    def validate(graph_owner, tasks, actual_binding, actual_metadata, actual_backend, tokens):
+    def validate(graph_owner, tasks, *, route):
         assert current.get() is manager_config, "Current vLLM config is not set"
-        assert graph_owner is graph and tasks is resolved and actual_binding is binding
-        assert actual_metadata is metadata and actual_backend is backend and tokens == 16
+        assert graph_owner is graph and tasks is resolved
+        assert route is namespace["route"]
         observations.append("validated")
         if failure == "validation":
             raise RuntimeError("original validation failure")
@@ -506,7 +498,10 @@ def test_typed_update_uses_manager_config_and_restores_context(relative, method_
     self = SimpleNamespace(
         vllm_config=manager_config,
         update_stream=object(),
-        speculator=SimpleNamespace(attn_backends={"draft": backend}),
+        speculator=SimpleNamespace(
+            attn_backends={"draft": backend},
+            _draft_window_graph_binding_provider=SimpleNamespace(validate_update=validate),
+        ),
     )
     graph = SimpleNamespace(update=update)
     namespace = dict(
@@ -515,12 +510,11 @@ def test_typed_update_uses_manager_config_and_restores_context(relative, method_
         desc=SimpleNamespace(num_tokens=16),
         resolved=resolved,
         resolved_tasks=resolved,
-        binding=binding,
-        draft_attn_metadatas=metadata,
-        metadata_batch=metadata,
+        route=route,
+        graph_route=route,
+        session=SimpleNamespace(provider=SimpleNamespace(validate_update=validate)),
         owner=SimpleNamespace(attn_backend=backend),
         set_current_vllm_config=set_current_vllm_config,
-        validate_draft_window_update_tasks=validate,
     )
 
     def execute(nodes):
@@ -572,72 +566,6 @@ def test_window_off_update_keeps_the_original_two_argument_call():
         assert ast.dump(ast.Module(body=actual, type_ignores=[])) == ast.dump(
             ast.Module(body=expected, type_ignores=[])
         )
-
-
-@pytest.fixture
-def typed_update_guard(monkeypatch):
-    """Run the actual UPDATE guard with real provider and operation identities."""
-    import torch_npu
-
-    from vllm_ascend.attention.attention_v1 import FIAParamProvider
-    from vllm_ascend.worker.v2.spec_decode import draft_window_graph
-
-    checks = []
-    monkeypatch.setattr(
-        draft_window_graph,
-        "validate_draft_window_graph_backend_update",
-        lambda *args, **kwargs: checks.append((args, kwargs)),
-    )
-    operation = torch_npu.npu_fused_infer_attention_score.out
-    provider = FIAParamProvider(layer_name="draft.layer.0", sliding_window=None, is_draft_model=True)
-    metadata = SimpleNamespace(block_tables=object(), seq_lens_list=[17], actual_seq_lengths_q=[8])
-    captured = SimpleNamespace(handle=object(), event=object(), provider=provider, provider_index=0)
-    task = SimpleNamespace(
-        handle=captured.handle,
-        event=captured.event,
-        provider=provider,
-        provider_index=0,
-        operation=operation,
-        kwargs={
-            "block_table": metadata.block_tables,
-            "actual_seq_lengths_kv": metadata.seq_lens_list,
-            "actual_seq_lengths": metadata.actual_seq_lengths_q,
-        },
-    )
-    backend = SimpleNamespace(get_impl_cls=lambda: object, get_builder_cls=lambda: object)
-    return SimpleNamespace(
-        call=draft_window_graph.validate_draft_window_update_tasks,
-        graph=SimpleNamespace(tasks=[captured]),
-        task=task,
-        metadata=[{"draft.layer.0": metadata}],
-        backend=backend,
-        checks=checks,
-    )
-
-
-def test_typed_update_keeps_actual_captured_handles_and_current_metadata(typed_update_guard):
-    case = typed_update_guard
-    binding = object()
-    case.call(case.graph, [case.task], binding, case.metadata, case.backend, 8)
-    assert len(case.checks) == 1
-    assert case.checks[0][0] == (binding,)
-    assert case.checks[0][1]["draft_attn_metadatas"] is case.metadata
-
-
-@pytest.mark.parametrize(
-    "field", ["handle", "event", "provider_index", "operation", "block_table", "actual_seq_lengths_kv"]
-)
-def test_typed_update_rejects_stale_task_or_replaced_read_operands(typed_update_guard, field):
-    case = typed_update_guard
-    if field == "provider_index":
-        case.task.provider_index = 1
-    elif field in case.task.kwargs:
-        case.task.kwargs[field] = object()
-    else:
-        setattr(case.task, field, object())
-    with pytest.raises(RuntimeError):
-        case.call(case.graph, [case.task], object(), case.metadata, case.backend, 8)
-    assert not case.checks
 
 
 @pytest.fixture
@@ -732,13 +660,13 @@ def test_full_metadata_dispatch_does_not_replace_published_metadata(full_metadat
 
 @pytest.fixture
 def full_metadata_finalization():
-    """Execute the real in-place finalization of one private metadata mapping."""
+    """Finalize one private mapping without inventing a second reader group."""
     source = SOURCE.with_name("draft_window_graph_runtime.py")
     tree = ast.parse(source.read_text())
     function = next(
         n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_build_private_graph_metadata"
     )
-    loop = next(n for n in function.body if isinstance(n, ast.For) and ast.unparse(n.iter) == "metadata.items()")
+    loop = next(n for n in function.body if isinstance(n, ast.For) and ast.unparse(n.iter) == "metadata.values()")
     writes = SimpleNamespace(
         slot_mapping=object(),
         positions=object(),
@@ -748,92 +676,24 @@ def full_metadata_finalization():
         num_actual_tokens=8,
         causal=False,
     )
-    validates = []
-    snapshot = SimpleNamespace(
-        validate=lambda *args: validates.append(args),
-        device_exact=object(),
-        cpu_exact=SimpleNamespace(tolist=lambda: [17]),
-    )
-
-    class Slots:
-        def __getitem__(self, key):
-            return key[0], "canonical-full-slots"
 
     def finalize(metadata):
-        namespace: dict[str, Any] = dict(
-            metadata=metadata,
-            finalized_groups={},
-            native_gids={"swa.a": 0, "swa.b": 1},
-            native_snapshot=snapshot,
-            native_swa=object(),
-            write_side=writes,
-            workspace=SimpleNamespace(max_num_reqs=1),
-            capture_identity=SimpleNamespace(descriptor=SimpleNamespace(num_tokens=8)),
-            owner=SimpleNamespace(
-                _draft_window_live_inputs=SimpleNamespace(identity=object()),
-                block_tables=SimpleNamespace(input_block_tables=[[10], [20]], slot_mappings=Slots()),
-            ),
-        )
         exec(
             compile(ast.fix_missing_locations(ast.Module(body=[loop], type_ignores=[])), str(source), "exec"),
-            namespace,
+            {"metadata": metadata, "write_side": writes},
         )
-        return namespace["metadata"]
+        return metadata
 
-    return SimpleNamespace(finalize=finalize, writes=writes, snapshot=snapshot, validates=validates)
+    return SimpleNamespace(finalize=finalize, writes=writes)
 
 
-def test_full_graph_final_metadata_reuses_actual_builder_groups_without_mixing_native_reads(full_metadata_finalization):
+def test_full_graph_final_metadata_preserves_group_aliases_and_canonical_write_state(full_metadata_finalization):
     case = full_metadata_finalization
-    full, swa0, swa1 = (SimpleNamespace(attn_state=object()) for _ in range(3))
-    metadata = {"full.a": full, "full.b": full, "swa.a": swa0, "swa.b": swa1, "unused": None}
+    layer = SimpleNamespace(attn_state=object())
+    metadata = {"draft.a": layer, "draft.b": layer, "unused": None}
     result = case.finalize(metadata)
-    assert result is metadata  # Final operands use the one private build.
-    assert result["full.a"] is result["full.b"] is full
-    assert full.causal is False and full.slot_mapping is case.writes.slot_mapping
-    assert full.positions is case.writes.positions and full.query_start_loc is case.writes.query_start_loc
-    assert full.actual_seq_lengths_q == [8] and full.num_actual_tokens == 8
-    assert full.attn_state is case.writes.attn_state
-    assert swa0.block_tables == [10] and swa1.block_tables == [20]
-    assert swa0.seq_lens is swa1.seq_lens is case.snapshot.device_exact
-    assert swa0.seq_lens_cpu is swa1.seq_lens_cpu is case.snapshot.cpu_exact
-    assert swa0.seq_lens_list == swa1.seq_lens_list == [17]
-    assert swa0.slot_mapping == (0, "canonical-full-slots")
-    assert swa1.slot_mapping == (1, "canonical-full-slots")
-    assert swa0.causal is swa1.causal is True
-    assert result["unused"] is None and len(case.validates) == 2
-
-
-def test_full_graph_final_metadata_rejects_one_object_for_incompatible_reader_groups(full_metadata_finalization):
-    shared = SimpleNamespace(attn_state=object())
-    with pytest.raises(RuntimeError, match="one Draft metadata object spans incompatible native groups"):
-        full_metadata_finalization.finalize({"full.a": shared, "swa.a": shared})
-
-
-@pytest.mark.parametrize("causal", [True, False, [], object()])
-def test_native_graph_requires_actual_per_group_causality(causal):
-    from vllm_ascend.worker.v2.spec_decode.draft_window_swa_graph import partition_source
-
-    native_group = SimpleNamespace(kv_cache_spec=SimpleNamespace(sliding_window=2048))
-    with pytest.raises(RuntimeError, match="actual private inputs and per-group causality"):
-        partition_source(
-            attn_groups=[[native_group]],
-            block_tables=object(),
-            input_buffers=object(),
-            causal=causal,
-            window_size=4096,
-            query_width=8,
-        )
-
-
-def test_native_graph_requires_a_real_owned_full_snapshot_before_metadata_build():
-    from vllm_ascend.worker.v2.spec_decode.draft_window_swa_graph import NativeSWAGraphPlan, build_group_metadata
-
-    owner = SimpleNamespace(
-        _draft_window_source_capability=SimpleNamespace(native_swa_graph=object.__new__(NativeSWAGraphPlan)),
-        _draft_window_native_full_snapshot=None,
-        _draft_window_live_inputs=object(),
-        input_buffers=object(),
-    )
-    with pytest.raises(RuntimeError, match="native SWA current full snapshot missing"):
-        build_group_metadata(owner, read_inputs=object(), builder_kwargs={})
+    assert result is metadata and result["draft.a"] is result["draft.b"] is layer
+    assert layer.causal is False and layer.slot_mapping is case.writes.slot_mapping
+    assert layer.positions is case.writes.positions and layer.query_start_loc is case.writes.query_start_loc
+    assert layer.actual_seq_lengths_q == [8] and layer.num_actual_tokens == 8
+    assert layer.attn_state is case.writes.attn_state and result["unused"] is None

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from contextlib import ExitStack
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -33,13 +33,12 @@ from vllm_ascend.worker.v2.spec_decode.draft_window import (
     build_draft_window_runtime_context,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_eager import (
-    AscendDraftAttentionReadInputs,
     build_draft_window_attn_metadata,
+    draft_window_read_inputs,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
     DraftWindowGraphBindingProvider,
     DraftWindowGraphCaptureIdentity,
-    DraftWindowGraphMetadataBuild,
     DraftWindowGraphReadCarrier,
     DraftWindowGraphRoute,
     DraftWindowGraphWriteSideReference,
@@ -76,9 +75,7 @@ def draft_window_graph_enabled() -> bool:
 
 def validate_graph_context(runtime_context: DraftWindowRuntimeContext, vllm_config: Any) -> bool:
     """Match the actual executor to its once-resolved supported Graph route."""
-    from vllm_ascend.ascend_config import validate_draft_window_graph_config
-
-    if not validate_draft_window_graph_config(vllm_config):
+    if not draft_window_graph_enabled():
         raise NotImplementedError("Draft Window Graph requires its explicit supported Graph configuration")
     if runtime_context.attention_backend_family is not AttentionBackendFamily.STANDARD:
         raise NotImplementedError("Draft Window Graph requires the STANDARD hardware family")
@@ -124,46 +121,17 @@ def build_parallel_graph_source(
     if bool(speculative_config.uses_dynamic_speculative_decoding()):
         raise NotImplementedError("Draft Window Graph requires static K")
 
-    # The source builder validates the real executor and rank-local Draft
-    # consumer separately. Never hide Graph/Async/Target SP in a fake eager
-    # context, or reconstruct a second topology after source construction.
-    from vllm_ascend.worker.v2.spec_decode.draft_window_swa_graph import partition_source
-
     if runtime_route == "dflash2":
         from vllm_ascend.worker.v2.spec_decode.draft_window_dflash2_graph import DFlash2GraphContract
 
         if not isinstance(dflash2_graph_contract, DFlash2GraphContract):
             raise NotImplementedError("DFlash2 Graph has no admitted model/selector/native reader contract")
-        # Native-only noncausal DFlash2 projects the same complete canonical
-        # source through its own resident-interval contract. It does not use
-        # the older causal Full+SWA passthrough partition or change native P.
-        source_groups, native_swa = attn_groups, None
-    else:
-        if dflash2_graph_contract is not None:
-            raise RuntimeError("DFlash2 source contract belongs to a different method")
-        source_groups, native_swa = partition_source(
-            attn_groups=attn_groups,
-            block_tables=block_tables,
-            input_buffers=input_buffers,
-            causal=causal,
-            window_size=policy.effective_window_size,
-            query_width=int(speculative_config.num_speculative_tokens) + 1,
-        )
-    if native_swa is not None and (
-        runtime_route != "dflash"
-        or not replicated_review
-        or runtime_context.tensor_parallel_size != 4
-        or runtime_context.async_scheduling
-        or runtime_context.prefix_caching
-        or runtime_context.sequence_parallel
-        or runtime_context.dsa_context_parallel
-        or runtime_context.flashcomm
-    ):
-        raise NotImplementedError("native SWA Graph first requires the actual uncombined DFlash TP4 review route")
+    elif dflash2_graph_contract is not None:
+        raise RuntimeError("DFlash2 source contract belongs to a different method")
     capability = _build_draft_window_source_capability_for_context(
         policy=policy,
         runtime_route=runtime_route,
-        attn_groups=source_groups,
+        attn_groups=attn_groups,
         block_tables=block_tables,
         kv_cache_config=kv_cache_config,
         causal=causal,
@@ -185,7 +153,6 @@ def build_parallel_graph_source(
         capability.full_source.validate_owner_bindings()
         if topology.prefix_caching is not True:
             raise RuntimeError("parallel prefix Graph source lost the actual caching identity")
-    capability = replace(capability, native_swa_graph=native_swa)
     return capability, runtime_context
 
 
@@ -341,20 +308,13 @@ def _build_private_graph_metadata(
     write_side: DraftWindowGraphWriteSideReference,
     target_metadata: Mapping[Any, Any],
     capture_identity: DraftWindowGraphCaptureIdentity,
-) -> DraftWindowGraphMetadataBuild:
-    active_upper = workspace.cpu_window_upper[:actual_request_count]
-    max_seq_len = int(active_upper.max().item()) if active_upper.numel() else 0
-    group_id = owner._draft_window_graph_binding_provider.group.gid
-    block_tables = tuple(
-        workspace.window_block_table if gid == group_id else full_table[: workspace.max_num_reqs]
-        for gid, full_table in enumerate(owner.block_tables.input_block_tables)
-    )
-    typed_read_inputs = AscendDraftAttentionReadInputs(
-        block_tables=block_tables,
-        seq_lens=workspace.device_window_exact,
-        seq_lens_cpu_exact=workspace.cpu_window_exact,
-        seq_lens_cpu_upper_bound=workspace.cpu_window_upper,
-        max_seq_len=max_seq_len,
+) -> Mapping[str, Any]:
+    typed_read_inputs = draft_window_read_inputs(
+        workspace,
+        actual_request_count=actual_request_count,
+        padded_request_count=workspace.max_num_reqs,
+        block_tables=owner.block_tables.input_block_tables,
+        global_group_id=owner._draft_window_graph_binding_provider.group.gid,
     )
     with ExitStack() as stack:
         stack.enter_context(build_attn_metadata_wrapper())
@@ -392,45 +352,17 @@ def _build_private_graph_metadata(
                 layer_metadata, workspace, (capture_identity.descriptor.num_tokens // capture_identity.num_reqs)
             )
             bound_metadata_ids.add(id(layer_metadata))
-    finalized_groups: dict[int, int | None] = {}
-    native_swa = getattr(owner._draft_window_runtime_state.capability, "native_swa_graph", None)
-    native_snapshot = getattr(owner, "_draft_window_native_full_snapshot", None) if native_swa is not None else None
-    native_gids = (
-        {} if native_swa is None else {name: group.gid for group in native_swa.native_groups for name in group.layers}
-    )
-    for layer_name, layer_metadata in metadata.items():
+    for layer_metadata in metadata.values():
         if layer_metadata is None:
             continue
-        gid = native_gids.get(layer_name)
-        key = id(layer_metadata)
-        if key in finalized_groups:
-            if finalized_groups[key] != gid:
-                raise RuntimeError("one Draft metadata object spans incompatible native groups")
-            continue
-        finalized_groups[key] = gid
-        final_layer_metadata = layer_metadata
-        final_layer_metadata.slot_mapping = write_side.slot_mapping
-        final_layer_metadata.positions = write_side.positions
-        final_layer_metadata.query_start_loc = write_side.query_start_loc
-        final_layer_metadata.actual_seq_lengths_q = list(write_side.actual_seq_lengths_q)
-        final_layer_metadata.attn_state = write_side.attn_state
-        final_layer_metadata.num_actual_tokens = write_side.num_actual_tokens
-        final_layer_metadata.causal = write_side.causal
-        if layer_name in native_gids:
-            gid = native_gids[layer_name]
-            if native_snapshot is None:
-                raise RuntimeError("native SWA private Graph metadata has no current full-length snapshot")
-            native_snapshot.validate(owner._draft_window_live_inputs.identity, native_swa)
-            final_layer_metadata.block_tables = owner.block_tables.input_block_tables[gid][: workspace.max_num_reqs]
-            final_layer_metadata.seq_lens = native_snapshot.device_exact
-            final_layer_metadata.seq_lens_cpu = native_snapshot.cpu_exact
-            final_layer_metadata.seq_lens_list = native_snapshot.cpu_exact.tolist()
-            final_layer_metadata.slot_mapping = owner.block_tables.slot_mappings[
-                gid, : capture_identity.descriptor.num_tokens
-            ]
-            final_layer_metadata.causal = True
-            final_layer_metadata.attn_state = layer_metadata.attn_state
-    return DraftWindowGraphMetadataBuild(metadata=metadata, native_full_snapshot=native_snapshot)
+        layer_metadata.slot_mapping = write_side.slot_mapping
+        layer_metadata.positions = write_side.positions
+        layer_metadata.query_start_loc = write_side.query_start_loc
+        layer_metadata.actual_seq_lengths_q = list(write_side.actual_seq_lengths_q)
+        layer_metadata.attn_state = write_side.attn_state
+        layer_metadata.num_actual_tokens = write_side.num_actual_tokens
+        layer_metadata.causal = write_side.causal
+    return metadata
 
 
 def _build_write_side_reference(

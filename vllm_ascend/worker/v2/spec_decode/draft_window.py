@@ -11,7 +11,7 @@ import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import numpy as np
 import torch
@@ -40,9 +40,6 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_policy import (
     DraftWindowPolicyDecision,
     DraftWindowPolicyState,
 )
-
-if TYPE_CHECKING:
-    from vllm_ascend.worker.v2.spec_decode.draft_window_swa_graph import NativeSWAGraphPlan
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,10 +89,7 @@ class DraftWindowInventory:
             )
             dense = group.status is DraftWindowProviderStatus.DIRECT_DENSE and group.native_window is None
             if not dense and not native_dflash2:
-                failures.append(
-                    f"gid={group.gid} backend={group.backend} builder={group.builder} "
-                    f"layout={group.status.value} reason={group.reason}"
-                )
+                failures.append(f"gid={group.gid} layout={group.status.value} reason={group.reason}")
         if failures:
             raise NotImplementedError(
                 "MRV2 draft-window Graph source rejected: "
@@ -113,7 +107,7 @@ def _group_diagnostic_context(
     return (
         f"method={inventory.method} model={inventory.target_model_type} "
         f"route={inventory.runtime_route} gid={group.gid} "
-        f"backend={group.backend} layout={group.status.value}"
+        f"layout={group.status.value}"
     )
 
 
@@ -455,9 +449,6 @@ class DraftWindowSourceCapability:
     # Mixed/prefix rows can require a full-resident row in the same stable
     # backing that carries narrow decode rows.
     workspace_capacity_columns: int | None = None
-    # Only a reviewed native-SWA/Full Graph route may retain its independent
-    # native groups beside the single P3 extra-Window source.
-    native_swa_graph: "NativeSWAGraphPlan | None" = None
 
 
 def _read_coordinate_semantics(groups: Sequence[DraftWindowGroupRoute]) -> str:
@@ -637,9 +628,7 @@ def build_draft_window_inventory(
         allow_parallel_prefix_graph_source=allow_parallel_prefix_graph_source,
         allow_parallel_dp_graph_source=allow_parallel_dp_graph_source,
     )
-    topology = DraftWindowTopology.from_config(
-        vllm_config, block_tables, dsa_cp_effective=runtime_context.dsa_context_parallel
-    )
+    topology = DraftWindowTopology.from_config(vllm_config)
     groups = inventory_draft_window_groups(
         attn_groups=attn_groups,
         kv_cache_config=kv_cache_config,

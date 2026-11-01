@@ -40,10 +40,7 @@ from vllm_ascend.worker.v2.aclgraph_utils import (
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
     DraftWindowGraphRoute,
-    assert_draft_window_graph_metadata_batch,
-    build_draft_window_graph_update_binding,
     validate_draft_window_graph_capture,
-    validate_draft_window_update_tasks,
 )
 from vllm_ascend.worker.v2.utils import communicator_switch
 
@@ -362,7 +359,7 @@ class AutoRegressiveAclGraphManager(SpeculatorCudaGraphManager):
     def _run_eagle_window_fullgraph(self, desc, session):
         owner = self.speculator
         try:
-            session.controller.require_reusable()
+            session.require_reusable()
             if self.update_stream is None:
                 raise RuntimeError("Eagle3 Graph has no UPDATE stream")
             stream = int(self.update_stream.npu_stream)
@@ -371,12 +368,6 @@ class AutoRegressiveAclGraphManager(SpeculatorCudaGraphManager):
             if stream != session._update_stream_identity:
                 raise RuntimeError("Eagle3 UPDATE stream changed across proposals")
             if self.is_draft_model_prefill:
-                context = owner._require_eagle3_window_context()
-                session.controller.begin(
-                    context.mapping_epoch,
-                    context.ordered_request_ids,
-                    num_speculative_tokens=owner._eagle3_window_scheduled_tokens,
-                )
                 bank = session.provider.prepare_workspace(
                     session.resolve(first=True, n=desc.num_reqs, tokens=desc.num_tokens, ordinal=0)
                 )
@@ -396,18 +387,12 @@ class AutoRegressiveAclGraphManager(SpeculatorCudaGraphManager):
                 if self.is_draft_model_prefill
                 else DraftWindowGraphRoute.EAGLE3_AR_STEP
             )
-            assert_draft_window_graph_metadata_batch(
-                owner,
+            session.provider.assert_metadata_batch(
                 route=route,
                 draft_attn_metadatas=metadata_batch,
                 num_reqs=desc.num_reqs,
                 num_tokens=desc.num_tokens,
                 graph_mode=desc.cg_mode.name,
-            )
-            binding = build_draft_window_graph_update_binding(
-                owner,
-                route=route,
-                draft_attn_metadatas=metadata_batch,
             )
             graph = self.graphs[desc]
             if not isinstance(graph, UpdatableGraph):
@@ -434,12 +419,10 @@ class AutoRegressiveAclGraphManager(SpeculatorCudaGraphManager):
             # Keep typed backend validation and optional UPDATE observations in
             # the same configuration that owns this captured graph manager.
             with set_current_vllm_config(self.vllm_config):
-                validate_draft_window_update_tasks(
-                    graph, resolved, binding, metadata_batch, owner.attn_backend, desc.num_tokens
-                )
+                session.provider.validate_update(graph, resolved, route=route)
                 graph.update(self.update_stream, resolved)
             return ret
-        except BaseException as error:
-            session.controller.quarantine(type(error).__name__ + ": " + str(error))
+        except BaseException:
+            owner._quarantine_eagle3_window()
             owner._draft_window_graph_submission_uncertain = True
             raise

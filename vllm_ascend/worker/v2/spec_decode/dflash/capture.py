@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
-"""Instance-scoped DFlash capture adapter for the Draft Window spike.
+"""Instance-scoped DFlash capture adapter for Draft Window.
 
-The worker patch installs :func:`ascend_prepare_dflash_inputs_to_capture` once.
+The Ascend worker installs :func:`ascend_prepare_dflash_inputs_to_capture` once.
 Without an explicit context on the Draft speculator's private ``InputBuffers``
-instance, the adapter delegates to the exact upstream helper. The experimental
+instance, the adapter delegates to the exact upstream helper. The
 Window path changes only Draft read tables and lengths; dummy full slot
 mappings and query/write carriers remain owned by canonical ``BlockTables``.
 """
@@ -45,85 +45,39 @@ _CAPTURE_CONTEXT_ATTRIBUTE = "_ascend_draft_window_capture_context"
 
 
 @dataclass(slots=True)
-class _CaptureScopeState:
-    active: bool = True
-
-
-@dataclass(frozen=True, slots=True)
-class _CaptureEntry:
-    key: tuple[int, int, str]
-    identity: DraftWindowGraphCaptureIdentity
-    workspace: DraftWindowWorkspace
-
-
-@dataclass(frozen=True, slots=True)
 class DraftWindowDFlashCaptureContext:
-    """Typed startup context attached only to one Draft ``InputBuffers``."""
+    """Temporarily bind the real provider to its Draft-private input buffers."""
 
     provider: DraftWindowGraphBindingProvider
     route: DraftWindowGraphRoute
-    input_buffers_owner_id: int
-    entries: tuple[_CaptureEntry, ...]
-    _state: _CaptureScopeState
-    target_metadata: Mapping[str, Any] | None = None
-    native_swa_plan: Any = None
+    input_buffers: InputBuffers
+    active: bool = True
 
-    def validate_for_provider(
-        self,
-        provider: DraftWindowGraphBindingProvider,
-    ) -> None:
-        self._require_active()
+    def validate_for_provider(self, provider: DraftWindowGraphBindingProvider) -> None:
+        if not self.active:
+            raise RuntimeError("stale Draft Window capture context is no longer active")
         if provider is not self.provider:
             raise RuntimeError("capture context belongs to another graph provider")
-        if self.native_swa_plan is not provider.native_swa_graph_plan:
-            raise RuntimeError("native SWA capture program contract changed")
-        if not self.entries:
-            raise RuntimeError("capture context has no registered graph consumers")
 
     def resolve(
-        self,
-        num_reqs: int,
-        num_tokens: int,
-        skip_attn: bool,
+        self, num_reqs: int, num_tokens: int, skip_attn: bool
     ) -> tuple[DraftWindowGraphCaptureIdentity, DraftWindowWorkspace]:
-        self._require_active()
-        mode = CUDAGraphMode.PIECEWISE.name if skip_attn else CUDAGraphMode.FULL.name
-        key = (num_reqs, num_tokens, mode)
-        matches = tuple(entry for entry in self.entries if entry.key == key)
+        self.validate_for_provider(self.provider)
+        mode = CUDAGraphMode.PIECEWISE if skip_attn else CUDAGraphMode.FULL
+        matches = tuple(
+            identity
+            for identity in self.provider.registered_capture_identities(route=self.route)
+            if identity.num_reqs == num_reqs
+            and identity.descriptor.num_tokens == num_tokens
+            and identity.descriptor.cg_mode is mode
+        )
         if len(matches) != 1:
             raise RuntimeError(
                 "Draft Window capture bucket does not resolve exactly one persistent "
-                f"carrier: key={key!r} matches={len(matches)}"
+                f"carrier: requests={num_reqs} tokens={num_tokens} mode={mode} matches={len(matches)}"
             )
-        entry = matches[0]
-        current = self.provider.startup_capture_workspace(entry.identity)
-        if current is not entry.workspace:
-            raise RuntimeError("Draft Window capture backing changed after context binding")
-        return entry.identity, entry.workspace
-
-    def _require_active(self) -> None:
-        if not self._state.active:
-            raise RuntimeError("stale Draft Window capture context is no longer active")
-
-
-def _normalized_request_count(
-    descriptor: BatchExecutionDescriptor,
-    *,
-    max_num_reqs: int,
-) -> int:
-    return descriptor.num_reqs or min(descriptor.num_tokens, max_num_reqs)
-
-
-def _descriptor_key(
-    descriptor: BatchExecutionDescriptor,
-    *,
-    max_num_reqs: int,
-) -> tuple[int, int, str]:
-    return (
-        _normalized_request_count(descriptor, max_num_reqs=max_num_reqs),
-        descriptor.num_tokens,
-        descriptor.cg_mode.name,
-    )
+        identity = matches[0]
+        return identity, self.provider.startup_capture_workspace(identity)
 
 
 def _build_capture_context(
@@ -138,63 +92,32 @@ def _build_capture_context(
         return None
     if not isinstance(provider, DraftWindowGraphBindingProvider):
         raise TypeError("invalid instance-owned Draft Window graph binding provider")
-    if not isinstance(input_buffers, InputBuffers) or (getattr(owner, "input_buffers", None) is not input_buffers):
-        raise RuntimeError(
-            "P6 has no safe Ascend-only capture carrier: capture must use the speculator-owned Draft input buffers"
-        )
+    if not isinstance(input_buffers, InputBuffers) or getattr(owner, "input_buffers", None) is not input_buffers:
+        raise RuntimeError("capture must use the speculator-owned Draft input buffers")
     if getattr(owner, "target_input_buffers", None) is input_buffers:
         raise RuntimeError("Draft Window capture context cannot use Target input buffers")
-    native_swa = provider.native_swa_graph_plan
-    if native_swa is not None and (
-        native_swa.input_owner_id != id(input_buffers)
-        or native_swa.device_lengths_ptr != input_buffers.seq_lens.data_ptr()
-    ):
-        raise RuntimeError("native SWA capture replaced its admitted private input owner")
     route = resolve_parallel_draft_window_graph_route(owner)
     if route is None:
         raise RuntimeError("Draft Window graph provider has no parallel capture route")
-
-    descriptors = tuple(descriptor for mode_descriptors in capture_descs.values() for descriptor in mode_descriptors)
+    descriptors = tuple(descriptor for entries in capture_descs.values() for descriptor in entries)
     identities = provider.registered_capture_identities(route=route)
-    if not descriptors or not identities:
-        raise RuntimeError(
-            "P6 has no safe Ascend-only capture carrier: capture descriptors and "
-            "registered capture identities must both be explicit"
-        )
-    if len(descriptors) != len(identities):
+    if not descriptors or len(descriptors) != len(identities):
         raise RuntimeError("Draft Window capture descriptor/carrier cardinality mismatch")
-
-    entries: list[_CaptureEntry] = []
+    # The upstream helper receives only these three coordinates. Require that
+    # they select exactly one of the provider's real, fully qualified keys.
+    keys = set()
     for descriptor in descriptors:
-        key = _descriptor_key(descriptor, max_num_reqs=max_num_reqs)
-        matches = tuple(
-            identity for identity in identities if identity.descriptor == descriptor and identity.num_reqs == key[0]
-        )
+        num_reqs = descriptor.num_reqs or min(descriptor.num_tokens, max_num_reqs)
+        matches = [
+            identity for identity in identities if identity.descriptor == descriptor and identity.num_reqs == num_reqs
+        ]
         if len(matches) != 1:
-            raise RuntimeError(
-                "Draft Window capture descriptor does not resolve exactly one "
-                f"registered carrier: descriptor={descriptor!r} matches={len(matches)}"
-            )
-        identity = matches[0]
-        entries.append(
-            _CaptureEntry(
-                key=key,
-                identity=identity,
-                workspace=provider.startup_capture_workspace(identity),
-            )
-        )
-    if len({entry.key for entry in entries}) != len(entries):
-        raise RuntimeError("Draft Window capture descriptor mapping is ambiguous")
-
-    return DraftWindowDFlashCaptureContext(
-        provider=provider,
-        route=route,
-        input_buffers_owner_id=id(input_buffers),
-        entries=tuple(entries),
-        _state=_CaptureScopeState(),
-        target_metadata=getattr(getattr(owner, "model_state", None), "attn_metadata", None),
-        native_swa_plan=native_swa,
-    )
+            raise RuntimeError("Draft Window capture descriptor does not resolve exactly one registered carrier")
+        key = (num_reqs, descriptor.num_tokens, descriptor.cg_mode)
+        if key in keys:
+            raise RuntimeError("Draft Window capture descriptor mapping is ambiguous")
+        keys.add(key)
+    return DraftWindowDFlashCaptureContext(provider, route, input_buffers)
 
 
 @contextmanager
@@ -221,7 +144,7 @@ def draft_window_dflash_capture_scope(
     try:
         yield context
     finally:
-        context._state.active = False
+        context.active = False
         if hasattr(input_buffers, _CAPTURE_CONTEXT_ATTRIBUTE):
             delattr(input_buffers, _CAPTURE_CONTEXT_ATTRIBUTE)
 
@@ -290,7 +213,7 @@ def ascend_prepare_dflash_inputs_to_capture(
         )
     if not isinstance(context, DraftWindowDFlashCaptureContext):
         raise TypeError("invalid Draft Window capture context on Draft input buffers")
-    if context.input_buffers_owner_id != id(input_buffers):
+    if context.input_buffers is not input_buffers:
         raise RuntimeError("Draft Window capture context owner mismatch")
     identity, workspace = context.resolve(num_reqs, num_tokens, skip_attn)
 
@@ -321,7 +244,6 @@ def ascend_prepare_dflash_inputs_to_capture(
         )
     read_block_tables = list(input_block_tables)
     read_block_tables[context.provider.group.gid] = workspace.window_block_table
-    native_swa = context.native_swa_plan
     from vllm_ascend.worker.v2.spec_decode.draft_window_eager import AscendDraftAttentionReadInputs
 
     graph_read_inputs = AscendDraftAttentionReadInputs(
@@ -333,7 +255,7 @@ def ascend_prepare_dflash_inputs_to_capture(
         dcp_local_seq_lens=dcp_local_seq_lens,
     )
     attn_metadata = build_attn_metadata(
-        attn_groups=attn_groups if native_swa is None else native_swa.filter_groups(attn_groups, native=False),
+        attn_groups=attn_groups,
         num_reqs=num_reqs,
         num_tokens=num_tokens,
         query_start_loc_gpu=input_batch.query_start_loc,
@@ -351,28 +273,4 @@ def ascend_prepare_dflash_inputs_to_capture(
         for_cudagraph_capture=True,
         causal=causal,
     )
-    window_metadata = attn_metadata
-    if native_swa is not None:
-        # Reproduce the upstream native read inputs, not Window lengths.
-        # Its captured canonical table remains the baseline stable owner;
-        # every group's original full write slots and causality are retained.
-        native_metadata = build_attn_metadata(
-            attn_groups=native_swa.filter_groups(attn_groups, native=True),
-            num_reqs=num_reqs,
-            num_tokens=num_tokens,
-            query_start_loc_gpu=input_batch.query_start_loc,
-            query_start_loc_cpu=query_start_loc_cpu,
-            max_query_len=num_tokens // num_reqs,
-            seq_lens=input_batch.seq_lens,
-            dcp_local_seq_lens=None,
-            max_seq_len=max_model_len,
-            block_tables=input_block_tables,
-            slot_mappings=slot_mappings,
-            kv_cache_config=kv_cache_config,
-            for_cudagraph_capture=True,
-            causal=causal,
-        )
-        if set(native_metadata) != set(native_swa.native_layers) or set(window_metadata) != set(native_swa.full_layers):
-            raise RuntimeError("native SWA capture metadata does not cover the admitted readers")
-        attn_metadata = {**native_metadata, **window_metadata}
     return AttentionState(attn_metadata, slot_mappings_by_layer)

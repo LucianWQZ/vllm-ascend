@@ -28,11 +28,8 @@ from vllm_ascend.utils import use_updatable_graph
 from vllm_ascend.worker.v2.aclgraph_utils import collect_sorted_captured_token_sizes, model_capture_wrapper
 from vllm_ascend.worker.v2.spec_decode.dflash.capture import draft_window_dflash_capture_scope
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
-    assert_draft_window_graph_metadata_batch,
-    build_draft_window_graph_update_binding,
     resolve_parallel_draft_window_graph_route,
     validate_draft_window_graph_capture,
-    validate_draft_window_update_tasks,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph_runtime import (
     prepare_parallel_graph,
@@ -166,8 +163,7 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
             graph_mode_name = getattr(desc.cg_mode, "name", None)
             if not isinstance(graph_mode_name, str):
                 raise RuntimeError("Draft Window Graph requires an explicit replay mode")
-            assert_draft_window_graph_metadata_batch(
-                self.speculator,
+            self.speculator._draft_window_graph_binding_provider.assert_metadata_batch(
                 route=graph_route,
                 draft_attn_metadatas=draft_attn_metadatas,
                 num_reqs=desc.num_reqs,
@@ -225,19 +221,11 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
             # Exact existing OFF updatable call; no Window-only construction.
             graph.update(self.update_stream, resolved_tasks)
         else:
-            binding = build_draft_window_graph_update_binding(
-                self.speculator, route=graph_route, draft_attn_metadatas=draft_attn_metadatas
-            )
             # Backend dispatch resolves CP classes from the captured manager's
             # configuration, also when this path is entered outside a model forward.
             with set_current_vllm_config(self.vllm_config):
-                validate_draft_window_update_tasks(
-                    graph,
-                    resolved_tasks,
-                    binding,
-                    draft_attn_metadatas,
-                    list(self.speculator.attn_backends.values())[0],
-                    desc.num_tokens,
+                self.speculator._draft_window_graph_binding_provider.validate_update(
+                    graph, resolved_tasks, route=graph_route
                 )
                 graph.update(self.update_stream, resolved_tasks)
         return ret
