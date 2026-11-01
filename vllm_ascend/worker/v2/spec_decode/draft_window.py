@@ -130,13 +130,6 @@ class DraftWindowSourceCapability:
                 f"Draft Graph source cannot read gid={self.group.gid} layout={self.group.status.value}"
             )
         _require_nonnegative_python_int(self.expected_future_offset, "expected future offset")
-        self.full_source.validate_owner_bindings()
-        _validate_source_geometry(
-            group=self.group,
-            logical_block_sizes=self.full_source.logical_block_sizes,
-            kernel_block_sizes=self.full_source.kernel_block_sizes,
-            num_groups=self.full_source.num_groups,
-        )
         object.__setattr__(self, "window_size", window)
         span = self.group.table_column_span
         capacity_tokens = window_capacity_tokens(window, span)
@@ -223,10 +216,6 @@ class DraftWindowSourceCapability:
         )
 
 
-def _normalize_method(method: str) -> str:
-    return method.strip().lower()
-
-
 def resolve_static_future_offset(
     *,
     normalized_method: str,
@@ -243,16 +232,6 @@ def resolve_static_future_offset(
     raise NotImplementedError(
         f"no static draft-window future offset is defined for speculative method {normalized_method!r}"
     )
-
-
-def validate_eligible_window_numbers(*, window_size: int, future_offset: int) -> None:
-    """Apply the interim fail-closed numeric gate for eligible routes."""
-    if window_size <= 0:
-        raise ValueError("draft_window_size must be greater than 0 for an eligible MRV2 route")
-    if future_offset < 0:
-        raise ValueError("static future offset must be greater than or equal to 0")
-    if window_size < future_offset:
-        raise ValueError("draft_window_size must be at least the static future offset")
 
 
 def build_full_draft_kv_source(
@@ -435,7 +414,7 @@ def _build_draft_window_source_capability_for_context(
     """
     if policy.state is not DraftWindowPolicyState.ELIGIBLE_ON or policy.effective_window_size is None:
         raise ValueError("Graph source requires an eligible Window policy")
-    runtime_route = _normalize_method(runtime_route)
+    runtime_route = runtime_route.strip().lower()
     expected_method = "dflash" if runtime_route == "dflash2" else runtime_route
     if runtime_route not in {"eagle3", "dflash", "dflash2", "dspark"} or expected_method != policy.normalized_method:
         raise ValueError("Graph source route differs from the actual method policy")

@@ -408,7 +408,7 @@ class Eagle3DraftWindowMixin:
             padded_request_count=num_reqs_padded,
         )
         self._eagle3_window_epoch_source.validate(context, input_batch)
-        inputs = self._draft_window_graph_binding_provider.materialize_serialized_step(
+        inputs = self._draft_window_graph_binding_provider.materialize(
             previous_identity=previous_identity,
             proposal=context,
             idx_mapping=input_batch.idx_mapping,

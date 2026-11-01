@@ -64,7 +64,6 @@ def graph_buffers():
         table_column_span=4,
         read_semantics="replicated",
         status=DraftWindowProviderStatus.DIRECT_DENSE,
-        reason="direct CPU fixture",
     )
     parallel = SimpleNamespace(
         tensor_parallel_size=1,
@@ -341,20 +340,14 @@ def test_eagle_serialized_steps_own_distinct_banks_and_preserve_previous_consume
                 replaced_mapping = case.mapping.clone()
                 assert replaced_mapping.data_ptr() != previous.idx_mapping_ptr
                 with pytest.raises(RuntimeError, match="request mapping changed"):
-                    provider.materialize_serialized_step(
-                        previous_identity=previous, **{**kwargs, "idx_mapping": replaced_mapping}
-                    )
+                    provider.materialize(previous_identity=previous, **{**kwargs, "idx_mapping": replaced_mapping})
                 with pytest.raises(RuntimeError, match="proposal or request mapping changed"):
-                    provider.materialize_serialized_step(
-                        previous_identity=previous, **{**kwargs, "proposal": replace(proposal)}
-                    )
-                with pytest.raises(RuntimeError, match="padded request capacity exceeded"):
-                    provider.materialize_serialized_step(
-                        previous_identity=previous, **{**kwargs, "num_reqs_padded": padded + 1}
-                    )
+                    provider.materialize(previous_identity=previous, **{**kwargs, "proposal": replace(proposal)})
+                with pytest.raises(RuntimeError, match="request capacity exceeded"):
+                    provider.materialize(previous_identity=previous, **{**kwargs, "num_reqs_padded": padded + 1})
                 assert provider._last_retired_identity is previous
                 assert bank.bound_identity is None
-            inputs = provider.materialize_serialized_step(previous_identity=previous, **kwargs)
+            inputs = provider.materialize(previous_identity=previous, **kwargs)
         current = SimpleNamespace(**{**vars(case), "provider": provider, "capture": capture})
         carrier = _bind(current, inputs)
         assert carrier.inputs is inputs

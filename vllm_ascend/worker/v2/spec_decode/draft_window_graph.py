@@ -243,100 +243,43 @@ class DraftWindowGraphBindingProvider:
         cpu_valid_num_blocks: torch.Tensor,
         num_reqs_padded: int,
         step: int,
+        previous_identity: DraftWindowGenerationIdentity | None = None,
         quarantine_on_failure: bool = False,
         output_workspace: DraftWindowWorkspace | None = None,
     ) -> DraftMetadataInputs:
-        """Materialize one consumer under the caller's actual proposal owner."""
+        """Populate a new proposal or the next retired Eagle consumer's bank."""
         if self._quarantined_identity is not None:
             raise RuntimeError("draft-window backing is quarantined after uncertain Graph submission")
-        _validate_idx_mapping(idx_mapping)
-        identity = DraftWindowGenerationIdentity(
-            proposal=proposal,
-            padded_request_count=num_reqs_padded,
-            read_descriptors=tuple(read_descriptors),
-            idx_mapping_ptr=idx_mapping.data_ptr(),
-            step=step,
-        )
-        if proposal.mapping_epoch <= self._last_mapping_epoch:
-            raise ValueError(
-                f"mapping epoch must strictly increase: current={proposal.mapping_epoch} "
-                f"previous={self._last_mapping_epoch}"
-            )
-        self._last_retired_identity = None
-        return self._materialize_identity(
-            identity=identity,
-            cpu_window_exact=cpu_window_exact,
-            cpu_window_upper=cpu_window_upper,
-            cpu_valid_num_blocks=cpu_valid_num_blocks,
-            quarantine_on_failure=quarantine_on_failure,
-            output_workspace=output_workspace,
-        )
-
-    def materialize_serialized_step(
-        self,
-        *,
-        previous_identity: DraftWindowGenerationIdentity,
-        proposal: DraftWindowProposalContext,
-        idx_mapping: torch.Tensor,
-        read_descriptors: Sequence[DraftWindowReadDescriptor],
-        cpu_window_exact: torch.Tensor,
-        cpu_window_upper: torch.Tensor,
-        cpu_valid_num_blocks: torch.Tensor,
-        num_reqs_padded: int,
-        step: int,
-        quarantine_on_failure: bool = False,
-        output_workspace: DraftWindowWorkspace | None = None,
-    ) -> DraftMetadataInputs:
-        """Continue the same real proposal, only after its preceding reader retires."""
-        if self._active_inputs is not None:
-            raise RuntimeError("cannot refresh a Draft Window while the previous reader is active")
-        if self._last_retired_identity is not previous_identity:
-            raise RuntimeError("serialized step does not continue the most recently retired generation")
-        if proposal is not previous_identity.proposal or proposal.mapping_epoch != self._last_mapping_epoch:
-            raise RuntimeError("serialized step proposal or request mapping changed")
-        if self.source.policy.normalized_method != "eagle3":
-            raise RuntimeError("serialized per-step continuation is supported only for Eagle3")
-        if step != previous_identity.step + 1:
-            raise RuntimeError(
-                "serialized Draft Window steps must strictly advance by one: "
-                f"previous={previous_identity.step} current={step}"
-            )
-        _validate_idx_mapping(idx_mapping)
-        if idx_mapping.data_ptr() != previous_identity.idx_mapping_ptr:
-            raise RuntimeError("serialized step request mapping changed within one proposal")
-        identity = DraftWindowGenerationIdentity(
-            proposal=proposal,
-            padded_request_count=num_reqs_padded,
-            read_descriptors=tuple(read_descriptors),
-            idx_mapping_ptr=idx_mapping.data_ptr(),
-            step=step,
-        )
-        workspace = self.workspace if output_workspace is None else output_workspace
-        if identity.padded_request_count > workspace.max_num_reqs:
-            raise RuntimeError("serialized step padded request capacity exceeded")
-        self._last_retired_identity = None
-        return self._materialize_identity(
-            identity=identity,
-            cpu_window_exact=cpu_window_exact,
-            cpu_window_upper=cpu_window_upper,
-            cpu_valid_num_blocks=cpu_valid_num_blocks,
-            quarantine_on_failure=quarantine_on_failure,
-            output_workspace=output_workspace,
-        )
-
-    def _materialize_identity(
-        self,
-        *,
-        identity: DraftWindowGenerationIdentity,
-        cpu_window_exact: torch.Tensor,
-        cpu_window_upper: torch.Tensor,
-        cpu_valid_num_blocks: torch.Tensor,
-        quarantine_on_failure: bool = False,
-        output_workspace: DraftWindowWorkspace | None = None,
-    ) -> DraftMetadataInputs:
-        """Acquire and populate the one serialized backing for an identity."""
         if self._active_inputs is not None:
             raise RuntimeError("Draft Graph provider still owns an active read bank")
+        _validate_idx_mapping(idx_mapping)
+        if previous_identity is None:
+            if proposal.mapping_epoch <= self._last_mapping_epoch:
+                raise ValueError(
+                    f"mapping epoch must strictly increase: current={proposal.mapping_epoch} "
+                    f"previous={self._last_mapping_epoch}"
+                )
+        else:
+            if self._last_retired_identity is not previous_identity:
+                raise RuntimeError("serialized step does not continue the most recently retired generation")
+            if proposal is not previous_identity.proposal or proposal.mapping_epoch != self._last_mapping_epoch:
+                raise RuntimeError("serialized step proposal or request mapping changed")
+            if self.source.policy.normalized_method != "eagle3":
+                raise RuntimeError("serialized per-step continuation is supported only for Eagle3")
+            if step != previous_identity.step + 1:
+                raise RuntimeError(
+                    "serialized Draft Window steps must strictly advance by one: "
+                    f"previous={previous_identity.step} current={step}"
+                )
+            if idx_mapping.data_ptr() != previous_identity.idx_mapping_ptr:
+                raise RuntimeError("serialized step request mapping changed within one proposal")
+        identity = DraftWindowGenerationIdentity(
+            proposal=proposal,
+            padded_request_count=num_reqs_padded,
+            read_descriptors=tuple(read_descriptors),
+            idx_mapping_ptr=idx_mapping.data_ptr(),
+            step=step,
+        )
         workspace = self.workspace if output_workspace is None else output_workspace
         self._quarantine_on_failure = quarantine_on_failure
         self._last_mapping_epoch = max(self._last_mapping_epoch, identity.proposal.mapping_epoch)
@@ -350,6 +293,7 @@ class DraftWindowGraphBindingProvider:
                 cpu_valid_num_blocks=cpu_valid_num_blocks,
                 preserve_on_failure=quarantine_on_failure,
             )
+            self._last_retired_identity = None
             inputs = DraftMetadataInputs(identity=identity, workspace=workspace, _owner=self)
             self._active_inputs = inputs
             return inputs

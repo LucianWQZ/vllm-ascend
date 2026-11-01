@@ -471,7 +471,7 @@ class DraftGraphSupportTest(unittest.TestCase):
             num_query_per_req=8,
             num_speculative_steps=7,
             vllm_config=config,
-            _draft_window_runtime_state=object(),
+            _draft_window_graph_binding_provider=object(),
         )
         batch = self.batch()
         batch.num_reqs_after_padding = 2
@@ -618,7 +618,7 @@ class ActualGraphDescriptorControls(unittest.TestCase):
             self.assertEqual(seen, [])
         self.assertEqual(self.run_actual(manager, N(num_reqs=1, num_tokens=1)), "legacy-result")
         self.assertEqual([v[0] for v in seen], ["metadata", "replay"])
-        self.assertFalse(hasattr(owner, "_draft_window_runtime_state"))
+        self.assertFalse(hasattr(owner, "_draft_window_graph_binding_provider"))
         self.assertFalse(hasattr(owner, "_draft_window_runtime"))
 
     def test_first_q4_and_existing_on_identity_checks(self):
@@ -784,7 +784,7 @@ class EagleMixedRequestControls(unittest.TestCase):
 
 
 def idle_owner():
-    provider = NS(method="eagle3")
+    provider = NS(method="eagle3", _active_inputs=None)
     session = NS(provider=provider, _capture_call=None)
     batch = NS(is_dummy=True, num_reqs=1, num_reqs_after_padding=1)
     owner = NS(
@@ -800,7 +800,6 @@ def idle_owner():
         _eagle3_window_bypass_active=True,
         _eagle3_window_continuing_prefill=False,
         _draft_window_graph_binding_provider=provider,
-        _draft_window_runtime_state=NS(_active_inputs=None),
     )
 
     def require_reusable():
@@ -859,7 +858,7 @@ class EagleIdleOwnershipControls(unittest.TestCase):
                 self.fail("live business generation entered dummy replay")
             self.assertTrue(owner._draft_window_graph_submission_uncertain)
         owner, batch, session = idle_owner()
-        owner._draft_window_runtime_state._active_inputs = object()
+        owner._draft_window_graph_binding_provider._active_inputs = object()
         with (
             self.assertRaises(RuntimeError),
             IDLE["eagle3_dp_dummy_scope"](owner, batch, dummy_run=True, is_profile=False),
