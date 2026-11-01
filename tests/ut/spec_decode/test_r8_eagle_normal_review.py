@@ -189,6 +189,14 @@ class Controls(unittest.TestCase):
             M.validate_eagle_single_request_review_config(c, experimental_graph_review=True),
             M.EagleSingleRequestReviewScope,
         )
+        c = config()
+        c.scheduler_config.async_scheduling = True
+        c.cache_config.enable_prefix_caching = True
+        c.additional_config["enable_flashcomm1"] = True
+        self.assertIsInstance(
+            M.validate_eagle_single_request_review_config(c, experimental_graph_review=True),
+            M.EagleSingleRequestReviewScope,
+        )
         for backend, sp in [
             ("allgather_reducescatter", False),
             ("flashinfer_all2allv", True),
@@ -207,8 +215,10 @@ class Controls(unittest.TestCase):
             ("parallel_config", "decode_context_parallel_size", 2),
             ("parallel_config", "enable_expert_parallel", False),
             ("parallel_config", "use_sequence_parallel_moe", False),
-            ("scheduler_config", "async_scheduling", True),
-            ("cache_config", "enable_prefix_caching", True),
+            ("scheduler_config", "async_scheduling", 1),
+            ("scheduler_config", "async_scheduling", "true"),
+            ("cache_config", "enable_prefix_caching", 1),
+            ("cache_config", "enable_prefix_caching", "true"),
             ("speculative_config", "num_speculative_tokens", 4),
         ]:
             c = config()
