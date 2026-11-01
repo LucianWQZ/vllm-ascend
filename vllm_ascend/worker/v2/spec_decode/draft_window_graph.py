@@ -489,7 +489,7 @@ class DraftWindowGraphBindingProvider:
             raise TypeError("graph metadata builder must be callable")
         generation = inputs.identity
         inputs.validate_for(generation)
-        if inputs.lease._owner is not self._runtime_state:
+        if inputs._owner is not self._runtime_state:
             raise RuntimeError("graph carrier inputs do not belong to the provider runtime")
         _validate_route(capture_identity.route, generation)
         self._validate_runtime_capture_compatibility(capture_identity, generation)
@@ -502,7 +502,7 @@ class DraftWindowGraphBindingProvider:
         )
 
         read_inputs = carrier.read_inputs
-        if inputs.lease.workspace is not carrier.workspace:
+        if inputs.workspace is not carrier.workspace:
             raise RuntimeError("Graph generation was not materialized into its exact capture bank")
         carrier.read_inputs = DraftWindowGraphReadInputs(
             window_block_table=read_inputs.window_block_table,

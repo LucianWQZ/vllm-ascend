@@ -19,7 +19,6 @@ from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftMetadataInputs,
     DraftWindowExecutionPhase,
     DraftWindowGenerationIdentity,
-    DraftWindowLeaseState,
     DraftWindowReadDescriptor,
     DraftWindowRuntimeState,
     DraftWindowSourceCapability,
@@ -219,7 +218,7 @@ class Eagle3DraftWindowMixin:
             try:
                 if (
                     live_inputs is not None
-                    and live_inputs.lease.state is not DraftWindowLeaseState.RETIRED
+                    and not live_inputs.retired
                     and not (graph_session is not None and graph_session.controller.quarantined)
                 ):
                     self._draft_window_runtime_state.abort_generation(live_inputs.identity)
@@ -497,7 +496,7 @@ class Eagle3DraftWindowMixin:
                 self._eagle3_window_last_identity = inputs.identity
                 self._eagle3_window_next_step = inputs.identity.step + 1
             else:
-                if inputs.lease.state is not DraftWindowLeaseState.RETIRED:
+                if not inputs.retired:
                     self._draft_window_runtime_state.abort_generation(inputs.identity)
                 self._eagle3_window_last_identity = None
         except BaseException:
@@ -505,7 +504,7 @@ class Eagle3DraftWindowMixin:
                 graph_session.controller.quarantine("Eagle3 step retirement failed")
                 self._draft_window_graph_submission_uncertain = True
             else:
-                if inputs.lease.state is not DraftWindowLeaseState.RETIRED:
+                if not inputs.retired:
                     self._draft_window_runtime_state.abort_generation(inputs.identity)
                 self._eagle3_window_last_identity = None
                 self._eagle3_window_live_inputs = None

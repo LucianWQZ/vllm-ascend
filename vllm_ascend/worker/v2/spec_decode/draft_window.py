@@ -8,11 +8,10 @@ Full write tables and Target state remain owned by the existing runner.
 """
 
 import os
-from collections.abc import Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -1052,21 +1051,6 @@ class DraftWindowGenerationIdentity:
             raise ValueError("row phase fingerprint must match the actual request count")
 
 
-class DraftWindowCompletionToken(Protocol):
-    """Minimal completion contract; concrete NPU events remain a later gate."""
-
-    def is_complete(self) -> bool: ...
-
-
-class DraftWindowLeaseState(Enum):
-    """Observable states of the single serialized P3 execution lane."""
-
-    ACQUIRED = "acquired"
-    READER_PENDING = "reader_pending"
-    RETIRED_PENDING = "retired_pending"
-    RETIRED = "retired"
-
-
 class DraftWindowWorkspace:
     """Fixed-capacity, stable-address backing for one serialized read lane."""
 
@@ -1238,8 +1222,9 @@ class DraftWindowWorkspace:
                 self._zero_all()
             raise
 
-    def build_inputs(self, lease: "DraftWindowLease") -> "DraftMetadataInputs":
-        identity = lease.identity
+    def build_inputs(
+        self, owner: "DraftWindowRuntimeState", identity: DraftWindowGenerationIdentity
+    ) -> "DraftMetadataInputs":
         self.assert_bound(identity)
         padded = identity.padded_request_count
         return DraftMetadataInputs(
@@ -1253,7 +1238,8 @@ class DraftWindowWorkspace:
             actual_request_count=identity.actual_request_count,
             padded_request_count=padded,
             table_capacity_columns=self.table_capacity_columns,
-            _lease=lease,
+            _owner=owner,
+            workspace=self,
         )
 
     def assert_bound(self, expected_identity: DraftWindowGenerationIdentity) -> None:
@@ -1281,47 +1267,11 @@ class DraftWindowWorkspace:
         self._needs_clear = False
 
 
-class DraftWindowLease:
-    """Generation handle whose retirement is coordinated by its runtime owner."""
-
-    def __init__(
-        self,
-        *,
-        owner: "DraftWindowRuntimeState",
-        identity: DraftWindowGenerationIdentity,
-        workspace: DraftWindowWorkspace,
-    ) -> None:
-        self._owner = owner
-        self.identity = identity
-        self.workspace = workspace
-        self._state = DraftWindowLeaseState.ACQUIRED
-        self._completion_token: DraftWindowCompletionToken | None = None
-        self._quarantine_on_failure = False
-
-    @property
-    def state(self) -> DraftWindowLeaseState:
-        return self._state
-
-    def assert_current(self, expected_identity: DraftWindowGenerationIdentity) -> None:
-        if self.identity != expected_identity:
-            raise RuntimeError("lease generation identity does not match the expected generation")
-        if self._state in (
-            DraftWindowLeaseState.RETIRED_PENDING,
-            DraftWindowLeaseState.RETIRED,
-        ):
-            raise RuntimeError("cannot use a retired lease")
-        self.workspace.assert_bound(expected_identity)
-
-    def retire(self, expected_identity: DraftWindowGenerationIdentity) -> None:
-        """Retire through the one runtime owner so store and backing agree."""
-        self._owner._retire_lease(self, expected_identity)
-
-
 @dataclass(frozen=True, slots=True, eq=False)
 class DraftMetadataInputs:
     """Immutable typed transport for one workspace binding.
 
-    The tensor references are workspace views protected by ``_lease``.  They
+    The runtime owns one current generation and retains its workspace. These
     are read inputs only: positions, query layout, slot mappings, Target state,
     and the canonical FullSource owner are intentionally absent.
     """
@@ -1336,7 +1286,8 @@ class DraftMetadataInputs:
     actual_request_count: int
     padded_request_count: int
     table_capacity_columns: int
-    _lease: DraftWindowLease = field(repr=False, compare=False)
+    _owner: "DraftWindowRuntimeState" = field(repr=False, compare=False)
+    workspace: DraftWindowWorkspace = field(repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.actual_request_count != self.identity.actual_request_count:
@@ -1406,13 +1357,15 @@ class DraftMetadataInputs:
                 raise ValueError("padded Draft metadata rows must be deterministically zero")
 
     @property
-    def lease(self) -> DraftWindowLease:
-        return self._lease
+    def retired(self) -> bool:
+        return self._owner._active_inputs is not self
 
     def validate_for(self, expected_identity: DraftWindowGenerationIdentity) -> None:
         if self.identity != expected_identity:
             raise RuntimeError("typed inputs generation identity does not match the expected generation")
-        self._lease.assert_current(expected_identity)
+        if self.retired:
+            raise RuntimeError("cannot use retired Draft inputs")
+        self.workspace.assert_bound(expected_identity)
 
 
 class DraftWindowRuntimeState:
@@ -1433,11 +1386,11 @@ class DraftWindowRuntimeState:
         self._workspace = workspace
         self.execution_lane = execution_lane
         self._metadata: Any = None
-        self._current_lease: DraftWindowLease | None = None
+        self._current_workspace: DraftWindowWorkspace | None = None
+        self._quarantine_on_failure = False
         self._active_inputs: DraftMetadataInputs | None = None
         self._last_mapping_epoch = -1
         self._last_retired_identity: DraftWindowGenerationIdentity | None = None
-        self._pending_retirement_identity: DraftWindowGenerationIdentity | None = None
         self._quarantined_identity: DraftWindowGenerationIdentity | None = None
 
     @property
@@ -1503,8 +1456,8 @@ class DraftWindowRuntimeState:
 
         The opt-in Graph and async eager callers request
         ``quarantine_on_failure`` because a native exception cannot attest that
-        no device work was submitted. Other callers retain the default cleanup
-        contract until they establish an explicit native submission owner.
+        no device work was submitted. The existing manager owns normal Graph
+        completion and orders the next bank write on the same stream.
         """
         if self._quarantined_identity is not None:
             raise RuntimeError("draft-window backing is quarantined after uncertain Graph submission")
@@ -1572,7 +1525,6 @@ class DraftWindowRuntimeState:
         This models several Eagle3 forwards within one proposal without lying
         that the batch mapping changed between those forwards.
         """
-        self._reclaim_completed_reader()
         if self._active_inputs is not None:
             raise RuntimeError("cannot refresh a Draft Window while the previous reader is active")
         if self._last_retired_identity != previous_identity:
@@ -1655,15 +1607,13 @@ class DraftWindowRuntimeState:
         output_workspace: DraftWindowWorkspace | None = None,
     ) -> DraftMetadataInputs:
         """Acquire and populate the one serialized backing for an identity."""
-        self._reclaim_completed_reader()
-        if self._current_lease is not None:
+        if self._current_workspace is not None:
             raise RuntimeError(f"draft-window execution lane {self.execution_lane} is still in use")
         if identity.execution_lane != self.execution_lane:
             raise RuntimeError("draft-window generation lane does not match its owner")
         workspace = self.workspace if output_workspace is None else output_workspace
-        lease = DraftWindowLease(owner=self, identity=identity, workspace=workspace)
-        self._current_lease = lease
-        lease._quarantine_on_failure = quarantine_on_failure
+        self._current_workspace = workspace
+        self._quarantine_on_failure = quarantine_on_failure
         self._last_mapping_epoch = max(self._last_mapping_epoch, identity.mapping_epoch)
         try:
             workspace.materialize(
@@ -1675,17 +1625,17 @@ class DraftWindowRuntimeState:
                 cpu_valid_num_blocks=cpu_valid_num_blocks,
                 preserve_on_failure=quarantine_on_failure,
             )
-            inputs = workspace.build_inputs(lease)
+            inputs = workspace.build_inputs(self, identity)
             self._active_inputs = inputs
             return inputs
         except BaseException:
             if quarantine_on_failure:
                 # A native write may have been submitted before raising, even
-                # though no typed inputs exist yet. Keep the acquired lease and
+                # though no typed inputs exist yet. Keep the workspace and
                 # backing; only Host state may be changed before child isolation.
                 self._quarantined_identity = identity
                 raise
-            self._finish_lease(lease)
+            self._finish_generation(identity)
             self._active_inputs = None
             raise
 
@@ -1715,32 +1665,8 @@ class DraftWindowRuntimeState:
         self._active_inputs.validate_for(expected_identity)
         return self._metadata
 
-    def mark_reader_pending(self, inputs: DraftMetadataInputs, token: DraftWindowCompletionToken) -> None:
-        self._require_active_inputs(inputs)
-        lease = inputs.lease
-        if lease.state is not DraftWindowLeaseState.ACQUIRED:
-            raise RuntimeError("a completion token is already bound to this lease")
-        if not callable(getattr(token, "is_complete", None)):
-            raise TypeError("completion token must implement is_complete()")
-        lease._completion_token = token
-        lease._state = DraftWindowLeaseState.READER_PENDING
-
-    @contextmanager
-    def generation_guard(
-        self,
-        inputs: DraftMetadataInputs,
-    ) -> Iterator[DraftMetadataInputs]:
-        """Abort this generation on an exception without retiring on success."""
-        self._require_active_inputs(inputs)
-        try:
-            yield inputs
-        except BaseException:
-            if self._active_inputs is inputs:
-                self._handle_active_failure(inputs)
-            raise
-
     def _handle_active_failure(self, inputs: DraftMetadataInputs) -> None:
-        if inputs.lease._quarantine_on_failure:
+        if self._quarantine_on_failure:
             self.quarantine_generation(inputs.identity)
         else:
             self._abort_active(inputs.identity)
@@ -1750,66 +1676,19 @@ class DraftWindowRuntimeState:
             raise RuntimeError("cannot retire quarantined draft-window backing")
         inputs = self._active_inputs
         if inputs is None:
-            raise RuntimeError("cannot use a retired lease")
-        self._retire_lease(inputs.lease, expected_identity)
-
-    def poll_reader_completion(
-        self,
-        expected_identity: DraftWindowGenerationIdentity,
-    ) -> bool:
-        """Poll an explicitly retired reader without allowing early reuse."""
-        if self._quarantined_identity is not None:
-            raise RuntimeError("cannot poll quarantined draft-window backing")
-        if self._last_retired_identity == expected_identity:
-            return True
-        inputs = self._active_inputs
-        if inputs is not None:
-            inputs.validate_for(expected_identity)
-            if inputs.lease.state is not DraftWindowLeaseState.READER_PENDING:
-                raise RuntimeError("active Draft Window reader has not been submitted")
-            self._retire_lease(inputs.lease, expected_identity)
-            if self._last_retired_identity == expected_identity:
-                return True
-            if self._pending_retirement_identity == expected_identity:
-                return False
-        if self._pending_retirement_identity != expected_identity:
-            raise RuntimeError("pending reader belongs to a different generation")
-        retired = self._reclaim_lease(expected_identity)
-        if retired is None:
-            return False
-        self._pending_retirement_identity = None
-        self._last_retired_identity = retired
-        return True
+            raise RuntimeError("cannot use retired Draft inputs")
+        inputs.validate_for(expected_identity)
+        self._finish_generation(expected_identity)
+        self._last_retired_identity = expected_identity
 
     def abort_generation(self, expected_identity: DraftWindowGenerationIdentity) -> None:
         if self._quarantined_identity is not None:
             raise RuntimeError("cannot abort quarantined draft-window backing")
         inputs = self._active_inputs
         if inputs is None:
-            raise RuntimeError("cannot use a retired lease")
+            raise RuntimeError("cannot use retired Draft inputs")
         inputs.validate_for(expected_identity)
         self._abort_active(expected_identity)
-
-    def _retire_lease(
-        self,
-        lease: DraftWindowLease,
-        expected_identity: DraftWindowGenerationIdentity,
-    ) -> None:
-        if self._quarantined_identity is not None:
-            raise RuntimeError("cannot retire quarantined draft-window backing")
-        inputs = self._active_inputs
-        if inputs is None or inputs.lease is not lease:
-            raise RuntimeError("cannot use a retired lease")
-        inputs.validate_for(expected_identity)
-        self._metadata = None
-        self._release_lease(lease)
-        self._active_inputs = None
-        if lease.state is DraftWindowLeaseState.RETIRED:
-            self._last_retired_identity = expected_identity
-            self._pending_retirement_identity = None
-        else:
-            self._last_retired_identity = None
-            self._pending_retirement_identity = expected_identity
 
     def _abort_active(self, identity: DraftWindowGenerationIdentity) -> None:
         if self._quarantined_identity is not None:
@@ -1818,48 +1697,19 @@ class DraftWindowRuntimeState:
         if inputs is None:
             return
         inputs.validate_for(identity)
-        self._metadata = None
-        self._release_lease(inputs.lease)
-        self._active_inputs = None
+        self._finish_generation(identity)
         self._last_retired_identity = None
-        self._pending_retirement_identity = (
-            identity if inputs.lease.state is DraftWindowLeaseState.RETIRED_PENDING else None
-        )
 
-    def _reclaim_completed_reader(self) -> None:
-        pending = self._pending_retirement_identity
-        if pending is None:
-            return
-        retired = self._reclaim_lease(pending)
-        if retired is not None:
-            self._pending_retirement_identity = None
-            self._last_retired_identity = retired
-
-    def _finish_lease(self, lease: DraftWindowLease) -> None:
-        # A Graph bank outlives this Host generation. Never enqueue a clear
-        # at retirement; its next same-stream prepare clears it before writing.
-        lease.workspace.reset(lease.identity, clear_buffers=lease.workspace is self._workspace)
-        lease._state = DraftWindowLeaseState.RETIRED
-        self._current_lease = None
-
-    def _release_lease(self, lease: DraftWindowLease) -> None:
-        if self._current_lease is not lease:
-            raise RuntimeError("cannot use a retired lease")
-        token = lease._completion_token
-        if token is None or bool(token.is_complete()):
-            self._finish_lease(lease)
-        else:
-            lease._state = DraftWindowLeaseState.RETIRED_PENDING
-
-    def _reclaim_lease(self, identity: DraftWindowGenerationIdentity) -> DraftWindowGenerationIdentity | None:
-        lease = self._current_lease
-        if lease is None or lease.identity != identity or lease.state is not DraftWindowLeaseState.RETIRED_PENDING:
-            raise RuntimeError("pending reader belongs to a different generation")
-        assert lease._completion_token is not None
-        if not bool(lease._completion_token.is_complete()):
-            return None
-        self._finish_lease(lease)
-        return identity
+    def _finish_generation(self, identity: DraftWindowGenerationIdentity) -> None:
+        # Graph bank lifetime belongs to capture, not this Host generation.
+        # Clear only at the next same-stream prepare, after the existing tail
+        # dependency. Non-FULL scratch follows its serialized current stream.
+        workspace = self._current_workspace
+        assert workspace is not None
+        workspace.reset(identity, clear_buffers=workspace is self._workspace)
+        self._metadata = None
+        self._active_inputs = None
+        self._current_workspace = None
 
     def _require_active_inputs(self, inputs: DraftMetadataInputs) -> None:
         if self._active_inputs is not inputs:

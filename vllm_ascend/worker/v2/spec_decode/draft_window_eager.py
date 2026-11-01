@@ -23,7 +23,6 @@ from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftMetadataInputs,
     DraftWindowExecutionPhase,
     DraftWindowGenerationIdentity,
-    DraftWindowLeaseState,
     DraftWindowRuntimeState,
     DraftWindowSourceCapability,
     gather_valid_num_blocks_cpu,
@@ -394,7 +393,7 @@ class DraftWindowGraphInputMixin:
                 self._draft_window_graph_submission_uncertain = True
             live_inputs = self._draft_window_live_inputs
             try:
-                if live_inputs is not None and live_inputs.lease.state is not DraftWindowLeaseState.RETIRED:
+                if live_inputs is not None and not live_inputs.retired:
                     if succeeded:
                         try:
                             self._draft_window_runtime_state.retire_generation(live_inputs.identity)

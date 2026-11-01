@@ -172,7 +172,7 @@ def test_direct_capture_bank_never_allocates_scratch_or_mutates_full_source(grap
     carrier = _bind(case, inputs)
     assert case.runtime._workspace is None
     assert inputs.window_block_table.data_ptr() == carrier.read_inputs.window_block_table.data_ptr()
-    assert inputs.lease.workspace is carrier.workspace
+    assert inputs.workspace is carrier.workspace
     assert torch.equal(inputs.window_block_table, torch.tensor([[12, 13], [23, 24]], dtype=torch.int32))
     assert torch.equal(case.owner.input_block_tables[0], full_before)
     assert case.target_metadata["target.layer"].seq_lens_list == [91, 92]
@@ -194,7 +194,7 @@ def test_first_real_generation_clears_startup_capture_seed_and_padding(graph_buf
 def test_retirement_preserves_bank_until_next_generation_then_clears_tail(graph_buffers):
     case = graph_buffers
     first = _materialize(case)
-    bank = first.lease.workspace
+    bank = first.workspace
     snapshots = [tensor.clone() for tensor in _bank_tensors(bank)]
     pointers = [tensor.data_ptr() for tensor in _bank_tensors(bank)]
     case.runtime.retire_generation(first.identity)
@@ -206,24 +206,23 @@ def test_retirement_preserves_bank_until_next_generation_then_clears_tail(graph_
     assert second.valid_num_blocks.tolist() == [4, 0]
     for tensor in _bank_tensors(bank)[2:]:
         assert tensor.tolist() == [4, 0]
-    with pytest.raises(RuntimeError, match="retired lease"):
+    with pytest.raises(RuntimeError, match="retired Draft inputs"):
         first.validate_for(first.identity)
 
 
-def test_pending_reader_blocks_reuse_and_preserves_all_backing(graph_buffers):
+def test_active_generation_blocks_reuse_and_preserves_all_backing(graph_buffers):
     case = graph_buffers
-    token = SimpleNamespace(complete=False)
-    token.is_complete = lambda: token.complete
     first = _materialize(case)
-    snapshots = [tensor.clone() for tensor in _bank_tensors(first.lease.workspace)]
-    case.runtime.mark_reader_pending(first, token)
-    case.runtime.retire_generation(first.identity)
-    assert not case.runtime.poll_reader_completion(first.identity)
+    snapshots = [tensor.clone() for tensor in _bank_tensors(first.workspace)]
+    assert not first.retired
+    assert case.runtime._current_workspace is first.workspace
     with pytest.raises(RuntimeError, match="still in use"):
         _materialize(case, epoch=1, ends=(4,))
-    assert all(torch.equal(tensor, old) for tensor, old in zip(_bank_tensors(first.lease.workspace), snapshots))
-    token.complete = True
-    assert case.runtime.poll_reader_completion(first.identity)
+    assert all(torch.equal(tensor, old) for tensor, old in zip(_bank_tensors(first.workspace), snapshots))
+    first.validate_for(first.identity)
+    case.runtime.retire_generation(first.identity)
+    assert first.retired
+    assert case.runtime._current_workspace is None
     second = _materialize(case, epoch=1, ends=(4,))
     assert second.identity.mapping_epoch == first.identity.mapping_epoch + 1
 
@@ -255,15 +254,17 @@ def test_provider_rejects_overwrite_before_bound_consumer_has_finished(graph_buf
         case.provider.prepare_workspace(case.capture)
 
 
-def test_exception_after_possible_submission_quarantines_bank_without_clearing(graph_buffers):
+def test_failed_metadata_isolation_quarantines_bank_without_clearing(graph_buffers):
     case = graph_buffers
     inputs = _materialize(case, quarantine=True)
-    before = [tensor.clone() for tensor in _bank_tensors(inputs.lease.workspace)]
-    with pytest.raises(ValueError, match="native submission failed"), case.runtime.generation_guard(inputs):
-        raise ValueError("native submission failed")
+    before = [tensor.clone() for tensor in _bank_tensors(inputs.workspace)]
+    with pytest.raises(ValueError, match="alias Target"):
+        case.runtime.publish_metadata(inputs, case.target_metadata, target_metadata=case.target_metadata)
     assert case.runtime.quarantined_identity == inputs.identity
-    assert inputs.lease.workspace.bound_identity == inputs.identity
-    assert all(torch.equal(tensor, old) for tensor, old in zip(_bank_tensors(inputs.lease.workspace), before))
+    assert case.runtime._current_workspace is inputs.workspace
+    assert case.runtime._active_inputs is inputs
+    assert inputs.workspace.bound_identity == inputs.identity
+    assert all(torch.equal(tensor, old) for tensor, old in zip(_bank_tensors(inputs.workspace), before))
     with pytest.raises(RuntimeError, match="quarantined"):
         case.provider.prepare_workspace(case.capture)
     with pytest.raises(RuntimeError, match="quarantined"):
