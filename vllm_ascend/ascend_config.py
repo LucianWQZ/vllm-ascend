@@ -2063,33 +2063,7 @@ def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
         "profiling_chunk_config",
         "batch_job_sched_config",
     }
-    retired_window_experiments = {
-        "draft_window_graph_replicated_tp_review",
-        "draft_window_graph_single_metadata",
-        "draft_window_graph_eagle_dp2_review",
-        "draft_window_parallel_eager_review",
-        "draft_window_graph_validation_memo",
-        "draft_window_graph_full8_single_request_review",
-        "draft_window_graph_numeric_owned_output",
-        "draft_window_graph_eagle_pinned_h2d_review",
-        "draft_window_graph_full8_two_request_review",
-        "draft_window_graph_eagle_attention_probe",
-        "draft_window_graph_eagle_two_request_review",
-        "draft_window_graph_eagle_single_request_review",
-        "draft_window_graph_numeric_diagnostic",
-    }
-    obsolete = sorted(key for key in retired_window_experiments if additional_config.get(key, False) is not False)
-    if obsolete:
-        raise ValueError(
-            "Removed Draft Window experiment options: "
-            + ", ".join(obsolete)
-            + ". Use the ordinary Draft Graph entry; support follows actual model, max_num_seqs and capture capacity."
-        )
-    kwargs = {
-        k: v
-        for k, v in additional_config.items()
-        if k not in _NON_USER_INPUT_KEYS and k not in retired_window_experiments
-    }
+    kwargs = {k: v for k, v in additional_config.items() if k not in _NON_USER_INPUT_KEYS}
     unknown_keys = sorted(set(kwargs) - AscendConfig.__dataclass_fields__.keys())
     # vLLM-Omni shares this mapping with the platform plugin. Preserve its
     # extension keys on VllmConfig while excluding them from Ascend validation.

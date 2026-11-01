@@ -2131,6 +2131,31 @@ class TestTopLevelSwitchTypeValidation(TestBase):
             init_ascend_config(vc)
 
     @_clean_up
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_removed_draft_experiment_options_are_unknown_even_when_false(self, mock_fix):
+        for key in ("draft_window_graph_replicated_tp_review", "draft_window_graph_numeric_diagnostic"):
+            for value in (False, True):
+                with self.subTest(key=key, value=value):
+                    vc = VllmConfig(device_config=DeviceConfig(device="cpu"))
+                    vc.additional_config = {key: value}
+                    with (
+                        patch("vllm_ascend.ascend_config.importlib.util.find_spec", return_value=None),
+                        self.assertRaisesRegex(ValueError, key),
+                    ):
+                        init_ascend_config(vc)
+
+    @_clean_up
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_normal_draft_window_option_survives_factory(self, mock_fix):
+        vc = VllmConfig(device_config=DeviceConfig(device="cpu"))
+        vc.additional_config = {"draft_window_size": 1024}
+
+        config = init_ascend_config(vc)
+
+        self.assertEqual(config.draft_window_size, 1024)
+        self.assertEqual(vc.additional_config, {"draft_window_size": 1024})
+
+    @_clean_up
     @patch("vllm_ascend.ascend_config.logger.warning")
     @patch(
         "vllm_ascend.ascend_config.importlib.util.find_spec",
