@@ -203,6 +203,25 @@ class Full8FiniteEntry(unittest.TestCase):
                     with self.assertRaisesRegex(NotImplementedError, "at most 1"):
                         guard(owner, batch)
 
+    def test_dp2_cannot_select_the_dp1_two_request_entry(self):
+        self.config.speculative_config.draft_parallel_config.data_parallel_size = 1
+        self.config.additional_config["draft_window_graph_full8_two_request_review"] = True
+        self.config.scheduler_config.max_num_seqs = 2
+        self.config.compilation_config.cudagraph_capture_sizes = [8, 16]
+        for window in (None, 32768):
+            self.config.additional_config["draft_window_size"] = window
+            for features in (False, True):
+                self.config.scheduler_config.async_scheduling = features
+                self.config.cache_config.enable_prefix_caching = features
+                self.config.additional_config["enable_flashcomm1"] = features
+                self.config.parallel_config.data_parallel_size = 1
+                self.assertEqual(
+                    self.resolve(self.config, experimental_graph_review=True), "full8_local_active_at_most_two"
+                )
+                self.config.parallel_config.data_parallel_size = 2
+                with self.assertRaisesRegex(NotImplementedError, "DP2 one request only"):
+                    self.resolve(self.config, experimental_graph_review=True)
+
     def test_two_request_entry_is_separate_and_uses_both_exact_banks(self):
         extra = self.config.additional_config
         extra["draft_window_graph_full8_two_request_review"] = True
