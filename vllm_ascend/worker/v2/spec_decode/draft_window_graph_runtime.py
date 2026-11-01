@@ -191,16 +191,17 @@ def build_parallel_graph_source(
         allow_parallel_dp_graph_source=replicated_review and runtime_context.data_parallel_size == 2,
         dflash2_graph_contract=dflash2_graph_contract,
     )
+    topology = capability.eager_topology_fingerprint
+    if topology is None:
+        raise RuntimeError("Draft Graph source has no actual runtime topology")
     if runtime_context.prefix_caching:
         # Reuse P7's current-request resident snapshot, owned exact lengths and
         # canonical Full source. Prefix is kept in the real topology identity;
         # it is not hidden by replacing it with an OFF context. A prefix hit
         # never permits changing canonical Full slots or source ownership.
         capability.full_source.validate_owner_bindings()
-        if capability.eager_topology_fingerprint.prefix_caching is not True:
+        if topology.prefix_caching is not True:
             raise RuntimeError("parallel prefix Graph source lost the actual caching identity")
-    if capability.eager_topology_fingerprint is None:
-        raise RuntimeError("Draft Graph source has no actual runtime topology")
     capability = replace(capability, native_swa_graph=native_swa)
     return capability, runtime_context
 

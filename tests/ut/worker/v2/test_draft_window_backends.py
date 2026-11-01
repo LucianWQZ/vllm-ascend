@@ -6,6 +6,7 @@ import ast
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -42,6 +43,7 @@ class CompressedBuilder:
 
 class FullSpec:
     sliding_window: int | None
+    attention_chunk_size: int | None
 
     def __init__(self, block_size=256, tokens_per_state=1):
         self.block_size = block_size
@@ -158,6 +160,15 @@ def test_full_spec_with_chunked_attention_cannot_claim_dense_prefix_reads(types,
         require_draft_window_providers((route,))
 
 
+def test_missing_native_window_is_a_missing_provider_not_an_implicit_full_reader(types, topology):
+    spec = SlidingSpec()
+    spec.sliding_window = None
+    (route,) = inventory(replace(types, sliding_window_spec=SlidingSpec), topology, specs=[spec])
+    assert route.status is DraftWindowProviderStatus.PROVIDER_MISSING
+    with pytest.raises(NotImplementedError, match="provider missing"):
+        require_draft_window_providers((route,))
+
+
 def _source_topology_fingerprint(groups, *, target_dsa_cp):
     """Run the actual source-coordinate decision, without hardware imports."""
     path = Path(__file__).resolve().parents[4] / "vllm_ascend/worker/v2/spec_decode/draft_window_eager_capability.py"
@@ -236,7 +247,7 @@ def test_graph_source_uses_shared_route_without_promoting_native_swa(
     inventory_class = next(
         n for n in ast.parse(path.read_text()).body if isinstance(n, ast.ClassDef) and n.name == "DraftWindowInventory"
     )
-    namespace = dict(
+    namespace: dict[str, Any] = dict(
         dataclass=dataclass,
         DraftWindowGroupRoute=DraftWindowGroupRoute,
         DraftWindowProviderStatus=DraftWindowProviderStatus,

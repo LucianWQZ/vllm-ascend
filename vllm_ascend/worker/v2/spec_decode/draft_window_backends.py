@@ -300,10 +300,10 @@ def inventory_draft_window_groups(
             ):
                 if topology.prefill_context_parallel_size != 1 or topology.decode_context_parallel_size != 1:
                     reason = "Native SWA context-parallel coordinates need a separate provider"
-                elif len(windows) != 1 or next(iter(windows)) <= 0:
+                elif len(windows) != 1 or native_window is None or native_window <= 0:
                     reason = "Native SWA group has inconsistent windows"
                 else:
-                    native_window = int(next(iter(windows)))
+                    native_window = int(native_window)
                     status = DraftWindowProviderStatus.NATIVE_SWA_CANDIDATE
                     reason = "Native SWA may already be a subset; requires a static query/window coverage certificate"
             elif (

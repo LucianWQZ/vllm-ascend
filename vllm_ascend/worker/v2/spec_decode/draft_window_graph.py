@@ -1034,6 +1034,8 @@ class DraftWindowGraphBindingProvider:
         if actual != self._capture_topology():
             raise RuntimeError("capture/P2 TP world, rank or parallel read semantics mismatch")
         topology = self._runtime_state.capability.eager_topology_fingerprint
+        if topology is None:
+            raise RuntimeError("Graph read banks require their actual source topology")
         source_prefix = topology.prefix_caching
         runtime = self._runtime_state.topology_fingerprint
         source_dp = topology.data_parallel_size

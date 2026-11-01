@@ -198,7 +198,7 @@ class Eagle3GraphSession:
             self.owner.max_model_len, identity.fingerprint.window_size + identity.fingerprint.block_span_tokens - 1
         )
         private = _isolate_draft_metadata_from_target(metadata, metadata)
-        result = {}
+        result: dict[str, Any] = {}
         for name, layer in private.items():
             if layer is None:
                 result[name] = None
@@ -269,7 +269,7 @@ class Eagle3GraphSession:
                 target_metadata=target,
                 first_pass=first,
             )
-            final = {}
+            final: dict[str, Any] = {}
             for name, layer in private.items():
                 if layer is None:
                     final[name] = None

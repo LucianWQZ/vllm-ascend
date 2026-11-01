@@ -13,6 +13,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from typing import Any
 from unittest.mock import Mock
 
 import pytest
@@ -118,17 +119,21 @@ def test_graph_capture_requires_explicit_matching_source_topology(case):
         if isinstance(n, ast.ClassDef) and n.name == "DraftWindowGraphBindingProvider"
     )
     method = next(n for n in provider.body if isinstance(n, ast.FunctionDef) and n.name == "_capture_topology")
-    namespace = {}
+    namespace: dict[str, Any] = {}
     exec(compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"), namespace)
-    source = SimpleNamespace(tensor_parallel_size=16, tensor_parallel_rank=7, parallel_read_semantics="replicated")
-    runtime = SimpleNamespace(**vars(source))
+    source: SimpleNamespace | None = SimpleNamespace(
+        tensor_parallel_size=16, tensor_parallel_rank=7, parallel_read_semantics="replicated"
+    )
+    runtime: SimpleNamespace | None = SimpleNamespace(**vars(source))
     if case == "missing-source":
         source = None
     elif case == "missing-runtime":
         runtime = None
     elif case == "rank-drift":
+        assert runtime is not None
         runtime.tensor_parallel_rank = 8
     elif case == "invalid-world":
+        assert source is not None
         source.tensor_parallel_size = 0
     owner = SimpleNamespace(
         _runtime_state=SimpleNamespace(

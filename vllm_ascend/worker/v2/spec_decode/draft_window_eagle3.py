@@ -141,7 +141,7 @@ class Eagle3DraftWindowMixin:
         self._eagle3_window_continuing_prefill = False
         self._eagle3_window_next_step = 0
         self._eagle3_window_static_k = static_k
-        self._eagle3_window_scheduled_tokens = None
+        self._eagle3_window_scheduled_tokens: int | None = None
         self._eagle3_window_expected_steps = static_k
         # Fused decode builds metadata once and mutates it for later steps.
         # P4b must rematerialize every step from canonical FullSource.

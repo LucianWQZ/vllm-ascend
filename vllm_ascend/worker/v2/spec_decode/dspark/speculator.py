@@ -415,12 +415,15 @@ class AscendDSparkSpeculator(DraftWindowGraphInputMixin, LmheadTPDraftSamplingMi
         if hasattr(self, "_draft_window_runtime_state") and not getattr(self, "_draft_window_bypass_active", False):
             # The Graph read transport owns the current exact CPU/device pair.
             # Do not run PR eager projection or its CPU-upper preparer again.
+            input_batch = self.input_batch
+            if input_batch is None:
+                raise RuntimeError("Draft Graph metadata requires the current input batch")
             with (
                 build_attn_metadata_wrapper(),
                 build_attn_metadata_factory(
                     self.input_buffers.positions,
                     batch_desc.num_tokens,
-                    torch.from_numpy(self.input_batch.is_prefilling_np),
+                    torch.from_numpy(input_batch.is_prefilling_np),
                     parallel_config=self.attn_vllm_config.parallel_config,
                 ),
             ):
