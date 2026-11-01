@@ -79,8 +79,8 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
-    # Private MRV2 Draft Graph review gate. Default 0, valid 0/1, non-sensitive.
-    # This does not enable public Draft Window Graph support.
+    # Explicit MRV2 Draft Window Graph entry. Default 0, valid 0/1, non-sensitive.
+    # Actual method, capacity and backend support are checked before use.
     "VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH": lambda: _strict_binary_env(
         "VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH"
     ),

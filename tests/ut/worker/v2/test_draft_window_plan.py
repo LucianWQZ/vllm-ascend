@@ -4,10 +4,8 @@
 import pytest
 
 from vllm_ascend.worker.v2.spec_decode.draft_window_plan import (
-    DraftWindowLengthBounds,
     compute_draft_window_plan,
     freeze_eagle_window_plan,
-    project_direct_prefix,
     project_draft_window_interval,
     window_capacity_tokens,
 )
@@ -33,14 +31,12 @@ def test_exact_window_boundaries_against_literal_token_oracle():
 
 
 def test_upper_bound_does_not_replace_exact_length():
-    bounds = DraftWindowLengthBounds(exact_end=1025, upper_end=1088)
-    plan = compute_draft_window_plan(full_exact_end=bounds.exact_end, window_size=128, block_span_tokens=64)
+    exact, upper = 1025, 1088
+    plan = compute_draft_window_plan(full_exact_end=exact, window_size=128, block_span_tokens=64)
     assert plan.window_start == 896
-    assert bounds.window_lengths(plan.window_start) == (129, 192)
-    wrong_plan = compute_draft_window_plan(full_exact_end=bounds.upper_end, window_size=128, block_span_tokens=64)
+    assert (exact - plan.window_start, upper - plan.window_start) == (129, 192)
+    wrong_plan = compute_draft_window_plan(full_exact_end=upper, window_size=128, block_span_tokens=64)
     assert wrong_plan.window_start != plan.window_start
-    with pytest.raises(ValueError, match="cover exact"):
-        DraftWindowLengthBounds(exact_end=1025, upper_end=1024)
 
 
 def test_eagle_frozen_anchor_survives_all_bounded_rejections():
@@ -71,59 +67,23 @@ def test_eagle_invalid_configuration_rejected_before_request_execution():
         plan.at_exact_end(1033)
 
 
-def _project(**overrides):
-    args = dict(
-        window_start=96, full_exact_end=137, block_span_tokens=16, valid_columns=9, resident_start=0, resident_end=137
-    )
-    args.update(overrides)
-    return project_direct_prefix(**args)
-
-
 def test_each_group_projects_same_logical_interval_without_lcm():
-    for span in (8, 16, 32):
-        projected = _project(block_span_tokens=span, valid_columns=18)
+    for span in (8, 16, 32, 64):
+        projected = project_draft_window_interval(window_start=96, full_exact_end=137, block_span_tokens=span)
         assert projected.source_start_column * span + projected.first_token_offset == 96
-        source_blocks = [list(range(start, start + span)) for start in range(0, 160, span)]
+        source_blocks = [list(range(start, start + span)) for start in range(0, 192, span)]
         selected = source_blocks[projected.source_start_column : projected.source_end_column]
         tokens = [token for block in selected for token in block]
         assert tokens[projected.first_token_offset : projected.first_token_offset + 41] == list(range(96, 137))
-    with pytest.raises(NotImplementedError, match="first-token offset"):
-        _project(block_span_tokens=64)
-    with_offset = _project(block_span_tokens=64, supports_first_token_offset=True)
-    assert (with_offset.source_start_column, with_offset.first_token_offset, with_offset.required_columns) == (1, 32, 2)
-
-
-def test_valid_columns_are_not_residency_proof():
-    with pytest.raises(ValueError, match="resident"):
-        _project(valid_columns=1000, resident_start=128)
-    with pytest.raises(ValueError, match="resident"):
-        _project(valid_columns=1000, resident_end=136)
-    with pytest.raises(ValueError, match="valid source columns"):
-        _project(valid_columns=8)
-    assert _project().required_columns == 3
+        assert projected.safe_extent_tokens >= 41
+        assert projected.safe_extent_tokens < 41 + span
+    assert (projected.source_start_column, projected.first_token_offset, projected.required_columns) == (1, 32, 2)
 
 
 def test_empty_request_does_not_invent_padding_or_read_columns():
-    projection = _project(window_start=0, full_exact_end=0, valid_columns=0, resident_end=0)
+    projection = project_draft_window_interval(window_start=0, full_exact_end=0, block_span_tokens=128)
     assert projection.required_columns == 0
     assert projection.safe_extent_tokens == 0
-
-
-def test_owned_graph_and_checked_eager_projection_share_the_same_interval():
-    for start, end, span in ((96, 137, 16), (96, 137, 64), (0, 0, 128), (0, 7, 8)):
-        owned = project_draft_window_interval(window_start=start, full_exact_end=end, block_span_tokens=span)
-        checked = project_direct_prefix(
-            window_start=start,
-            full_exact_end=end,
-            block_span_tokens=span,
-            valid_columns=(end + span - 1) // span,
-            resident_start=0,
-            resident_end=end,
-            supports_first_token_offset=True,
-        )
-        assert owned == checked
-        assert owned.safe_extent_tokens >= end - start
-        assert owned.safe_extent_tokens < end - start + span or end == start
     assert window_capacity_tokens(1024, 128) == 1151
 
 

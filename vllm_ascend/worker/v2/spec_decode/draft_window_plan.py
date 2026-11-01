@@ -26,30 +26,6 @@ def _positive_integer(name: str, value: int) -> None:
 
 
 @dataclass(frozen=True)
-class DraftWindowLengthBounds:
-    """An exact end and a distinct scheduling upper bound for the same row.
-
-    Construct only when the CPU end is exact for the current preparation phase.
-    An upper bound alone cannot construct this value or plan a read interval.
-    """
-
-    exact_end: int
-    upper_end: int
-
-    def __post_init__(self) -> None:
-        _nonnegative_integer("exact_end", self.exact_end)
-        _nonnegative_integer("upper_end", self.upper_end)
-        if self.upper_end < self.exact_end:
-            raise ValueError("upper_end must cover exact_end")
-
-    def window_lengths(self, start: int) -> tuple[int, int]:
-        _nonnegative_integer("start", start)
-        if start > self.exact_end:
-            raise ValueError("window start exceeds exact end")
-        return self.exact_end - start, self.upper_end - start
-
-
-@dataclass(frozen=True)
 class DraftWindowPlan:
     full_exact_end: int
     full_horizon_end: int
@@ -160,48 +136,3 @@ def project_draft_window_interval(
     columns = (offset + visible + block_span_tokens - 1) // block_span_tokens if visible else 0
     safe_extent = columns * block_span_tokens - offset if columns else 0
     return DirectPrefixProjection(column, offset, columns, safe_extent)
-
-
-def project_direct_prefix(
-    *,
-    window_start: int,
-    full_exact_end: int,
-    block_span_tokens: int,
-    valid_columns: int,
-    resident_start: int,
-    resident_end: int,
-    supports_first_token_offset: bool = False,
-) -> DirectPrefixProjection:
-    """Project a fixed logical window onto one direct-paged group.
-
-    The source owner must separately certify the contiguous resident interval.
-    Valid columns describe initialized table entries, not resident tokens. A
-    native/recycling/striped/compressed layout needs its own provider rather
-    than using this direct-prefix projection without proof.
-
-    Different groups receive the same logical S. An unrepresentable offset is
-    rejected; rounding S again or using an LCM would change window semantics.
-    """
-    for name, value in (
-        ("window_start", window_start),
-        ("full_exact_end", full_exact_end),
-        ("valid_columns", valid_columns),
-        ("resident_start", resident_start),
-        ("resident_end", resident_end),
-    ):
-        _nonnegative_integer(name, value)
-    _positive_integer("block_span_tokens", block_span_tokens)
-    if full_exact_end < window_start:
-        raise ValueError("window start exceeds exact end")
-    if resident_start > resident_end:
-        raise ValueError("resident interval is reversed")
-    if window_start < resident_start or full_exact_end > resident_end:
-        raise ValueError("requested read interval is not fully resident")
-    projection = project_draft_window_interval(
-        window_start=window_start, full_exact_end=full_exact_end, block_span_tokens=block_span_tokens
-    )
-    if projection.first_token_offset and not supports_first_token_offset:
-        raise NotImplementedError("group cannot represent the logical window start without a first-token offset")
-    if projection.required_columns and projection.source_end_column > valid_columns:
-        raise ValueError("requested read interval exceeds valid source columns")
-    return projection
