@@ -19,7 +19,7 @@ def test_ragged_queries_keep_full_row_and_use_device_exact_at_boundary(causal):
     before = table.clone()
     offsets = torch.tensor([0, 3, 8], dtype=torch.int32)
     exact = torch.tensor([1151, 1408], dtype=torch.int32)
-    held = []
+    held: list[object] = []
     read = prepare_dense_draft_read(
         source,
         exact_device=exact,

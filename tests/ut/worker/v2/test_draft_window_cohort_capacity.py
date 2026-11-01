@@ -21,7 +21,7 @@ def test_different_full_row_bounds_do_not_multiply_largest_workspace(order):
     rows = torch.tensor([2, 0, 1], dtype=torch.int64)[list(order)]
     table = torch.arange(3 * 64, dtype=torch.int32).reshape(3, 64)
     original = table.clone()
-    held = []
+    held: list[object] = []
     read = prepare_dense_draft_read(
         DirectPrefixSource(table, tuple(rows.tolist()), tuple(((upper + 127) // 128).tolist()), 128),
         exact_device=exact,

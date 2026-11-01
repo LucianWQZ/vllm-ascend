@@ -7,7 +7,11 @@ import pytest
 import torch
 
 from tests.ut.worker.v2.draft_window_cpu import cpu_dense_planning as cpu_dense_planning
-from vllm_ascend.worker.v2.spec_decode.draft_window_dense import gather_dense_draft_kv, prepare_dense_draft_read
+from vllm_ascend.worker.v2.spec_decode.draft_window_dense import (
+    DenseDraftRead,
+    gather_dense_draft_kv,
+    prepare_dense_draft_read,
+)
 from vllm_ascend.worker.v2.spec_decode.draft_window_read import DirectPrefixSource
 
 
@@ -27,6 +31,7 @@ def test_frozen_eagle_anchor_does_not_follow_later_exact_lengths():
             retain=lambda *objects: None,
             frozen_starts=frozen,
         )
+        assert isinstance(read, DenseDraftRead)
         assert read.starts.tolist() == [4]
         assert read.seq_lens.tolist() == [end - 4]
         expected = [int(source.table[0, pos // 4]) * 4 + pos % 4 for pos in range(4, end)]
@@ -37,7 +42,7 @@ def test_frozen_eagle_anchor_does_not_follow_later_exact_lengths():
 def test_rejected_first_pass_keeps_native_query_alignment_and_excludes_unwritten_tail():
     end, native_end, block = 1159, 1160, 128
     source = DirectPrefixSource(torch.arange(12, dtype=torch.int32).reshape(1, 12), (0,), (12,), block)
-    held = []
+    held: list[object] = []
     read = prepare_dense_draft_read(
         source,
         exact_device=torch.tensor([end], dtype=torch.int32),
@@ -51,6 +56,7 @@ def test_rejected_first_pass_keeps_native_query_alignment_and_excludes_unwritten
         frozen_starts=torch.tensor([0], dtype=torch.int32),
         retain=lambda *items: held.extend(items),
     )
+    assert isinstance(read, DenseDraftRead)
     assert read.seq_lens.tolist() == [end]
     assert read.slots[0, :end].tolist() == list(range(end))
     assert read.slots[0, end:].tolist() == [end - 1] * (read.capacity - end)
@@ -72,7 +78,7 @@ def test_device_exact_read_set_reorder_rejection_and_nan_tail(causal, query_widt
     )
     ends = torch.tensor([1151, 1152], dtype=torch.int32)
     upper = torch.tensor([1152, 1152], dtype=torch.int32)
-    held = []
+    held: list[object] = []
     source = DirectPrefixSource(table, (1, 0), (12, 12), block)
     read = prepare_dense_draft_read(
         source,
@@ -85,6 +91,7 @@ def test_device_exact_read_set_reorder_rejection_and_nan_tail(causal, query_widt
         causal=causal,
         retain=lambda *objects: held.extend(objects),
     )
+    assert isinstance(read, DenseDraftRead)
     assert read.starts.tolist() == [0, 128]  # U1152 must not move row0's start.
     assert read.seq_lens.tolist() == [1151, 1024]
     cache = torch.full((24, block, 2, 16), torch.nan, dtype=torch.bfloat16)
@@ -139,6 +146,7 @@ def test_apply_keeps_full_write_and_absolute_query_operands():
         causal=False,
         retain=lambda *objects: None,
     )
+    assert isinstance(read, DenseDraftRead)
     full = source.table
     slots, positions = object(), object()
     common = SimpleNamespace(num_reqs=2, block_table_tensor=full, slot_mapping=slots, positions=positions)
@@ -182,6 +190,7 @@ def test_cpu_capacity_fields_ignore_default_tensor_device():
             causal=False,
             retain=lambda *objects: None,
         )
+        assert isinstance(read, DenseDraftRead)
         common = SimpleNamespace(num_reqs=1)
         read.apply(common)
         assert common.seq_lens_cpu_upper_bound.device.type == "cpu"
@@ -201,6 +210,7 @@ def test_short_context_large_window_does_not_gather_window_sized_padding():
         causal=False,
         retain=lambda *objects: None,
     )
+    assert isinstance(read, DenseDraftRead)
     assert read.capacity == 64
     assert read.starts.tolist() == [0] and read.seq_lens.tolist() == [31]
     assert read.slots[0, :31].tolist() == list(range(128, 159))

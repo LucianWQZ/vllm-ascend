@@ -65,7 +65,10 @@ def _plan_cpu(
     if causal:
         query_ends = exact if query_ends is None else query_ends
         queries = (
-            query_ends[:, None] - starts[:, None] - query_width + torch.arange(query_width, device=exact.device)[None, :]
+            query_ends[:, None]
+            - starts[:, None]
+            - query_width
+            + torch.arange(query_width, device=exact.device)[None, :]
         )
         mask = mask | (columns[None, None, :] > queries[:, :, None])
     if query_offsets is not None:

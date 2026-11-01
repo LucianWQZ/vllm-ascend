@@ -301,9 +301,7 @@ def prepare_dense_draft_read(
             total = int(query_start_loc_cpu[-1])
             from vllm_ascend.ops.triton.v2.spec_decode.draft_window import pack_draft_query_indices
 
-            query_indices, output_indices = pack_draft_query_indices(
-                query_offsets, total, query_width, retain=retain
-            )
+            query_indices, output_indices = pack_draft_query_indices(query_offsets, total, query_width, retain=retain)
             retain(query_offsets, query_indices, output_indices)
     # Both are allocation bounds: V <= E <= U and V <= W+B-1. Avoid
     # window-sized padding on short contexts without using U to choose S/V.
