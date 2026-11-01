@@ -242,21 +242,11 @@ class DraftWindowGraphBindingProvider:
         self._capability = runtime_state.capability
         self.group = self._capability.group
         self.window_size = self._capability.window_size
-        self._topology = self._capability.runtime_context
-        if self._topology is None:
-            raise RuntimeError("Draft Graph provider requires the actual source topology")
-        self._capture_topology()
-        if (
-            self.group.topology.dsa_cp_effective
-            or self.group.topology.decode_context_parallel_size != 1
-            or any(
-                value != 1
-                for value in (
-                    self._topology.pipeline_parallel_size,
-                    self._topology.prefill_context_parallel_size,
-                    self._topology.decode_context_parallel_size,
-                )
-            )
+        self._parallel_config = self._capability.parallel_config
+        self._tp_identity = self._capture_topology()
+        if self.group.read_semantics != "replicated" or any(
+            getattr(self._parallel_config, name) != 1
+            for name in ("pipeline_parallel_size", "prefill_context_parallel_size", "decode_context_parallel_size")
         ):
             raise ValueError("Draft Graph read banks require replicated reads and PP=PCP=DCP=1")
         self._carriers: dict[DraftWindowGraphCaptureIdentity, DraftWindowGraphReadCarrier] = {}
@@ -567,20 +557,22 @@ class DraftWindowGraphBindingProvider:
         return carrier
 
     def _capture_topology(self) -> tuple[int, int]:
-        topology = self._runtime_state.capability.runtime_context
-        if topology is None:
-            raise RuntimeError("Graph read banks require their actual source topology")
-        world, rank = topology.tensor_parallel_size, topology.tensor_parallel_rank
+        parallel = self._runtime_state.capability.parallel_config
+        if parallel is None:
+            raise RuntimeError("Graph read banks require their actual parallel configuration")
+        world, rank = parallel.tensor_parallel_size, self._runtime_state.capability.tensor_parallel_rank
         if type(world) is not int or world < 1 or type(rank) is not int or not 0 <= rank < world:
             raise RuntimeError("Graph TP world/rank must be explicit integers within range")
         return world, rank
 
     def _validate_source_contract(self) -> None:
-        # Both are frozen construction facts, not per-proposal identities.
         if self._runtime_state.capability is not self._capability:
             raise RuntimeError("Draft Graph source capability changed after provider installation")
-        if self._capability.runtime_context is not self._topology:
-            raise RuntimeError("Draft Graph runtime topology changed after capture")
+        if (
+            self._capability.parallel_config is not self._parallel_config
+            or self._capture_topology() != self._tp_identity
+        ):
+            raise RuntimeError("Draft Graph parallel configuration or TP rank changed after capture")
 
     def _validate_write_side_reference(
         self,

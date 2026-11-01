@@ -11,10 +11,8 @@ import torch
 from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 
-from vllm_ascend.device.hardware_profile import AttentionBackendFamily
 from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftWindowExecutionPhase,
-    DraftWindowRuntimeContext,
     DraftWindowSourceCapability,
     DraftWindowWorkspace,
     FullDraftKVSource,
@@ -23,7 +21,6 @@ from vllm_ascend.worker.v2.spec_decode.draft_window import (
 from vllm_ascend.worker.v2.spec_decode.draft_window_backends import (
     DraftWindowGroupRoute,
     DraftWindowProviderStatus,
-    DraftWindowTopology,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowProposalContext
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
@@ -67,12 +64,15 @@ def graph_buffers():
         layers=("draft.layer",),
         scheduler_block_size=4,
         table_column_span=4,
-        topology=DraftWindowTopology(1, 1),
+        read_semantics="replicated",
         status=DraftWindowProviderStatus.DIRECT_DENSE,
         reason="direct CPU fixture",
     )
-    context = DraftWindowRuntimeContext(
-        AttentionBackendFamily.STANDARD, "FULL", True, 1, 1, 1, 1, 1, False, False, False, False
+    parallel = SimpleNamespace(
+        tensor_parallel_size=1,
+        pipeline_parallel_size=1,
+        prefill_context_parallel_size=1,
+        decode_context_parallel_size=1,
     )
     projection = DraftWindowSourceCapability(
         policy=resolve_draft_window_policy(requested_window_size=4, method="dflash", target_model_type="qwen3"),
@@ -80,7 +80,8 @@ def graph_buffers():
         group=group,
         full_source=source,
         expected_future_offset=0,
-        runtime_context=context,
+        parallel_config=parallel,
+        tensor_parallel_rank=0,
     )
     runtime = build_draft_window_runtime_state(projection)
     provider = DraftWindowGraphBindingProvider(runtime_state=runtime)
@@ -284,7 +285,7 @@ def test_cpu_valid_counts_are_required_before_any_bank_materialization(graph_buf
     before = [tensor.clone() for tensor in _bank_tensors(bank)]
     with pytest.raises(TypeError, match="cpu_valid_num_blocks"):
         case.runtime.materialize(
-            proposal=_proposal(0, ()),
+            proposal=_proposal(),
             idx_mapping=case.mapping,
             read_descriptors=(),
             cpu_window_exact=torch.zeros(2, dtype=torch.int32),
@@ -351,6 +352,15 @@ def test_eagle_serialized_steps_own_distinct_banks_and_preserve_previous_consume
                     runtime.materialize_serialized_step(
                         previous_identity=previous, **{**kwargs, "idx_mapping": replaced_mapping}
                     )
+                with pytest.raises(RuntimeError, match="proposal or request mapping changed"):
+                    runtime.materialize_serialized_step(
+                        previous_identity=previous, **{**kwargs, "proposal": replace(proposal)}
+                    )
+                with pytest.raises(RuntimeError, match="padded request capacity exceeded"):
+                    runtime.materialize_serialized_step(
+                        previous_identity=previous, **{**kwargs, "num_reqs_padded": padded + 1}
+                    )
+                assert runtime._last_retired_identity is previous
                 assert bank.bound_identity is None
             inputs = runtime.materialize_serialized_step(previous_identity=previous, **kwargs)
         current = SimpleNamespace(**{**vars(case), "runtime": runtime, "provider": provider, "capture": capture})
@@ -634,3 +644,10 @@ def test_update_rejects_stale_handles_or_replaced_operands(typed_update_guard, f
     with pytest.raises(RuntimeError):
         c.case.provider.validate_update(c.graph, [c.task], route=c.case.capture.route)
     assert c.carrier.state is DraftWindowGraphCarrierState.SUBMITTED
+
+
+@pytest.mark.parametrize("field,value", [("full_horizon_end", 12), ("window_start", 8), ("window_capacity_tokens", 8)])
+def test_source_rejects_plans_from_a_different_horizon_anchor_or_capacity(graph_buffers, field, value):
+    plan = compute_draft_window_plan(full_exact_end=11, future_offset=0, window_size=4, block_span_tokens=4)
+    with pytest.raises(ValueError, match="canonical method horizon, anchor and capacity"):
+        graph_buffers.projection.describe(replace(plan, **{field: value}), valid_num_blocks=4)

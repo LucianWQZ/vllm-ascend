@@ -28,8 +28,8 @@ def graph_source_initialization(request, monkeypatch):
     from vllm_ascend.worker.v2.spec_decode import draft_window_graph_runtime
     from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowGraphInputMixin
 
-    capability, context, state = object(), object(), object()
-    build_source = Mock(return_value=(capability, context))
+    capability, state = object(), object()
+    build_source = Mock(return_value=capability)
     build_state = Mock(return_value=state)
     monkeypatch.setattr(draft_window_graph_runtime, "build_parallel_graph_source", build_source)
     if method == "eagle3":
@@ -61,9 +61,7 @@ def graph_source_initialization(request, monkeypatch):
         build_source=build_source,
         build_state=build_state,
         capability=capability,
-        context=context,
         state=state,
-        context_attr="_eagle3_graph_runtime_context" if method == "eagle3" else "_draft_window_graph_context",
     )
 
 
@@ -74,7 +72,6 @@ def test_graph_owner_installs_only_its_admitted_source(graph_source_initializati
     c.build_state.assert_called_once_with(c.capability)
     assert c.owner._draft_window_source_capability is c.capability
     assert c.owner._draft_window_runtime_state is c.state
-    assert getattr(c.owner, c.context_attr) is c.context
     assert not hasattr(c.owner, "_draft_window_runtime")
 
 
@@ -108,29 +105,17 @@ def test_window_off_without_graph_policy_does_not_construct_source(graph_source_
 
 @pytest.fixture
 def source_contract():
-    from vllm_ascend.device.hardware_profile import AttentionBackendFamily
-    from vllm_ascend.worker.v2.spec_decode.draft_window import DraftWindowRuntimeContext
     from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphBindingProvider
 
-    context = DraftWindowRuntimeContext(
-        AttentionBackendFamily.STANDARD,
-        "FULL",
-        True,
-        16,
-        1,
-        1,
-        1,
-        1,
-        True,
-        True,
-        True,
-        True,
-        tensor_parallel_rank=7,
-    )
-    capability = SimpleNamespace(runtime_context=context)
+    parallel = SimpleNamespace(tensor_parallel_size=16)
+    capability = SimpleNamespace(parallel_config=parallel, tensor_parallel_rank=7)
     owner = SimpleNamespace(
-        _runtime_state=SimpleNamespace(capability=capability), _capability=capability, _topology=context
+        _runtime_state=SimpleNamespace(capability=capability),
+        _capability=capability,
+        _parallel_config=parallel,
+        _tp_identity=(16, 7),
     )
+    owner._capture_topology = lambda: DraftWindowGraphBindingProvider._capture_topology(owner)
     return owner, DraftWindowGraphBindingProvider
 
 
@@ -138,7 +123,7 @@ def source_contract():
     "field,value",
     [
         (None, None),
-        ("runtime_context", None),
+        ("parallel_config", None),
         ("tensor_parallel_size", 0),
         ("tensor_parallel_size", True),
         ("tensor_parallel_rank", None),
@@ -148,35 +133,33 @@ def source_contract():
     ],
 )
 def test_graph_capture_requires_real_explicit_world_and_rank(source_contract, field, value):
-    from dataclasses import replace
-
     owner, methods = source_contract
-    if field == "runtime_context":
-        owner._capability.runtime_context = value
+    if field == "parallel_config":
+        owner._capability.parallel_config = value
+    elif field == "tensor_parallel_size":
+        owner._capability.parallel_config.tensor_parallel_size = value
     elif field is not None:
-        owner._capability.runtime_context = replace(owner._topology, **{field: value})
+        owner._capability.tensor_parallel_rank = value
     if field is None:
         assert methods._capture_topology(owner) == (16, 7)
     else:
-        with pytest.raises(RuntimeError, match="source topology|world/rank"):
+        with pytest.raises(RuntimeError, match="parallel configuration|world/rank"):
             methods._capture_topology(owner)
 
 
-@pytest.mark.parametrize("replacement", [None, "capability", "context", "rank-drift"])
-def test_graph_source_guard_keeps_actual_capability_and_context_identity(source_contract, replacement):
-    from dataclasses import replace
-
+@pytest.mark.parametrize("replacement", [None, "capability", "parallel", "rank-drift"])
+def test_graph_source_guard_keeps_actual_capability_parallel_object_and_rank(source_contract, replacement):
     owner, methods = source_contract
     if replacement == "capability":
         owner._runtime_state.capability = SimpleNamespace(**vars(owner._capability))
-    elif replacement == "context":
-        owner._capability.runtime_context = replace(owner._topology)
+    elif replacement == "parallel":
+        owner._capability.parallel_config = SimpleNamespace(**vars(owner._parallel_config))
     elif replacement == "rank-drift":
-        owner._capability.runtime_context = replace(owner._topology, tensor_parallel_rank=8)
+        owner._capability.tensor_parallel_rank = 8
     if replacement is None:
         methods._validate_source_contract(owner)
     else:
-        with pytest.raises(RuntimeError, match="capability changed|topology changed"):
+        with pytest.raises(RuntimeError, match="capability changed|parallel configuration or TP rank changed"):
             methods._validate_source_contract(owner)
 
 

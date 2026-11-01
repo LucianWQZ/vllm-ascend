@@ -7,7 +7,6 @@ runtime. This module owns only source geometry and persistent Graph backing;
 Full write tables and Target state remain owned by the existing runner.
 """
 
-import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
@@ -17,17 +16,9 @@ import numpy as np
 import torch
 from vllm.v1.worker.utils import AttentionGroup
 
-from vllm_ascend.ascend_config import (
-    validate_additional_config_bool,
-)
-from vllm_ascend.device.hardware_profile import (
-    AttentionBackendFamily,
-    get_current_hardware_profile,
-)
 from vllm_ascend.worker.v2.spec_decode.draft_window_backends import (
     DraftWindowGroupRoute,
     DraftWindowProviderStatus,
-    DraftWindowTopology,
     inventory_draft_window_groups,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_plan import (
@@ -43,25 +34,6 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_policy import (
 
 if TYPE_CHECKING:
     from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowProposalContext
-
-
-@dataclass(frozen=True, slots=True)
-class DraftWindowRuntimeContext:
-    """Runtime modes that must be proven before a P2 candidate is usable."""
-
-    attention_backend_family: AttentionBackendFamily
-    graph_mode: str
-    async_scheduling: bool
-    tensor_parallel_size: int
-    data_parallel_size: int
-    pipeline_parallel_size: int
-    prefill_context_parallel_size: int
-    decode_context_parallel_size: int
-    sequence_parallel: bool
-    dsa_context_parallel: bool
-    flashcomm: bool
-    prefix_caching: bool
-    tensor_parallel_rank: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,7 +112,8 @@ class DraftWindowSourceCapability:
     group: DraftWindowGroupRoute
     full_source: FullDraftKVSource
     expected_future_offset: int
-    runtime_context: DraftWindowRuntimeContext | None = None
+    parallel_config: Any
+    tensor_parallel_rank: int
     workspace_capacity_columns: int | None = None
     capacity_columns: int = field(init=False)
     window_size: int = field(init=False)
@@ -439,66 +412,6 @@ def _validate_source_geometry(
         )
 
 
-def build_draft_window_runtime_context(
-    vllm_config: Any,
-    block_tables: Any,
-) -> DraftWindowRuntimeContext:
-    """Read the actual configured topology/mode gates without model guessing."""
-    speculative_config = vllm_config.speculative_config
-    compilation_config = vllm_config.compilation_config
-    parallel_config = vllm_config.parallel_config
-    scheduler_config = vllm_config.scheduler_config
-    mode = compilation_config.cudagraph_mode
-    mode_name = getattr(mode, "name", str(mode).rsplit(".", 1)[-1]).upper()
-    if bool(getattr(speculative_config, "enforce_eager", False)):
-        mode_name = "NONE"
-    additional_config = getattr(vllm_config, "additional_config", None) or {}
-    sequence_parallel = bool(getattr(parallel_config, "use_sequence_parallel_moe", False))
-    dsa_context_parallel_requested = validate_additional_config_bool(
-        additional_config.get("enable_dsa_cp", False),
-        "additional_config.enable_dsa_cp",
-    )
-    dsa_context_parallel = dsa_context_parallel_requested and _effective_dsa_context_parallel()
-    flashcomm_explicitly_enabled = validate_additional_config_bool(
-        additional_config.get("enable_flashcomm1", False),
-        "additional_config.enable_flashcomm1",
-    ) or os.getenv("VLLM_ASCEND_ENABLE_FLASHCOMM1", "0").strip().lower() in (
-        "1",
-        "true",
-    )
-    # AscendConfig disables FlashComm when SP MoE is unavailable.  Retain the
-    # effective executor identity here rather than treating a requested but
-    # rejected option as active.  A DSA-CP request auto-enables FlashComm
-    # before the model-specific DSA gate is resolved, so that request still
-    # contributes when SP itself is effective.
-    flashcomm = sequence_parallel and (flashcomm_explicitly_enabled or dsa_context_parallel_requested)
-    return DraftWindowRuntimeContext(
-        attention_backend_family=get_current_hardware_profile().attention_backend_family,
-        graph_mode=mode_name,
-        async_scheduling=bool(getattr(scheduler_config, "async_scheduling", False)),
-        tensor_parallel_size=int(parallel_config.tensor_parallel_size),
-        data_parallel_size=int(parallel_config.data_parallel_size),
-        pipeline_parallel_size=int(parallel_config.pipeline_parallel_size),
-        prefill_context_parallel_size=int(parallel_config.prefill_context_parallel_size),
-        decode_context_parallel_size=max(
-            int(parallel_config.decode_context_parallel_size),
-            int(getattr(block_tables, "cp_size", 1)),
-        ),
-        sequence_parallel=sequence_parallel,
-        dsa_context_parallel=dsa_context_parallel,
-        flashcomm=flashcomm,
-        prefix_caching=bool(getattr(getattr(vllm_config, "cache_config", None), "enable_prefix_caching", False)),
-        tensor_parallel_rank=_get_tensor_parallel_rank(parallel_config),
-    )
-
-
-def _effective_dsa_context_parallel() -> bool:
-    """Read the same validated DSA-CP authority used by backend selection."""
-    from vllm_ascend.utils import enable_dsa_cp
-
-    return bool(enable_dsa_cp())
-
-
 def _get_tensor_parallel_rank(parallel_config: Any) -> int:
     """Resolve process-local TP identity without inventing a rank.
 
@@ -533,7 +446,6 @@ def _build_draft_window_source_capability_for_context(
     kv_cache_config: Any,
     causal: bool | Mapping[int, bool],
     vllm_config: Any,
-    runtime_context: DraftWindowRuntimeContext,
     dflash2_graph_contract: Any = None,
 ) -> DraftWindowSourceCapability:
     """Build source geometry after the caller validates its real Graph executor.
@@ -563,7 +475,7 @@ def _build_draft_window_source_capability_for_context(
         attn_groups=attn_groups,
         kv_cache_config=kv_cache_config,
         block_tables=block_tables,
-        topology=DraftWindowTopology.from_config(vllm_config),
+        parallel_config=vllm_config.parallel_config,
         full_retention_dflash2=dflash2_graph_contract is not None,
     )
     if len(groups) != 1:
@@ -590,7 +502,8 @@ def _build_draft_window_source_capability_for_context(
             configured_k=int(vllm_config.speculative_config.num_speculative_tokens),
             uses_dynamic_k=uses_dynamic_k,
         ),
-        runtime_context=runtime_context,
+        parallel_config=vllm_config.parallel_config,
+        tensor_parallel_rank=_get_tensor_parallel_rank(vllm_config.parallel_config),
         # Mixed/chunked rows may retain a full-resident row beside windowed
         # decode rows in the same stable read bank.
         workspace_capacity_columns=full_source.input_block_table_row_width(group.gid),
@@ -993,8 +906,11 @@ class DraftWindowRuntimeState:
                 f"previous={previous_identity.step} current={step}"
             )
         _validate_idx_mapping(idx_mapping)
-        if idx_mapping.data_ptr() != previous_identity.idx_mapping_ptr:
-            raise RuntimeError("serialized step request mapping changed within one proposal")
+        if (
+            self.capability.full_source is not self._source
+            or idx_mapping.data_ptr() != previous_identity.idx_mapping_ptr
+        ):
+            raise RuntimeError("serialized step FullSource or request mapping changed within one proposal")
         identity = DraftWindowGenerationIdentity(
             proposal=proposal,
             padded_request_count=num_reqs_padded,
@@ -1003,6 +919,9 @@ class DraftWindowRuntimeState:
             phase=DraftWindowExecutionPhase.STEP,
             step=step,
         )
+        workspace = self.workspace if output_workspace is None else output_workspace
+        if identity.padded_request_count > workspace.max_num_reqs:
+            raise RuntimeError("serialized step padded request capacity exceeded")
         self._last_retired_identity = None
         return self._materialize_identity(
             identity=identity,

@@ -20,17 +20,15 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 
 import vllm_ascend.envs as envs
-from vllm_ascend.device.hardware_profile import AttentionBackendFamily
+from vllm_ascend.device.hardware_profile import AttentionBackendFamily, get_current_hardware_profile
 from vllm_ascend.worker.v2.attn_utils import build_attn_metadata_factory, build_attn_metadata_wrapper
 from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftMetadataInputs,
     DraftWindowPolicyDecision,
-    DraftWindowRuntimeContext,
     DraftWindowRuntimeState,
     DraftWindowSourceCapability,
     DraftWindowWorkspace,
     _build_draft_window_source_capability_for_context,
-    build_draft_window_runtime_context,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_eager import (
     build_draft_window_attn_metadata,
@@ -72,28 +70,23 @@ def draft_window_graph_enabled() -> bool:
     return bool(envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH)
 
 
-def validate_graph_context(runtime_context: DraftWindowRuntimeContext, vllm_config: Any) -> None:
-    """Match the actual executor to its once-resolved supported Graph route."""
+def validate_graph_context(vllm_config: Any, block_tables: Any) -> None:
+    """Check the actual executor and source, without copying feature state."""
     if not draft_window_graph_enabled():
         raise NotImplementedError("Draft Window Graph requires its explicit supported Graph configuration")
-    if runtime_context.attention_backend_family is not AttentionBackendFamily.STANDARD:
+    if get_current_hardware_profile().attention_backend_family is not AttentionBackendFamily.STANDARD:
         raise NotImplementedError("Draft Window Graph requires the STANDARD hardware family")
-    if runtime_context.graph_mode != "FULL_DECODE_ONLY":
-        raise ValueError("Draft Window Graph runtime mode differs from FULL_DECODE_ONLY")
+    if vllm_config.compilation_config.cudagraph_mode.name != "FULL_DECODE_ONLY":
+        raise ValueError("Draft Window Graph requires FULL_DECODE_ONLY")
     parallel = vllm_config.parallel_config
-    actual = (
-        runtime_context.tensor_parallel_size,
-        runtime_context.data_parallel_size,
-        runtime_context.pipeline_parallel_size,
-        runtime_context.prefill_context_parallel_size,
-        runtime_context.decode_context_parallel_size,
-    )
-    expected = (parallel.tensor_parallel_size, parallel.data_parallel_size, 1, 1, 1)
-    if actual != expected:
-        raise RuntimeError("Draft Window Graph source and configured executor topology differ")
-    rank = runtime_context.tensor_parallel_rank
-    if type(rank) is not int or not 0 <= rank < runtime_context.tensor_parallel_size:
-        raise ValueError("Draft Window Graph requires its actual TP rank")
+    if (
+        any(
+            getattr(parallel, name) != 1
+            for name in ("pipeline_parallel_size", "prefill_context_parallel_size", "decode_context_parallel_size")
+        )
+        or getattr(block_tables, "cp_size", 1) != 1
+    ):
+        raise RuntimeError("Draft Window Graph requires PP=PCP=DCP=1 and unsharded Draft tables")
 
 
 def build_parallel_graph_source(
@@ -106,12 +99,11 @@ def build_parallel_graph_source(
     causal: bool | Mapping[int, bool],
     vllm_config: Any,
     dflash2_graph_contract: Any = None,
-) -> tuple[DraftWindowSourceCapability, DraftWindowRuntimeContext]:
+) -> DraftWindowSourceCapability:
     """Build P2/P3 source state only after the real Graph route is gated."""
     if not draft_window_graph_enabled():
         raise RuntimeError("internal Draft Window Graph flag is not enabled")
-    runtime_context = build_draft_window_runtime_context(vllm_config, block_tables)
-    validate_graph_context(runtime_context, vllm_config)
+    validate_graph_context(vllm_config, block_tables)
     if runtime_route not in {"dflash", "dflash2", "dspark"}:
         raise NotImplementedError("Draft Window Graph supports only DFlash and eligible DSpark")
     if runtime_route == "dflash2":
@@ -129,36 +121,18 @@ def build_parallel_graph_source(
         kv_cache_config=kv_cache_config,
         causal=causal,
         vllm_config=vllm_config,
-        runtime_context=runtime_context,
         dflash2_graph_contract=dflash2_graph_contract,
     )
-    topology = capability.runtime_context
-    if topology is None:
-        raise RuntimeError("Draft Graph source has no actual runtime topology")
-    if runtime_context.prefix_caching:
-        # Reuse P7's current-request resident snapshot, owned exact lengths and
-        # canonical Full source. Prefix is kept in the real topology identity;
-        # it is not hidden by replacing it with an OFF context. A prefix hit
-        # never permits changing canonical Full slots or source ownership.
-        capability.full_source.validate_owner_bindings()
-        if topology.prefix_caching is not True:
-            raise RuntimeError("parallel prefix Graph source lost the actual caching identity")
-    return capability, runtime_context
+    return capability
 
 
-def install_parallel_graph(
-    owner: Any,
-    *,
-    runtime_context: DraftWindowRuntimeContext,
-) -> DraftWindowGraphSession:
+def install_parallel_graph(owner: Any) -> DraftWindowGraphSession:
     """Install one provider and register every real startup capture bucket."""
     if hasattr(owner, "_draft_window_graph_session"):
         raise RuntimeError("Draft Window Graph is already installed on this speculator")
     runtime_state = getattr(owner, "_draft_window_runtime_state", None)
     if not isinstance(runtime_state, DraftWindowRuntimeState):
         raise RuntimeError("Draft Window Graph requires initialized P3 runtime state")
-    if runtime_context is not runtime_state.capability.runtime_context:
-        raise RuntimeError("Draft Window Graph installation has a different source/executor context")
     manager = getattr(owner, "query_cudagraph_manager", None)
     capture_descs = getattr(manager, "_capture_descs", None)
     max_num_reqs = getattr(manager, "max_num_reqs", None)
