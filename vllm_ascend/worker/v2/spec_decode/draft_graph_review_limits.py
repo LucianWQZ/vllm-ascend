@@ -89,8 +89,17 @@ _FULL8_QUERY_TOKENS = 8
 def _consumer_profile(speculative):
     """Use the same normalized configuration that constructs the actual model."""
     hf = speculative.draft_model_config.hf_config
+    model_type = getattr(hf, "model_type", None)
+    if model_type == "eagle":
+        from vllm.transformers_utils.configs.eagle import EAGLEConfig
+
+        # Fixed vLLM wraps DFlash and Eagle configs before worker creation.
+        # Keep checking the outer, effective projection/attention fields;
+        # only the architecture's model type belongs to the wrapped model.
+        if isinstance(hf, EAGLEConfig) and hf.model is not None:
+            model_type = hf.model.model_type
     architectures = getattr(hf, "architectures", ()) or ()
-    if architectures == ["DFlashDraftModel"] and getattr(hf, "model_type", None) == "qwen3":
+    if architectures == ["DFlashDraftModel"] and model_type == "qwen3":
         if (
             getattr(hf, "layer_types", None) == ["sliding_attention"] * 5 + ["full_attention"]
             and getattr(hf, "sliding_window", None) == 4096
@@ -103,7 +112,7 @@ def _consumer_profile(speculative):
         return None
     expected = _CONSUMER_CONFIGS[profile]
     for field, value in expected.items():
-        actual = getattr(hf, field, None)
+        actual = model_type if field == "model_type" else getattr(hf, field, None)
         if field == "rope_parameters" and isinstance(actual, dict):
             actual = dict(actual)
             actual.pop("type", None)  # Transformers can retain this legacy alias.

@@ -162,6 +162,23 @@ class DraftGraphSupportTest(unittest.TestCase):
         with patch.object(Path, "read_text", side_effect=AssertionError("unexpected config IO")):
             self.assertEqual(self.resolve(config).method, "eagle3")
 
+    def test_worker_wrapped_config_keeps_actual_consumer_geometry(self):
+        from transformers import AutoConfig
+        from vllm.transformers_utils.configs.eagle import EAGLEConfig
+
+        for method, profile in (("dflash", "dflash_full8"), ("eagle3", "eagle3")):
+            config = self.config(method=method)
+            inner = AutoConfig.for_model(**copy.deepcopy(GUARD._CONSUMER_CONFIGS[profile]))
+            wrapped = EAGLEConfig(inner, method=method, model_type="eagle")
+            config.speculative_config.draft_model_config.hf_config = wrapped
+            self.assertEqual(wrapped.model_type, "eagle")
+            self.assertEqual(self.resolve(config).method, method)
+            # The model consumes outer effective fields. Unwrapping the whole
+            # config would silently ignore this changed projection geometry.
+            wrapped.hidden_size += 1
+            with self.assertRaisesRegex(NotImplementedError, "hidden_size"):
+                self.resolve(config)
+
     def test_startup_reuses_the_frozen_support_without_reparsing(self):
         config = self.config(rows=2)
         support = self.resolve(config)
