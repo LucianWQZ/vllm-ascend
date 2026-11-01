@@ -156,7 +156,7 @@ class Eagle3DraftWindowMixin:
         expected_steps = _eagle3_graph_scheduled_consumers(self._eagle3_window_static_k, num_speculative_tokens)
         graph_session = getattr(self, "_eagle3_graph_session", None)
         if graph_session is not None:
-            graph_session.controller.require_reusable()
+            graph_session.require_reusable()
         bypass_for_prefill = False
         if not dummy_run and not is_profile:
             bypass_for_prefill = _requires_prefill_baseline_bypass(input_batch)
@@ -195,11 +195,10 @@ class Eagle3DraftWindowMixin:
                     f"static_K={self._eagle3_window_static_k}"
                 )
             if graph_session is not None:
-                graph_session.controller.finish()
-        except BaseException as error:
+                graph_session.finish()
+        except BaseException:
             if graph_session is not None:
-                graph_session.controller.quarantine(type(error).__name__ + ": " + str(error))
-                self._draft_window_graph_submission_uncertain = True
+                self._quarantine_eagle3_window()
             raise
         finally:
             live_inputs = self._eagle3_window_live_inputs
@@ -207,7 +206,7 @@ class Eagle3DraftWindowMixin:
                 if (
                     live_inputs is not None
                     and not live_inputs.retired
-                    and not (graph_session is not None and graph_session.controller.quarantined)
+                    and not getattr(self, "_draft_window_graph_submission_uncertain", False)
                 ):
                     self._draft_window_runtime_state.abort_generation(live_inputs.identity)
             finally:
@@ -309,8 +308,8 @@ class Eagle3DraftWindowMixin:
         try:
             self._eagle3_window_epoch_source.validate(context, input_batch)
         except BaseException:
-            if graph_session := getattr(self, "_eagle3_graph_session", None):
-                graph_session.controller.quarantine("mapping changed after first materialization")
+            if getattr(self, "_eagle3_graph_session", None) is not None:
+                self._quarantine_eagle3_window()
             else:
                 self._draft_window_runtime_state.abort_generation(inputs.identity)
                 self._eagle3_window_live_inputs = None
@@ -432,8 +431,8 @@ class Eagle3DraftWindowMixin:
         try:
             self._eagle3_window_epoch_source.validate(context, input_batch)
         except BaseException:
-            if graph_session := getattr(self, "_eagle3_graph_session", None):
-                graph_session.controller.quarantine("mapping changed after AR materialization")
+            if getattr(self, "_eagle3_graph_session", None) is not None:
+                self._quarantine_eagle3_window()
             else:
                 self._draft_window_runtime_state.abort_generation(inputs.identity)
                 self._eagle3_window_live_inputs = None
@@ -466,8 +465,7 @@ class Eagle3DraftWindowMixin:
             raise RuntimeError("Eagle3 step completion does not own the active generation")
         graph_session = getattr(self, "_eagle3_graph_session", None)
         if not succeeded and graph_session is not None:
-            graph_session.controller.quarantine("Eagle3 Python forward/metadata exception")
-            self._draft_window_graph_submission_uncertain = True
+            self._quarantine_eagle3_window()
             return
         try:
             if succeeded:
@@ -480,8 +478,7 @@ class Eagle3DraftWindowMixin:
                 self._eagle3_window_last_identity = None
         except BaseException:
             if graph_session is not None:
-                graph_session.controller.quarantine("Eagle3 step retirement failed")
-                self._draft_window_graph_submission_uncertain = True
+                self._quarantine_eagle3_window()
             else:
                 if not inputs.retired:
                     self._draft_window_runtime_state.abort_generation(inputs.identity)
@@ -489,6 +486,13 @@ class Eagle3DraftWindowMixin:
                 self._eagle3_window_live_inputs = None
             raise
         self._eagle3_window_live_inputs = None
+
+    def _quarantine_eagle3_window(self) -> None:
+        """Keep actual banks alive after an uncertain partial submission."""
+        self._draft_window_graph_submission_uncertain = True
+        runtime = self._draft_window_runtime_state
+        if runtime._active_inputs is not None and runtime.quarantined_identity is None:
+            runtime.quarantine_generation(runtime._active_inputs.identity)
 
     def _require_eagle3_window_context(self) -> DraftWindowProposalContext:
         context = self._eagle3_window_proposal_context

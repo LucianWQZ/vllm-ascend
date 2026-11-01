@@ -10,7 +10,7 @@ from contextlib import contextmanager
 
 
 def _validate_eagle_dp_dummy(owner, session):
-    session.controller.require_reusable()
+    session.require_reusable()
     provider = getattr(owner, "_draft_window_graph_binding_provider", None)
     runtime = getattr(owner, "_draft_window_runtime_state", None)
     support = getattr(owner, "_draft_graph_review_limit", None)
@@ -30,16 +30,12 @@ def _validate_eagle_dp_dummy(owner, session):
         or getattr(owner, "_eagle3_window_live_inputs", None) is not None
         or runtime is None
         or getattr(runtime, "_active_inputs", None) is not None
-        or session.controller._proposal_epoch is not None
         or getattr(owner, "_draft_window_graph_submission_uncertain", False) is not False
         or session._capture_call is not None
         or provider is not session.provider
         or getattr(provider, "inventory_method", None) != "eagle3"
     ):
         raise RuntimeError("Eagle DP dummy requires its explicit local1 no-business-generation Full scope")
-    previous_stream = session.controller._owner_stream
-    if previous_stream is not None and previous_stream != session.controller._stream_identity():
-        raise RuntimeError("Eagle DP dummy changed the current stream owning persistent Graph banks")
 
 
 @contextmanager
@@ -69,9 +65,8 @@ def eagle3_dp_dummy_scope(owner, input_batch, *, dummy_run, is_profile):
         _validate_eagle_dp_dummy(owner, session)
         yield
         _validate_eagle_dp_dummy(owner, session)
-    except BaseException as error:
-        session.controller.quarantine(type(error).__name__ + ": " + str(error))
-        owner._draft_window_graph_submission_uncertain = True
+    except BaseException:
+        owner._quarantine_eagle3_window()
         raise
     finally:
         owner._eagle3_graph_dp_dummy_active = False

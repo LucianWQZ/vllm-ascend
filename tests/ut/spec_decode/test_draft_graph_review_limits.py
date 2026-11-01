@@ -664,222 +664,6 @@ class ActualGraphDescriptorControls(unittest.TestCase):
         self.assertEqual(seen, [])
 
 
-def eagle_graph_protocol():
-    """Execute actual Source ownership methods with no framework/device import."""
-    from unittest.mock import patch
-
-    base = SOURCE / "vllm_ascend/worker/v2/spec_decode"
-    module = ast.parse((base / "draft_window_eagle3.py").read_text())
-    scheduled = next(
-        n for n in module.body if isinstance(n, ast.FunctionDef) and n.name == "_eagle3_graph_scheduled_consumers"
-    )
-    graph = ast.parse((base / "draft_window_eagle3_graph.py").read_text())
-    nodes = [scheduled] + [n for n in graph.body if isinstance(n, ast.ClassDef) and n.name == "Eagle3GraphStagingOwner"]
-    states = N(BOUND=object(), UPDATED=object())
-    module_name = "_r8_eagle_protocol"
-    ns: dict[str, Any] = dict(
-        __name__=module_name,
-        DraftWindowGraphCarrierState=states,
-        _current_stream_identity=lambda: 7,
-    )
-    sys.modules[module_name] = types.ModuleType(module_name)
-    tree = ast.Module(
-        body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), *nodes],
-        type_ignores=[],
-    )
-    exec(compile(ast.fix_missing_locations(tree), "<actual-eagle-owner-source>", "exec"), ns)
-    helper_module = types.ModuleType("vllm_ascend.worker.v2.spec_decode.draft_window_eagle3")
-    helper_module.__dict__["_eagle3_graph_scheduled_consumers"] = ns["_eagle3_graph_scheduled_consumers"]
-    owner_type = ns["Eagle3GraphStagingOwner"]
-
-    def make(scheduled_count, first_graph=False):
-        runtime = N(
-            capability=N(inventory=N(method="eagle3"), provider=N(expected_future_offset=3)),
-            quarantined_identity=None,
-            _active_inputs=None,
-            _last_retired_identity=None,
-        )
-        provider = N(_runtime_state=runtime)
-        owner = owner_type(runtime, provider, static_k=3, current_stream_identity=lambda: 7)
-        with patch.dict(sys.modules, {helper_module.__name__: helper_module}):
-            owner.begin(1, ("A",), first_pass_is_graph=first_graph, num_speculative_tokens=scheduled_count)
-        return owner, runtime, provider
-
-    ns["_source_helper_module"] = helper_module
-    return ns, states, make
-
-
-class Main544EagleControls(unittest.TestCase):
-    def test_zero_still_requires_one_real_first_and_static_geometry(self):
-        ns, states, make = eagle_graph_protocol()
-        owner, runtime, _ = make(0)
-        self.assertEqual((owner.static_k, owner._expected_steps), (3, 1))
-        identity = N(step=0, normalized_method="eagle3", mapping_epoch=1, ordered_request_fingerprint=("A",))
-        runtime._last_retired_identity = identity
-        owner.adopt_eager_first_pass(identity)
-        owner.finish()
-        self.assertFalse(owner.quarantined)
-        self.assertEqual(owner.static_k, 3)
-        owner, _, _ = make(0)
-        with self.assertRaisesRegex(RuntimeError, "omitted a real"):
-            owner.finish()
-        self.assertTrue(owner.quarantined)
-
-    def test_normal_k_requires_all_ar_and_wrong_zero_owner_rejected(self):
-        _, _, make = eagle_graph_protocol()
-        owner, runtime, _ = make(3)
-        identity = N(step=0, normalized_method="eagle3", mapping_epoch=1, ordered_request_fingerprint=("A",))
-        runtime._last_retired_identity = identity
-        owner.adopt_eager_first_pass(identity)
-        with self.assertRaisesRegex(RuntimeError, "omitted a real"):
-            owner.finish()
-        self.assertTrue(owner.quarantined)
-        owner, runtime, _ = make(0)
-        identity.ordered_request_fingerprint = ("stale",)
-        runtime._last_retired_identity = identity
-        with self.assertRaisesRegex(RuntimeError, "actual retired"):
-            owner.adopt_eager_first_pass(identity)
-
-    def test_partial_and_invalid_schedule_rejected_without_ownership(self):
-        ns, _, make = eagle_graph_protocol()
-        for scheduled in (-1, 1, 2, 4, True):
-            with self.subTest(scheduled=scheduled), self.assertRaises(NotImplementedError):
-                make(scheduled)
-        self.assertEqual(ns["_eagle3_graph_scheduled_consumers"](3, None), 3)
-        self.assertEqual(ns["_eagle3_graph_scheduled_consumers"](3, 0), 1)
-
-    def test_zero_graph_first_needs_real_updated_bank_and_forbids_ar(self):
-        ns, states, make = eagle_graph_protocol()
-        route = N(EAGLE3_FIRST_PASS=object(), EAGLE3_AR_STEP=object())
-        ns["DraftWindowGraphRoute"] = route
-
-        def stage(owner, runtime, provider, step):
-            identity = N(
-                step=step,
-                generation_id=step,
-                mapping_epoch=1,
-                normalized_method="eagle3",
-                ordered_request_fingerprint=("A",),
-            )
-            buffers = (
-                "window_block_table",
-                "valid_num_blocks",
-                "device_window_exact",
-                "cpu_window_exact",
-                "cpu_window_upper",
-            )
-
-            def buffer(address):
-                return N(untyped_storage=lambda: N(data_ptr=lambda: address))
-
-            inputs = N(
-                identity=identity,
-                validate_for=lambda actual: self.assertIs(actual, identity),
-                **{name: buffer(index + 1) for index, name in enumerate(buffers)},
-            )
-            carrier = N(
-                state=states.BOUND, read_inputs=N(**{name: buffer(index + 101) for index, name in enumerate(buffers)})
-            )
-            provider.bind_read_carrier = lambda **kwargs: carrier
-            runtime.retire_generation = lambda actual: setattr(runtime, "_last_retired_identity", actual)
-            capture = N(
-                consumer_ordinal=0 if step == 0 else step - 1,
-                route=route.EAGLE3_FIRST_PASS if step == 0 else route.EAGLE3_AR_STEP,
-                num_reqs=1,
-                descriptor=N(num_tokens=4 if step == 0 else 1, cg_mode=N(name="FULL")),
-            )
-            owner.publish_step(
-                capture_identity=capture,
-                inputs=inputs,
-                metadata_builder=lambda read: None,
-                target_metadata={},
-                write_side_reference=None,
-            )
-            return carrier
-
-        owner, runtime, provider = make(0, True)
-        stage(owner, runtime, provider, 0)
-        with self.assertRaisesRegex(RuntimeError, "UPDATE attribution"):
-            owner.finish()
-        owner, runtime, provider = make(0, True)
-        carrier = stage(owner, runtime, provider, 0)
-        carrier.state = states.UPDATED
-        owner.finish()
-        self.assertEqual(runtime._last_retired_identity.step, 0)
-        owner, runtime, provider = make(0, True)
-        carrier = stage(owner, runtime, provider, 0)
-        carrier.state = states.UPDATED
-        with self.assertRaisesRegex(RuntimeError, "proposal/step"):
-            stage(owner, runtime, provider, 1)
-        self.assertTrue(owner.quarantined)
-
-    def test_actual_zero_scope_completes_first_only_and_failed_scope_isolates(self):
-        from contextlib import contextmanager
-        from unittest.mock import patch
-
-        ns, _, make = eagle_graph_protocol()
-        path = SOURCE / "vllm_ascend/worker/v2/spec_decode/draft_window_eagle3.py"
-        module = ast.parse(path.read_text())
-        actual = next(n for n in module.body if isinstance(n, ast.ClassDef) and n.name == "Eagle3DraftWindowMixin")
-        scope = next(
-            n for n in actual.body if isinstance(n, ast.FunctionDef) and n.name == "_eagle3_draft_window_proposal_scope"
-        )
-        env = dict(
-            contextmanager=contextmanager,
-            _requires_prefill_baseline_bypass=lambda batch: False,
-            _eagle3_graph_scheduled_consumers=ns["_eagle3_graph_scheduled_consumers"],
-        )
-        tree = ast.Module(
-            body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), scope],
-            type_ignores=[],
-        )
-        exec(compile(ast.fix_missing_locations(tree), "<actual-eagle-proposal-scope>", "exec"), env)
-
-        def state():
-            controller, runtime, _ = make(0)
-            # Start the actual scope with a fresh, unowned controller.
-            controller._proposal_epoch = controller._request_fingerprint = controller._stream = None
-            controller._last_epoch = -1
-            finished = []
-            context = N(mapping_epoch=1, ordered_request_ids=("A",))
-            owner = N(
-                _eagle3_window_epoch_source=N(begin=lambda batch: context, finish=lambda c: finished.append(c)),
-                _eagle3_window_static_k=3,
-                _eagle3_window_expected_steps=3,
-                _eagle3_graph_session=N(controller=controller),
-                _draft_window_runtime_state=runtime,
-            )
-            return owner, controller, runtime, finished
-
-        owner, controller, runtime, finished = state()
-        with env["_eagle3_draft_window_proposal_scope"](
-            owner, N(), dummy_run=False, is_profile=False, num_speculative_tokens=0
-        ):
-            self.assertEqual((owner._eagle3_window_scheduled_tokens, owner._eagle3_window_expected_steps), (0, 1))
-            helper = ns["_source_helper_module"]
-            with patch.dict(sys.modules, {helper.__name__: helper}):
-                controller.begin(1, ("A",), first_pass_is_graph=False, num_speculative_tokens=0)
-            identity = N(step=0, normalized_method="eagle3", mapping_epoch=1, ordered_request_fingerprint=("A",))
-            runtime._last_retired_identity = identity
-            controller.adopt_eager_first_pass(identity)
-            owner._eagle3_window_next_step = 1
-        self.assertEqual(len(finished), 1)
-        self.assertFalse(controller.quarantined)
-        self.assertIsNone(owner._eagle3_window_proposal_context)
-        self.assertEqual((owner._eagle3_window_static_k, owner._eagle3_window_expected_steps), (3, 3))
-        owner, controller, runtime, finished = state()
-        with (
-            self.assertRaisesRegex(RuntimeError, "without consuming all"),
-            env["_eagle3_draft_window_proposal_scope"](
-                owner, N(), dummy_run=False, is_profile=False, num_speculative_tokens=0
-            ),
-        ):
-            pass
-        self.assertTrue(controller.quarantined)
-        self.assertTrue(owner._draft_window_graph_submission_uncertain)
-        self.assertEqual(len(finished), 1)
-
-
 class Vector:
     def __init__(self, values):
         self.values = values
@@ -999,24 +783,9 @@ class EagleMixedRequestControls(unittest.TestCase):
                 )
 
 
-class Controller:
-    def __init__(self):
-        self._proposal_epoch = None
-        self._owner_stream = 17
-        self._stream_identity = lambda: 17
-        self.quarantined = False
-
-    def require_reusable(self):
-        if self.quarantined:
-            raise RuntimeError("quarantined")
-
-    def quarantine(self, _):
-        self.quarantined = True
-
-
 def idle_owner():
     provider = NS(inventory_method="eagle3")
-    session = NS(controller=Controller(), provider=provider, _capture_call=None)
+    session = NS(provider=provider, _capture_call=None)
     batch = NS(is_dummy=True, num_reqs=1, num_reqs_after_padding=1)
     owner = NS(
         method="eagle3",
@@ -1033,6 +802,13 @@ def idle_owner():
         _draft_window_graph_binding_provider=provider,
         _draft_window_runtime_state=NS(_active_inputs=None),
     )
+
+    def require_reusable():
+        if getattr(owner, "_draft_window_graph_submission_uncertain", False):
+            raise RuntimeError("quarantined")
+
+    session.require_reusable = require_reusable
+    owner._quarantine_eagle3_window = lambda: setattr(owner, "_draft_window_graph_submission_uncertain", True)
     return owner, batch, session
 
 
@@ -1055,9 +831,9 @@ class EagleIdleOwnershipControls(unittest.TestCase):
                 self.assertTrue(IDLE["validate_eagle_dp_dummy_replay"](owner, manager, descriptor, [{}] * count))
                 with self.assertRaises(RuntimeError):
                     IDLE["validate_eagle_dp_dummy_replay"](owner, manager, descriptor, [{}] * (count + 1))
-            self.assertIsNone(session.controller._proposal_epoch)
+            self.assertIsNone(getattr(owner, "_eagle3_window_proposal_context", None))
         self.assertFalse(owner._eagle3_graph_dp_dummy_active)
-        self.assertFalse(session.controller.quarantined)
+        self.assertFalse(getattr(owner, "_draft_window_graph_submission_uncertain", False))
         # K0 business first-only is a genuine request, never dummy/idle.
         batch.is_dummy = False
         with IDLE["eagle3_dp_dummy_scope"](owner, batch, dummy_run=False, is_profile=False):
@@ -1070,7 +846,7 @@ class EagleIdleOwnershipControls(unittest.TestCase):
             IDLE["eagle3_dp_dummy_scope"](owner, batch, dummy_run=True, is_profile=False),
         ):
             raise RuntimeError("injected submission uncertainty")
-        self.assertTrue(session.controller.quarantined)
+        self.assertTrue(owner._draft_window_graph_submission_uncertain)
         self.assertTrue(owner._draft_window_graph_submission_uncertain)
         self.assertFalse(owner._eagle3_graph_dp_dummy_active)
         for field in ("_eagle3_window_proposal_context", "_eagle3_window_live_inputs"):
@@ -1081,7 +857,7 @@ class EagleIdleOwnershipControls(unittest.TestCase):
                 IDLE["eagle3_dp_dummy_scope"](owner, batch, dummy_run=True, is_profile=False),
             ):
                 self.fail("live business generation entered dummy replay")
-            self.assertTrue(session.controller.quarantined)
+            self.assertTrue(owner._draft_window_graph_submission_uncertain)
         owner, batch, session = idle_owner()
         owner._draft_window_runtime_state._active_inputs = object()
         with (

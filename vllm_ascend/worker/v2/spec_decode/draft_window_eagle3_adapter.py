@@ -248,14 +248,12 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentA
                     )
                     session.stage(inputs, first=False, n=padded, tokens=batch_desc.num_tokens, ordinal=step - 1)
                 return self.decode_cudagraph_manager.run_fullgraph(batch_desc)
-            except BaseException as error:
-                session.controller.quarantine(type(error).__name__ + ": " + str(error))
-                self._draft_window_graph_submission_uncertain = True
+            except BaseException:
+                self._quarantine_eagle3_window()
                 raise
         if self._eagle3_window_is_active():
             if session is not None:
-                session.controller.quarantine("Eagle3 merged AR has no actual FULL descriptor")
-                self._draft_window_graph_submission_uncertain = True
+                self._quarantine_eagle3_window()
                 raise RuntimeError("Eagle3 Window merged AR Graph has no exact FULL descriptor; no eager fallback")
             if batch_desc.cg_mode != CUDAGraphMode.NONE or skip_attn or seq_lens_cpu_upper_bound is None:
                 raise RuntimeError("Eagle3 eager proposal requires real per-step metadata")
@@ -300,13 +298,7 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentA
             raise ValueError("Eagle3 first pass requires canonical Full slots")
         session = getattr(self, "_eagle3_graph_session", None)
         if session is not None:
-            context = self._require_eagle3_window_context()
-            session.controller.begin(
-                context.mapping_epoch,
-                context.ordered_request_ids,
-                first_pass_is_graph=False,
-                num_speculative_tokens=self._eagle3_window_scheduled_tokens,
-            )
+            session.require_reusable()
         target = self._require_eagle3_target_metadata(attn_metadata)
         inputs = self._materialize_eagle3_first_pass(num_reqs=num_reqs, num_reqs_padded=num_reqs)
         try:
@@ -333,8 +325,6 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentA
             self._finish_eagle3_window_step(inputs, succeeded=False)
             raise
         self._finish_eagle3_window_step(inputs, succeeded=True)
-        if session is not None:
-            session.controller.adopt_eager_first_pass(inputs.identity)
 
     def _build_attn_metadata(
         self,

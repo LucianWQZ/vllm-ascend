@@ -12,8 +12,13 @@ from vllm.v1.worker.gpu.spec_decode.eagle.speculator import EagleSpeculator
 
 from vllm_ascend.worker.v2.spec_decode import draft_window_eager
 from vllm_ascend.worker.v2.spec_decode.draft_window_eager import AscendDraftAttentionReadInputs
-from vllm_ascend.worker.v2.spec_decode.draft_window_eagle3 import Eagle3DraftWindowMixin
+from vllm_ascend.worker.v2.spec_decode.draft_window_eagle3 import (
+    Eagle3DraftWindowMixin,
+    _eagle3_graph_scheduled_consumers,
+)
 from vllm_ascend.worker.v2.spec_decode.draft_window_eagle3_adapter import Eagle3GraphIntegrationMixin
+from vllm_ascend.worker.v2.spec_decode.draft_window_eagle3_capture import Eagle3GraphSession
+from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphCarrierState
 from vllm_ascend.worker.v2.spec_decode.eagle.speculator import AscendEagleSpeculator
 from vllm_ascend.worker.v2.spec_decode.target_dependent_ar.speculator import AscendTargetDependentARSpeculator
 
@@ -121,3 +126,105 @@ def test_eager_forward_is_delegated_once_and_reader_retires_after_it(monkeypatch
         assert owner._generate_draft(*args) == "result"
     assert calls[0][0] == "forward" and calls[0][1][:5] == args
     assert calls[1:] == ([("retire", not fail)] if active else [])
+
+
+@pytest.mark.parametrize("scheduled", [-1, 1, 2, 4, True])
+def test_eagle_partial_schedule_is_not_dynamic_k(scheduled):
+    with pytest.raises(NotImplementedError):
+        _eagle3_graph_scheduled_consumers(3, scheduled)
+
+
+@pytest.fixture
+def proposal():
+    owner: Any = Eagle3DraftWindowMixin()
+    owner.method, owner.num_speculative_steps = "eagle3", 3
+    owner.speculative_config = SimpleNamespace(uses_dynamic_speculative_decoding=lambda: False)
+    owner._draft_window_source_capability = SimpleNamespace(
+        inventory=SimpleNamespace(method="eagle3"), provider=SimpleNamespace(expected_future_offset=3)
+    )
+    runtime: Any = SimpleNamespace(_active_inputs=None, quarantined_identity=None, _last_retired_identity=None)
+
+    def retire(identity):
+        assert runtime._active_inputs.identity is identity
+        runtime._last_retired_identity, runtime._active_inputs = identity, None
+
+    runtime.retire_generation = retire
+    runtime.quarantine_generation = lambda identity: setattr(runtime, "quarantined_identity", identity)
+    owner._draft_window_runtime_state = runtime
+    owner._initialize_eagle3_draft_window_state()
+    batch = SimpleNamespace(
+        num_reqs=1,
+        req_ids=["request"],
+        idx_mapping_np=np.array([0]),
+        num_computed_prefill_tokens_np=np.array([10]),
+        prefill_len_np=np.array([10]),
+        num_scheduled_tokens=np.array([1]),
+        num_draft_tokens_per_req=None,
+        is_prefilling_np=np.array([False]),
+        has_prefill=False,
+    )
+    session: Any = object.__new__(Eagle3GraphSession)
+    session.owner, session._carriers = owner, []
+    session.provider = SimpleNamespace(require_reusable=lambda: None)
+    owner._eagle3_graph_session = session
+    owner._require_eagle3_target_metadata = lambda: {}
+    session.write_reference = lambda identity, target: None
+    session.resolve = lambda **kwargs: object()
+    session.provider.bind_read_carrier = lambda **kwargs: SimpleNamespace(state=DraftWindowGraphCarrierState.BOUND)
+
+    def inputs(step, **changes):
+        context = owner._require_eagle3_window_context()
+        values = dict(
+            mapping_epoch=context.mapping_epoch, ordered_request_fingerprint=context.ordered_request_ids, step=step
+        )
+        values.update(changes)
+        identity = SimpleNamespace(**values)
+        current = SimpleNamespace(identity=identity, retired=False)
+        current.validate_for = lambda actual: actual is identity or pytest.fail("replaced identity")
+        runtime._active_inputs = owner._eagle3_window_live_inputs = current
+        return current
+
+    return owner, batch, session, runtime, inputs
+
+
+def test_real_proposal_zero_uses_first_reader_and_keeps_static_k(proposal):
+    owner, batch, session, runtime, inputs = proposal
+    with owner._eagle3_draft_window_proposal_scope(batch, dummy_run=False, is_profile=False, num_speculative_tokens=0):
+        assert owner._eagle3_window_expected_steps == 1
+        current = inputs(0)
+        owner._finish_eagle3_window_step(current, succeeded=True)
+    assert runtime._last_retired_identity is current.identity
+    assert owner._eagle3_window_static_k == owner._eagle3_window_expected_steps == 3
+    assert not session._carriers
+
+
+def test_real_proposal_keeps_each_submitted_consumer_until_update(proposal):
+    owner, batch, session, runtime, inputs = proposal
+    with owner._eagle3_draft_window_proposal_scope(batch, dummy_run=False, is_profile=False):
+        for step in range(3):
+            current = inputs(step)
+            session.stage(current, first=step == 0, n=1, tokens=4 if step == 0 else 1, ordinal=max(0, step - 1))
+            assert owner._eagle3_window_next_step == step + 1
+            assert runtime._last_retired_identity is current.identity
+            assert owner._eagle3_window_live_inputs is None
+            assert len(session._carriers) == step + 1
+            session._carriers[-1].state = DraftWindowGraphCarrierState.UPDATED
+    assert not session._carriers
+    assert not getattr(owner, "_draft_window_graph_submission_uncertain", False)
+
+
+@pytest.mark.parametrize("damage", ["missing_reader", "missing_update", "wrong_request", "wrong_step", "wrong_ordinal"])
+def test_real_proposal_rejects_unconsumed_or_misattributed_reader(proposal, damage):
+    owner, batch, session, runtime, inputs = proposal
+    with (
+        pytest.raises(RuntimeError),
+        owner._eagle3_draft_window_proposal_scope(batch, dummy_run=False, is_profile=False, num_speculative_tokens=0),
+    ):
+        if damage != "missing_reader":
+            changes = {"ordered_request_fingerprint": ("stale",)} if damage == "wrong_request" else {}
+            current = inputs(1 if damage == "wrong_step" else 0, **changes)
+            session.stage(current, first=True, n=1, tokens=4, ordinal=1 if damage == "wrong_ordinal" else 0)
+    assert owner._draft_window_graph_submission_uncertain
+    assert owner._eagle3_window_proposal_context is None
+    if damage in ("wrong_request", "wrong_step", "wrong_ordinal"):
+        assert runtime.quarantined_identity is current.identity

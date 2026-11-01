@@ -23,9 +23,10 @@ from vllm_ascend.worker.v2.spec_decode.draft_window import (
     _build_draft_window_source_capability_for_context,
     build_draft_window_runtime_context,
 )
-from vllm_ascend.worker.v2.spec_decode.draft_window_eagle3_graph import Eagle3GraphStagingOwner
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
     DraftWindowGraphCaptureIdentity,
+    DraftWindowGraphCarrierState,
+    DraftWindowGraphReadCarrier,
     DraftWindowGraphRoute,
     DraftWindowGraphWriteSideReference,
     install_draft_window_graph_binding_provider,
@@ -87,9 +88,7 @@ class Eagle3GraphSession:
         self.owner = owner
         self.context = context
         self.provider = install_draft_window_graph_binding_provider(owner)
-        self.controller = Eagle3GraphStagingOwner(
-            owner._draft_window_runtime_state, self.provider, static_k=owner.num_speculative_steps
-        )
+        self._carriers: list[DraftWindowGraphReadCarrier] = []
         self._captures: dict[
             tuple[DraftWindowGraphRoute, BatchExecutionDescriptor, int], DraftWindowGraphCaptureIdentity
         ] = {}
@@ -128,6 +127,18 @@ class Eagle3GraphSession:
                         read.cpu_window_exact.fill_(capacity)
                         read.cpu_window_upper.fill_(capacity)
                         read.device_window_exact.copy_(read.cpu_window_exact)
+
+    def require_reusable(self) -> None:
+        if getattr(self.owner, "_draft_window_graph_submission_uncertain", False):
+            raise RuntimeError("Eagle3 Graph backing is quarantined; process isolation required")
+        self.provider.require_reusable()
+
+    def finish(self) -> None:
+        """Check real UPDATE attribution; Host retirement is not completion."""
+        self.require_reusable()
+        if any(carrier.state is not DraftWindowGraphCarrierState.UPDATED for carrier in self._carriers):
+            raise RuntimeError("Eagle3 Graph banks lack actual backend UPDATE attribution")
+        self._carriers.clear()
 
     def validate_for_provider(self, provider: Any) -> None:
         if provider is not self.provider or not self._captures:
@@ -260,13 +271,35 @@ class Eagle3GraphSession:
                     layer.positions = write.positions
             return private
 
-        self.controller.publish_step(
-            capture_identity=identity,
-            inputs=inputs,
-            metadata_builder=build,
-            target_metadata=target,
-            write_side_reference=write,
-        )
-        owner._eagle3_window_last_identity = inputs.identity
-        owner._eagle3_window_next_step = inputs.identity.step + 1
-        owner._eagle3_window_live_inputs = None
+        try:
+            self.require_reusable()
+            current = inputs.identity
+            inputs.validate_for(current)
+            context = owner._require_eagle3_window_context()
+            if (
+                current.mapping_epoch != context.mapping_epoch
+                or current.ordered_request_fingerprint != context.ordered_request_ids
+                or current.step != owner._eagle3_window_next_step
+                or current.step >= owner._eagle3_window_expected_steps
+                or first is not (current.step == 0)
+                or ordinal != (0 if first else current.step - 1)
+            ):
+                raise RuntimeError("Eagle3 Graph consumer does not match the active proposal/step")
+            carrier = self.provider.bind_read_carrier(
+                capture_identity=identity,
+                inputs=inputs,
+                metadata_builder=build,
+                target_metadata=target,
+                write_side_reference=write,
+            )
+            if carrier.state is not DraftWindowGraphCarrierState.BOUND:
+                raise RuntimeError("Eagle3 consumer has no bound persistent destination")
+            self.require_reusable()
+            owner._draft_window_runtime_state.retire_generation(current)
+            self._carriers.append(carrier)
+            owner._eagle3_window_last_identity = current
+            owner._eagle3_window_next_step = current.step + 1
+            owner._eagle3_window_live_inputs = None
+        except BaseException:
+            owner._quarantine_eagle3_window()
+            raise
