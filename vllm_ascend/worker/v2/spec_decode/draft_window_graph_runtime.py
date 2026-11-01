@@ -318,7 +318,6 @@ def _build_private_graph_metadata(
         if layer_metadata is None:
             continue
         layer_metadata.slot_mapping = write_side.slot_mapping
-        layer_metadata.positions = write_side.positions
         layer_metadata.query_start_loc = write_side.query_start_loc
         layer_metadata.actual_seq_lengths_q = list(write_side.actual_seq_lengths_q)
         layer_metadata.attn_state = write_side.attn_state
@@ -344,7 +343,6 @@ def _build_write_side_reference(
         causal = causal[gid]
     return DraftWindowGraphWriteSideReference(
         slot_mapping=owner.block_tables.slot_mappings[gid, :token_count],
-        positions=owner.input_buffers.positions[:token_count],
         query_start_loc=owner.input_buffers.query_start_loc[: request_count + 1],
         actual_seq_lengths_q=tuple((row + 1) * query_width for row in range(request_count)),
         attn_state=getattr(target_layer, "attn_state", None),

@@ -82,7 +82,6 @@ class DraftWindowGraphWriteSideReference:
     """
 
     slot_mapping: torch.Tensor
-    positions: torch.Tensor
     query_start_loc: torch.Tensor
     actual_seq_lengths_q: tuple[int, ...]
     attn_state: Any
@@ -669,14 +668,13 @@ class DraftWindowGraphBindingProvider:
     ) -> None:
         if not isinstance(reference, DraftWindowGraphWriteSideReference):
             raise TypeError("graph carrier requires its canonical Full write inputs")
-        tensors = (reference.slot_mapping, reference.positions, reference.query_start_loc)
+        tensors = (reference.slot_mapping, reference.query_start_loc)
         tokens = reference.num_actual_tokens
         if (
             any(not isinstance(value, torch.Tensor) or value.ndim != 1 for value in tensors)
             or type(tokens) is not int
             or not 0 <= tokens <= capture_identity.descriptor.num_tokens
             or reference.slot_mapping.shape[0] != tokens
-            or reference.positions.shape[0] < tokens
             or type(reference.causal) is not bool
         ):
             raise RuntimeError("canonical Full write inputs do not cover this capture token shape")
@@ -717,7 +715,6 @@ class DraftWindowGraphBindingProvider:
         cls._validate_metadata_uses_read_carrier(metadata, workspace)
         expected_slot = identity(write_side_reference.slot_mapping)
         expected_query = identity(write_side_reference.query_start_loc)
-        expected_positions = identity(write_side_reference.positions)
         for layer_name, layer_metadata in metadata.items():
             if layer_metadata is None:
                 continue
@@ -736,11 +733,6 @@ class DraftWindowGraphBindingProvider:
                 raise RuntimeError(f"Draft graph metadata {layer_name!r} has a mismatched actual token count")
             if getattr(layer_metadata, "causal", None) is not write_side_reference.causal:
                 raise RuntimeError(f"Draft graph metadata {layer_name!r} has a mismatched causal contract")
-            metadata_positions = getattr(layer_metadata, "positions", None)
-            if metadata_positions is not None and (
-                not isinstance(metadata_positions, torch.Tensor) or identity(metadata_positions) != expected_positions
-            ):
-                raise RuntimeError(f"Draft graph metadata {layer_name!r} does not preserve full positions")
 
     @staticmethod
     def _validate_metadata_uses_read_carrier(

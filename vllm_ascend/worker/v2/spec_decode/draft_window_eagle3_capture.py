@@ -203,7 +203,6 @@ class Eagle3GraphSession:
             state = AscendAttentionState.DecodeOnly
         return DraftWindowGraphWriteSideReference(
             slot_mapping=self.owner.block_tables.slot_mappings[self.provider.source.group.gid, :tokens],
-            positions=self.owner.input_buffers.positions[:tokens],
             query_start_loc=self.owner.input_buffers.query_start_loc[: n + 1],
             actual_seq_lengths_q=tuple((i + 1) * query_width for i in range(n)),
             attn_state=state,
@@ -250,8 +249,6 @@ class Eagle3GraphSession:
                     write.num_actual_tokens,
                     True,
                 )
-                if hasattr(layer, "positions"):
-                    layer.positions = write.positions
             return private
 
         try:

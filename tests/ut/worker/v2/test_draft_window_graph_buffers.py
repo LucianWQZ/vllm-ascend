@@ -10,6 +10,7 @@ import pytest
 import torch
 from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
+from vllm.v1.worker.gpu.input_batch import InputBuffers
 
 from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftWindowSourceCapability,
@@ -43,6 +44,8 @@ def _proposal(epoch=0, requests=("request-a",)):
 
 @pytest.fixture
 def graph_buffers():
+    input_buffers = object.__new__(InputBuffers)
+    input_buffers.positions = torch.arange(8, dtype=torch.int64)
     table = torch.tensor([[11, 12, 13, 14], [21, 22, 23, 24]], dtype=torch.int32)
     counts = torch.full((1, 2), 4, dtype=torch.int32)
     owner = SimpleNamespace(
@@ -87,6 +90,7 @@ def graph_buffers():
         provider=provider,
         capture=capture,
         projection=projection,
+        input_buffers=input_buffers,
         mapping=torch.tensor([0, 1], dtype=torch.int64),
         source=source,
         owner=owner,
@@ -132,7 +136,6 @@ def _bind(case, inputs):
     query_lengths = tuple(row * query_width for row in range(1, actual + 1)) + (tokens,) * (padded - actual)
     reference = DraftWindowGraphWriteSideReference(
         slot_mapping=case.owner.slot_mappings[0, :tokens],
-        positions=torch.arange(tokens),
         query_start_loc=torch.tensor((0,) + query_lengths, dtype=torch.int32),
         actual_seq_lengths_q=query_lengths,
         attn_state=object(),
@@ -167,6 +170,8 @@ def _bind(case, inputs):
 
 def test_direct_capture_bank_never_allocates_scratch_or_mutates_full_source(graph_buffers):
     case = graph_buffers
+    positions = case.input_buffers.positions
+    positions_before = positions.clone()
     full_before = case.owner.input_block_tables[0].clone()
     inputs = _materialize(case)
     carrier = _bind(case, inputs)
@@ -175,6 +180,8 @@ def test_direct_capture_bank_never_allocates_scratch_or_mutates_full_source(grap
     assert inputs.workspace is carrier.workspace
     assert torch.equal(inputs.workspace.window_block_table, torch.tensor([[12, 13], [23, 24]], dtype=torch.int32))
     assert torch.equal(case.owner.input_block_tables[0], full_before)
+    assert case.input_buffers.positions is positions
+    torch.testing.assert_close(positions, positions_before, rtol=0, atol=0)
     assert case.target_metadata["target.layer"].seq_lens_list == [91, 92]
 
 
@@ -464,8 +471,6 @@ def test_startup_capture_exposes_the_real_bank_without_fake_generation(graph_buf
 
 
 def test_parallel_capture_uses_exact_manager_descriptor_and_preserves_full_tables(graph_buffers):
-    from vllm.v1.worker.gpu.input_batch import InputBuffers
-
     from vllm_ascend.worker.v2.spec_decode.dflash.capture import _build_capture_context, _seed_capture_workspace
 
     case = graph_buffers

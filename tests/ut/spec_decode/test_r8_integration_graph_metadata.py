@@ -631,7 +631,6 @@ def full_metadata_finalization():
     loop = next(n for n in function.body if isinstance(n, ast.For) and ast.unparse(n.iter) == "metadata.values()")
     writes = SimpleNamespace(
         slot_mapping=object(),
-        positions=object(),
         query_start_loc=object(),
         actual_seq_lengths_q=(8,),
         attn_state=object(),
@@ -651,11 +650,14 @@ def full_metadata_finalization():
 
 def test_full_graph_final_metadata_preserves_group_aliases_and_canonical_write_state(full_metadata_finalization):
     case = full_metadata_finalization
-    layer = SimpleNamespace(attn_state=object())
+    from vllm_ascend.attention.attention_v1 import AscendMetadata
+
+    layer = AscendMetadata(attn_state=object())
     metadata = {"draft.a": layer, "draft.b": layer, "unused": None}
     result = case.finalize(metadata)
     assert result is metadata and result["draft.a"] is result["draft.b"] is layer
     assert layer.causal is False and layer.slot_mapping is case.writes.slot_mapping
-    assert layer.positions is case.writes.positions and layer.query_start_loc is case.writes.query_start_loc
+    assert not hasattr(layer, "positions")
+    assert layer.query_start_loc is case.writes.query_start_loc
     assert layer.actual_seq_lengths_q == [8] and layer.num_actual_tokens == 8
     assert layer.attn_state is case.writes.attn_state and result["unused"] is None
