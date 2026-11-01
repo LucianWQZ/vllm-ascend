@@ -578,18 +578,19 @@ def full_metadata_dispatch():
         validate_deferred_parallel_graph_metadata,
     )
 
-    identity = SimpleNamespace(mapping_epoch=7, ordered_request_fingerprint=("req-a", "req-b"), padded_request_count=2)
+    proposal = SimpleNamespace(mapping_epoch=7, ordered_request_ids=("req-a", "req-b"))
+    identity = SimpleNamespace(proposal=proposal, padded_request_count=2)
     inputs = SimpleNamespace(identity=identity)
     inputs.validate_for = lambda expected: None if expected is identity else (_ for _ in ()).throw(ValueError("stale"))
     runtime: Any = SimpleNamespace(
         _active_inputs=inputs,
         _metadata=None,
-        capability=SimpleNamespace(inventory=SimpleNamespace(method="dflash")),
+        capability=SimpleNamespace(policy=SimpleNamespace(normalized_method="dflash")),
     )
     provider = object.__new__(DraftWindowGraphBindingProvider)
     provider._runtime_state = runtime
     owner = SimpleNamespace(
-        _draft_window_proposal_context=SimpleNamespace(mapping_epoch=7, ordered_request_ids=("req-a", "req-b")),
+        _draft_window_proposal_context=proposal,
         _draft_window_graph_binding_provider=provider,
         num_query_per_req=8,
         _draft_window_runtime_state=runtime,
@@ -612,8 +613,8 @@ def test_full_metadata_dispatch_defers_once_for_current_generation(full_metadata
     c.select_parallel_graph_metadata(c.owner, c.descriptor)
     selected = c.owner._draft_window_selected_metadata
     assert selected.descriptor is c.descriptor
-    assert selected.request_ids == ("req-a", "req-b") and selected.mapping_epoch == 7
-    assert selected.padded_requests == 2 and selected.padded_tokens == 16
+    assert selected.proposal is c.inputs.identity.proposal
+    assert selected.descriptor.num_reqs == 2 and selected.descriptor.num_tokens == 16
     assert c.defer_parallel_graph_metadata(c.owner, c.inputs, padded_requests=2, padded_tokens=16)
     c.validate_deferred_parallel_graph_metadata(c.owner, c.inputs, c.descriptor)
     assert c.owner._draft_window_deferred_metadata is c.inputs.identity
@@ -623,7 +624,12 @@ def test_full_metadata_dispatch_defers_once_for_current_generation(full_metadata
 
 @pytest.mark.parametrize(
     "field,value",
-    [("mapping_epoch", 8), ("ordered_request_fingerprint", ("req-b", "req-a")), ("padded_request_count", 4)],
+    [
+        ("proposal", SimpleNamespace(mapping_epoch=8, ordered_request_ids=("req-a", "req-b"))),
+        ("proposal", SimpleNamespace(mapping_epoch=7, ordered_request_ids=("req-b", "req-a"))),
+        ("proposal", SimpleNamespace(mapping_epoch=7, ordered_request_ids=("req-a", "req-b"))),
+        ("padded_request_count", 4),
+    ],
 )
 def test_full_metadata_dispatch_rejects_stale_generation_or_rows(full_metadata_dispatch, field, value):
     c = full_metadata_dispatch

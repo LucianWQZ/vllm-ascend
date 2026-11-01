@@ -14,12 +14,10 @@ from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm_ascend.device.hardware_profile import AttentionBackendFamily
 from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftWindowExecutionPhase,
-    DraftWindowInventory,
     DraftWindowRuntimeContext,
     DraftWindowSourceCapability,
     DraftWindowWorkspace,
     FullDraftKVSource,
-    SingleGroupDirectPrefixProvider,
     build_draft_window_runtime_state,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_backends import (
@@ -27,12 +25,25 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_backends import (
     DraftWindowProviderStatus,
     DraftWindowTopology,
 )
+from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowProposalContext
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
     DraftWindowGraphBindingProvider,
     DraftWindowGraphRoute,
     DraftWindowGraphWriteSideReference,
 )
+from vllm_ascend.worker.v2.spec_decode.draft_window_nongraph import DraftWindowBatchPhasePlan, DraftWindowRowPhase
 from vllm_ascend.worker.v2.spec_decode.draft_window_plan import compute_draft_window_plan
+from vllm_ascend.worker.v2.spec_decode.draft_window_policy import resolve_draft_window_policy
+
+
+def _proposal(epoch=0, requests=("request-a",)):
+    return DraftWindowProposalContext(
+        epoch,
+        0,
+        requests,
+        tuple(range(len(requests))),
+        DraftWindowBatchPhasePlan((DraftWindowRowPhase.PURE_DECODE,) * len(requests), requests),
+    )
 
 
 @pytest.fixture
@@ -60,14 +71,18 @@ def graph_buffers():
         status=DraftWindowProviderStatus.DIRECT_DENSE,
         reason="direct CPU fixture",
     )
-    inventory = DraftWindowInventory("dflash", "qwen3", "graph", 4, (group,), ())
-    projection = SingleGroupDirectPrefixProvider(inventory, source, legacy_block_size=4, expected_future_offset=0)
     context = DraftWindowRuntimeContext(
         AttentionBackendFamily.STANDARD, "FULL", True, 1, 1, 1, 1, 1, False, False, False, False
     )
-    runtime = build_draft_window_runtime_state(
-        DraftWindowSourceCapability(inventory, source, projection, runtime_context=context)
+    projection = DraftWindowSourceCapability(
+        policy=resolve_draft_window_policy(requested_window_size=4, method="dflash", target_model_type="qwen3"),
+        runtime_route="dflash",
+        group=group,
+        full_source=source,
+        expected_future_offset=0,
+        runtime_context=context,
     )
+    runtime = build_draft_window_runtime_state(projection)
     provider = DraftWindowGraphBindingProvider(runtime_state=runtime)
     descriptor = BatchExecutionDescriptor(CUDAGraphMode.FULL, num_tokens=2, num_reqs=2, uniform_token_count=1)
     capture = provider.register_capture_identity(route=DraftWindowGraphRoute.DFLASH, descriptor=descriptor, num_reqs=2)
@@ -90,8 +105,7 @@ def _materialize(case, *, epoch=0, ends=(11, 14), quarantine=False):
     ]
     exact = torch.tensor([plan.window_visible_length for plan in plans] + [0] * (2 - len(plans)), dtype=torch.int32)
     return case.runtime.materialize(
-        mapping_epoch=epoch,
-        ordered_request_ids=("request-a", "request-b")[: len(plans)],
+        proposal=_proposal(epoch, ("request-a", "request-b")[: len(plans)]),
         idx_mapping=case.mapping,
         read_descriptors=[case.projection.describe(plan, valid_num_blocks=4) for plan in plans],
         cpu_window_exact=exact.clone(),
@@ -116,7 +130,7 @@ def _bank_tensors(bank):
 
 
 def _bind(case, inputs):
-    actual = inputs.identity.actual_request_count
+    actual = len(inputs.identity.proposal.ordered_request_ids)
     padded = inputs.identity.padded_request_count
     query_width = case.capture.descriptor.num_tokens // case.capture.num_reqs
     tokens = actual * query_width
@@ -215,7 +229,7 @@ def test_active_generation_blocks_reuse_and_preserves_all_backing(graph_buffers)
     assert first.retired
     assert case.runtime._current_workspace is None
     second = _materialize(case, epoch=1, ends=(4,))
-    assert second.identity.mapping_epoch == first.identity.mapping_epoch + 1
+    assert second.identity.proposal.mapping_epoch == first.identity.proposal.mapping_epoch + 1
 
 
 def test_same_mapping_pointer_does_not_allow_epoch_or_generation_aba(graph_buffers):
@@ -230,7 +244,9 @@ def test_same_mapping_pointer_does_not_allow_epoch_or_generation_aba(graph_buffe
     with pytest.raises(RuntimeError, match="generation identity"):
         current.validate_for(first.identity)
     with pytest.raises(RuntimeError, match="generation identity"):
-        case.runtime.retire_generation(replace(current.identity, mapping_epoch=0))
+        case.runtime.retire_generation(
+            replace(current.identity, proposal=replace(current.identity.proposal, mapping_epoch=0))
+        )
     current.validate_for(current.identity)
 
 
@@ -268,8 +284,7 @@ def test_cpu_valid_counts_are_required_before_any_bank_materialization(graph_buf
     before = [tensor.clone() for tensor in _bank_tensors(bank)]
     with pytest.raises(TypeError, match="cpu_valid_num_blocks"):
         case.runtime.materialize(
-            mapping_epoch=0,
-            ordered_request_ids=(),
+            proposal=_proposal(0, ()),
             idx_mapping=case.mapping,
             read_descriptors=(),
             cpu_window_exact=torch.zeros(2, dtype=torch.int32),
@@ -287,15 +302,14 @@ def test_cpu_valid_counts_are_required_before_any_bank_materialization(graph_buf
 def test_eagle_serialized_steps_own_distinct_banks_and_preserve_previous_consumers(graph_buffers):
     case = graph_buffers
     capability = case.runtime.capability
-    inventory = replace(capability.inventory, method="eagle3")
-    projection = SingleGroupDirectPrefixProvider(inventory, case.source, legacy_block_size=4, expected_future_offset=3)
-    runtime = build_draft_window_runtime_state(
-        replace(
-            capability,
-            inventory=inventory,
-            provider=projection,
-        )
+    projection = replace(
+        capability,
+        policy=replace(capability.policy, normalized_method="eagle3"),
+        runtime_route="eagle3",
+        expected_future_offset=3,
     )
+    runtime = build_draft_window_runtime_state(projection)
+    proposal = _proposal(7)
     provider = DraftWindowGraphBindingProvider(runtime_state=runtime)
     case.owner.slot_mappings = torch.arange(8, dtype=torch.int64).reshape(1, 8)
     proposal_plan = compute_draft_window_plan(full_exact_end=11, future_offset=3, window_size=4, block_span_tokens=4)
@@ -315,7 +329,7 @@ def test_eagle_serialized_steps_own_distinct_banks_and_preserve_previous_consume
         bank = provider.prepare_workspace(capture)
         exact = torch.tensor([11 + step - proposal_plan.window_start] + [0] * (padded - 1), dtype=torch.int32)
         kwargs = dict(
-            ordered_request_ids=("request-a",),
+            proposal=proposal,
             idx_mapping=case.mapping,
             read_descriptors=[
                 projection.describe_frozen_step(proposal_plan, full_exact_end=11 + step, valid_num_blocks=4)
@@ -328,7 +342,7 @@ def test_eagle_serialized_steps_own_distinct_banks_and_preserve_previous_consume
             output_workspace=bank,
         )
         if previous is None:
-            inputs = runtime.materialize(mapping_epoch=7, phase=DraftWindowExecutionPhase.PROPOSAL, **kwargs)
+            inputs = runtime.materialize(phase=DraftWindowExecutionPhase.PROPOSAL, **kwargs)
         else:
             if step == 1:
                 replaced_mapping = case.mapping.clone()
@@ -343,7 +357,7 @@ def test_eagle_serialized_steps_own_distinct_banks_and_preserve_previous_consume
         carrier = _bind(current, inputs)
         assert carrier.runtime_identity is inputs.identity
         assert runtime._workspace is None
-        assert inputs.identity.mapping_epoch == 7 and inputs.identity.step == step
+        assert inputs.identity.proposal.mapping_epoch == 7 and inputs.identity.step == step
         for old_bank, old_values in retained:
             for tensor, old_tensor, snapshot in zip(_bank_tensors(bank), _bank_tensors(old_bank), old_values):
                 assert tensor.untyped_storage().data_ptr() != old_tensor.untyped_storage().data_ptr()
@@ -506,8 +520,7 @@ def test_nonfull_scratch_narrows_the_actual_bank_only_at_the_ascend_read_seam(gr
     case = graph_buffers
     plan = compute_draft_window_plan(full_exact_end=11, future_offset=0, window_size=4, block_span_tokens=4)
     inputs = case.runtime.materialize(
-        mapping_epoch=0,
-        ordered_request_ids=("request-a",),
+        proposal=_proposal(),
         idx_mapping=case.mapping,
         read_descriptors=[case.projection.describe(plan, valid_num_blocks=4)],
         cpu_window_exact=torch.tensor([plan.window_visible_length], dtype=torch.int32),
@@ -557,8 +570,7 @@ def test_runtime_group_rejects_a_descriptor_for_another_cache_group(graph_buffer
     descriptor = replace(case.projection.describe(plan, valid_num_blocks=4), global_group_id=1)
     with pytest.raises(ValueError, match="global gid does not match the runtime source"):
         case.runtime.materialize(
-            mapping_epoch=0,
-            ordered_request_ids=("request-a",),
+            proposal=_proposal(),
             idx_mapping=case.mapping,
             read_descriptors=[descriptor],
             cpu_window_exact=torch.tensor([plan.window_visible_length], dtype=torch.int32),

@@ -52,7 +52,6 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
 class DraftWindowGraphSession:
     owner: Any
     provider: DraftWindowGraphBindingProvider
-    runtime_context: DraftWindowRuntimeContext
     route: DraftWindowGraphRoute
 
     def resolve_capture_identity(
@@ -73,7 +72,7 @@ def draft_window_graph_enabled() -> bool:
     return bool(envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH)
 
 
-def validate_graph_context(runtime_context: DraftWindowRuntimeContext, vllm_config: Any) -> bool:
+def validate_graph_context(runtime_context: DraftWindowRuntimeContext, vllm_config: Any) -> None:
     """Match the actual executor to its once-resolved supported Graph route."""
     if not draft_window_graph_enabled():
         raise NotImplementedError("Draft Window Graph requires its explicit supported Graph configuration")
@@ -95,7 +94,6 @@ def validate_graph_context(runtime_context: DraftWindowRuntimeContext, vllm_conf
     rank = runtime_context.tensor_parallel_rank
     if type(rank) is not int or not 0 <= rank < runtime_context.tensor_parallel_size:
         raise ValueError("Draft Window Graph requires its actual TP rank")
-    return True
 
 
 def build_parallel_graph_source(
@@ -107,20 +105,15 @@ def build_parallel_graph_source(
     kv_cache_config: Any,
     causal: bool | Mapping[int, bool],
     vllm_config: Any,
-    input_buffers: Any = None,
     dflash2_graph_contract: Any = None,
 ) -> tuple[DraftWindowSourceCapability, DraftWindowRuntimeContext]:
     """Build P2/P3 source state only after the real Graph route is gated."""
     if not draft_window_graph_enabled():
         raise RuntimeError("internal Draft Window Graph flag is not enabled")
     runtime_context = build_draft_window_runtime_context(vllm_config, block_tables)
-    replicated_review = validate_graph_context(runtime_context, vllm_config)
+    validate_graph_context(runtime_context, vllm_config)
     if runtime_route not in {"dflash", "dflash2", "dspark"}:
         raise NotImplementedError("Draft Window Graph supports only DFlash and eligible DSpark")
-    speculative_config = vllm_config.speculative_config
-    if bool(speculative_config.uses_dynamic_speculative_decoding()):
-        raise NotImplementedError("Draft Window Graph requires static K")
-
     if runtime_route == "dflash2":
         from vllm_ascend.worker.v2.spec_decode.draft_window_dflash2_graph import DFlash2GraphContract
 
@@ -137,9 +130,6 @@ def build_parallel_graph_source(
         causal=causal,
         vllm_config=vllm_config,
         runtime_context=runtime_context,
-        allow_replicated_tp_graph_source=replicated_review,
-        allow_parallel_prefix_graph_source=runtime_context.prefix_caching,
-        allow_parallel_dp_graph_source=replicated_review and runtime_context.data_parallel_size == 2,
         dflash2_graph_contract=dflash2_graph_contract,
     )
     topology = capability.runtime_context
@@ -162,12 +152,13 @@ def install_parallel_graph(
     runtime_context: DraftWindowRuntimeContext,
 ) -> DraftWindowGraphSession:
     """Install one provider and register every real startup capture bucket."""
-    validate_graph_context(runtime_context, getattr(owner, "vllm_config", None))
     if hasattr(owner, "_draft_window_graph_session"):
         raise RuntimeError("Draft Window Graph is already installed on this speculator")
     runtime_state = getattr(owner, "_draft_window_runtime_state", None)
     if not isinstance(runtime_state, DraftWindowRuntimeState):
         raise RuntimeError("Draft Window Graph requires initialized P3 runtime state")
+    if runtime_context is not runtime_state.capability.runtime_context:
+        raise RuntimeError("Draft Window Graph installation has a different source/executor context")
     manager = getattr(owner, "query_cudagraph_manager", None)
     capture_descs = getattr(manager, "_capture_descs", None)
     max_num_reqs = getattr(manager, "max_num_reqs", None)
@@ -183,7 +174,6 @@ def install_parallel_graph(
     session = DraftWindowGraphSession(
         owner=owner,
         provider=provider,
-        runtime_context=runtime_context,
         route=route,
     )
     descriptors = tuple(descriptor for mode_descriptors in capture_descs.values() for descriptor in mode_descriptors)
@@ -229,7 +219,7 @@ def prepare_parallel_graph(
         raise RuntimeError("Draft Window Graph replay has no real P3 proposal generation")
     inputs.validate_for(inputs.identity)
     proposal_context = getattr(owner, "_draft_window_proposal_context", None)
-    if proposal_context is None or proposal_context.mapping_epoch != inputs.identity.mapping_epoch:
+    if proposal_context is not inputs.identity.proposal:
         raise RuntimeError("Draft Window Graph proposal identity is stale")
     capture_identity = session.resolve_capture_identity(descriptor)
     if inputs.identity.padded_request_count != capture_identity.num_reqs:
@@ -253,9 +243,8 @@ def prepare_parallel_graph(
         metadata_builder=lambda workspace: _build_private_graph_metadata(
             owner,
             workspace=workspace,
-            actual_request_count=inputs.identity.actual_request_count,
+            actual_request_count=len(inputs.identity.proposal.ordered_request_ids),
             write_side=write_side,
-            target_metadata=target_metadata,
             capture_identity=capture_identity,
         ),
         target_metadata=target_metadata,
@@ -306,7 +295,6 @@ def _build_private_graph_metadata(
     workspace: DraftWindowWorkspace,
     actual_request_count: int,
     write_side: DraftWindowGraphWriteSideReference,
-    target_metadata: Mapping[Any, Any],
     capture_identity: DraftWindowGraphCaptureIdentity,
 ) -> Mapping[str, Any]:
     typed_read_inputs = draft_window_read_inputs(
@@ -343,7 +331,7 @@ def _build_private_graph_metadata(
     from vllm_ascend.worker.v2.spec_decode.draft_window_graph_metadata import copy_draft_attention_metadata
 
     metadata = copy_draft_attention_metadata(metadata)
-    window_layers = owner._draft_window_runtime_state.capability.inventory.require_single_group_direct_prefix().layers
+    window_layers = owner._draft_window_runtime_state.capability.group.layers
     bound_metadata_ids: set[int] = set()
     for layer_name in window_layers:
         layer_metadata = metadata.get(layer_name)

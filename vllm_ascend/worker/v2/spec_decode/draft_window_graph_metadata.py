@@ -12,7 +12,10 @@ from __future__ import annotations
 from collections.abc import Mapping
 from copy import copy
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowProposalContext
 
 
 def copy_draft_attention_metadata(metadata: Mapping[str, Any]) -> dict[str, Any]:
@@ -85,17 +88,8 @@ def validate_draft_metadata_isolation(metadata: Mapping[str, Any], *, target_met
 
 @dataclass(frozen=True, slots=True)
 class ParallelGraphMetadataSelection:
-    mapping_epoch: int
-    request_ids: tuple[str, ...]
+    proposal: DraftWindowProposalContext
     descriptor: Any
-
-    @property
-    def padded_requests(self) -> int:
-        return self.descriptor.num_reqs
-
-    @property
-    def padded_tokens(self) -> int:
-        return self.descriptor.num_tokens
 
 
 def is_parallel_graph_dp_dummy(owner: Any) -> bool:
@@ -121,7 +115,7 @@ def is_parallel_graph_dp_dummy(owner: Any) -> bool:
         or getattr(owner, "_draft_window_proposal_context", None) is not None
         or getattr(owner, "_draft_window_live_inputs", None) is not None
         or not isinstance(provider, DraftWindowGraphBindingProvider)
-        or provider.inventory_method not in ("dflash", "dspark")
+        or provider.method not in ("dflash", "dspark")
     ):
         raise RuntimeError("DP dummy Graph requires its explicit full-read scope without a live Window generation")
     return True
@@ -135,7 +129,7 @@ def select_parallel_graph_metadata(owner: Any, descriptor: Any) -> None:
     if context is None or getattr(descriptor.cg_mode, "name", None) != "FULL":
         return
     provider = getattr(owner, "_draft_window_graph_binding_provider", None)
-    if not isinstance(provider, DraftWindowGraphBindingProvider) or provider.inventory_method not in (
+    if not isinstance(provider, DraftWindowGraphBindingProvider) or provider.method not in (
         "dspark",
         "dflash",
     ):
@@ -143,9 +137,7 @@ def select_parallel_graph_metadata(owner: Any, descriptor: Any) -> None:
     n, tokens = descriptor.num_reqs, descriptor.num_tokens
     if type(n) is not int or n < len(context.ordered_request_ids) or tokens != n * owner.num_query_per_req:
         raise RuntimeError("single-metadata selection does not match actual FULL dispatch geometry")
-    owner._draft_window_selected_metadata = ParallelGraphMetadataSelection(
-        context.mapping_epoch, context.ordered_request_ids, descriptor
-    )
+    owner._draft_window_selected_metadata = ParallelGraphMetadataSelection(context, descriptor)
 
 
 def defer_parallel_graph_metadata(owner: Any, inputs: Any, *, padded_requests: int, padded_tokens: int) -> bool:
@@ -155,11 +147,10 @@ def defer_parallel_graph_metadata(owner: Any, inputs: Any, *, padded_requests: i
     identity = inputs.identity
     inputs.validate_for(identity)
     if (
-        selected.mapping_epoch != identity.mapping_epoch
-        or selected.request_ids != identity.ordered_request_fingerprint
-        or selected.padded_requests != padded_requests
-        or selected.padded_requests != identity.padded_request_count
-        or selected.padded_tokens != padded_tokens
+        selected.proposal is not identity.proposal
+        or selected.descriptor.num_reqs != padded_requests
+        or selected.descriptor.num_reqs != identity.padded_request_count
+        or selected.descriptor.num_tokens != padded_tokens
     ):
         raise RuntimeError("stale or wrong-bucket deferred Graph metadata selection")
     runtime = owner._draft_window_runtime_state
@@ -177,8 +168,8 @@ def validate_deferred_parallel_graph_metadata(owner: Any, inputs: Any, descripto
         raise RuntimeError("single-build FULL replay has no actual dispatch selection")
     if (
         getattr(descriptor.cg_mode, "name", None) != "FULL"
-        or descriptor.num_reqs != selected.padded_requests
-        or descriptor.num_tokens != selected.padded_tokens
+        or descriptor.num_reqs != selected.descriptor.num_reqs
+        or descriptor.num_tokens != selected.descriptor.num_tokens
         or getattr(owner, "_draft_window_deferred_metadata", None) != inputs.identity
         or owner._draft_window_runtime_state._metadata is not None
     ):

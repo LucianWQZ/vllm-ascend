@@ -11,7 +11,7 @@ import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -41,6 +41,9 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_policy import (
     DraftWindowPolicyState,
 )
 
+if TYPE_CHECKING:
+    from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowProposalContext
+
 
 @dataclass(frozen=True, slots=True)
 class DraftWindowRuntimeContext:
@@ -59,56 +62,6 @@ class DraftWindowRuntimeContext:
     flashcomm: bool
     prefix_caching: bool
     tensor_parallel_rank: int = 0
-
-
-@dataclass(frozen=True, slots=True)
-class DraftWindowInventory:
-    """Immutable inventory and fail-closed result for one eligible route."""
-
-    method: str
-    target_model_type: str
-    runtime_route: str
-    window_size: int
-    groups: tuple[DraftWindowGroupRoute, ...]
-    capability_failures: tuple[str, ...]
-    dflash2_graph_source: bool = False
-
-    @property
-    def consumer_global_group_ids(self) -> tuple[int, ...]:
-        """Unique global gids in first-consumer order."""
-        return tuple(dict.fromkeys(group.gid for group in self.groups))
-
-    def require_single_group_direct_prefix(self) -> DraftWindowGroupRoute:
-        """Select the one already-inventoried consumer admitted by this Graph source."""
-        failures = list(self.capability_failures)
-        if len(self.groups) != 1:
-            failures.append(f"expected one executable consumer, found {len(self.groups)}")
-        for group in self.groups:
-            native_dflash2 = (
-                self.dflash2_graph_source and group.status is DraftWindowProviderStatus.NATIVE_SWA_CANDIDATE
-            )
-            dense = group.status is DraftWindowProviderStatus.DIRECT_DENSE and group.native_window is None
-            if not dense and not native_dflash2:
-                failures.append(f"gid={group.gid} layout={group.status.value} reason={group.reason}")
-        if failures:
-            raise NotImplementedError(
-                "MRV2 draft-window Graph source rejected: "
-                f"method={self.method} model={self.target_model_type} route={self.runtime_route}; "
-                + "; ".join(failures)
-            )
-        return self.groups[0]
-
-
-def _group_diagnostic_context(
-    inventory: DraftWindowInventory,
-    group: DraftWindowGroupRoute,
-) -> str:
-    """Return the common identity required on every P2 source failure."""
-    return (
-        f"method={inventory.method} model={inventory.target_model_type} "
-        f"route={inventory.runtime_route} gid={group.gid} "
-        f"layout={group.status.value}"
-    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,15 +88,6 @@ class FullDraftKVSource:
     def input_block_table_row_width(self, global_group_id: int) -> int:
         self._validate_global_group_id(global_group_id)
         return self._input_block_tables[global_group_id].shape[1]
-
-    def shares_canonical_storage(self, tensor: torch.Tensor) -> bool:
-        """Return whether a tensor aliases any canonical FullSource backing."""
-        self.validate_owner_bindings()
-        canonical_tensors = self._input_block_tables + (
-            self._persistent_num_blocks_cpu,
-            self._block_tables_owner.num_blocks.gpu,
-        )
-        return any(draft_window_tensors_share_storage(tensor, canonical) for canonical in canonical_tensors)
 
     def validate_owner_bindings(self) -> None:
         """Reject replacement of a canonical owner tensor after P2 binding."""
@@ -188,138 +132,65 @@ class DraftWindowReadDescriptor:
 
 
 @dataclass(frozen=True, slots=True)
-class SingleGroupDirectPrefixProvider:
+class DraftWindowSourceCapability:
     """Canonical read projection; it never materializes a window table."""
 
-    inventory: DraftWindowInventory
+    policy: DraftWindowPolicyDecision
+    runtime_route: str
+    group: DraftWindowGroupRoute
     full_source: FullDraftKVSource
-    legacy_block_size: int
     expected_future_offset: int
-    # The backend inventory and method contract admit one actual reader;
-    # this provider adds only the Graph bank's canonical-source coordinates.
-    _group: DraftWindowGroupRoute = field(init=False, repr=False)
-    _capacity_columns: int = field(init=False, repr=False)
-    _block_span_tokens: int = field(init=False, repr=False)
+    runtime_context: DraftWindowRuntimeContext | None = None
+    workspace_capacity_columns: int | None = None
+    capacity_columns: int = field(init=False)
+    window_size: int = field(init=False)
 
     def __post_init__(self) -> None:
-        group = self.inventory.require_single_group_direct_prefix()
-        span = group.table_column_span
-        if self.legacy_block_size <= 0:
-            raise ValueError("legacy block size must be greater than 0")
-        if not isinstance(self.expected_future_offset, int) or isinstance(
-            self.expected_future_offset,
-            bool,
-        ):
-            raise TypeError("expected future offset must be a Python int")
-        if self.expected_future_offset < 0:
-            raise ValueError("expected future offset must be greater than or equal to 0")
-        method_future_offset = resolve_static_future_offset(
-            normalized_method=self.inventory.method,
+        window = self.policy.effective_window_size
+        if self.policy.state is not DraftWindowPolicyState.ELIGIBLE_ON or window is None:
+            raise ValueError("Graph source requires an eligible Window policy")
+        dense = self.group.status is DraftWindowProviderStatus.DIRECT_DENSE and self.group.native_window is None
+        native_dflash2 = (
+            self.runtime_route == "dflash2" and self.group.status is DraftWindowProviderStatus.NATIVE_SWA_CANDIDATE
+        )
+        if not dense and not native_dflash2:
+            raise NotImplementedError(
+                f"Draft Graph source cannot read gid={self.group.gid} "
+                f"layout={self.group.status.value}: {self.group.reason}"
+            )
+        _require_nonnegative_python_int(self.expected_future_offset, "expected future offset")
+        expected_offset = resolve_static_future_offset(
+            normalized_method=self.policy.normalized_method,
             configured_k=self.expected_future_offset,
             uses_dynamic_k=False,
         )
-        if method_future_offset != self.expected_future_offset:
-            raise ValueError(
-                "configured future offset does not match method semantics: "
-                f"method={self.inventory.method} "
-                f"offset={self.expected_future_offset} "
-                f"expected={method_future_offset}"
-            )
-        if group.gid >= self.full_source.num_groups:
-            raise RuntimeError(f"inventory gid {group.gid} has no canonical full source")
+        if expected_offset != self.expected_future_offset:
+            raise ValueError("configured future offset does not match method semantics")
         self.full_source.validate_owner_bindings()
         _validate_source_geometry(
-            inventory=self.inventory,
-            group=group,
+            group=self.group,
             logical_block_sizes=self.full_source.logical_block_sizes,
             kernel_block_sizes=self.full_source.kernel_block_sizes,
             num_groups=self.full_source.num_groups,
         )
-        try:
-            capacity_columns = compute_direct_prefix_capacity(
-                window_size=self.inventory.window_size,
-                legacy_block_size=self.legacy_block_size,
-                block_span_tokens=span,
-            )
-        except ValueError as error:
-            raise NotImplementedError(
-                "MRV2 direct-prefix geometry is not proven: "
-                f"method={self.inventory.method} "
-                f"model={self.inventory.target_model_type} "
-                f"gid={group.gid} span={span} "
-                f"legacy_block_size={self.legacy_block_size}"
-            ) from error
-        object.__setattr__(self, "_group", group)
-        object.__setattr__(self, "_capacity_columns", capacity_columns)
-        object.__setattr__(self, "_block_span_tokens", span)
+        object.__setattr__(self, "window_size", window)
+        span = self.group.table_column_span
+        capacity_tokens = window_capacity_tokens(window, span)
+        object.__setattr__(self, "capacity_columns", (capacity_tokens + span - 1) // span)
 
-    @property
-    def global_group_id(self) -> int:
-        """Return the sole executable global cache-group id."""
-        return self._group.gid
-
-    @property
-    def capacity_columns(self) -> int:
-        """Return the fixed narrow-table capacity proven by P2 geometry."""
-        return self._capacity_columns
-
-    @property
-    def block_span_tokens(self) -> int:
-        """Return the source-token span represented by one table column."""
-        return self._block_span_tokens
-
-    @property
-    def source_group(self) -> DraftWindowGroupRoute:
-        """Return the exact inventory consumer bound by this provider."""
-        return self._group
-
-    def describe(
-        self,
-        plan: DraftWindowPlan,
-        *,
-        valid_num_blocks: int,
-    ) -> DraftWindowReadDescriptor:
-        """Validate one active row and return its canonical source interval."""
-        self.full_source.validate_owner_bindings()
-        if not isinstance(valid_num_blocks, int) or isinstance(
-            valid_num_blocks,
-            bool,
-        ):
-            raise TypeError("valid_num_blocks must be a Python int")
-        if valid_num_blocks < 0:
-            raise ValueError("valid_num_blocks must be greater than or equal to 0")
-        if plan.full_horizon_end < plan.full_exact_end:
-            raise ValueError("scalar plan horizon cannot precede its exact end")
-        future_offset = plan.full_horizon_end - plan.full_exact_end
-        if future_offset != self.expected_future_offset:
-            raise ValueError(
-                "scalar plan future offset does not match configured static "
-                "future offset: "
-                f"method={self.inventory.method} "
-                f"offset={future_offset} expected={self.expected_future_offset}"
-            )
-        expected_start = compute_draft_window_plan(
+    def _validate_plan(self, plan: DraftWindowPlan) -> None:
+        expected = compute_draft_window_plan(
             full_exact_end=plan.full_exact_end,
-            future_offset=future_offset,
-            window_size=self.inventory.window_size,
-            block_span_tokens=self.legacy_block_size,
-        ).window_start
-        if plan.window_start != expected_start:
-            raise ValueError(
-                f"scalar plan does not use the canonical P1 anchor: {plan.window_start} != {expected_start}"
-            )
-        expected_visible_length = plan.full_exact_end - plan.window_start
-        if plan.window_visible_length != expected_visible_length:
-            raise ValueError(
-                "scalar plan visible length is inconsistent with its exact end: "
-                f"{plan.window_visible_length} != {expected_visible_length}"
-            )
-        expected_capacity = window_capacity_tokens(self.inventory.window_size, self.legacy_block_size)
-        if plan.window_capacity_tokens != expected_capacity:
-            raise ValueError(
-                "scalar plan capacity does not match provider geometry: "
-                f"{plan.window_capacity_tokens} != {expected_capacity}"
-            )
+            future_offset=self.expected_future_offset,
+            window_size=self.window_size,
+            block_span_tokens=self.group.table_column_span,
+        )
+        if plan != expected:
+            raise ValueError("scalar plan does not match the canonical method horizon, anchor and capacity")
+
+    def describe(self, plan: DraftWindowPlan, *, valid_num_blocks: int) -> DraftWindowReadDescriptor:
+        """Project the shared scalar plan onto the canonical batch-sorted table."""
+        self._validate_plan(plan)
         return self._describe_interval(
             window_start=plan.window_start,
             window_visible_length=plan.window_visible_length,
@@ -333,53 +204,14 @@ class SingleGroupDirectPrefixProvider:
         full_exact_end: int,
         valid_num_blocks: int,
     ) -> DraftWindowReadDescriptor:
-        """Project one Eagle3 step using the proposal-frozen anchor.
-
-        ``describe`` validates the one-shot ``E + K`` contract used by P2 and
-        parallel drafting. Eagle3 instead freezes ``S`` from proposal-entry
-        ``L0 + K`` and advances only the real per-step end ``E_s``. This method
-        keeps that distinction explicit and refuses to infer a new anchor from
-        ``E_s``.
-        """
-        self.full_source.validate_owner_bindings()
-        if not isinstance(valid_num_blocks, int) or isinstance(valid_num_blocks, bool):
-            raise TypeError("valid_num_blocks must be a Python int")
-        if valid_num_blocks < 0:
-            raise ValueError("valid_num_blocks must be greater than or equal to 0")
-        if self.inventory.method != "eagle3":
+        """Advance Eagle's actual end while retaining its proposal-frozen anchor."""
+        if self.policy.normalized_method != "eagle3":
             raise ValueError("frozen per-step projection is defined only for Eagle3")
-        proposal_offset = proposal_plan.full_horizon_end - proposal_plan.full_exact_end
-        if proposal_offset != self.expected_future_offset:
-            raise ValueError(
-                "proposal future offset does not match configured static future offset: "
-                f"offset={proposal_offset} expected={self.expected_future_offset}"
-            )
-        expected_start = compute_draft_window_plan(
-            full_exact_end=proposal_plan.full_exact_end,
-            future_offset=proposal_offset,
-            window_size=self.inventory.window_size,
-            block_span_tokens=self.legacy_block_size,
-        ).window_start
-        if proposal_plan.window_start != expected_start:
-            raise ValueError(
-                "proposal plan does not use the canonical frozen anchor: "
-                f"{proposal_plan.window_start} != {expected_start}"
-            )
-        if not proposal_plan.window_start <= full_exact_end <= proposal_plan.full_horizon_end:
-            raise ValueError(
-                "Eagle3 step end is outside the frozen proposal interval: "
-                f"start={proposal_plan.window_start} end={full_exact_end} "
-                f"horizon={proposal_plan.full_horizon_end}"
-            )
-        expected_capacity = window_capacity_tokens(self.inventory.window_size, self.legacy_block_size)
-        if proposal_plan.window_capacity_tokens != expected_capacity:
-            raise ValueError(
-                "proposal plan capacity does not match provider geometry: "
-                f"{proposal_plan.window_capacity_tokens} != {expected_capacity}"
-            )
+        self._validate_plan(proposal_plan)
+        step_plan = proposal_plan.at_exact_end(full_exact_end)
         return self._describe_interval(
-            window_start=proposal_plan.window_start,
-            window_visible_length=full_exact_end - proposal_plan.window_start,
+            window_start=step_plan.window_start,
+            window_visible_length=step_plan.window_visible_length,
             valid_num_blocks=valid_num_blocks,
         )
 
@@ -391,7 +223,8 @@ class SingleGroupDirectPrefixProvider:
         valid_num_blocks: int,
     ) -> DraftWindowReadDescriptor:
         """Project a previously validated absolute interval onto FullSource."""
-        span = self._block_span_tokens
+        _require_nonnegative_python_int(valid_num_blocks, "valid_num_blocks")
+        span = self.group.table_column_span
         projection = project_draft_window_interval(
             window_start=window_start,
             full_exact_end=window_start + window_visible_length,
@@ -400,35 +233,35 @@ class SingleGroupDirectPrefixProvider:
         if projection.first_token_offset != 0:
             raise NotImplementedError(
                 "MRV2 direct-prefix provider cannot consume a nonzero first-token "
-                f"offset: gid={self._group.gid} "
+                f"offset: gid={self.group.gid} "
                 f"start={window_start} span={span} "
                 f"offset={projection.first_token_offset}"
             )
-        if projection.required_columns > self._capacity_columns:
+        if projection.required_columns > self.capacity_columns:
             raise RuntimeError(
                 "draft-window projection exceeds provider capacity: "
                 f"required={projection.required_columns} "
-                f"capacity={self._capacity_columns}"
+                f"capacity={self.capacity_columns}"
             )
-        source_row_width = self.full_source.input_block_table_row_width(self._group.gid)
+        source_row_width = self.full_source.input_block_table_row_width(self.group.gid)
         if valid_num_blocks > source_row_width:
             raise RuntimeError(
                 "canonical valid block count exceeds source row width: "
-                f"gid={self._group.gid} valid={valid_num_blocks} "
+                f"gid={self.group.gid} valid={valid_num_blocks} "
                 f"row_width={source_row_width}"
             )
         if projection.source_end_column > valid_num_blocks:
             raise RuntimeError(
                 "draft-window source shortage: "
-                f"method={self.inventory.method} "
-                f"model={self.inventory.target_model_type} "
-                f"gid={self._group.gid} "
+                f"method={self.policy.normalized_method} "
+                f"model={self.policy.target_model_type} "
+                f"gid={self.group.gid} "
                 f"start={projection.source_start_column} "
                 f"required={projection.required_columns} "
                 f"end={projection.source_end_column} valid={valid_num_blocks}"
             )
         return DraftWindowReadDescriptor(
-            global_group_id=self._group.gid,
+            global_group_id=self.group.gid,
             source_start_column=projection.source_start_column,
             first_token_offset=projection.first_token_offset,
             required_columns=projection.required_columns,
@@ -436,34 +269,6 @@ class SingleGroupDirectPrefixProvider:
             valid_num_blocks=valid_num_blocks,
             source_row_width=source_row_width,
         )
-
-
-@dataclass(frozen=True, slots=True)
-class DraftWindowSourceCapability:
-    """P2 state attached to an eligible speculator after ``set_attn``."""
-
-    inventory: DraftWindowInventory
-    full_source: FullDraftKVSource
-    provider: SingleGroupDirectPrefixProvider
-    runtime_context: DraftWindowRuntimeContext | None = None
-    # Mixed/prefix rows can require a full-resident row in the same stable
-    # backing that carries narrow decode rows.
-    workspace_capacity_columns: int | None = None
-
-
-def _read_coordinate_semantics(groups: Sequence[DraftWindowGroupRoute]) -> str:
-    """Read coordinates belong to the actual Draft consumer, not Target flags."""
-    semantics = {
-        "dsa_cp_derived"
-        if group.topology.dsa_cp_effective
-        else "dcp_interleaved"
-        if group.topology.decode_context_parallel_size > 1
-        else "replicated"
-        for group in groups
-    }
-    if len(semantics) != 1:
-        raise NotImplementedError("Draft Graph source requires one parallel read-coordinate contract")
-    return semantics.pop()
 
 
 def _normalize_method(method: str) -> str:
@@ -498,174 +303,13 @@ def validate_eligible_window_numbers(*, window_size: int, future_offset: int) ->
         raise ValueError("draft_window_size must be at least the static future offset")
 
 
-def compute_direct_prefix_capacity(
-    *,
-    window_size: int,
-    legacy_block_size: int,
-    block_span_tokens: int,
-) -> int:
-    """Return source-column capacity for the default zero-offset geometry.
-
-    Every legacy-aligned anchor must also be block-span aligned.  Requiring
-    ``block_span_tokens`` to divide ``legacy_block_size`` makes that invariant
-    hold for every possible anchor rather than only for a particular request.
-    Offset-aware layouts must use a separate capacity contract.
-    """
-    if block_span_tokens <= 0:
-        raise ValueError("block span must be greater than 0")
-    capacity_tokens = window_capacity_tokens(window_size, legacy_block_size)
-    if legacy_block_size % block_span_tokens != 0:
-        raise ValueError("zero-offset direct-prefix capacity requires block span to divide legacy block size")
-    return (capacity_tokens + block_span_tokens - 1) // block_span_tokens
-
-
-def _runtime_capability_failures(
-    runtime_context: DraftWindowRuntimeContext,
-    *,
-    allow_replicated_tp_graph_source: bool = False,
-    allow_parallel_prefix_graph_source: bool = False,
-    allow_parallel_dp_graph_source: bool = False,
-) -> list[str]:
-    failures: list[str] = []
-    if runtime_context.attention_backend_family is not AttentionBackendFamily.STANDARD:
-        failures.append("Draft Window source requires the STANDARD attention backend family")
-    topology = (
-        ("TP", runtime_context.tensor_parallel_size),
-        ("DP", runtime_context.data_parallel_size),
-        ("PP", runtime_context.pipeline_parallel_size),
-        ("PCP", runtime_context.prefill_context_parallel_size),
-        ("DCP", runtime_context.decode_context_parallel_size),
-    )
-    failures.extend(
-        f"gid=none backend=none layout=runtime reason={name}={size} is not verified in P2"
-        for name, size in topology
-        if size != 1
-        and not (
-            name == "TP"
-            and type(size) is int
-            and size in (2, 4, 16)
-            and allow_replicated_tp_graph_source
-            or name == "DP"
-            and type(size) is int
-            and size == 2
-            and runtime_context.tensor_parallel_size == 4
-            and allow_replicated_tp_graph_source
-            and allow_parallel_dp_graph_source
-        )
-    )
-    if allow_replicated_tp_graph_source and (
-        type(runtime_context.tensor_parallel_rank) is not int
-        or not 0 <= runtime_context.tensor_parallel_rank < runtime_context.tensor_parallel_size
-    ):
-        failures.append("gid=none backend=none layout=runtime reason=replicated TP source requires a real integer rank")
-    if runtime_context.prefix_caching and not allow_parallel_prefix_graph_source:
-        failures.append("gid=none backend=none layout=runtime reason=prefix cache is not verified for Window ON")
-    return failures
-
-
-def build_draft_window_inventory(
-    *,
-    policy: DraftWindowPolicyDecision,
-    runtime_route: str,
-    attn_groups: Sequence[Sequence[AttentionGroup]],
-    block_tables: Any,
-    kv_cache_config: Any,
-    causal: bool | Mapping[int, bool],
-    vllm_config: Any,
-    runtime_context: DraftWindowRuntimeContext,
-    allow_replicated_tp_graph_source: bool = False,
-    allow_parallel_prefix_graph_source: bool = False,
-    allow_parallel_dp_graph_source: bool = False,
-    dflash2_graph_contract: Any = None,
-) -> DraftWindowInventory:
-    """Inventory every executable draft consumer in global-gid order."""
-    if policy.state is not DraftWindowPolicyState.ELIGIBLE_ON:
-        raise ValueError("P2 inventory requires an ELIGIBLE_ON policy decision")
-    if policy.effective_window_size is None:
-        raise AssertionError("eligible draft-window policy has no window size")
-
-    runtime_route = _normalize_method(runtime_route)
-    native_windows: dict[int, int | None] = {}
-    if dflash2_graph_contract is not None:
-        from vllm_ascend.worker.v2.spec_decode.draft_window_dflash2_graph import DFlash2GraphContract
-
-        if runtime_route != "dflash2" or not isinstance(dflash2_graph_contract, DFlash2GraphContract):
-            raise TypeError("DFlash2 Graph source requires its actual typed method contract")
-        native_windows = dflash2_graph_contract.validate_source(
-            attn_groups,
-            block_tables,
-            causal,
-            policy.effective_window_size,
-            dflash2_graph_contract.query_width,
-        )
-    if type(allow_parallel_dp_graph_source) is not bool:
-        raise TypeError("parallel DP Graph source allowance must be an explicit boolean")
-    if allow_parallel_dp_graph_source and (
-        runtime_route not in ("dflash", "eagle3")
-        or (runtime_route == "eagle3" and (causal is not True or policy.effective_window_size != 1024))
-        or not allow_replicated_tp_graph_source
-        or runtime_context.tensor_parallel_size != 4
-        or runtime_context.data_parallel_size != 2
-    ):
-        raise NotImplementedError("parallel DP source requires the reviewed rank-local DFlash TP4/DP2 route")
-    if type(allow_parallel_prefix_graph_source) is not bool:
-        raise TypeError("parallel prefix source allowance must be an explicit boolean")
-    eagle_tp4_prefix = (
-        runtime_route == "eagle3"
-        and allow_replicated_tp_graph_source
-        and runtime_context.tensor_parallel_size == 4
-        and (runtime_context.data_parallel_size == 1 or allow_parallel_dp_graph_source)
-    )
-    if (
-        allow_parallel_prefix_graph_source
-        and runtime_route not in {"dspark", "dflash", "dflash2"}
-        and not eagle_tp4_prefix
-    ):
-        raise NotImplementedError("prefix Graph source requires parallel Draft or the reviewed Eagle3 TP4 owner")
-    failures = _runtime_capability_failures(
-        runtime_context,
-        allow_replicated_tp_graph_source=allow_replicated_tp_graph_source,
-        allow_parallel_prefix_graph_source=allow_parallel_prefix_graph_source,
-        allow_parallel_dp_graph_source=allow_parallel_dp_graph_source,
-    )
-    topology = DraftWindowTopology.from_config(vllm_config)
-    groups = inventory_draft_window_groups(
-        attn_groups=attn_groups,
-        kv_cache_config=kv_cache_config,
-        block_tables=block_tables,
-        topology=topology,
-        full_retention_dflash2=dflash2_graph_contract is not None,
-    )
-    if dflash2_graph_contract is not None:
-        for group in groups:
-            if group.gid not in native_windows or group.native_window != native_windows[group.gid]:
-                failures.append(f"gid={group.gid} backend inventory and DFlash2 native reader contract disagree")
-    expected_policy_method = "dflash" if runtime_route == "dflash2" else runtime_route
-    if expected_policy_method != policy.normalized_method:
-        failures.append(f"runtime route {runtime_route!r} does not match policy method {policy.normalized_method!r}")
-    if runtime_route == "dflash2" and dflash2_graph_contract is None:
-        failures.append("DFlash2 Graph source requires its typed native-reader contract")
-    elif runtime_route not in {"eagle3", "dflash", "dflash2", "dspark"}:
-        failures.append(f"runtime route {runtime_route!r} is not eligible")
-    return DraftWindowInventory(
-        method=policy.normalized_method,
-        target_model_type=policy.target_model_type,
-        runtime_route=runtime_route,
-        window_size=policy.effective_window_size,
-        groups=groups,
-        capability_failures=tuple(failures),
-        dflash2_graph_source=dflash2_graph_contract is not None,
-    )
-
-
 def build_full_draft_kv_source(
     *,
-    inventory: DraftWindowInventory,
+    group: DraftWindowGroupRoute,
     block_tables: Any,
 ) -> FullDraftKVSource:
     """Bind, but never copy or mutate, canonical full BlockTables tensors."""
-    group = inventory.require_single_group_direct_prefix()
-    context = _group_diagnostic_context(inventory, group)
+    context = f"gid={group.gid} layout={group.status.value}"
     input_block_tables = tuple(block_tables.input_block_tables)
     logical_block_sizes = tuple(int(size) for size in block_tables.block_sizes)
     kernel_block_sizes = tuple(int(size) for size in block_tables.kernel_block_sizes)
@@ -690,7 +334,6 @@ def build_full_draft_kv_source(
             f"num_blocks={persistent_num_blocks.shape[0]}"
         )
     _validate_source_geometry(
-        inventory=inventory,
         group=group,
         logical_block_sizes=logical_block_sizes,
         kernel_block_sizes=kernel_block_sizes,
@@ -771,23 +414,14 @@ def _shares_storage(left: torch.Tensor, right: torch.Tensor) -> bool:
         return left.data_ptr() == right.data_ptr()
 
 
-def draft_window_tensors_share_storage(
-    left: torch.Tensor,
-    right: torch.Tensor,
-) -> bool:
-    """Expose the conservative storage-alias oracle to sibling read-plane owners."""
-    return _shares_storage(left, right)
-
-
 def _validate_source_geometry(
     *,
-    inventory: DraftWindowInventory,
     group: DraftWindowGroupRoute,
     logical_block_sizes: tuple[int, ...],
     kernel_block_sizes: tuple[int, ...],
     num_groups: int,
 ) -> None:
-    context = _group_diagnostic_context(inventory, group)
+    context = f"gid={group.gid} layout={group.status.value}"
     global_group_id = group.gid
     if not (
         0 <= global_group_id < num_groups
@@ -900,9 +534,6 @@ def _build_draft_window_source_capability_for_context(
     causal: bool | Mapping[int, bool],
     vllm_config: Any,
     runtime_context: DraftWindowRuntimeContext,
-    allow_replicated_tp_graph_source: bool = False,
-    allow_parallel_prefix_graph_source: bool = False,
-    allow_parallel_dp_graph_source: bool = False,
     dflash2_graph_contract: Any = None,
 ) -> DraftWindowSourceCapability:
     """Build source geometry after the caller validates its real Graph executor.
@@ -911,51 +542,58 @@ def _build_draft_window_source_capability_for_context(
     Keep the actual context in the owner identity and check the source layout
     directly, without constructing an artificial eager capability decision.
     """
-    inventory = build_draft_window_inventory(
-        policy=policy,
-        runtime_route=runtime_route,
+    if policy.state is not DraftWindowPolicyState.ELIGIBLE_ON or policy.effective_window_size is None:
+        raise ValueError("Graph source requires an eligible Window policy")
+    runtime_route = _normalize_method(runtime_route)
+    expected_method = "dflash" if runtime_route == "dflash2" else runtime_route
+    if runtime_route not in {"eagle3", "dflash", "dflash2", "dspark"} or expected_method != policy.normalized_method:
+        raise ValueError("Graph source route differs from the actual method policy")
+    native_windows: dict[int, int | None] = {}
+    if runtime_route == "dflash2":
+        from vllm_ascend.worker.v2.spec_decode.draft_window_dflash2_graph import DFlash2GraphContract
+
+        if not isinstance(dflash2_graph_contract, DFlash2GraphContract):
+            raise TypeError("DFlash2 Graph source requires its actual typed method contract")
+        native_windows = dflash2_graph_contract.validate_source(
+            attn_groups, block_tables, causal, policy.effective_window_size, dflash2_graph_contract.query_width
+        )
+    elif dflash2_graph_contract is not None:
+        raise ValueError("DFlash2 source contract belongs to a different method")
+    groups = inventory_draft_window_groups(
         attn_groups=attn_groups,
-        block_tables=block_tables,
         kv_cache_config=kv_cache_config,
-        causal=causal,
-        vllm_config=vllm_config,
-        runtime_context=runtime_context,
-        allow_replicated_tp_graph_source=allow_replicated_tp_graph_source,
-        allow_parallel_prefix_graph_source=allow_parallel_prefix_graph_source,
-        allow_parallel_dp_graph_source=allow_parallel_dp_graph_source,
-        dflash2_graph_contract=dflash2_graph_contract,
+        block_tables=block_tables,
+        topology=DraftWindowTopology.from_config(vllm_config),
+        full_retention_dflash2=dflash2_graph_contract is not None,
     )
+    if len(groups) != 1:
+        raise NotImplementedError(f"Draft Graph requires one executable consumer group, found {len(groups)}")
+    group = groups[0]
+    if runtime_route == "dflash2" and (
+        group.gid not in native_windows or group.native_window != native_windows[group.gid]
+    ):
+        raise RuntimeError("backend inventory and DFlash2 native reader contract disagree")
     uses_dynamic_k = bool(vllm_config.speculative_config.uses_dynamic_speculative_decoding())
     if uses_dynamic_k:
         raise NotImplementedError("Draft Window Graph source requires static speculative decoding")
-    group = inventory.require_single_group_direct_prefix()
     full_source = build_full_draft_kv_source(
-        inventory=inventory,
+        group=group,
         block_tables=block_tables,
     )
-    provider = SingleGroupDirectPrefixProvider(
-        inventory=inventory,
+    return DraftWindowSourceCapability(
+        policy=policy,
+        runtime_route=runtime_route,
+        group=group,
         full_source=full_source,
-        # MRV1 aligned its anchor to the first executable draft kernel block.
-        # With one verified consumer this is the only legacy anchor quantum.
-        legacy_block_size=group.table_column_span,
         expected_future_offset=resolve_static_future_offset(
             normalized_method=policy.normalized_method,
             configured_k=int(vllm_config.speculative_config.num_speculative_tokens),
             uses_dynamic_k=uses_dynamic_k,
         ),
-    )
-    return DraftWindowSourceCapability(
-        inventory=inventory,
-        full_source=full_source,
-        provider=provider,
         runtime_context=runtime_context,
-        # Mixed/chunked rows may carry a canonical full-resident read beside
-        # windowed decode rows. Reserve one stable full-width backing once;
-        # active rows still copy only their descriptor columns.
-        workspace_capacity_columns=full_source.input_block_table_row_width(
-            group.gid,
-        ),
+        # Mixed/chunked rows may retain a full-resident row beside windowed
+        # decode rows in the same stable read bank.
+        workspace_capacity_columns=full_source.input_block_table_row_width(group.gid),
     )
 
 
@@ -968,43 +606,34 @@ class DraftWindowExecutionPhase(Enum):
 
 @dataclass(frozen=True, slots=True, eq=False)
 class DraftWindowGenerationIdentity:
-    """Immutable freshness identity for one materialized Draft read state.
+    """A fresh consumer handle retaining its real proposal and selected shape.
 
-    ``mapping_epoch`` belongs to the caller.  Pointer and Python-object
-    identity are allocation guards only; neither substitutes for the epoch
-    or ordered stable request IDs. Equal fields from another runtime do not
-    identify this generation; its owner retains the actual immutable handle.
+    The proposal already freezes request order, row phases and mapping epoch.
+    This handle adds only the current consumer step, read projection and bank
+    geometry. Equal values from another runtime cannot impersonate the handle.
     """
 
-    mapping_epoch: int
-    ordered_request_fingerprint: tuple[str, ...]
-    actual_request_count: int
+    proposal: "DraftWindowProposalContext"
     padded_request_count: int
-    read_descriptor_fingerprint: tuple[DraftWindowReadDescriptor, ...]
+    read_descriptors: tuple[DraftWindowReadDescriptor, ...]
     idx_mapping_ptr: int
     phase: DraftWindowExecutionPhase
     step: int
-    row_phase_fingerprint: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        _require_nonnegative_python_int(self.mapping_epoch, "mapping epoch")
-        _require_nonnegative_python_int(self.actual_request_count, "actual request count")
+        from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowProposalContext
+
+        if not isinstance(self.proposal, DraftWindowProposalContext):
+            raise TypeError("generation requires the actual Draft Window proposal context")
         _require_nonnegative_python_int(self.padded_request_count, "padded request count")
         _require_nonnegative_python_int(self.step, "step")
-        if self.actual_request_count != len(self.ordered_request_fingerprint):
-            raise ValueError("actual request count must match the ordered request fingerprint")
-        if self.padded_request_count < self.actual_request_count:
+        actual = len(self.proposal.ordered_request_ids)
+        if self.padded_request_count < actual:
             raise ValueError("padded request count must be at least the actual request count")
-        if len(self.read_descriptor_fingerprint) != self.actual_request_count:
-            raise ValueError("read descriptor fingerprint must match the actual request count")
-        if any(not isinstance(request_id, str) or not request_id for request_id in self.ordered_request_fingerprint):
-            raise ValueError("request fingerprint must contain non-empty stable request IDs")
-        if len(set(self.ordered_request_fingerprint)) != len(self.ordered_request_fingerprint):
-            raise ValueError("request fingerprint must contain unique stable request IDs")
+        if len(self.read_descriptors) != actual:
+            raise ValueError("read descriptors must match the actual request count")
         if not isinstance(self.phase, DraftWindowExecutionPhase):
             raise TypeError("phase must be a DraftWindowExecutionPhase")
-        if self.row_phase_fingerprint and len(self.row_phase_fingerprint) != self.actual_request_count:
-            raise ValueError("row phase fingerprint must match the actual request count")
 
 
 class DraftWindowWorkspace:
@@ -1053,7 +682,6 @@ class DraftWindowWorkspace:
         identity: DraftWindowGenerationIdentity,
         full_source: FullDraftKVSource,
         global_group_id: int,
-        read_descriptors: Sequence[DraftWindowReadDescriptor],
         cpu_window_exact: torch.Tensor,
         cpu_window_upper: torch.Tensor,
         cpu_valid_num_blocks: torch.Tensor,
@@ -1062,14 +690,10 @@ class DraftWindowWorkspace:
         """Rewrite all active and inert state from the canonical full source."""
         if self._bound_identity is not None:
             raise RuntimeError("workspace is already bound to an active generation")
-        actual = identity.actual_request_count
+        actual = len(identity.proposal.ordered_request_ids)
         padded = identity.padded_request_count
         if padded > self.max_num_reqs:
             raise RuntimeError(f"draft-window request capacity exceeded: padded={padded} capacity={self.max_num_reqs}")
-        if len(read_descriptors) != actual:
-            raise ValueError("read descriptor count must match the actual request count")
-        if tuple(read_descriptors) != identity.read_descriptor_fingerprint:
-            raise RuntimeError("read descriptors do not match the generation fingerprint")
         _validate_window_length_input(
             cpu_window_exact,
             name="CPU Window exact",
@@ -1128,7 +752,7 @@ class DraftWindowWorkspace:
             if actual:
                 self.valid_num_blocks[:actual].copy_(cpu_valid_num_blocks[:actual])
             active_columns: list[int] = []
-            for row, descriptor in enumerate(read_descriptors):
+            for row, descriptor in enumerate(identity.read_descriptors):
                 if descriptor.global_group_id != global_group_id:
                     raise ValueError("read descriptor global gid does not match the runtime source")
                 if (
@@ -1271,11 +895,11 @@ class DraftWindowRuntimeState:
 
     def new_workspace(self, num_reqs: int | None = None) -> DraftWindowWorkspace:
         capability = self.capability
-        gid = capability.provider.global_group_id
+        gid = capability.group.gid
         table = capability.full_source._input_block_tables[gid]
         return DraftWindowWorkspace(
             max_num_reqs=table.shape[0] if num_reqs is None else num_reqs,
-            table_capacity_columns=capability.workspace_capacity_columns or capability.provider.capacity_columns,
+            table_capacity_columns=capability.workspace_capacity_columns or capability.capacity_columns,
             table_template=table,
             valid_count_template=capability.full_source._block_tables_owner.num_blocks.gpu[gid],
         )
@@ -1300,8 +924,7 @@ class DraftWindowRuntimeState:
     def materialize(
         self,
         *,
-        mapping_epoch: int,
-        ordered_request_ids: Sequence[str],
+        proposal: "DraftWindowProposalContext",
         idx_mapping: torch.Tensor,
         read_descriptors: Sequence[DraftWindowReadDescriptor],
         cpu_window_exact: torch.Tensor,
@@ -1310,50 +933,29 @@ class DraftWindowRuntimeState:
         num_reqs_padded: int,
         phase: DraftWindowExecutionPhase,
         step: int,
-        row_phase_fingerprint: Sequence[str] = (),
         quarantine_on_failure: bool = False,
         output_workspace: DraftWindowWorkspace | None = None,
     ) -> DraftMetadataInputs:
-        """Acquire, bind, and materialize one generation or cleanly fail.
-
-        ``mapping_epoch`` is the caller's monotonic attestation for the exact
-        ``idx_mapping`` contents supplied to this call.  A future live caller
-        must advance it whenever that mapping generation changes; a pointer,
-        object identity, or unrelated counter is not a valid substitute.
-
-        The opt-in Graph and async eager callers request
-        ``quarantine_on_failure`` because a native exception cannot attest that
-        no device work was submitted. The existing manager owns normal Graph
-        completion and orders the next bank write on the same stream.
-        """
+        """Materialize one consumer under the caller's actual proposal owner."""
         if self._quarantined_identity is not None:
             raise RuntimeError("draft-window backing is quarantined after uncertain Graph submission")
-        _require_nonnegative_python_int(mapping_epoch, "mapping epoch")
-        if mapping_epoch <= self._last_mapping_epoch:
-            raise ValueError(
-                f"mapping epoch must strictly increase: current={mapping_epoch} previous={self._last_mapping_epoch}"
-            )
-        request_fingerprint = tuple(ordered_request_ids)
-        descriptor_fingerprint = tuple(read_descriptors)
-        actual_request_count = len(request_fingerprint)
         _validate_idx_mapping(idx_mapping)
-        bound_source = self.capability.full_source
         identity = DraftWindowGenerationIdentity(
-            mapping_epoch=mapping_epoch,
-            ordered_request_fingerprint=request_fingerprint,
-            actual_request_count=actual_request_count,
+            proposal=proposal,
             padded_request_count=num_reqs_padded,
-            read_descriptor_fingerprint=descriptor_fingerprint,
+            read_descriptors=tuple(read_descriptors),
             idx_mapping_ptr=idx_mapping.data_ptr(),
             phase=phase,
             step=step,
-            row_phase_fingerprint=tuple(row_phase_fingerprint),
         )
+        if proposal.mapping_epoch <= self._last_mapping_epoch:
+            raise ValueError(
+                f"mapping epoch must strictly increase: current={proposal.mapping_epoch} "
+                f"previous={self._last_mapping_epoch}"
+            )
         self._last_retired_identity = None
         return self._materialize_identity(
             identity=identity,
-            bound_source=bound_source,
-            read_descriptors=read_descriptors,
             cpu_window_exact=cpu_window_exact,
             cpu_window_upper=cpu_window_upper,
             cpu_valid_num_blocks=cpu_valid_num_blocks,
@@ -1365,7 +967,7 @@ class DraftWindowRuntimeState:
         self,
         *,
         previous_identity: DraftWindowGenerationIdentity,
-        ordered_request_ids: Sequence[str],
+        proposal: "DraftWindowProposalContext",
         idx_mapping: torch.Tensor,
         read_descriptors: Sequence[DraftWindowReadDescriptor],
         cpu_window_exact: torch.Tensor,
@@ -1376,66 +978,34 @@ class DraftWindowRuntimeState:
         quarantine_on_failure: bool = False,
         output_workspace: DraftWindowWorkspace | None = None,
     ) -> DraftMetadataInputs:
-        """Materialize the next serialized AR step under one mapping epoch.
-
-        The ordinary :meth:`materialize` contract remains strictly monotonic:
-        only this continuation API may reuse a mapping epoch. It requires the
-        immediately preceding generation to have retired successfully, keeps
-        request/source/provider identity fixed, and advances the step by one.
-        This models several Eagle3 forwards within one proposal without lying
-        that the batch mapping changed between those forwards.
-        """
+        """Continue the same real proposal, only after its preceding reader retires."""
         if self._active_inputs is not None:
             raise RuntimeError("cannot refresh a Draft Window while the previous reader is active")
-        if self._last_retired_identity != previous_identity:
+        if self._last_retired_identity is not previous_identity:
             raise RuntimeError("serialized step does not continue the most recently retired generation")
-        if previous_identity.mapping_epoch != self._last_mapping_epoch:
-            raise RuntimeError("serialized step mapping epoch is not the active proposal epoch")
-        if self.capability.inventory.method != "eagle3":
+        if proposal is not previous_identity.proposal or proposal.mapping_epoch != self._last_mapping_epoch:
+            raise RuntimeError("serialized step proposal or request mapping changed")
+        if self.capability.policy.normalized_method != "eagle3":
             raise RuntimeError("serialized per-step continuation is supported only for Eagle3")
-        if previous_identity.phase not in (
-            DraftWindowExecutionPhase.PROPOSAL,
-            DraftWindowExecutionPhase.STEP,
-        ):
-            raise RuntimeError("serialized step has an invalid predecessor phase")
         if step != previous_identity.step + 1:
             raise RuntimeError(
                 "serialized Draft Window steps must strictly advance by one: "
                 f"previous={previous_identity.step} current={step}"
             )
-        request_fingerprint = tuple(ordered_request_ids)
-        if request_fingerprint != previous_identity.ordered_request_fingerprint:
-            raise RuntimeError("serialized step request fingerprint changed within one proposal")
-        # Only logical requests/source/epoch are fixed across AR consumers.
-        # Each consumer keeps its own padding in its generation identity.
-        # The active-reader and last-retired guards above still govern scratch
-        # reuse; Graph uses distinct descriptor/ordinal banks.
-        if type(num_reqs_padded) is not int or num_reqs_padded < len(request_fingerprint):
-            raise ValueError("serialized step padding must be an integer covering active requests")
-        if num_reqs_padded > (self.workspace if output_workspace is None else output_workspace).max_num_reqs:
-            raise RuntimeError("serialized step padded request capacity exceeded")
-
-        descriptor_fingerprint = tuple(read_descriptors)
         _validate_idx_mapping(idx_mapping)
-        bound_source = self.capability.full_source
-        if bound_source is not self._source or idx_mapping.data_ptr() != previous_identity.idx_mapping_ptr:
-            raise RuntimeError("serialized step FullSource or request mapping changed within one proposal")
+        if idx_mapping.data_ptr() != previous_identity.idx_mapping_ptr:
+            raise RuntimeError("serialized step request mapping changed within one proposal")
         identity = DraftWindowGenerationIdentity(
-            mapping_epoch=previous_identity.mapping_epoch,
-            ordered_request_fingerprint=request_fingerprint,
-            actual_request_count=len(request_fingerprint),
+            proposal=proposal,
             padded_request_count=num_reqs_padded,
-            read_descriptor_fingerprint=descriptor_fingerprint,
+            read_descriptors=tuple(read_descriptors),
             idx_mapping_ptr=idx_mapping.data_ptr(),
             phase=DraftWindowExecutionPhase.STEP,
             step=step,
-            row_phase_fingerprint=previous_identity.row_phase_fingerprint,
         )
         self._last_retired_identity = None
         return self._materialize_identity(
             identity=identity,
-            bound_source=bound_source,
-            read_descriptors=read_descriptors,
             cpu_window_exact=cpu_window_exact,
             cpu_window_upper=cpu_window_upper,
             cpu_valid_num_blocks=cpu_valid_num_blocks,
@@ -1447,8 +1017,6 @@ class DraftWindowRuntimeState:
         self,
         *,
         identity: DraftWindowGenerationIdentity,
-        bound_source: FullDraftKVSource,
-        read_descriptors: Sequence[DraftWindowReadDescriptor],
         cpu_window_exact: torch.Tensor,
         cpu_window_upper: torch.Tensor,
         cpu_valid_num_blocks: torch.Tensor,
@@ -1458,18 +1026,17 @@ class DraftWindowRuntimeState:
         """Acquire and populate the one serialized backing for an identity."""
         if self._current_workspace is not None:
             raise RuntimeError("draft-window runtime still owns an active read bank")
-        if bound_source is not self._source:
+        if self.capability.full_source is not self._source:
             raise RuntimeError("draft-window canonical source changed after runtime initialization")
         workspace = self.workspace if output_workspace is None else output_workspace
         self._current_workspace = workspace
         self._quarantine_on_failure = quarantine_on_failure
-        self._last_mapping_epoch = max(self._last_mapping_epoch, identity.mapping_epoch)
+        self._last_mapping_epoch = max(self._last_mapping_epoch, identity.proposal.mapping_epoch)
         try:
             workspace.materialize(
                 identity=identity,
-                full_source=bound_source,
-                global_group_id=self.capability.provider.global_group_id,
-                read_descriptors=read_descriptors,
+                full_source=self._source,
+                global_group_id=self.capability.group.gid,
                 cpu_window_exact=cpu_window_exact,
                 cpu_window_upper=cpu_window_upper,
                 cpu_valid_num_blocks=cpu_valid_num_blocks,
@@ -1571,11 +1138,7 @@ def build_draft_window_runtime_state(
     capability: DraftWindowSourceCapability,
 ) -> DraftWindowRuntimeState:
     """Allocate P3 state only after P2 has closed all capability gates."""
-    group = capability.provider.source_group
-    if len(capability.inventory.groups) != 1 or capability.inventory.groups[0] != group:
-        raise RuntimeError("provider source group does not match the capability inventory")
-    if group.gid != capability.provider.global_group_id:
-        raise RuntimeError("provider gid does not match the inventory candidate")
+    group = capability.group
     capability.full_source.validate_owner_bindings()
     source_table = capability.full_source._input_block_tables[group.gid]
     persistent_counts = capability.full_source._block_tables_owner.num_blocks.gpu[group.gid]
@@ -1584,11 +1147,11 @@ def build_draft_window_runtime_state(
     if source_table.device != persistent_counts.device:
         raise ValueError("P3 source table and valid counts must share a device")
     table_capacity_columns = (
-        capability.provider.capacity_columns
+        capability.capacity_columns
         if capability.workspace_capacity_columns is None
         else capability.workspace_capacity_columns
     )
-    if table_capacity_columns < capability.provider.capacity_columns:
+    if table_capacity_columns < capability.capacity_columns:
         raise ValueError("configured workspace capacity is smaller than the provider capacity")
     if table_capacity_columns > source_table.shape[1]:
         raise ValueError("configured workspace capacity exceeds the canonical source row width")

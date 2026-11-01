@@ -24,7 +24,6 @@ from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftWindowGenerationIdentity,
     DraftWindowRuntimeState,
     DraftWindowWorkspace,
-    _read_coordinate_semantics,
 )
 
 
@@ -241,18 +240,22 @@ class DraftWindowGraphBindingProvider:
             raise TypeError("graph binding provider requires a P3 runtime state")
         self._runtime_state = runtime_state
         self._capability = runtime_state.capability
-        self.group = self._capability.inventory.require_single_group_direct_prefix()
-        self.window_size = self._capability.inventory.window_size
+        self.group = self._capability.group
+        self.window_size = self._capability.window_size
         self._topology = self._capability.runtime_context
         if self._topology is None:
             raise RuntimeError("Draft Graph provider requires the actual source topology")
         self._capture_topology()
-        if _read_coordinate_semantics(self._capability.inventory.groups) != "replicated" or any(
-            value != 1
-            for value in (
-                self._topology.pipeline_parallel_size,
-                self._topology.prefill_context_parallel_size,
-                self._topology.decode_context_parallel_size,
+        if (
+            self.group.topology.dsa_cp_effective
+            or self.group.topology.decode_context_parallel_size != 1
+            or any(
+                value != 1
+                for value in (
+                    self._topology.pipeline_parallel_size,
+                    self._topology.prefill_context_parallel_size,
+                    self._topology.decode_context_parallel_size,
+                )
             )
         ):
             raise ValueError("Draft Graph read banks require replicated reads and PP=PCP=DCP=1")
@@ -296,9 +299,9 @@ class DraftWindowGraphBindingProvider:
         return carrier.workspace
 
     @property
-    def inventory_method(self) -> str:
+    def method(self) -> str:
         """Return the P2-normalized method owned by this provider."""
-        return self._runtime_state.capability.inventory.method
+        return self._runtime_state.capability.policy.normalized_method
 
     def register_capture_identity(
         self,
@@ -309,7 +312,7 @@ class DraftWindowGraphBindingProvider:
         consumer_ordinal: int = 0,
     ) -> DraftWindowGraphCaptureIdentity:
         """Bind the manager's exact frozen descriptor to one persistent bank."""
-        if not isinstance(route, DraftWindowGraphRoute) or _ROUTE_CONTRACTS[route][0] != self.inventory_method:
+        if not isinstance(route, DraftWindowGraphRoute) or _ROUTE_CONTRACTS[route][0] != self.method:
             raise ValueError("capture route does not match the actual Draft method")
         if type(descriptor) is not BatchExecutionDescriptor:
             raise TypeError("capture requires the actual BatchExecutionDescriptor")
@@ -395,7 +398,7 @@ class DraftWindowGraphBindingProvider:
         inputs.validate_for(generation)
         if inputs._owner is not self._runtime_state:
             raise RuntimeError("graph carrier inputs do not belong to the provider runtime")
-        _validate_route(capture_identity.route, generation, self.inventory_method)
+        _validate_route(capture_identity.route, generation, self.method)
         self._validate_source_contract()
         if generation.padded_request_count != capture_identity.num_reqs:
             raise RuntimeError("capture/runtime padded request count mismatch")
@@ -457,11 +460,8 @@ class DraftWindowGraphBindingProvider:
             raise RuntimeError("graph read carrier has no runtime generation")
         typed_identities = tuple(identity for identity in identities if identity is not None)
         first = typed_identities[0]
-        for identity in typed_identities[1:]:
-            if identity.mapping_epoch != first.mapping_epoch:
-                raise RuntimeError("graph read carriers have different mapping_epoch values")
-            if identity.ordered_request_fingerprint != first.ordered_request_fingerprint:
-                raise RuntimeError("graph read carriers have different request fingerprints")
+        if any(identity.proposal is not first.proposal for identity in typed_identities[1:]):
+            raise RuntimeError("graph read carriers do not belong to the same actual proposal")
         metadata = tuple(carrier.metadata for carrier in carriers)
         if any(entry is None for entry in metadata):
             raise RuntimeError("graph read carrier has no Draft-private metadata")
@@ -740,7 +740,7 @@ def install_draft_window_graph_binding_provider(
 def resolve_parallel_draft_window_graph_route(
     owner: Any,
 ) -> DraftWindowGraphRoute | None:
-    """Resolve DFlash/DSpark from the provider's canonical P2 inventory.
+    """Resolve DFlash/DSpark from the provider's actual method policy.
 
     The class-name/debug label on a speculator is not a policy or capability
     source.  When no provider is installed this remains an exact OFF-path
@@ -751,7 +751,7 @@ def resolve_parallel_draft_window_graph_route(
         return None
     if not isinstance(provider, DraftWindowGraphBindingProvider):
         raise TypeError("invalid instance-owned Draft Window graph binding provider")
-    method = provider.inventory_method
+    method = provider.method
     if method == "dflash":
         return DraftWindowGraphRoute.DFLASH
     if method == "dspark":
