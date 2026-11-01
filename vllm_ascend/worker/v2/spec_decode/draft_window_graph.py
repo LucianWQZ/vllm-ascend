@@ -714,7 +714,7 @@ class DraftWindowGraphBindingProvider:
         write_side_reference: DraftWindowGraphWriteSideReference,
     ) -> None:
         identity = _tensor_identity
-        cls._validate_metadata_uses_read_carrier(metadata, workspace, _identity=identity)
+        cls._validate_metadata_uses_read_carrier(metadata, workspace)
         expected_slot = identity(write_side_reference.slot_mapping)
         expected_query = identity(write_side_reference.query_start_loc)
         expected_positions = identity(write_side_reference.positions)
@@ -746,11 +746,9 @@ class DraftWindowGraphBindingProvider:
     def _validate_metadata_uses_read_carrier(
         metadata: Mapping[str, Any],
         workspace: DraftWindowWorkspace,
-        *,
-        _identity=None,
     ) -> None:
         """Validate only Draft-private read carriers, never full write state."""
-        identity = _tensor_identity if _identity is None else _identity
+        identity = _tensor_identity
         expected_table_storage = identity(workspace.window_block_table).storage_data_ptr
         expected_device_storage = identity(workspace.device_window_exact).storage_data_ptr
         expected_cpu_storage = identity(workspace.cpu_window_exact).storage_data_ptr
