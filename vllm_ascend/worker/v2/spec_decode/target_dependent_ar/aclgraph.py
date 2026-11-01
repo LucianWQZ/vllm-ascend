@@ -67,11 +67,13 @@ def _eagle_ar_capture_config(vllm_config: VllmConfig, cudagraph_mode: CUDAGraphM
         or speculative.num_speculative_tokens != 3
         or speculative.uses_dynamic_speculative_decoding()
         or (vllm_config.additional_config or {}).get("draft_window_graph_replicated_tp_review") is not True
-        or vllm_config.parallel_config.use_sequence_parallel_moe is not True
+        or (
+            vllm_config.parallel_config.use_sequence_parallel_moe is not True
+            and (vllm_config.additional_config or {}).get("draft_window_graph_eagle_dp2_review", False) is not True
+        )
         or any(
             getattr(vllm_config.parallel_config, name) != 1
             for name in (
-                "data_parallel_size",
                 "pipeline_parallel_size",
                 "prefill_context_parallel_size",
                 "decode_context_parallel_size",
@@ -81,6 +83,17 @@ def _eagle_ar_capture_config(vllm_config: VllmConfig, cudagraph_mode: CUDAGraphM
         return vllm_config
     from vllm_ascend import envs
     from vllm_ascend.ascend_config import _eagle3_tp4_graph_review
+
+    dp = vllm_config.parallel_config.data_parallel_size
+    if type(dp) is not int or dp not in (1, 2):
+        return vllm_config
+    if dp == 2:
+        if (vllm_config.additional_config or {}).get("draft_window_graph_eagle_dp2_review", False) is False:
+            return vllm_config
+        from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import eagle_dp2_graph_review_enabled
+
+        if not eagle_dp2_graph_review_enabled(vllm_config):
+            return vllm_config
 
     if not envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH or not _eagle3_tp4_graph_review(vllm_config):
         return vllm_config
@@ -318,6 +331,9 @@ class AutoRegressiveAclGraphManager(SpeculatorCudaGraphManager):
         return ret
 
     def _updatable_graph_replay(self, desc, draft_attn_metadatas):
+        from vllm_ascend.worker.v2.spec_decode.draft_window_eagle3_dp import validate_eagle_dp_dummy_replay
+
+        dp_dummy = validate_eagle_dp_dummy_replay(self.speculator, self, desc, draft_attn_metadatas)
         graph = self.graphs[desc]
         assert isinstance(graph, UpdatableGraph)
         fia_params = self.speculator.build_fia_params(
@@ -328,7 +344,13 @@ class AutoRegressiveAclGraphManager(SpeculatorCudaGraphManager):
         resolved_tasks = graph.resolve_tasks(SharedSource(fia_params))
         self.update_stream.wait_stream(torch.npu.current_stream())
         ret = super().run_fullgraph(desc)
-        graph.update(self.update_stream, resolved_tasks)
+        if dp_dummy:
+            # Keep the fixed Full/PAD dummy operands and original UPDATE/event
+            # order; no Window generation or business bank is staged here.
+            with set_current_vllm_config(self.vllm_config):
+                graph.update(self.update_stream, resolved_tasks)
+        else:
+            graph.update(self.update_stream, resolved_tasks)
         return ret
 
     def dispatch(self, num_reqs, num_tokens, uniform_token_count, num_active_loras, max_query_len=None, num_ubatches=1):

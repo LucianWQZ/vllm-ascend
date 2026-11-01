@@ -1049,7 +1049,8 @@ def build_draft_window_inventory(
     if type(allow_parallel_dp_graph_source) is not bool:
         raise TypeError("parallel DP Graph source allowance must be an explicit boolean")
     if allow_parallel_dp_graph_source and (
-        runtime_route != "dflash"
+        runtime_route not in ("dflash", "eagle3")
+        or (runtime_route == "eagle3" and (causal is not True or policy.effective_window_size != 1024))
         or not allow_replicated_tp_graph_source
         or runtime_context.tensor_parallel_size != 4
         or runtime_context.data_parallel_size != 2
@@ -1061,7 +1062,7 @@ def build_draft_window_inventory(
         runtime_route == "eagle3"
         and allow_replicated_tp_graph_source
         and runtime_context.tensor_parallel_size == 4
-        and runtime_context.data_parallel_size == 1
+        and (runtime_context.data_parallel_size == 1 or allow_parallel_dp_graph_source)
     )
     if (
         allow_parallel_prefix_graph_source

@@ -891,6 +891,7 @@ def validate_parallel_graph_characterization_context(
         or runtime_context.flashcomm
     ):
         from vllm_ascend.ascend_config import _dense_dp_graph_window_review
+        from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import eagle_dp2_graph_review_enabled
 
         speculative = vllm_config.speculative_config
         hf = getattr(getattr(speculative, "draft_model_config", None), "hf_config", None)
@@ -899,7 +900,7 @@ def validate_parallel_graph_characterization_context(
         # Each real DP/TP worker keeps its own source/provider/captured bank.
         # Retain Async/prefix/SP/FlashComm in the final topology identity; this
         # is not permission to normalize a different method/backend/DSA route.
-        if (
+        if not eagle_dp2_graph_review_enabled(vllm_config) and (
             not _dense_dp_graph_window_review(vllm_config, window)
             or not isinstance(layers, (list, tuple))
             or len(layers) != 8

@@ -51,9 +51,14 @@ class EagleSingleRequestReviewScope:
     max_model_len: int
     static_k: int = 3
     max_requests: int = 1
+    data_parallel_size: int = 1
 
 
-def validate_eagle_single_request_review_config(vllm_config, *, experimental_graph_review):
+def validate_eagle_single_request_review_config(
+    vllm_config, *, experimental_graph_review, _expected_dp=1, _allow_numeric=False
+):
+    if type(_expected_dp) is not int or _expected_dp not in (1, 2) or type(_allow_numeric) is not bool:
+        raise TypeError("Eagle review needs its exact internal DP and diagnostic contract")
     speculative = vllm_config.speculative_config
     parallel = vllm_config.parallel_config
     scheduler = vllm_config.scheduler_config
@@ -88,7 +93,8 @@ def validate_eagle_single_request_review_config(vllm_config, *, experimental_gra
         or getattr(draft_parallel, "use_sequence_parallel_moe", None) is not False
         or getattr(draft_parallel, "enable_expert_parallel", None) is not False
         or parallel.tensor_parallel_size != 4
-        or parallel.data_parallel_size != 1
+        or type(parallel.data_parallel_size) is not int
+        or parallel.data_parallel_size != _expected_dp
         or parallel.pipeline_parallel_size != 1
         or parallel.prefill_context_parallel_size != 1
         or parallel.decode_context_parallel_size != 1
@@ -106,7 +112,8 @@ def validate_eagle_single_request_review_config(vllm_config, *, experimental_gra
         or type(maximum) is not int
         or maximum <= 3
         or additional.get("draft_window_graph_replicated_tp_review") is not True
-        or additional.get("draft_window_graph_numeric_diagnostic", False) is not False
+        or type(additional.get("draft_window_graph_numeric_diagnostic", False)) is not bool
+        or (not _allow_numeric and additional.get("draft_window_graph_numeric_diagnostic", False))
         or speculative.enable_adaptive_verification is not False
     ):
         raise ValueError(
@@ -139,7 +146,7 @@ def validate_eagle_single_request_review_config(vllm_config, *, experimental_gra
             f"'numeric': {additional.get('draft_window_graph_numeric_diagnostic', False)!r}, "
             f"'adaptive': {getattr(speculative, 'enable_adaptive_verification', None)!r}}}"
         )
-    return EagleSingleRequestReviewScope(max_model_len=maximum)
+    return EagleSingleRequestReviewScope(max_model_len=maximum, data_parallel_size=_expected_dp)
 
 
 def validate_eagle_two_request_review_config(vllm_config, *, experimental_graph_review):
@@ -167,6 +174,55 @@ def validate_eagle_two_request_review_config(vllm_config, *, experimental_graph_
             "the single flag and larger request shapes remain separate"
         )
     return EagleSingleRequestReviewScope(max_model_len=scope.max_model_len, max_requests=2)
+
+
+def validate_eagle_dp2_review_config(vllm_config, *, experimental_graph_review):
+    """Explicit rank-local TP4xDP2; its TP-only Draft descriptor remains DP1.
+
+    The existing private numeric flag keeps its diagnostic meaning. It does not
+    admit ordinary requests; the resolver independently binds the checkpoint.
+    """
+    scope = validate_eagle_single_request_review_config(
+        vllm_config, experimental_graph_review=experimental_graph_review, _expected_dp=2, _allow_numeric=True
+    )
+    additional = vllm_config.additional_config or {}
+    compilation = vllm_config.compilation_config
+    sizes = compilation.cudagraph_capture_sizes
+    draft_parallel = vllm_config.speculative_config.draft_parallel_config
+    if (
+        additional.get("draft_window_graph_eagle_dp2_review") is not True
+        or additional.get("draft_window_graph_eagle_single_request_review", False) is not False
+        or additional.get("draft_window_graph_eagle_two_request_review", False) is not False
+        or type(vllm_config.scheduler_config.max_num_seqs) is not int
+        or vllm_config.scheduler_config.max_num_seqs != 1
+        or type(getattr(draft_parallel, "data_parallel_size", None)) is not int
+        or draft_parallel.data_parallel_size != 1
+        or not sizes
+        or any(type(size) is not int or size <= 0 for size in sizes)
+        or 4 not in sizes
+        or type(compilation.max_cudagraph_capture_size) is not int
+        or compilation.max_cudagraph_capture_size < 4
+    ):
+        raise ValueError(
+            "Eagle DP2 review requires its separate flag, local max_num_seqs=1, TP-only Draft DP1 and first Q4 bucket"
+        )
+    return scope
+
+
+def eagle_dp2_graph_review_enabled(vllm_config):
+    """Validate this specific startup allowance without normalizing real DP2."""
+    from vllm_ascend import envs
+    from vllm_ascend.ascend_config import validate_additional_config_bool
+
+    enabled = validate_additional_config_bool(
+        (vllm_config.additional_config or {}).get("draft_window_graph_eagle_dp2_review", False),
+        "additional_config.draft_window_graph_eagle_dp2_review",
+    )
+    if enabled:
+        validate_eagle_dp2_review_config(
+            vllm_config, experimental_graph_review=envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH
+        )
+    return enabled
 
 
 def note_eagle_single_request_review_lifecycle(owner, scheduler_output):
@@ -526,16 +582,24 @@ def resolve_draft_graph_review_limit(vllm_config, *, experimental_graph_review=F
         additional.get("draft_window_graph_eagle_two_request_review", False),
         "additional_config.draft_window_graph_eagle_two_request_review",
     )
-    if finite_review and pair_review:
-        raise ValueError("Eagle single- and two-request review entries are mutually exclusive")
+    dp_review = validate_additional_config_bool(
+        additional.get("draft_window_graph_eagle_dp2_review", False),
+        "additional_config.draft_window_graph_eagle_dp2_review",
+    )
+    if sum((finite_review, pair_review, dp_review)) > 1:
+        raise ValueError("Eagle single, two-request and DP2 review entries are mutually exclusive")
     full8_review = _full8_requested_review_max_requests(additional)
-    if full8_review and (finite_review or pair_review):
+    if full8_review and (finite_review or pair_review or dp_review):
         raise ValueError("Full8 and Eagle finite review entries are mutually exclusive")
     if full8_review:
         return validate_full8_single_request_review_entry(
             vllm_config, experimental_graph_review=experimental_graph_review
         )
-    if pair_review:
+    if dp_review:
+        finite_scope = validate_eagle_dp2_review_config(
+            vllm_config, experimental_graph_review=experimental_graph_review
+        )
+    elif pair_review:
         finite_scope = validate_eagle_two_request_review_config(
             vllm_config, experimental_graph_review=experimental_graph_review
         )
@@ -544,7 +608,7 @@ def resolve_draft_graph_review_limit(vllm_config, *, experimental_graph_review=F
             vllm_config,
             experimental_graph_review=experimental_graph_review,
         )
-    finite_review = finite_review or pair_review
+    finite_review = finite_review or pair_review or dp_review
     if speculative.method not in ("dflash", "eagle3") or speculative.enforce_eager is True:
         return None
     compilation = getattr(vllm_config, "compilation_config", None)
@@ -575,6 +639,8 @@ def resolve_draft_graph_review_limit(vllm_config, *, experimental_graph_review=F
             raise NotImplementedError("Eagle single-request review requires its fixed checkpoint configuration")
         # A bounded ordinary qualification entry, not an unrestricted product
         # PASS. Actual request/exact/stage guards below retain this scope.
+        if dp_review and additional.get("draft_window_graph_numeric_diagnostic", False) is True:
+            return None  # Preserve the existing private diagnostic entry, not ordinary row admission.
         return finite_scope
     diagnostic = additional.get("draft_window_graph_numeric_diagnostic", False)
     if type(diagnostic) is not bool:

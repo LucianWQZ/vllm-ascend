@@ -198,7 +198,10 @@ class Eagle3DraftWindowMixin:
             self._eagle3_window_bypass_active = True
             self._eagle3_window_continuing_prefill = bypass_for_prefill
             try:
-                yield
+                from vllm_ascend.worker.v2.spec_decode.draft_window_eagle3_dp import eagle3_dp_dummy_scope
+
+                with eagle3_dp_dummy_scope(self, input_batch, dummy_run=dummy_run, is_profile=is_profile):
+                    yield
             finally:
                 self._eagle3_window_bypass_active = False
                 self._eagle3_window_continuing_prefill = False

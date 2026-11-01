@@ -151,6 +151,23 @@ requires separate ordinary-service qualification; the existing paired
 numerical result does not open unqualified multi-request service. Actual3,
 padded4, DP2 and the historical TP2 four-request route remain excluded.
 
+The separately selected `draft_window_graph_eagle_dp2_review=true` entry
+keeps TP4 and static K3 but permits two actual parent DP replicas. Each replica
+has `max_num_seqs=1`, actual1/padded1 and its own request, Full KV source,
+first-Q4 bank and two AR-Q1 banks; it does not enable a local two-request
+batch. The fixed vLLM's independent Draft descriptor remains TP4/DP1 while
+the actual executor, DP synchronization and captured identity remain TP4xDP2.
+Target/first-pass SP alignment stays unchanged; the AR-only compilation
+sizes are derived from the real admitted first-pass request bucket. Idle
+replicas keep the fixed Full/PAD dummy computation and UPDATE/event order,
+without creating or reusing a business Window generation. A failed idle
+submission quarantines its owner. A normal K0 request still has a real first
+consumer and is not idle. This default-off entry requires separate eight-rank
+numeric/Full/Target and ordinary idle/active reuse qualification; it is not a
+PASS or release approval. The other Eagle finite flags are mutually exclusive
+with this entry. The existing explicitly gated private numeric diagnostic
+retains its separate meaning and cannot qualify ordinary service by itself.
+
 The designated Full8 checkpoint has a separate, default-off
 `draft_window_graph_full8_single_request_review=true` qualification entry.
 It requires its exact checkpoint config, TP4 with parent DP1 or DP2, static K7,

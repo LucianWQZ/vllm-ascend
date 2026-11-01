@@ -352,7 +352,8 @@ def evaluate_p7x_nongraph_capability(
     if type(allow_parallel_dp_graph_source) is not bool:
         raise TypeError("parallel DP source allowance must be an explicit boolean")
     if allow_parallel_dp_graph_source and (
-        inventory.runtime_route != "dflash"
+        inventory.runtime_route not in ("dflash", "eagle3")
+        or (inventory.runtime_route == "eagle3" and inventory.window_size != 1024)
         or runtime_context.tensor_parallel_size != 4
         or runtime_context.data_parallel_size != 2
     ):

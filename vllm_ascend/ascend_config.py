@@ -215,6 +215,7 @@ def _single_request_graph_off_review(vllm_config: Any) -> bool:
             "draft_window_graph_full8_two_request_review",
             "draft_window_graph_eagle_single_request_review",
             "draft_window_graph_eagle_two_request_review",
+            "draft_window_graph_eagle_dp2_review",
         )
     )
     if not enabled:
@@ -289,8 +290,13 @@ def validate_draft_window_replicated_tp_review(vllm_config: Any) -> bool:
     dp = getattr(vllm_config.parallel_config, "data_parallel_size", 1)
     if type(dp) is not int or dp not in (1, 2):
         raise ValueError("replicated Graph review requires integer DP1 or the explicit DFlash TP4/DP2 route")
+    eagle_dp2 = False
+    if dp == 2 and speculative.method == "eagle3":
+        from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import eagle_dp2_graph_review_enabled
+
+        eagle_dp2 = eagle_dp2_graph_review_enabled(vllm_config)
     if dp == 2 and (
-        speculative.method != "dflash"
+        (speculative.method != "dflash" and not eagle_dp2)
         or tp != 4
         # Pinned SpeculativeConfig.create_draft_parallel_config builds a
         # TP-only model descriptor with DP1. The actual two replicas live
@@ -908,6 +914,8 @@ class AscendConfig:
     draft_window_graph_eagle_single_request_review: bool = False
     # Separate default-off exact n1/n2 Eagle ordinary qualification entry.
     draft_window_graph_eagle_two_request_review: bool = False
+    # Exact TP4xDP2 local1/padded1 entry; device qualification is separate.
+    draft_window_graph_eagle_dp2_review: bool = False
     # Controlled Full8 active1/padded1 ordinary qualification; default still closed.
     draft_window_graph_full8_single_request_review: bool = False
     # Separate controlled Full8 actual/padded1-or-2 qualification; never opens larger batches.
@@ -2334,6 +2342,17 @@ def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
             "Controlled Eagle two-request Draft Graph qualification: exact checkpoint, TP4/DP1, static K3, "
             "max_num_seqs=2, Window OFF or W1024, exact n1/n2 first Q4 and AR Q1 banks only; "
             "ordinary device qualification is separate."
+        )
+    if new_config.draft_window_graph_eagle_dp2_review:
+        from vllm_ascend import envs
+        from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import resolve_draft_graph_review_limit
+
+        resolve_draft_graph_review_limit(
+            vllm_config, experimental_graph_review=envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH
+        )
+        logger.warning_once(
+            "Controlled Eagle TP4xDP2 Graph review: local actual1/padded1, max_num_seqs=1, static K3, "
+            "Window OFF or W1024 and separate first Q4/AR Q1 banks; device qualification is pending."
         )
     if new_config.draft_window_graph_single_metadata:
         speculative = vllm_config.speculative_config

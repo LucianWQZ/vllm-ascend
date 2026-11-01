@@ -45,7 +45,10 @@ def build_eagle3_graph_source(owner: Any) -> tuple[Any, Any]:
     """Account for Graph explicitly before using the existing P2 inventory."""
     if not experimental_draft_window_graph_characterization_enabled():
         raise RuntimeError("Eagle3 Graph Window requires the default-off experimental gate")
+    from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import eagle_dp2_graph_review_enabled
+
     context = build_draft_window_runtime_context(owner.vllm_config, owner.block_tables)
+    rank_local_dp = eagle_dp2_graph_review_enabled(owner.vllm_config)
     replicated_review = validate_parallel_graph_characterization_context(context, owner.vllm_config)
     if context.graph_mode != "FULL_DECODE_ONLY":
         raise NotImplementedError("Eagle3 Graph first implementation requires FULL_DECODE_ONLY")
@@ -71,6 +74,7 @@ def build_eagle3_graph_source(owner: Any) -> tuple[Any, Any]:
         runtime_context=source_context,
         allow_replicated_tp_graph_source=replicated_review,
         allow_parallel_prefix_graph_source=reviewed_tp4 and context.prefix_caching,
+        allow_parallel_dp_graph_source=rank_local_dp,
     )
     group = capability.inventory.require_single_group_direct_prefix()
     if group.layout_category is not DraftWindowLayoutCategory.DENSE_GQA_DIRECT_PREFIX:

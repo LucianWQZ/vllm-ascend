@@ -247,8 +247,31 @@ class DraftWindowGraphRouteFingerprint:
             and self.window_size == 32768
             and not self.dsa_context_parallel
         )
+        eagle_local1_dp = (
+            self.data_parallel_size == 2
+            and self.method == "eagle3"
+            and self.tensor_parallel_size == 4
+            and self.static_k == 3
+            and self.window_size == 1024
+            and self.layout == "dense_gqa_direct_prefix"
+            and self.graph_mode == "FULL"
+            and self.padded_request_count == 1
+            and not self.dsa_context_parallel
+            and (
+                (
+                    self.route is DraftWindowGraphRoute.EAGLE3_FIRST_PASS
+                    and self.query_width == 4
+                    and self.padded_token_count == 4
+                )
+                or (
+                    self.route is DraftWindowGraphRoute.EAGLE3_AR_STEP
+                    and self.query_width == 1
+                    and self.padded_token_count == 1
+                )
+            )
+        )
         unsupported_topology = (
-            (self.data_parallel_size != 1 and not (parallel_dp or combined_full8_dp))
+            (self.data_parallel_size != 1 and not (parallel_dp or combined_full8_dp or eagle_local1_dp))
             or self.pipeline_parallel_size != 1
             or self.prefill_context_parallel_size != 1
             or self.decode_context_parallel_size != 1
