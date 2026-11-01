@@ -211,7 +211,9 @@ def inventory_draft_window_groups(
     if types is None:
         types = DraftWindowBackendTypes.load()
     cache_groups = kv_cache_config.kv_cache_groups
-    if len(attn_groups) != len(cache_groups) or len(block_tables.kernel_block_sizes) != len(cache_groups):
+    if not (
+        len(attn_groups) == len(cache_groups) == len(block_tables.block_sizes) == len(block_tables.kernel_block_sizes)
+    ):
         raise ValueError("Draft attention groups and block-table geometry do not match")
     routes = []
     for gid, (groups, cache_group) in enumerate(zip(attn_groups, cache_groups)):
@@ -229,6 +231,8 @@ def inventory_draft_window_groups(
         if len(spans) != 1 or len(ratios) != 1 or len(storage_sizes) != 1:
             raise ValueError(f"Draft KV group {gid} has inconsistent cache geometry")
         scheduler_span, ratio, storage_size = spans.pop(), ratios.pop(), storage_sizes.pop()
+        if int(block_tables.block_sizes[gid]) != scheduler_span:
+            raise ValueError(f"Draft KV group {gid} scheduler and canonical table spans disagree")
         column_span = int(block_tables.kernel_block_sizes[gid])
         if (
             min(scheduler_span, column_span, ratio, storage_size) <= 0
@@ -237,6 +241,8 @@ def inventory_draft_window_groups(
         ):
             raise ValueError(f"Draft KV group {gid} has invalid block geometry")
         for group in groups:
+            if group.kv_cache_group_id != gid or int(group.kv_cache_spec.block_size) != scheduler_span:
+                raise ValueError(f"Draft KV group {gid} consumer and canonical source geometry disagree")
             if isinstance(spec, types.uniform_spec):
                 try:
                     consumer_specs = tuple(spec.kv_cache_specs[name] for name in group.layer_names)
@@ -259,11 +265,14 @@ def inventory_draft_window_groups(
             )
             reason = "No read-view provider is registered for this consumer"
             status = DraftWindowProviderStatus.PROVIDER_MISSING
-            native_window = None
+            windows = {getattr(item, "sliding_window", None) for item in consumer_specs}
+            native_window = next(iter(windows)) if len(windows) == 1 else None
             if (
                 backend is types.dense_backend
                 and type(builder) is types.dense_builder
                 and all(type(item) is types.full_attention_spec for item in consumer_specs)
+                and all(getattr(item, "attention_chunk_size", None) is None for item in consumer_specs)
+                and len(windows) == 1
                 and not (
                     full_retention_dflash2 and all(getattr(item, "sliding_window", None) for item in consumer_specs)
                 )
@@ -289,7 +298,6 @@ def inventory_draft_window_groups(
                 and ratio == 1
                 and storage_size == scheduler_span
             ):
-                windows = {item.sliding_window for item in consumer_specs}
                 if topology.prefill_context_parallel_size != 1 or topology.decode_context_parallel_size != 1:
                     reason = "Native SWA context-parallel coordinates need a separate provider"
                 elif len(windows) != 1 or next(iter(windows)) <= 0:

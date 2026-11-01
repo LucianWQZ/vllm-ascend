@@ -465,7 +465,6 @@ class ActualGraphDescriptorControls(unittest.TestCase):
 
 def eagle_graph_protocol():
     """Execute actual Source ownership methods with no framework/device import."""
-    import dataclasses
     from unittest.mock import patch
 
     base = SOURCE / "vllm_ascend/worker/v2/spec_decode"
@@ -474,15 +473,10 @@ def eagle_graph_protocol():
         n for n in module.body if isinstance(n, ast.FunctionDef) and n.name == "_eagle3_graph_scheduled_consumers"
     )
     graph = ast.parse((base / "draft_window_eagle3_graph.py").read_text())
-    nodes = [scheduled] + [
-        n
-        for n in graph.body
-        if isinstance(n, ast.ClassDef) and n.name in ("Eagle3ScratchTransfer", "Eagle3GraphStagingOwner")
-    ]
+    nodes = [scheduled] + [n for n in graph.body if isinstance(n, ast.ClassDef) and n.name == "Eagle3GraphStagingOwner"]
     states = N(BOUND=object(), UPDATED=object())
     ns = dict(
         __name__="_r8_eagle_protocol",
-        dataclass=dataclasses.dataclass,
         DraftWindowGraphCarrierState=states,
         _current_stream_identity=lambda: 7,
     )
@@ -521,7 +515,8 @@ class Main544EagleControls(unittest.TestCase):
         identity = N(step=0, normalized_method="eagle3", mapping_epoch=1, ordered_request_fingerprint=("A",))
         runtime._last_retired_identity = identity
         owner.adopt_eager_first_pass(identity)
-        self.assertEqual(owner.finish(), ())
+        owner.finish()
+        self.assertFalse(owner.quarantined)
         self.assertEqual(owner.static_k, 3)
         owner, _, _ = make(0)
         with self.assertRaisesRegex(RuntimeError, "omitted a real"):
@@ -610,7 +605,8 @@ class Main544EagleControls(unittest.TestCase):
         owner, runtime, provider = make(0, True)
         carrier = stage(owner, runtime, provider, 0)
         carrier.state = states.UPDATED
-        self.assertEqual(len(owner.finish()), 1)
+        owner.finish()
+        self.assertEqual(runtime._last_retired_identity.step, 0)
         owner, runtime, provider = make(0, True)
         carrier = stage(owner, runtime, provider, 0)
         carrier.state = states.UPDATED

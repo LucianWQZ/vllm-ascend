@@ -139,7 +139,6 @@ class Eagle3DraftWindowMixin:
         self._eagle3_window_decode_step_one_exact = None
         self._eagle3_window_bypass_active = False
         self._eagle3_window_continuing_prefill = False
-        self._eagle3_graph_eager_proposal = False
         self._eagle3_window_next_step = 0
         self._eagle3_window_static_k = static_k
         self._eagle3_window_scheduled_tokens = None
@@ -198,7 +197,6 @@ class Eagle3DraftWindowMixin:
         self._eagle3_window_next_step = 0
         self._eagle3_window_scheduled_tokens = num_speculative_tokens
         self._eagle3_window_expected_steps = expected_steps
-        self._eagle3_graph_eager_proposal = False
         try:
             yield
             if self._eagle3_window_live_inputs is not None:
@@ -209,7 +207,7 @@ class Eagle3DraftWindowMixin:
                     f"consumed={self._eagle3_window_next_step} expected={expected_steps} "
                     f"static_K={self._eagle3_window_static_k}"
                 )
-            if graph_session is not None and not self._eagle3_graph_eager_proposal:
+            if graph_session is not None:
                 graph_session.controller.finish()
         except BaseException as error:
             if graph_session is not None:
@@ -234,7 +232,6 @@ class Eagle3DraftWindowMixin:
                 self._eagle3_window_next_step = 0
                 self._eagle3_window_scheduled_tokens = None
                 self._eagle3_window_expected_steps = self._eagle3_window_static_k
-                self._eagle3_graph_eager_proposal = False
                 epoch_source.finish(context)
 
     def _eagle3_window_is_active(self) -> bool:

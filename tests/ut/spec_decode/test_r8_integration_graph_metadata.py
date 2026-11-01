@@ -51,6 +51,7 @@ def graph_source_initialization(request, monkeypatch):
         _speculator_name=method,
         attn_groups=object(),
         block_tables=object(),
+        kv_cache_config=object(),
         _group_causal=False,
         vllm_config=object(),
         input_buffers=object(),
@@ -106,6 +107,39 @@ def test_window_off_without_graph_policy_does_not_construct_source(graph_source_
     c.initialize(c.owner)
     c.build_source.assert_not_called()
     assert not hasattr(c.owner, "_draft_window_runtime_state")
+
+
+@pytest.mark.parametrize("case", ["valid", "missing-source", "missing-runtime", "rank-drift", "invalid-world"])
+def test_graph_capture_requires_explicit_matching_source_topology(case):
+    path = SOURCE.with_name("draft_window_graph.py")
+    provider = next(
+        n
+        for n in ast.parse(path.read_text()).body
+        if isinstance(n, ast.ClassDef) and n.name == "DraftWindowGraphBindingProvider"
+    )
+    method = next(n for n in provider.body if isinstance(n, ast.FunctionDef) and n.name == "_capture_topology")
+    namespace = {}
+    exec(compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"), namespace)
+    source = SimpleNamespace(tensor_parallel_size=16, tensor_parallel_rank=7, parallel_read_semantics="replicated")
+    runtime = SimpleNamespace(**vars(source))
+    if case == "missing-source":
+        source = None
+    elif case == "missing-runtime":
+        runtime = None
+    elif case == "rank-drift":
+        runtime.tensor_parallel_rank = 8
+    elif case == "invalid-world":
+        source.tensor_parallel_size = 0
+    owner = SimpleNamespace(
+        _runtime_state=SimpleNamespace(
+            capability=SimpleNamespace(eager_topology_fingerprint=source), topology_fingerprint=runtime
+        )
+    )
+    if case == "valid":
+        assert namespace[method.name](owner) == (16, 7, "replicated")
+    else:
+        with pytest.raises(RuntimeError, match="source topology|world/rank|identity drift"):
+            namespace[method.name](owner)
 
 
 class TensorProtocol:

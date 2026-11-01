@@ -94,10 +94,6 @@ class P7EagerTopologyFingerprint:
         )
 
 
-def _qualified_type_name(value: type[object]) -> str:
-    return f"{value.__module__}.{value.__qualname__}"
-
-
 def _build_topology_fingerprint(
     *,
     inventory: DraftWindowInventory,
@@ -106,19 +102,32 @@ def _build_topology_fingerprint(
     execution_lane: int,
 ) -> P7EagerTopologyFingerprint:
     groups = inventory.groups
+    # The executor can enable legacy DSA-CP for the Target while the Draft
+    # uses replicated dense attention. Read coordinates belong to the actual
+    # consumers inventoried by the shared provider, not the Target flag.
+    read_semantics = {
+        "dsa_cp_derived"
+        if group.topology.dsa_cp_effective
+        else "dcp_interleaved"
+        if group.topology.decode_context_parallel_size > 1
+        else "replicated"
+        for group in groups
+    }
+    if len(read_semantics) != 1:
+        raise NotImplementedError("Draft Graph source requires one parallel read-coordinate contract")
     return P7EagerTopologyFingerprint(
         normalized_method=inventory.method,
         runtime_route=inventory.runtime_route,
         attention_backend_family=runtime_context.attention_backend_family,
-        backend_impls=tuple(_qualified_type_name(group.backend_class) for group in groups),
-        builder_impls=tuple(_qualified_type_name(group.builder_class) for group in groups),
-        global_group_ids=tuple(group.global_group_id for group in groups),
-        layouts=tuple(group.layout_category.value for group in groups),
+        backend_impls=tuple(group.backend for group in groups),
+        builder_impls=tuple(group.builder for group in groups),
+        global_group_ids=tuple(group.gid for group in groups),
+        layouts=tuple(group.status.value for group in groups),
         block_geometry=tuple(
             (
-                group.global_group_id,
-                group.logical_block_size,
-                group.kernel_block_size,
+                group.gid,
+                group.scheduler_block_size,
+                group.table_column_span,
             )
             for group in groups
         ),
@@ -136,11 +145,5 @@ def _build_topology_fingerprint(
         provider_version=provider_version,
         execution_lane=execution_lane,
         tensor_parallel_rank=runtime_context.tensor_parallel_rank,
-        parallel_read_semantics=(
-            "dsa_cp_derived"
-            if runtime_context.dsa_context_parallel
-            else "dcp_interleaved"
-            if runtime_context.decode_context_parallel_size > 1
-            else "replicated"
-        ),
+        parallel_read_semantics=read_semantics.pop(),
     )

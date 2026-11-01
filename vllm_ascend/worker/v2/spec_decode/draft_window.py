@@ -16,30 +16,20 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 import numpy as np
 import torch
-from vllm.v1.kv_cache_interface import (
-    ChunkedLocalAttentionSpec,
-    CircularBufferSpec,
-    FullAttentionSpec,
-    MLAAttentionSpec,
-    RSWASpec,
-    SlidingWindowSpec,
-)
 from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_ascend.ascend_config import (
     validate_additional_config_bool,
 )
-from vllm_ascend.attention.attention_v1 import (
-    AscendAttentionBackend,
-    AscendAttentionMetadataBuilder,
-)
-from vllm_ascend.attention.dsa_v1 import AscendDSABackend
-from vllm_ascend.attention.indexer import AscendSFAIndexerBackend
-from vllm_ascend.attention.mla_v1 import AscendMLABackend
-from vllm_ascend.attention.sfa_v1 import AscendSFABackend
 from vllm_ascend.device.hardware_profile import (
     AttentionBackendFamily,
     get_current_hardware_profile,
+)
+from vllm_ascend.worker.v2.spec_decode.draft_window_backends import (
+    DraftWindowGroupRoute,
+    DraftWindowProviderStatus,
+    DraftWindowTopology,
+    inventory_draft_window_groups,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_plan import (
     DraftWindowPlan,
@@ -57,17 +47,6 @@ if TYPE_CHECKING:
         P7EagerTopologyFingerprint,
     )
     from vllm_ascend.worker.v2.spec_decode.draft_window_swa_graph import NativeSWAGraphPlan
-
-
-class DraftWindowLayoutCategory(Enum):
-    """P2 classification of the actual draft attention read layout."""
-
-    DENSE_GQA_DIRECT_PREFIX = "dense_gqa_direct_prefix"
-    MLA = "mla"
-    DSA = "dsa"
-    SFA = "sfa"
-    NATIVE_OR_RECYCLING = "native_or_recycling"
-    UNKNOWN = "unknown"
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,32 +69,6 @@ class DraftWindowRuntimeContext:
 
 
 @dataclass(frozen=True, slots=True)
-class DraftWindowGroupInventory:
-    """One executable ``AttentionGroup`` with its global cache-group id."""
-
-    global_group_id: int
-    layer_names: tuple[str, ...]
-    backend_class: type[Any]
-    builder_class: type[Any]
-    logical_block_size: int
-    kernel_block_size: int
-    block_span_tokens: int | None
-    layout_category: DraftWindowLayoutCategory
-    capability_failures: tuple[str, ...]
-    # Geometry facts are kept separate from phase-specific capability gates.
-    # P7-X may close a conservative P2 backend/runtime gate, but it must never
-    # erase a source-owner or block-geometry failure.
-    source_geometry_failures: tuple[str, ...] = ()
-    # DSA drafting supports only the uncompressed/native SWA cache contract.
-    # This value comes from the actual metadata-builder instance, not a model
-    # name or backend-class guess.
-    drafting_compression_ratio: int | None = None
-    # Native attention is independent of Full KV retention/direct addressing.
-    # A noncausal DFlash2 Graph source can retain a native band on this layout.
-    native_window: int | None = None
-
-
-@dataclass(frozen=True, slots=True)
 class DraftWindowInventory:
     """Immutable inventory and fail-closed result for one eligible route."""
 
@@ -123,57 +76,48 @@ class DraftWindowInventory:
     target_model_type: str
     runtime_route: str
     window_size: int
-    groups: tuple[DraftWindowGroupInventory, ...]
+    groups: tuple[DraftWindowGroupRoute, ...]
     capability_failures: tuple[str, ...]
     dflash2_graph_source: bool = False
 
     @property
     def consumer_global_group_ids(self) -> tuple[int, ...]:
         """Unique global gids in first-consumer order."""
-        return tuple(dict.fromkeys(group.global_group_id for group in self.groups))
+        return tuple(dict.fromkeys(group.gid for group in self.groups))
 
-    def require_single_group_direct_prefix(self) -> DraftWindowGroupInventory:
-        """Return the sole candidate or raise one exhaustive diagnostic."""
+    def require_single_group_direct_prefix(self) -> DraftWindowGroupRoute:
+        """Select the one already-inventoried consumer admitted by this Graph source."""
         failures = list(self.capability_failures)
-        for group in self.groups:
-            failures.extend(
-                "gid={gid} backend={backend} builder={builder} layout={layout} reason={reason}".format(
-                    gid=group.global_group_id,
-                    backend=group.backend_class.__name__,
-                    builder=group.builder_class.__name__,
-                    layout=group.layout_category.value,
-                    reason=reason,
-                )
-                for reason in group.capability_failures
-            )
-        if len(self.groups) != 1 and not failures:
+        if len(self.groups) != 1:
             failures.append(f"expected one executable consumer, found {len(self.groups)}")
-        if failures:
-            details = "; ".join(failures)
-            raise NotImplementedError(
-                "MRV2 draft-window capability rejected: "
-                f"method={self.method} model={self.target_model_type} "
-                f"route={self.runtime_route}; {details}"
+        for group in self.groups:
+            native_dflash2 = (
+                self.dflash2_graph_source and group.status is DraftWindowProviderStatus.NATIVE_SWA_CANDIDATE
             )
-        group = self.groups[0]
-        if (
-            group.layout_category is not DraftWindowLayoutCategory.DENSE_GQA_DIRECT_PREFIX
-            or group.block_span_tokens is None
-        ):
-            raise RuntimeError("a failure-free inventory must be direct-prefix")
-        return group
+            dense = group.status is DraftWindowProviderStatus.DIRECT_DENSE and group.native_window is None
+            if not dense and not native_dflash2:
+                failures.append(
+                    f"gid={group.gid} backend={group.backend} builder={group.builder} "
+                    f"layout={group.status.value} reason={group.reason}"
+                )
+        if failures:
+            raise NotImplementedError(
+                "MRV2 draft-window Graph source rejected: "
+                f"method={self.method} model={self.target_model_type} route={self.runtime_route}; "
+                + "; ".join(failures)
+            )
+        return self.groups[0]
 
 
 def _group_diagnostic_context(
     inventory: DraftWindowInventory,
-    group: DraftWindowGroupInventory,
+    group: DraftWindowGroupRoute,
 ) -> str:
     """Return the common identity required on every P2 source failure."""
-    backend_name = getattr(group.backend_class, "__name__", repr(group.backend_class))
     return (
         f"method={inventory.method} model={inventory.target_model_type} "
-        f"route={inventory.runtime_route} gid={group.global_group_id} "
-        f"backend={backend_name} layout={group.layout_category.value}"
+        f"route={inventory.runtime_route} gid={group.gid} "
+        f"backend={group.backend} layout={group.status.value}"
     )
 
 
@@ -306,47 +250,15 @@ class SingleGroupDirectPrefixProvider:
     full_source: FullDraftKVSource
     legacy_block_size: int
     expected_future_offset: int
-    # P2 uses the implicit failure-free dense group. P7-X can explicitly bind
-    # one source-safe backend group (currently uncompressed DSA/DSA-CP) while
-    # preserving the original inventory diagnostics and layout identity.
-    explicit_source_group: DraftWindowGroupInventory | None = field(
-        default=None,
-        repr=False,
-        compare=False,
-    )
-    source_block_span_tokens: int | None = None
-    _group: DraftWindowGroupInventory = field(init=False, repr=False)
+    # The backend inventory and method contract admit one actual reader;
+    # this provider adds only the Graph bank's canonical-source coordinates.
+    _group: DraftWindowGroupRoute = field(init=False, repr=False)
     _capacity_columns: int = field(init=False, repr=False)
     _block_span_tokens: int = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
-        if self.explicit_source_group is None:
-            group = self.inventory.require_single_group_direct_prefix()
-            span = group.block_span_tokens
-            assert span is not None
-            if self.source_block_span_tokens is not None and self.source_block_span_tokens != span:
-                raise ValueError("explicit source block span disagrees with the P2 group")
-        else:
-            group = self.explicit_source_group
-            if len(self.inventory.groups) != 1 or self.inventory.groups[0] != group:
-                raise ValueError("explicit source group must be the sole inventory consumer")
-            if group.source_geometry_failures:
-                raise NotImplementedError(
-                    "explicit backend provider has unresolved source geometry: "
-                    + "; ".join(group.source_geometry_failures)
-                )
-            if group.layout_category not in (
-                DraftWindowLayoutCategory.DENSE_GQA_DIRECT_PREFIX,
-                DraftWindowLayoutCategory.DSA,
-            ):
-                raise NotImplementedError(
-                    f"layout {group.layout_category.value} has no explicit direct-prefix source contract"
-                )
-            span = self.source_block_span_tokens
-            if span is None:
-                raise ValueError("explicit backend provider requires a source block span")
-            if span != group.kernel_block_size:
-                raise ValueError("explicit source block span must equal the canonical kernel block size")
+        group = self.inventory.require_single_group_direct_prefix()
+        span = group.table_column_span
         if self.legacy_block_size <= 0:
             raise ValueError("legacy block size must be greater than 0")
         if not isinstance(self.expected_future_offset, int) or isinstance(
@@ -368,8 +280,8 @@ class SingleGroupDirectPrefixProvider:
                 f"offset={self.expected_future_offset} "
                 f"expected={method_future_offset}"
             )
-        if group.global_group_id >= self.full_source.num_groups:
-            raise RuntimeError(f"inventory gid {group.global_group_id} has no canonical full source")
+        if group.gid >= self.full_source.num_groups:
+            raise RuntimeError(f"inventory gid {group.gid} has no canonical full source")
         self.full_source.validate_owner_bindings()
         _validate_source_geometry(
             inventory=self.inventory,
@@ -389,7 +301,7 @@ class SingleGroupDirectPrefixProvider:
                 "MRV2 direct-prefix geometry is not proven: "
                 f"method={self.inventory.method} "
                 f"model={self.inventory.target_model_type} "
-                f"gid={group.global_group_id} span={span} "
+                f"gid={group.gid} span={span} "
                 f"legacy_block_size={self.legacy_block_size}"
             ) from error
         object.__setattr__(self, "_group", group)
@@ -399,7 +311,7 @@ class SingleGroupDirectPrefixProvider:
     @property
     def global_group_id(self) -> int:
         """Return the sole executable global cache-group id."""
-        return self._group.global_group_id
+        return self._group.gid
 
     @property
     def capacity_columns(self) -> int:
@@ -412,7 +324,7 @@ class SingleGroupDirectPrefixProvider:
         return self._block_span_tokens
 
     @property
-    def source_group(self) -> DraftWindowGroupInventory:
+    def source_group(self) -> DraftWindowGroupRoute:
         """Return the exact inventory consumer bound by this provider."""
         return self._group
 
@@ -543,7 +455,7 @@ class SingleGroupDirectPrefixProvider:
         if projection.first_token_offset != 0:
             raise NotImplementedError(
                 "MRV2 direct-prefix provider cannot consume a nonzero first-token "
-                f"offset: gid={self._group.global_group_id} "
+                f"offset: gid={self._group.gid} "
                 f"start={window_start} span={span} "
                 f"offset={projection.first_token_offset}"
             )
@@ -553,11 +465,11 @@ class SingleGroupDirectPrefixProvider:
                 f"required={projection.required_columns} "
                 f"capacity={self._capacity_columns}"
             )
-        source_row_width = self.full_source.input_block_table_row_width(self._group.global_group_id)
+        source_row_width = self.full_source.input_block_table_row_width(self._group.gid)
         if valid_num_blocks > source_row_width:
             raise RuntimeError(
                 "canonical valid block count exceeds source row width: "
-                f"gid={self._group.global_group_id} valid={valid_num_blocks} "
+                f"gid={self._group.gid} valid={valid_num_blocks} "
                 f"row_width={source_row_width}"
             )
         if projection.source_end_column > valid_num_blocks:
@@ -565,13 +477,13 @@ class SingleGroupDirectPrefixProvider:
                 "draft-window source shortage: "
                 f"method={self.inventory.method} "
                 f"model={self.inventory.target_model_type} "
-                f"gid={self._group.global_group_id} "
+                f"gid={self._group.gid} "
                 f"start={projection.source_start_column} "
                 f"required={projection.required_columns} "
                 f"end={projection.source_end_column} valid={valid_num_blocks}"
             )
         return DraftWindowReadDescriptor(
-            global_group_id=self._group.global_group_id,
+            global_group_id=self._group.gid,
             source_start_column=projection.source_start_column,
             first_token_offset=projection.first_token_offset,
             required_columns=projection.required_columns,
@@ -651,47 +563,6 @@ def compute_direct_prefix_capacity(
     return (capacity_tokens + block_span_tokens - 1) // block_span_tokens
 
 
-def _is_subclass(
-    candidate: type[Any],
-    parent: type[Any] | tuple[type[Any], ...],
-) -> bool:
-    try:
-        return issubclass(candidate, parent)
-    except TypeError:
-        return False
-
-
-def _classify_layout(
-    backend_class: type[Any],
-    builder_class: type[Any],
-    kv_cache_spec: Any,
-) -> DraftWindowLayoutCategory:
-    if _is_subclass(backend_class, AscendDSABackend):
-        return DraftWindowLayoutCategory.DSA
-    if _is_subclass(backend_class, AscendMLABackend) or isinstance(
-        kv_cache_spec,
-        MLAAttentionSpec,
-    ):
-        return DraftWindowLayoutCategory.MLA
-    if _is_subclass(backend_class, (AscendSFABackend, AscendSFAIndexerBackend)):
-        return DraftWindowLayoutCategory.SFA
-    if isinstance(
-        kv_cache_spec,
-        (ChunkedLocalAttentionSpec, CircularBufferSpec, RSWASpec, SlidingWindowSpec),
-    ):
-        return DraftWindowLayoutCategory.NATIVE_OR_RECYCLING
-    if isinstance(kv_cache_spec, FullAttentionSpec) and (
-        kv_cache_spec.sliding_window is not None or kv_cache_spec.attention_chunk_size is not None
-    ):
-        return DraftWindowLayoutCategory.NATIVE_OR_RECYCLING
-    if _is_subclass(builder_class, AscendAttentionMetadataBuilder) and isinstance(
-        kv_cache_spec,
-        FullAttentionSpec,
-    ):
-        return DraftWindowLayoutCategory.DENSE_GQA_DIRECT_PREFIX
-    return DraftWindowLayoutCategory.UNKNOWN
-
-
 def _runtime_capability_failures(
     runtime_context: DraftWindowRuntimeContext,
     *,
@@ -742,7 +613,9 @@ def build_draft_window_inventory(
     runtime_route: str,
     attn_groups: Sequence[Sequence[AttentionGroup]],
     block_tables: Any,
+    kv_cache_config: Any,
     causal: bool | Mapping[int, bool],
+    vllm_config: Any,
     runtime_context: DraftWindowRuntimeContext,
     allow_replicated_tp_graph_source: bool = False,
     allow_parallel_prefix_graph_source: bool = False,
@@ -793,145 +666,39 @@ def build_draft_window_inventory(
         and not eagle_tp4_prefix
     ):
         raise NotImplementedError("prefix Graph source requires parallel Draft or the reviewed Eagle3 TP4 owner")
-    num_global_groups = len(attn_groups)
-    block_sizes = tuple(block_tables.block_sizes)
-    kernel_block_sizes = tuple(block_tables.kernel_block_sizes)
     failures = _runtime_capability_failures(
         runtime_context,
         allow_replicated_tp_graph_source=allow_replicated_tp_graph_source,
         allow_parallel_prefix_graph_source=allow_parallel_prefix_graph_source,
         allow_parallel_dp_graph_source=allow_parallel_dp_graph_source,
     )
-    if len(block_sizes) != num_global_groups:
-        failures.append(
-            "gid=none backend=none layout=source reason="
-            f"logical block-size count {len(block_sizes)} does not match "
-            f"attention group count {num_global_groups}"
-        )
-    if len(kernel_block_sizes) != num_global_groups:
-        failures.append(
-            "gid=none backend=none layout=source reason="
-            f"kernel block-size count {len(kernel_block_sizes)} does not match "
-            f"attention group count {num_global_groups}"
-        )
-
-    groups: list[DraftWindowGroupInventory] = []
-    for outer_global_group_id, consumers in enumerate(attn_groups):
-        if not consumers:
-            continue
-        if outer_global_group_id >= len(block_sizes) or outer_global_group_id >= len(kernel_block_sizes):
-            failures.append(
-                "gid={gid} backend=unknown layout=source reason=missing block geometry".format(
-                    gid=outer_global_group_id
-                )
-            )
-            continue
-        logical_block_size = int(block_sizes[outer_global_group_id])
-        kernel_block_size = int(kernel_block_sizes[outer_global_group_id])
-        for consumer in consumers:
-            backend_class = consumer.backend
-            metadata_builder = consumer.get_metadata_builder(0)
-            builder_class = type(metadata_builder)
-            actual_global_group_id = int(consumer.kv_cache_group_id)
-            layout_category = _classify_layout(
-                backend_class,
-                builder_class,
-                consumer.kv_cache_spec,
-            )
-            if actual_global_group_id in native_windows:
-                # The dedicated contract checked actual Full retention,
-                # noncausal native operands and the resident Window bound.
-                # This category describes paged storage, NOT Full attention.
-                layout_category = DraftWindowLayoutCategory.DENSE_GQA_DIRECT_PREFIX
-            group_failures: list[str] = []
-            source_geometry_failures: list[str] = []
-            if actual_global_group_id != outer_global_group_id:
-                source_geometry_failures.append(
-                    "AttentionGroup global gid does not match its outer source "
-                    f"index ({actual_global_group_id} != {outer_global_group_id})"
-                )
-            spec_block_size = int(consumer.kv_cache_spec.block_size)
-            if spec_block_size != logical_block_size:
-                source_geometry_failures.append(
-                    f"KV spec logical block size does not match BlockTables ({spec_block_size} != {logical_block_size})"
-                )
-            if logical_block_size <= 0 or kernel_block_size <= 0:
-                source_geometry_failures.append("block sizes must be greater than zero")
-            elif logical_block_size % kernel_block_size != 0:
-                source_geometry_failures.append(
-                    f"kernel block size {kernel_block_size} does not divide logical block size {logical_block_size}"
-                )
-            group_failures.extend(source_geometry_failures)
-            if layout_category is not DraftWindowLayoutCategory.DENSE_GQA_DIRECT_PREFIX:
-                group_failures.append(f"{layout_category.value} has no verified P2 direct-prefix provider")
-            if not _is_subclass(backend_class, AscendAttentionBackend):
-                group_failures.append("only the AscendAttentionBackend FIA route is a P2 direct-prefix candidate")
-            if not _is_subclass(builder_class, AscendAttentionMetadataBuilder):
-                group_failures.append("runtime metadata builder is not an Ascend dense-GQA builder")
-            if type(consumer.kv_cache_spec) is not FullAttentionSpec:
-                group_failures.append("KV spec is not the exact prefix-resident FullAttentionSpec")
-            block_span_tokens = (
-                kernel_block_size if not group_failures and runtime_context.decode_context_parallel_size == 1 else None
-            )
-            drafting_compression_ratio: int | None = None
-            if layout_category is DraftWindowLayoutCategory.DSA:
-                raw_ratio = getattr(metadata_builder, "compressor_ratio", None)
-                if isinstance(raw_ratio, int) and not isinstance(raw_ratio, bool):
-                    drafting_compression_ratio = raw_ratio
-            groups.append(
-                DraftWindowGroupInventory(
-                    global_group_id=actual_global_group_id,
-                    layer_names=tuple(consumer.layer_names),
-                    backend_class=backend_class,
-                    builder_class=builder_class,
-                    logical_block_size=logical_block_size,
-                    kernel_block_size=kernel_block_size,
-                    block_span_tokens=block_span_tokens,
-                    layout_category=layout_category,
-                    capability_failures=tuple(group_failures),
-                    source_geometry_failures=tuple(source_geometry_failures),
-                    drafting_compression_ratio=drafting_compression_ratio,
-                    native_window=native_windows.get(actual_global_group_id),
-                )
-            )
-
-    consumer_gids = tuple(dict.fromkeys(group.global_group_id for group in groups))
-    if not groups:
-        failures.append("gid=none backend=none layout=unknown reason=no executable draft attention consumer was found")
-    if len(consumer_gids) > 1:
-        failures.append(
-            "gid={gids} backend=mixed layout=multi_group reason=homogeneous or "
-            "heterogeneous multi-group runtime Window is not verified in P2".format(
-                gids=",".join(str(gid) for gid in consumer_gids)
-            )
-        )
-    for global_group_id in consumer_gids:
-        count = sum(group.global_group_id == global_group_id for group in groups)
-        if count > 1:
-            failures.append(
-                f"gid={global_group_id} backend=mixed layout=mixed reason="
-                f"multiple executable consumers ({count}) share one global gid"
-            )
+    topology = DraftWindowTopology.from_config(
+        vllm_config, block_tables, dsa_cp_effective=runtime_context.dsa_context_parallel
+    )
+    groups = inventory_draft_window_groups(
+        attn_groups=attn_groups,
+        kv_cache_config=kv_cache_config,
+        block_tables=block_tables,
+        topology=topology,
+        full_retention_dflash2=dflash2_graph_contract is not None,
+    )
+    if dflash2_graph_contract is not None:
+        for group in groups:
+            if group.gid not in native_windows or group.native_window != native_windows[group.gid]:
+                failures.append(f"gid={group.gid} backend inventory and DFlash2 native reader contract disagree")
     expected_policy_method = "dflash" if runtime_route == "dflash2" else runtime_route
     if expected_policy_method != policy.normalized_method:
-        failures.append(
-            "gid=none backend=none layout=runtime reason="
-            f"runtime route {runtime_route!r} does not match policy method "
-            f"{policy.normalized_method!r}"
-        )
+        failures.append(f"runtime route {runtime_route!r} does not match policy method {policy.normalized_method!r}")
     if runtime_route == "dflash2" and dflash2_graph_contract is None:
-        failures.append(
-            "gid=none backend=none layout=runtime reason=DFlash2 runtime Window remains gated after P2 inventory"
-        )
+        failures.append("DFlash2 Graph source requires its typed native-reader contract")
     elif runtime_route not in {"eagle3", "dflash", "dflash2", "dspark"}:
-        failures.append(f"gid=none backend=none layout=runtime reason=runtime route {runtime_route!r} is not eligible")
-
+        failures.append(f"runtime route {runtime_route!r} is not eligible")
     return DraftWindowInventory(
         method=policy.normalized_method,
         target_model_type=policy.target_model_type,
         runtime_route=runtime_route,
         window_size=policy.effective_window_size,
-        groups=tuple(groups),
+        groups=groups,
         capability_failures=tuple(failures),
         dflash2_graph_source=dflash2_graph_contract is not None,
     )
@@ -942,19 +709,9 @@ def build_full_draft_kv_source(
     inventory: DraftWindowInventory,
     block_tables: Any,
     idx_mapping: torch.Tensor | None = None,
-    source_group: DraftWindowGroupInventory | None = None,
 ) -> FullDraftKVSource:
     """Bind, but never copy or mutate, canonical full BlockTables tensors."""
-    if source_group is None:
-        group = inventory.require_single_group_direct_prefix()
-    else:
-        group = source_group
-        if len(inventory.groups) != 1 or inventory.groups[0] != group:
-            raise ValueError("explicit FullSource group must be the sole inventory consumer")
-        if group.source_geometry_failures:
-            raise NotImplementedError(
-                "explicit FullSource group has unresolved source geometry: " + "; ".join(group.source_geometry_failures)
-            )
+    group = inventory.require_single_group_direct_prefix()
     context = _group_diagnostic_context(inventory, group)
     input_block_tables = tuple(block_tables.input_block_tables)
     logical_block_sizes = tuple(int(size) for size in block_tables.block_sizes)
@@ -1134,13 +891,13 @@ def draft_window_tensors_share_storage(
 def _validate_source_geometry(
     *,
     inventory: DraftWindowInventory,
-    group: DraftWindowGroupInventory,
+    group: DraftWindowGroupRoute,
     logical_block_sizes: tuple[int, ...],
     kernel_block_sizes: tuple[int, ...],
     num_groups: int,
 ) -> None:
     context = _group_diagnostic_context(inventory, group)
-    global_group_id = group.global_group_id
+    global_group_id = group.gid
     if not (
         0 <= global_group_id < num_groups
         and global_group_id < len(logical_block_sizes)
@@ -1149,11 +906,11 @@ def _validate_source_geometry(
         raise RuntimeError(f"{context}; reason=inventory gid has no canonical source geometry")
     source_logical = logical_block_sizes[global_group_id]
     source_kernel = kernel_block_sizes[global_group_id]
-    if source_logical != group.logical_block_size or source_kernel != group.kernel_block_size:
+    if source_logical != group.scheduler_block_size or source_kernel != group.table_column_span:
         raise RuntimeError(
             f"{context}; reason=source geometry logical={source_logical} "
             f"kernel={source_kernel} does not match inventory "
-            f"logical={group.logical_block_size} kernel={group.kernel_block_size}"
+            f"logical={group.scheduler_block_size} kernel={group.table_column_span}"
         )
 
 
@@ -1248,6 +1005,7 @@ def _build_draft_window_source_capability_for_context(
     runtime_route: str,
     attn_groups: Sequence[Sequence[AttentionGroup]],
     block_tables: Any,
+    kv_cache_config: Any,
     causal: bool | Mapping[int, bool],
     vllm_config: Any,
     runtime_context: DraftWindowRuntimeContext,
@@ -1267,7 +1025,9 @@ def _build_draft_window_source_capability_for_context(
         runtime_route=runtime_route,
         attn_groups=attn_groups,
         block_tables=block_tables,
+        kv_cache_config=kv_cache_config,
         causal=causal,
+        vllm_config=vllm_config,
         runtime_context=runtime_context,
         allow_replicated_tp_graph_source=allow_replicated_tp_graph_source,
         allow_parallel_prefix_graph_source=allow_parallel_prefix_graph_source,
@@ -1277,23 +1037,7 @@ def _build_draft_window_source_capability_for_context(
     uses_dynamic_k = bool(vllm_config.speculative_config.uses_dynamic_speculative_decoding())
     if uses_dynamic_k:
         raise NotImplementedError("Draft Window Graph source requires static speculative decoding")
-    if len(inventory.groups) != 1:
-        raise NotImplementedError("Draft Window Graph source requires one executable cache-group consumer")
-    group = inventory.groups[0]
-    failures = list(inventory.capability_failures) + list(group.source_geometry_failures)
-    if group.layout_category is DraftWindowLayoutCategory.DENSE_GQA_DIRECT_PREFIX:
-        failures.extend(group.capability_failures)
-    elif group.layout_category is DraftWindowLayoutCategory.DSA:
-        # The native, uncompressed DSA provider has its own metadata contract.
-        # Compressed storage cannot inherit a direct-prefix read projection.
-        if group.drafting_compression_ratio != 1:
-            failures.append("DSA source requires an explicit uncompressed drafting provider")
-        if runtime_context.async_scheduling:
-            failures.append("DSA source has no lane-owned Async metadata provider")
-    else:
-        failures.append(f"layout {group.layout_category.value} has no direct-prefix source provider")
-    if failures:
-        raise NotImplementedError("Draft Window source is not supported: " + "; ".join(failures))
+    group = inventory.require_single_group_direct_prefix()
     from vllm_ascend.worker.v2.spec_decode.draft_window_eager_capability import _build_topology_fingerprint
 
     eager_topology_fingerprint = _build_topology_fingerprint(
@@ -1305,21 +1049,18 @@ def _build_draft_window_source_capability_for_context(
     full_source = build_full_draft_kv_source(
         inventory=inventory,
         block_tables=block_tables,
-        source_group=group,
     )
     provider = SingleGroupDirectPrefixProvider(
         inventory=inventory,
         full_source=full_source,
         # MRV1 aligned its anchor to the first executable draft kernel block.
         # With one verified consumer this is the only legacy anchor quantum.
-        legacy_block_size=group.kernel_block_size,
+        legacy_block_size=group.table_column_span,
         expected_future_offset=resolve_static_future_offset(
             normalized_method=policy.normalized_method,
             configured_k=int(vllm_config.speculative_config.num_speculative_tokens),
             uses_dynamic_k=uses_dynamic_k,
         ),
-        explicit_source_group=group,
-        source_block_span_tokens=group.kernel_block_size,
     )
     return DraftWindowSourceCapability(
         inventory=inventory,
@@ -1330,7 +1071,7 @@ def _build_draft_window_source_capability_for_context(
         # windowed decode rows. Reserve one stable full-width backing once;
         # active rows still copy only their descriptor columns.
         workspace_capacity_columns=full_source.input_block_table_row_width(
-            group.global_group_id,
+            group.gid,
         ),
     )
 
@@ -1443,17 +1184,6 @@ class DraftWindowWorkspace:
         self.cpu_window_upper = torch.zeros(max_num_reqs, dtype=torch.int32)
         self._bound_identity: DraftWindowGenerationIdentity | None = None
         self._active_table_columns: tuple[int, ...] = ()
-
-    @property
-    def storage_pointers(self) -> tuple[int, ...]:
-        """Expose addresses for stability tests, never as freshness tokens."""
-        return (
-            self.window_block_table.data_ptr(),
-            self.valid_num_blocks.data_ptr(),
-            self.device_window_exact.data_ptr(),
-            self.cpu_window_exact.data_ptr(),
-            self.cpu_window_upper.data_ptr(),
-        )
 
     @property
     def bound_identity(self) -> DraftWindowGenerationIdentity | None:
@@ -2372,11 +2102,11 @@ def build_draft_window_runtime_state(
     group = capability.provider.source_group
     if len(capability.inventory.groups) != 1 or capability.inventory.groups[0] != group:
         raise RuntimeError("provider source group does not match the capability inventory")
-    if group.global_group_id != capability.provider.global_group_id:
+    if group.gid != capability.provider.global_group_id:
         raise RuntimeError("provider gid does not match the inventory candidate")
     capability.full_source.validate_owner_bindings()
-    source_table = capability.full_source._input_block_tables[group.global_group_id]
-    persistent_counts = capability.full_source._block_tables_owner.num_blocks.gpu[group.global_group_id]
+    source_table = capability.full_source._input_block_tables[group.gid]
+    persistent_counts = capability.full_source._block_tables_owner.num_blocks.gpu[group.gid]
     if source_table.dtype != torch.int32 or persistent_counts.dtype != torch.int32:
         raise TypeError("P3 direct-prefix source tables and valid counts must use int32")
     if source_table.device != persistent_counts.device:

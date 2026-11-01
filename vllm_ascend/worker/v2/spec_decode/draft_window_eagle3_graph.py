@@ -14,7 +14,6 @@ This owner is not installed by default and does not open any Graph gate.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -33,16 +32,6 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
 def _current_stream_identity() -> int:
     # Host stream identity only: no event, query, synchronize or tensor read.
     return int(torch.npu.current_stream().npu_stream)
-
-
-@dataclass(frozen=True, slots=True)
-class Eagle3ScratchTransfer:
-    generation: int
-    mapping_epoch: int
-    step: int
-    capture_identity: DraftWindowGraphCaptureIdentity
-    stream_identity: int
-    observation: str = "COPY_ENQUEUED_SCRATCH_RELEASED_NOT_GRAPH_COMPLETION"
 
 
 class Eagle3GraphStagingOwner:
@@ -78,17 +67,12 @@ class Eagle3GraphStagingOwner:
         self._expected_steps = static_k
         self._first_pass_is_graph = True
         self._carriers: list[DraftWindowGraphReadCarrier] = []
-        self._transfers: list[Eagle3ScratchTransfer] = []
         self._quarantined = False
         self._quarantine_reason: str | None = None
 
     @property
     def quarantined(self) -> bool:
         return self._quarantined
-
-    @property
-    def transfers(self) -> tuple[Eagle3ScratchTransfer, ...]:
-        return tuple(self._transfers)
 
     def begin(
         self,
@@ -127,7 +111,7 @@ class Eagle3GraphStagingOwner:
         self._next_step = 0
         self._expected_steps = expected_steps
         self._first_pass_is_graph = first_pass_is_graph
-        self._carriers, self._transfers = [], []
+        self._carriers = []
 
     def adopt_eager_first_pass(self, identity: Any) -> None:
         """Account for the real nonuniform-prefill eager first pass.
@@ -171,7 +155,7 @@ class Eagle3GraphStagingOwner:
         metadata_builder: Callable[[Any], Any],
         target_metadata: Mapping[str, Any],
         write_side_reference: DraftWindowGraphWriteSideReference,
-    ) -> Eagle3ScratchTransfer:
+    ) -> None:
         """Copy all read state into its registered bank, retaining that bank.
 
         Every later scratch materialization must stay on the same current
@@ -232,18 +216,13 @@ class Eagle3GraphStagingOwner:
                     raise RuntimeError("Eagle3 persistent read bank aliases reusable staging scratch")
             self._require_stream()
             self.runtime.retire_generation(identity)
-            transfer = Eagle3ScratchTransfer(
-                identity.generation_id, identity.mapping_epoch, identity.step, capture_identity, self._stream
-            )
             self._carriers.append(carrier)
-            self._transfers.append(transfer)
             self._next_step += 1
-            return transfer
         except BaseException as error:
             self.quarantine(type(error).__name__ + ": " + str(error))
             raise
 
-    def finish(self) -> tuple[Eagle3ScratchTransfer, ...]:
+    def finish(self) -> None:
         """End Host submission bookkeeping, never announce device completion."""
         self.require_reusable()
         try:
@@ -252,11 +231,9 @@ class Eagle3GraphStagingOwner:
                 raise RuntimeError("Eagle3 Graph proposal omitted a real first-pass/AR consumer")
             if any(carrier.state is not DraftWindowGraphCarrierState.UPDATED for carrier in self._carriers):
                 raise RuntimeError("Eagle3 Graph banks lack actual backend UPDATE attribution")
-            result = tuple(self._transfers)
             self._proposal_epoch = self._request_fingerprint = self._stream = None
             self._carriers = []
             self._expected_steps = self.static_k
-            return result
         except BaseException as error:
             self.quarantine(type(error).__name__ + ": " + str(error))
             raise

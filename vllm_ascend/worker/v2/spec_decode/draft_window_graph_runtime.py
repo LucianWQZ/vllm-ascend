@@ -27,7 +27,6 @@ from vllm_ascend.worker.v2.attn_utils import build_attn_metadata_factory, build_
 from vllm_ascend.worker.v2.spec_decode.dflash.capture import format_dflash_capture_descriptor
 from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftMetadataInputs,
-    DraftWindowLayoutCategory,
     DraftWindowPolicyDecision,
     DraftWindowRuntimeContext,
     DraftWindowRuntimeState,
@@ -125,6 +124,7 @@ def build_parallel_graph_source(
     runtime_route: str,
     attn_groups: Sequence[Sequence[Any]],
     block_tables: Any,
+    kv_cache_config: Any,
     causal: bool | Mapping[int, bool],
     vllm_config: Any,
     input_buffers: Any = None,
@@ -182,6 +182,7 @@ def build_parallel_graph_source(
         runtime_route=runtime_route,
         attn_groups=source_groups,
         block_tables=block_tables,
+        kv_cache_config=kv_cache_config,
         causal=causal,
         vllm_config=vllm_config,
         runtime_context=runtime_context,
@@ -190,9 +191,6 @@ def build_parallel_graph_source(
         allow_parallel_dp_graph_source=replicated_review and runtime_context.data_parallel_size == 2,
         dflash2_graph_contract=dflash2_graph_contract,
     )
-    group = capability.inventory.require_single_group_direct_prefix()
-    if group.layout_category is not DraftWindowLayoutCategory.DENSE_GQA_DIRECT_PREFIX:
-        raise NotImplementedError("Draft Window Graph requires dense GQA/FIA direct-prefix metadata")
     if runtime_context.prefix_caching:
         # Reuse P7's current-request resident snapshot, owned exact lengths and
         # canonical Full source. Prefix is kept in the real topology identity;
@@ -252,7 +250,7 @@ def install_parallel_graph(
         raise NotImplementedError("Draft Window Graph does not support ambiguous LoRA capture buckets")
 
     group = runtime_state.capability.inventory.require_single_group_direct_prefix()
-    block_span_tokens = group.block_span_tokens
+    block_span_tokens = group.table_column_span
     if not isinstance(block_span_tokens, int) or isinstance(block_span_tokens, bool) or block_span_tokens <= 0:
         raise RuntimeError("Draft Window Graph group has no positive block-span contract")
     static_k = int(owner.speculative_config.num_speculative_tokens)
@@ -268,9 +266,9 @@ def install_parallel_graph(
             route=route,
             graph_mode=descriptor.cg_mode.name,
             backend_impl=_class_path(AscendAttentionBackendImpl),
-            builder_impl=_class_path(group.builder_class),
-            global_group_id=group.global_group_id,
-            layout=group.layout_category.value,
+            builder_impl=group.builder,
+            global_group_id=group.gid,
+            layout=group.status.value,
             capture_descriptor=format_dflash_capture_descriptor(
                 descriptor,
                 max_num_reqs=max_num_reqs,
@@ -281,8 +279,8 @@ def install_parallel_graph(
             padded_token_count=descriptor.num_tokens,
             static_k=static_k,
             window_size=runtime_state.capability.inventory.window_size,
-            logical_block_size=group.logical_block_size,
-            kernel_block_size=group.kernel_block_size,
+            logical_block_size=group.scheduler_block_size,
+            kernel_block_size=group.table_column_span,
             block_span_tokens=block_span_tokens,
             tensor_parallel_size=runtime_context.tensor_parallel_size,
             tensor_parallel_rank=runtime_context.tensor_parallel_rank,
@@ -447,9 +445,7 @@ def _build_private_graph_metadata(
     )
 
     private_isolation_view = _isolate_draft_metadata_from_target(metadata, target_metadata)
-    window_layers = (
-        owner._draft_window_runtime_state.capability.inventory.require_single_group_direct_prefix().layer_names
-    )
+    window_layers = owner._draft_window_runtime_state.capability.inventory.require_single_group_direct_prefix().layers
     # One backend object is shared by all layers in its attention group.
     # Validate and bind each private object once, retaining every layer alias.
     bound_metadata_ids: set[int] = set()

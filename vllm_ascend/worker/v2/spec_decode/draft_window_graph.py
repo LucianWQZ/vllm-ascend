@@ -589,13 +589,13 @@ class DraftWindowGraphBindingProvider:
         group = self._runtime_state.capability.inventory.require_single_group_direct_prefix()
         expected = {
             "method": self._runtime_state.capability.inventory.method,
-            "global gid": group.global_group_id,
-            "layout": group.layout_category.value,
-            "builder": _class_path(group.builder_class),
+            "global gid": group.gid,
+            "layout": group.status.value,
+            "builder": group.builder,
             "window size": self._runtime_state.capability.inventory.window_size,
-            "logical block size": group.logical_block_size,
-            "kernel block size": group.kernel_block_size,
-            "block span": group.block_span_tokens,
+            "logical block size": group.scheduler_block_size,
+            "kernel block size": group.table_column_span,
+            "block span": group.table_column_span,
         }
         actual = {
             "method": fingerprint.method,
@@ -901,7 +901,7 @@ class DraftWindowGraphBindingProvider:
             raise RuntimeError("per-consumer backend or builder identity mismatch")
 
         group = self._runtime_state.capability.inventory.require_single_group_direct_prefix()
-        expected_layers = set(group.layer_names)
+        expected_layers = set(group.layers)
         for metadata in draft_attn_metadatas:
             metadata_layers = set(self._window_metadata(metadata))
             if not metadata_layers or not metadata_layers.issubset(expected_layers):
@@ -1010,11 +1010,7 @@ class DraftWindowGraphBindingProvider:
     def _capture_topology(self) -> tuple[int, int, str]:
         topology = self._runtime_state.capability.eager_topology_fingerprint
         if topology is None:
-            # Compatibility for explicit single-card P3 fixtures only; never
-            # infer a multi-rank identity from a missing P2 topology.
-            if self._runtime_state.topology_fingerprint is not None:
-                raise RuntimeError("Graph explicit runtime topology requires its P2 topology")
-            return 1, 0, "replicated"
+            raise RuntimeError("Graph read banks require their actual source topology")
         world, rank = topology.tensor_parallel_size, topology.tensor_parallel_rank
         if type(world) is not int or world < 1 or type(rank) is not int or not 0 <= rank < world:
             raise RuntimeError("Graph P2 TP world/rank must be explicit integers within range")
@@ -1038,9 +1034,9 @@ class DraftWindowGraphBindingProvider:
         if actual != self._capture_topology():
             raise RuntimeError("capture/P2 TP world, rank or parallel read semantics mismatch")
         topology = self._runtime_state.capability.eager_topology_fingerprint
-        source_prefix = False if topology is None else topology.prefix_caching
+        source_prefix = topology.prefix_caching
         runtime = self._runtime_state.topology_fingerprint
-        source_dp = 1 if topology is None else topology.data_parallel_size
+        source_dp = topology.data_parallel_size
         if fingerprint.data_parallel_size != source_dp or (
             runtime is not None and runtime.data_parallel_size != source_dp
         ):

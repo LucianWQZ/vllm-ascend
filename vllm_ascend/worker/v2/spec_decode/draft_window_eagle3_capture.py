@@ -19,7 +19,6 @@ import torch
 
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackendImpl, AscendAttentionState
 from vllm_ascend.worker.v2.spec_decode.draft_window import (
-    DraftWindowLayoutCategory,
     _build_draft_window_source_capability_for_context,
     build_draft_window_runtime_context,
 )
@@ -62,6 +61,7 @@ def build_eagle3_graph_source(owner: Any) -> tuple[Any, Any]:
         runtime_route="eagle3",
         attn_groups=owner.attn_groups,
         block_tables=owner.block_tables,
+        kv_cache_config=owner.kv_cache_config,
         causal=True,
         vllm_config=owner.vllm_config,
         runtime_context=context,
@@ -69,9 +69,6 @@ def build_eagle3_graph_source(owner: Any) -> tuple[Any, Any]:
         allow_parallel_prefix_graph_source=context.prefix_caching,
         allow_parallel_dp_graph_source=rank_local_dp,
     )
-    group = capability.inventory.require_single_group_direct_prefix()
-    if group.layout_category is not DraftWindowLayoutCategory.DENSE_GQA_DIRECT_PREFIX:
-        raise NotImplementedError("Eagle3 Graph requires its dense GQA/FIA read-view backend")
     topology = capability.eager_topology_fingerprint
     if topology is None:
         raise RuntimeError("Eagle3 Graph has no installed-runtime topology identity")
@@ -118,9 +115,9 @@ class Eagle3GraphSession:
                         route=route,
                         graph_mode="FULL",
                         backend_impl=_class_path(AscendAttentionBackendImpl),
-                        builder_impl=_class_path(group.builder_class),
-                        global_group_id=group.global_group_id,
-                        layout=group.layout_category.value,
+                        builder_impl=group.builder,
+                        global_group_id=group.gid,
+                        layout=group.status.value,
                         capture_descriptor=f"eagle3:{route.value}:{n}:{desc.num_tokens}",
                         capture_bucket=(n, desc.num_tokens),
                         query_width=q,
@@ -128,9 +125,9 @@ class Eagle3GraphSession:
                         padded_token_count=desc.num_tokens,
                         static_k=owner.num_speculative_steps,
                         window_size=owner._draft_window_runtime_state.capability.inventory.window_size,
-                        logical_block_size=group.logical_block_size,
-                        kernel_block_size=group.kernel_block_size,
-                        block_span_tokens=group.block_span_tokens,
+                        logical_block_size=group.scheduler_block_size,
+                        kernel_block_size=group.table_column_span,
+                        block_span_tokens=group.table_column_span,
                         tensor_parallel_size=context.tensor_parallel_size,
                         tensor_parallel_rank=context.tensor_parallel_rank,
                         parallel_read_semantics="replicated",
@@ -154,7 +151,7 @@ class Eagle3GraphSession:
                         # Seed dummy contents before any GLOBAL capture.
                         # Synchronous H2D is forbidden inside the callback.
                         read = self.provider.startup_capture_read_inputs(self._captures[key])
-                        capacity = min(owner.max_model_len, fingerprint.window_size + group.block_span_tokens - 1)
+                        capacity = min(owner.max_model_len, fingerprint.window_size + group.table_column_span - 1)
                         read.window_block_table.zero_()
                         read.valid_num_blocks.fill_(read.window_block_table.shape[1])
                         read.cpu_window_exact.fill_(capacity)

@@ -2,13 +2,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CPU contracts for consumer identity and block-table units."""
 
-from dataclasses import replace
+import ast
+from dataclasses import dataclass, replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from vllm_ascend.worker.v2.spec_decode.draft_window_backends import (
     DraftWindowBackendTypes,
+    DraftWindowGroupRoute,
     DraftWindowProviderStatus,
     DraftWindowTopology,
     inventory_draft_window_groups,
@@ -72,7 +75,17 @@ def topology():
     return DraftWindowTopology(1, 1, 1, 1, 1, 0, 1, False, False, None, None, False)
 
 
-def inventory(types, topology, *, specs=None, builders=None, spans=None, full_retention_dflash2=False):
+def inventory(
+    types,
+    topology,
+    *,
+    specs=None,
+    builders=None,
+    spans=None,
+    table_spans=None,
+    group_ids=None,
+    full_retention_dflash2=False,
+):
     specs = [FullSpec()] if specs is None else specs
     builders = [DenseBuilder() for _ in specs] if builders is None else builders
     spans = [128 for _ in specs] if spans is None else spans
@@ -80,6 +93,10 @@ def inventory(types, topology, *, specs=None, builders=None, spans=None, full_re
         [
             SimpleNamespace(
                 backend=DenseBackend,
+                kv_cache_group_id=gid if group_ids is None else group_ids[gid],
+                kv_cache_spec=next(iter(specs[gid].kv_cache_specs.values()))
+                if isinstance(specs[gid], UniformSpec)
+                else specs[gid],
                 layer_names=list(specs[gid].kv_cache_specs)
                 if isinstance(specs[gid], UniformSpec)
                 else [f"draft.layers.{gid}"],
@@ -93,7 +110,17 @@ def inventory(types, topology, *, specs=None, builders=None, spans=None, full_re
     return inventory_draft_window_groups(
         attn_groups=groups,
         kv_cache_config=SimpleNamespace(kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec) for spec in specs]),
-        block_tables=SimpleNamespace(kernel_block_sizes=spans),
+        block_tables=SimpleNamespace(
+            block_sizes=table_spans
+            if table_spans is not None
+            else [
+                next(iter(spec.kv_cache_specs.values())).block_size
+                if isinstance(spec, UniformSpec) and spec.kv_cache_specs
+                else getattr(spec, "block_size", 0)
+                for spec in specs
+            ],
+            kernel_block_sizes=spans,
+        ),
         topology=topology,
         types=types,
         full_retention_dflash2=full_retention_dflash2,
@@ -106,9 +133,127 @@ def test_dflash2_reference_full_allocation_keeps_native_read_provider(types, top
     kinds = replace(types, sliding_window_spec=SlidingSpec)
     (original,) = inventory(kinds, topology, specs=[spec])
     assert original.status is DraftWindowProviderStatus.DIRECT_DENSE
+    assert original.native_window == 2048  # Full retention is not Full attention.
     (reference,) = inventory(kinds, topology, specs=[spec], full_retention_dflash2=True)
     assert reference.status is DraftWindowProviderStatus.NATIVE_SWA_CANDIDATE
     assert reference.native_window == 2048
+
+
+def test_consumer_gid_must_match_its_canonical_source(types, topology):
+    with pytest.raises(ValueError, match="consumer and canonical source geometry"):
+        inventory(types, topology, group_ids=[1])
+
+
+def test_cache_and_canonical_table_scheduler_spans_must_match(types, topology):
+    with pytest.raises(ValueError, match="scheduler and canonical table spans"):
+        inventory(types, topology, table_spans=[512])
+
+
+def test_full_spec_with_chunked_attention_cannot_claim_dense_prefix_reads(types, topology):
+    spec = FullSpec()
+    spec.attention_chunk_size = 1024
+    (route,) = inventory(types, topology, specs=[spec])
+    assert route.status is DraftWindowProviderStatus.PROVIDER_MISSING
+    with pytest.raises(NotImplementedError, match="provider missing"):
+        require_draft_window_providers((route,))
+
+
+def _source_topology_fingerprint(groups, *, target_dsa_cp):
+    """Run the actual source-coordinate decision, without hardware imports."""
+    path = Path(__file__).resolve().parents[4] / "vllm_ascend/worker/v2/spec_decode/draft_window_eager_capability.py"
+    function = next(
+        n
+        for n in ast.parse(path.read_text()).body
+        if isinstance(n, ast.FunctionDef) and n.name == "_build_topology_fingerprint"
+    )
+    namespace = {"P7EagerTopologyFingerprint": lambda **values: SimpleNamespace(**values)}
+    module = ast.Module(
+        body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), function],
+        type_ignores=[],
+    )
+    exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
+    context = SimpleNamespace(
+        attention_backend_family=object(),
+        tensor_parallel_size=16,
+        tensor_parallel_rank=7,
+        data_parallel_size=1,
+        pipeline_parallel_size=1,
+        prefill_context_parallel_size=1,
+        decode_context_parallel_size=1,
+        sequence_parallel=True,
+        dsa_context_parallel=target_dsa_cp,
+        flashcomm=True,
+        graph_mode="FULL_DECODE_ONLY",
+        async_scheduling=True,
+        prefix_caching=True,
+    )
+    return namespace[function.name](
+        inventory=SimpleNamespace(groups=groups, method="dspark", runtime_route="dspark"),
+        runtime_context=context,
+        provider_version=1,
+        execution_lane=0,
+    )
+
+
+def test_target_dsa_cp_does_not_change_dense_draft_read_coordinates(types, topology):
+    (route,) = inventory(types, replace(topology, dsa_cp_effective=True))
+    assert route.topology.dsa_cp_effective is False  # Actual GQA builder, independent of Target flag.
+    result = _source_topology_fingerprint((route,), target_dsa_cp=True)
+    assert result.parallel_read_semantics == "replicated"
+    assert result.dsa_context_parallel is True  # Retain actual executor feature identity.
+    assert (result.tensor_parallel_size, result.tensor_parallel_rank) == (16, 7)
+
+
+@pytest.mark.parametrize("dsa_cp,dcp,expected", [(True, 1, "dsa_cp_derived"), (False, 2, "dcp_interleaved")])
+def test_actual_consumer_cp_coordinates_are_not_erased(types, topology, dsa_cp, dcp, expected):
+    (route,) = inventory(types, topology)
+    route = replace(route, topology=replace(route.topology, dsa_cp_effective=dsa_cp, decode_context_parallel_size=dcp))
+    result = _source_topology_fingerprint((route,), target_dsa_cp=False)
+    assert result.parallel_read_semantics == expected
+
+
+def test_mixed_consumer_read_coordinate_contracts_are_not_silently_combined(types, topology):
+    (route,) = inventory(types, topology)
+    cp_route = replace(route, topology=replace(route.topology, dsa_cp_effective=True))
+    with pytest.raises(NotImplementedError, match="one parallel read-coordinate contract"):
+        _source_topology_fingerprint((route, cp_route), target_dsa_cp=True)
+
+
+@pytest.mark.parametrize(
+    "status,native_window,dflash2,allowed",
+    [
+        (DraftWindowProviderStatus.DIRECT_DENSE, None, False, True),
+        (DraftWindowProviderStatus.DIRECT_DENSE, 2048, False, False),
+        (DraftWindowProviderStatus.NATIVE_SWA_CANDIDATE, 2048, False, False),
+        (DraftWindowProviderStatus.NATIVE_SWA_CANDIDATE, 2048, True, True),
+        (DraftWindowProviderStatus.PROVIDER_MISSING, None, True, False),
+    ],
+)
+def test_graph_source_uses_shared_route_without_promoting_native_swa(
+    types, topology, status, native_window, dflash2, allowed
+):
+    path = Path(__file__).resolve().parents[4] / "vllm_ascend/worker/v2/spec_decode/draft_window.py"
+    inventory_class = next(
+        n for n in ast.parse(path.read_text()).body if isinstance(n, ast.ClassDef) and n.name == "DraftWindowInventory"
+    )
+    namespace = dict(
+        dataclass=dataclass,
+        DraftWindowGroupRoute=DraftWindowGroupRoute,
+        DraftWindowProviderStatus=DraftWindowProviderStatus,
+    )
+    exec(compile(ast.Module(body=[inventory_class], type_ignores=[]), str(path), "exec"), namespace)
+    (route,) = inventory(types, topology)
+    route = replace(route, status=status, native_window=native_window)
+    source = namespace[inventory_class.name](
+        "dflash", "target", "dflash2" if dflash2 else "dflash", 1024, (route,), (), dflash2
+    )
+    if allowed:
+        assert source.require_single_group_direct_prefix() is route
+        assert source.groups[0].status is status
+        assert source.groups[0].native_window == native_window
+    else:
+        with pytest.raises(NotImplementedError, match="Graph source rejected"):
+            source.require_single_group_direct_prefix()
 
 
 def test_kernel_column_span_is_not_scheduler_block_size(types, topology):
@@ -503,6 +648,8 @@ def test_mixed_uniform_group_uses_each_consumers_actual_spec(types, topology):
     groups = [
         SimpleNamespace(
             backend=DenseBackend,
+            kv_cache_group_id=0,
+            kv_cache_spec=specs[name],
             layer_names=[name],
             get_metadata_builder=lambda index, builder=builder: builder,
         )
@@ -511,7 +658,7 @@ def test_mixed_uniform_group_uses_each_consumers_actual_spec(types, topology):
     routes = inventory_draft_window_groups(
         attn_groups=[groups],
         kv_cache_config=SimpleNamespace(kv_cache_groups=[SimpleNamespace(kv_cache_spec=UniformSpec(specs))]),
-        block_tables=SimpleNamespace(kernel_block_sizes=[128]),
+        block_tables=SimpleNamespace(block_sizes=[256], kernel_block_sizes=[128]),
         topology=topology,
         types=sparse_types(types),
     )

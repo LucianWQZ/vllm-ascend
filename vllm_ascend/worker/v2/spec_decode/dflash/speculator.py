@@ -317,6 +317,7 @@ class AscendDFlashSpeculator(DraftWindowGraphInputMixin, LmheadTPDraftSamplingMi
             runtime_route=runtime_route,
             attn_groups=self.attn_groups,
             block_tables=self.block_tables,
+            kv_cache_config=self.kv_cache_config,
             causal=self._group_causal,
             vllm_config=self.vllm_config,
             input_buffers=self.input_buffers,
@@ -327,14 +328,6 @@ class AscendDFlashSpeculator(DraftWindowGraphInputMixin, LmheadTPDraftSamplingMi
         self._draft_window_runtime_state = runtime_state
         self._initialize_draft_window_graph_inputs()
         self._draft_window_graph_context = graph_context
-
-    def _run_model(
-        self, num_tokens, attn_metadata, slot_mappings, num_tokens_across_dp, cudagraph_runtime_mode=CUDAGraphMode.NONE
-    ):
-        output = super()._run_model(
-            num_tokens, attn_metadata, slot_mappings, num_tokens_across_dp, cudagraph_runtime_mode
-        )
-        return output
 
     def load_draft_model(
         self,

@@ -111,6 +111,7 @@ class AscendDSparkSpeculator(DraftWindowGraphInputMixin, LmheadTPDraftSamplingMi
             runtime_route=self._speculator_name.lower(),
             attn_groups=self.attn_groups,
             block_tables=self.block_tables,
+            kv_cache_config=self.kv_cache_config,
             causal=self._group_causal,
             vllm_config=self.vllm_config,
         )
