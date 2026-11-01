@@ -85,7 +85,7 @@ class DraftNativeAttentionLoggingTests(unittest.TestCase):
                 with patch.object(parallel_state, "_WORLD", SimpleNamespace(is_first_rank=rank == 0, local_rank=rank)):
                     for _ in range(2):
                         # Distinct loaded owners share the logger's exact
-                        # once-key; the original per-owner signature also stays.
+                        # once-key without a second per-owner deduplication cache.
                         owner = loaded(config(kinds=["sliding_attention"] * 2), [2048, 2048])
                         native.report_draft_native_attention(owner, logger=logger, window_size=1024)
                         native.report_draft_native_attention(owner, logger=logger, window_size=1024)

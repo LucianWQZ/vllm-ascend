@@ -47,6 +47,21 @@ def _kind(windows: Sequence[int | None]) -> str:
     return "SWA" if all(window is not None for window in windows) else "MIXED"
 
 
+def _layer_windows(kinds: Any, count: int, window: Any, *, use_swa: bool = False) -> tuple[int | None, ...]:
+    if kinds is not None and (
+        not isinstance(kinds, (list, tuple))
+        or len(kinds) != count
+        or any(kind not in ("full_attention", "sliding_attention") for kind in kinds)
+    ):
+        raise ValueError("native layer_types must describe every Draft attention layer")
+    if kinds is None or (use_swa and "sliding_attention" not in kinds):
+        kinds = ["sliding_attention" if use_swa else "full_attention"] * count
+    windows = tuple(_window(window) if kind == "sliding_attention" else None for kind in kinds)
+    if any(kind == "sliding_attention" and value is None for kind, value in zip(kinds, windows)):
+        raise ValueError("native sliding attention has no positive window")
+    return windows
+
+
 def configured_native_windows(config: Any, *, raw_config: bool = False) -> tuple[int | None, ...] | None:
     """Mirror the supported model implementations, not generic HF defaults.
 
@@ -94,21 +109,7 @@ def configured_native_windows(config: Any, *, raw_config: bool = False) -> tuple
         # delegates to LlamaAttention. That implementation defaults to Full
         # and only reads sliding_window for a declared sliding_attention row.
         # Do not apply DFlash use_swa or Qwen normalization to this architecture.
-        kinds = _get(config, "layer_types")
-        if not kinds:
-            return (None,) * count
-        if (
-            not isinstance(kinds, (list, tuple))
-            or len(kinds) != count
-            or any(kind not in ("full_attention", "sliding_attention") for kind in kinds)
-        ):
-            raise ValueError("Eagle3 native layer_types must describe every Draft attention layer")
-        result = tuple(
-            _window(_get(config, "sliding_window")) if kind == "sliding_attention" else None for kind in kinds
-        )
-        if any(kind == "sliding_attention" and window is None for kind, window in zip(kinds, result)):
-            raise ValueError("Eagle3 native sliding attention has no positive window")
-        return result
+        return _layer_windows(_get(config, "layer_types") or None, count, _get(config, "sliding_window"))
     if architectures == {"Glm5DSparkForCausalLM"}:
         return (None,) * count
     if len(architectures) != 1 or not architectures.issubset(_DFLASH_ARCHITECTURES):
@@ -130,30 +131,11 @@ def configured_native_windows(config: Any, *, raw_config: bool = False) -> tuple
                 "sliding_attention" if configured_window is not None and index >= first_sliding else "full_attention"
                 for index in range(count)
             ]
-    if layer_types is not None and (
-        not isinstance(layer_types, (list, tuple))
-        or len(layer_types) != count
-        or any(kind not in ("full_attention", "sliding_attention") for kind in layer_types)
-    ):
-        raise ValueError("native layer_types must describe every Draft attention layer")
     dflash = _get(config, "dflash_config", {}) or {}
     use_swa = _get(dflash, "use_swa", False)
     if type(use_swa) is not bool:
         raise ValueError("dflash_config.use_swa must be boolean")
-    any_sliding = layer_types is not None and "sliding_attention" in layer_types
-    windows = []
-    for index in range(count):
-        sliding = (
-            use_swa
-            if layer_types is None or (use_swa and not any_sliding)
-            else (layer_types[index] == "sliding_attention")
-        )
-        value = _get(dflash, "swa_window_size", configured_window) if sliding else None
-        window = _window(value)
-        if sliding and window is None:
-            raise ValueError("native sliding attention has no positive window")
-        windows.append(window)
-    return tuple(windows)
+    return _layer_windows(layer_types, count, _get(dflash, "swa_window_size", configured_window), use_swa=use_swa)
 
 
 @dataclass(frozen=True)
@@ -316,16 +298,6 @@ def report_draft_native_attention(
 ) -> DraftNativeAttention:
     """Emit a once-per-loaded-model summary, without installing an owner."""
     inventory = inspect_draft_native_attention(speculator, raw_config=raw_config, provider_routes=provider_routes)
-    signature = (
-        inventory.kind,
-        inventory.actual_layers,
-        inventory.issues,
-        inventory.actual_complete,
-        window_size,
-        graph_requested,
-    )
-    if _get(speculator, "_draft_native_attention_reported") == signature:
-        return inventory
     logger.info_once(
         "Draft native attention=%s; native windows=%s; extra Draft window=%s; "
         "Draft Graph requested=%s; complete actual inventory=%s; issues=%s. "
@@ -353,7 +325,6 @@ def report_draft_native_attention(
             window_size,
             scope="global",
         )
-    speculator._draft_native_attention_reported = signature
     return inventory
 
 

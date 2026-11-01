@@ -38,11 +38,11 @@ def test_ragged_queries_keep_full_row_and_use_device_exact_at_boundary(causal):
     assert read.capacity == 1440  # Full-row U controls allocation only.
     assert read.num_query_tokens == 8
     assert isinstance(read, DenseDraftReadBatch)
-    assert [part.query_indices.tolist() for part in read.parts] == [[0, 1, 2], [3, 4, 5, 6, 7]]
-    assert [part.read.capacity for part in read.parts] == [1152, 1440]
+    assert [indices.tolist() for indices, _ in read.parts] == [[0, 1, 2], [3, 4, 5, 6, 7]]
+    assert [part.capacity for _, part in read.parts] == [1152, 1440]
     for row, (state_row, end, width) in enumerate(((1, 1151, 3), (0, 1408, 5))):
         expected = [int(before[state_row, pos // 128]) * 128 + pos % 128 for pos in range(end)]
-        private = read.parts[row].read
+        private = read.parts[row][1]
         assert private.slots[0, :end].tolist() == expected
         assert private.slots[0, end:].tolist() == [expected[-1]] * (private.capacity - end)
         for local in range(width):
@@ -53,7 +53,7 @@ def test_ragged_queries_keep_full_row_and_use_device_exact_at_boundary(causal):
     offsets.zero_()
     exact.fill_(1)
     assert read.seq_lens.tolist() == [1151, 1408]
-    assert read.parts[1].query_indices.tolist() == [3, 4, 5, 6, 7]
+    assert read.parts[1][0].tolist() == [3, 4, 5, 6, 7]
     assert any(item is read for item in held)
 
 
@@ -81,10 +81,10 @@ def test_ragged_eagle_native_padding_preserves_frozen_anchor_and_full_continuati
     assert read.seq_lens.tolist() == [1155, 2177]
     assert read.num_query_tokens == 261
     assert isinstance(read, DenseDraftReadBatch)
-    assert (~read.parts[0].read.mask[0, 0]).sum(-1).tolist() == [1153, 1154, 1155, 1155]
-    assert read.parts[0].query_indices.tolist() == [0, 1, 2, 3]
-    assert read.parts[1].query_indices.tolist() == list(range(4, 261))
-    assert [part.read.capacity for part in read.parts] == [1152 + 32, 2208]
+    assert (~read.parts[0][1].mask[0, 0]).sum(-1).tolist() == [1153, 1154, 1155, 1155]
+    assert read.parts[0][0].tolist() == [0, 1, 2, 3]
+    assert read.parts[1][0].tolist() == list(range(4, 261))
+    assert [part.capacity for _, part in read.parts] == [1152 + 32, 2208]
 
 
 def test_uniform_full_read_rows_keep_original_query_layout():
@@ -105,5 +105,5 @@ def test_uniform_full_read_rows_keep_original_query_layout():
     assert read.capacity == 1312
     assert read.num_query_tokens == 16
     assert isinstance(read, DenseDraftReadBatch)
-    assert [part.query_indices.tolist() for part in read.parts] == [list(range(8)), list(range(8, 16))]
-    assert all(part.read.query_indices is None and part.read.output_indices is None for part in read.parts)
+    assert [indices.tolist() for indices, _ in read.parts] == [list(range(8)), list(range(8, 16))]
+    assert all(part.query_indices is None and part.output_indices is None for _, part in read.parts)

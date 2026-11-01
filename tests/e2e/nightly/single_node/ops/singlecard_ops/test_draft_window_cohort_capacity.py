@@ -53,7 +53,7 @@ def test_full_row_capacity_cohorts_have_independent_native_operands(decode_exact
     assert torch.equal(table.cpu(), table_cpu)
     assert not keys.count_nonzero().item()
     assert torch.equal(values.cpu(), values_cpu)
-    parts = (read,) if isinstance(read, DenseDraftRead) else tuple(part.read for part in read.parts)
+    parts = (read,) if isinstance(read, DenseDraftRead) else tuple(part for _, part in read.parts)
     private_buffers = {
         tensor.untyped_storage().data_ptr(): tensor.untyped_storage().nbytes()
         for part in parts

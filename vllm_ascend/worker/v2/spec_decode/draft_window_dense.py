@@ -70,13 +70,6 @@ class DenseDraftRead:
 
 
 @dataclass(frozen=True)
-class DenseDraftReadPart:
-    request_indices: tuple[int, ...]
-    query_indices: torch.Tensor
-    read: DenseDraftRead
-
-
-@dataclass(frozen=True)
 class DenseDraftReadBatch:
     """Private reads partitioned by phase, queries and Full allocation geometry.
 
@@ -86,7 +79,7 @@ class DenseDraftReadBatch:
     by device E, S, rejection, or any other value requiring a Host read.
     """
 
-    parts: tuple[DenseDraftReadPart, ...]
+    parts: tuple[tuple[torch.Tensor, DenseDraftRead], ...]
     seq_lens: torch.Tensor
     starts: torch.Tensor
     capacity: int
@@ -164,13 +157,13 @@ def _prepare_partitioned_reads(
         assert isinstance(read, DenseDraftRead)
         visible.index_copy_(0, selected, read.seq_lens)
         starts.index_copy_(0, selected, read.starts)
-        parts.append(DenseDraftReadPart(tuple(rows), queries, read))
+        parts.append((queries, read))
     result = DenseDraftReadBatch(
         tuple(parts),
         visible,
         starts,
-        max(part.read.capacity for part in parts),
-        sum(part.query_indices.numel() for part in parts),
+        max(read.capacity for _, read in parts),
+        sum(indices.numel() for indices, _ in parts),
         retain,
     )
     retain(result)
@@ -486,11 +479,11 @@ def dense_draft_attention(
     if isinstance(read, DenseDraftReadBatch):
         output = query.new_empty((read.num_query_tokens, *query.shape[-2:]))
         read.retain(output)
-        for part in read.parts:
-            queries = query.index_select(0, part.query_indices)
+        for indices, part in read.parts:
+            queries = query.index_select(0, indices)
             read.retain(queries)
-            value = dense_draft_attention(part.read, queries, key_cache, value_cache, scale)
-            output.index_copy_(0, part.query_indices, value)
+            value = dense_draft_attention(part, queries, key_cache, value_cache, scale)
+            output.index_copy_(0, indices, value)
         return output
     workspace_key = None
     if (

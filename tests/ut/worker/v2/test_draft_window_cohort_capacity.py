@@ -40,7 +40,7 @@ def test_different_full_row_bounds_do_not_multiply_largest_workspace(order):
     parts = (
         ((tuple(range(3)), read),)
         if isinstance(read, DenseDraftRead)
-        else tuple((part.request_indices, part.read) for part in read.parts)
+        else tuple((tuple((indices.reshape(-1, 8)[:, 0] // 8).tolist()), part) for indices, part in read.parts)
     )
     for indices, private in parts:
         for local, request in enumerate(indices):

@@ -46,7 +46,7 @@ class DraftWindowBackendTypes:
     dense_builder: type
     full_attention_spec: type
     uniform_spec: type[Any]
-    builder_families: tuple[tuple[type, str], ...]
+    context_parallel_builders: tuple[type, ...]
     storage_block_size: Callable[[Any], int]
     compression_ratio: Callable[[Any], int]
     mla_backend: type | None = None
@@ -55,7 +55,7 @@ class DraftWindowBackendTypes:
     sfa_backend: type | None = None
     sfa_builder: type | None = None
     indexer_backend: type | None = None
-    indexer_builder: type | None = None
+    indexer_builder: type[Any] | None = None
     indexer_spec: type | None = None
     dsa_backend: type | None = None
     dsa_builder: type | None = None
@@ -69,16 +69,12 @@ class DraftWindowBackendTypes:
         from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec, UniformTypeKVCacheSpecs
 
         from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionMetadataBuilder
-        from vllm_ascend.attention.context_parallel.dsa_cp import (
-            AscendDSACPMetadataBuilder,
-            AscendDSAPCPMetadataBuilder,
-        )
+        from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
         from vllm_ascend.attention.context_parallel.sfa_cp import (
             AscendSFADSACPMetadataBuilder,
             AscendSFADSADCPMetadataBuilder,
         )
         from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder, AscendDSASWABackend
-        from vllm_ascend.attention.dsa_v41 import AscendDSAV41MetadataBuilder
         from vllm_ascend.attention.indexer import AscendSFAIndexerBackend, AscendSFAIndexerMetadataBuilder
         from vllm_ascend.attention.mla_v1 import AscendMLABackend, AscendMLAMetadataBuilder
         from vllm_ascend.attention.sfa_v1 import AscendSFABackend, AscendSFAMetadataBuilder
@@ -95,18 +91,7 @@ class DraftWindowBackendTypes:
             AscendAttentionMetadataBuilder,
             FullAttentionSpec,
             UniformTypeKVCacheSpecs,
-            (
-                (AscendDSACPMetadataBuilder, "DSA_CP"),
-                (AscendDSAPCPMetadataBuilder, "DSA_PCP"),
-                (AscendSFADSADCPMetadataBuilder, "SFA_DSA_DCP"),
-                (AscendSFADSACPMetadataBuilder, "SFA_DSA_CP"),
-                (AscendDSAV41MetadataBuilder, "DSA_V41"),
-                (AscendDSAMetadataBuilder, "DSA"),
-                (AscendSFAIndexerMetadataBuilder, "SFA_INDEXER"),
-                (AscendSFAMetadataBuilder, "SFA"),
-                (AscendMLAMetadataBuilder, "MLA"),
-                (AscendAttentionMetadataBuilder, "GQA"),
-            ),
+            (AscendDSACPMetadataBuilder, AscendSFADSADCPMetadataBuilder, AscendSFADSACPMetadataBuilder),
             get_storage_block_size,
             get_kv_cache_compression_ratio,
             mla_backend=AscendMLABackend,
@@ -291,15 +276,18 @@ def inventory_draft_window_groups(
                 consumer_specs = specs
             builder = group.get_metadata_builder(0)
             backend = group.backend
-            family = next((name for kind, name in types.builder_families if isinstance(builder, kind)), "UNKNOWN")
             # The target can enable DSA-CP while the draft is dense GQA.
             # Selection of the actual builder, not the global flag, decides
             # whether this reader uses legacy DSA-CP coordinates.
             route_topology = replace(
                 topology,
                 dsa_cp_effective=(
-                    family in ("DSA_CP", "SFA_DSA_CP", "SFA_DSA_DCP")
-                    or (family == "SFA_INDEXER" and builder.use_dsa_cp)
+                    isinstance(builder, types.context_parallel_builders)
+                    or (
+                        types.indexer_builder is not None
+                        and isinstance(builder, types.indexer_builder)
+                        and builder.use_dsa_cp
+                    )
                 ),
             )
             windows = {getattr(item, "sliding_window", None) for item in consumer_specs}

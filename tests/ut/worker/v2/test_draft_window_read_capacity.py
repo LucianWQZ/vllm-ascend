@@ -27,7 +27,7 @@ def test_full_prompt_does_not_multiply_decode_scratch_by_full_capacity():
         query_start_loc_device=offsets.clone(),
         retain=lambda *objects: None,
     )
-    private_reads = [part.read for part in read.parts] if hasattr(read, "parts") else [read]
+    private_reads = [part for _, part in read.parts] if hasattr(read, "parts") else [read]
     # Bound actual private allocation geometry, rather than a nominal estimate.
     # The original implementation allocated n*32768 KV tokens and n*33*32768
     # mask elements for this mixed request, even though 15 rows only need W.

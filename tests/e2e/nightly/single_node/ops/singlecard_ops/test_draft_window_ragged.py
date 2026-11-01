@@ -81,10 +81,10 @@ def test_native_ragged_exact_read_with_full_continuation(dtype, dim, kv_heads, c
     for index, (row, start, end, width) in enumerate(zip(rows, starts, ends, widths)):
         expected_slots = [int(canonical[row, p // block]) * block + p % block for p in range(start, end)]
         assert isinstance(read, DenseDraftReadBatch)
-        part = next(part for part in read.parts if index in part.request_indices)
-        local_row = part.request_indices.index(index)
-        private = part.read
-        local_queries = part.query_indices.reshape(len(part.request_indices), width)[local_row].cpu().tolist()
+        indices, private = next((indices, part) for indices, part in read.parts if (indices == query_offset).any())
+        grouped_queries = indices.reshape(-1, width).cpu()
+        local_row = grouped_queries[:, 0].tolist().index(query_offset)
+        local_queries = grouped_queries[local_row].tolist()
         assert local_queries == list(range(query_offset, query_offset + width))
         actual_slots = private.slots[local_row].cpu().tolist()
         assert actual_slots[: end - start] == expected_slots

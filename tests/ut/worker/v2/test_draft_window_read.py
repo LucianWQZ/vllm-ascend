@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
 import ast
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -171,6 +172,20 @@ class TestCanonicalRead(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "inactive"):
             self.read()
 
+    def test_invalid_exact_upper_and_start_ordering_is_rejected(self):
+        for kwargs in ({"upper": (20, 15)}, {"starts": (24, 4)}, {"ends": (-1, 11)}):
+            with self.subTest(kwargs=kwargs), self.assertRaisesRegex(ValueError, "ordering"):
+                self.read(**kwargs)
+
+    def test_graph_read_view_preserves_its_bound_request_count(self):
+        view = replace(self.read(), starts_cpu=None, num_reqs=3)
+        common = SimpleNamespace(num_reqs=3)
+        view.apply(common)
+        self.assertIs(view.exact_cpu_for(common), view.seq_lens_cpu)
+        common.num_reqs = 2
+        with self.assertRaisesRegex(ValueError, "operands were replaced"):
+            view.exact_cpu_for(common)
+
     def test_continuing_full_row_and_window_row_share_batch(self):
         view = self.read(starts=(0, 4))
         self.assertEqual(view.seq_lens.tolist(), [21, 7, 0])
@@ -260,7 +275,7 @@ class TestCanonicalRead(unittest.TestCase):
                 self.assertNotEqual(selected.tolist(), view.seq_lens_cpu_upper_bound[:2].tolist())
 
     def test_replacing_a_window_read_operand_invalidates_its_cpu_certificate(self):
-        for field in ("seq_lens", "_seq_lens_cpu", "seq_lens_cpu", "block_table_tensor"):
+        for field in ("seq_lens", "_seq_lens_cpu", "seq_lens_cpu", "block_table_tensor", "seq_lens_cpu_upper_bound"):
             with self.subTest(field=field):
                 common = SimpleNamespace(num_reqs=2)
                 self.read().apply(common)

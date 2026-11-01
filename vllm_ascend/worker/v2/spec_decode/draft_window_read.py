@@ -72,8 +72,9 @@ class DraftReadView:
     seq_lens: torch.Tensor
     seq_lens_cpu: torch.Tensor
     seq_lens_cpu_upper_bound: torch.Tensor
-    starts_cpu: torch.Tensor
+    starts_cpu: torch.Tensor | None
     max_seq_len: int
+    num_reqs: int | None = None
 
     def apply(self, common_metadata: Any) -> None:
         """Apply only to a newly created draft common metadata object."""
@@ -88,10 +89,12 @@ class DraftReadView:
     def exact_cpu_for(self, common_metadata: Any) -> torch.Tensor:
         """Certify the snapshot only while all of its read operands are intact."""
         if (
-            common_metadata.seq_lens is not self.seq_lens
+            (self.num_reqs is not None and common_metadata.num_reqs != self.num_reqs)
+            or common_metadata.seq_lens is not self.seq_lens
             or common_metadata.seq_lens_cpu is not self.seq_lens_cpu
             or common_metadata._seq_lens_cpu is not self.seq_lens_cpu
             or common_metadata.block_table_tensor is not self.block_table
+            or common_metadata.seq_lens_cpu_upper_bound is not self.seq_lens_cpu_upper_bound
         ):
             raise ValueError("Draft Window read operands were replaced after projection")
         return self.seq_lens_cpu

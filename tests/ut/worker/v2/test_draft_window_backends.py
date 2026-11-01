@@ -66,7 +66,7 @@ def types():
         dense_builder=DenseBuilder,
         full_attention_spec=FullSpec,
         uniform_spec=UniformSpec,
-        builder_families=((CompressedBuilder, "DSA"), (DenseBuilder, "GQA")),
+        context_parallel_builders=(),
         storage_block_size=lambda spec: spec.block_size // spec.tokens_per_state,
         compression_ratio=lambda spec: spec.tokens_per_state,
     )
@@ -387,7 +387,7 @@ def test_native_swa_coverage_against_absolute_read_sets(types, topology, future)
 
 
 @pytest.mark.parametrize("ratio,span", [(4, 128), (128, 4096)])
-def test_compressed_geometry_records_raw_and_physical_units(types, topology, ratio, span):
+def test_compressed_layout_cannot_gain_a_direct_provider(types, topology, ratio, span):
     (route,) = inventory(
         types, topology, specs=[FullSpec(span * 2, ratio)], builders=[CompressedBuilder()], spans=[span]
     )
@@ -499,7 +499,7 @@ def test_target_dsa_cp_does_not_reclassify_dense_draft(types, topology):
 
 
 def test_actual_cp_builder_remains_missing_even_when_requested_flag_is_false(types, topology):
-    cp_types = replace(types, builder_families=((CompressedBuilder, "DSA_CP"),))
+    cp_types = replace(types, context_parallel_builders=(CompressedBuilder,))
     (route,) = inventory(cp_types, topology, builders=[CompressedBuilder()])
     assert route.topology.dsa_cp_effective is True
     assert route.status is DraftWindowProviderStatus.PROVIDER_MISSING
@@ -524,7 +524,7 @@ def test_plain_mla_provider_requires_actual_builder_and_spec(types, topology):
         mla_backend=DenseBackend,
         mla_builder=MLABuilder,
         mla_spec=MLASpec,
-        builder_families=((MLABuilder, "MLA"),),
+        context_parallel_builders=(),
     )
     (route,) = inventory(mla_types, topology, specs=[MLASpec()], builders=[MLABuilder()])
     assert route.status is DraftWindowProviderStatus.DIRECT_MLA
@@ -583,7 +583,7 @@ def sparse_types(types):
         indexer_backend=DenseBackend,
         indexer_builder=IndexerBuilder,
         indexer_spec=IndexerSpec,
-        builder_families=((SFABuilder, "SFA"), (IndexerBuilder, "SFA_INDEXER")),
+        context_parallel_builders=(),
     )
 
 
@@ -670,7 +670,7 @@ def dsa_types(types):
         dsa_builder=DSABuilder,
         dsa_cp_builder=DSACPBuilder,
         dsa_spec=DSASpec,
-        builder_families=((DSACPBuilder, "DSA_CP"), (DSABuilder, "DSA")),
+        context_parallel_builders=(DSACPBuilder,),
     )
 
 

@@ -56,10 +56,12 @@ class Log:
         self.warnings = []
 
     def info_once(self, *args, **kwargs):
-        self.info.append((args, kwargs))
+        if (args, kwargs) not in self.info:
+            self.info.append((args, kwargs))
 
     def warning_once(self, *args, **kwargs):
-        self.warnings.append((args, kwargs))
+        if (args, kwargs) not in self.warnings:
+            self.warnings.append((args, kwargs))
 
 
 class NativeAttentionTests(unittest.TestCase):
