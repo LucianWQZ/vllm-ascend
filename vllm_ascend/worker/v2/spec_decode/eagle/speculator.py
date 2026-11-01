@@ -17,15 +17,11 @@
 # This file is a part of the vllm-ascend project.
 #
 from vllm.config import VllmConfig, replace
-from vllm.v1.worker.gpu.spec_decode.eagle.speculator import EagleSpeculator
 
 from vllm_ascend.worker.v2.spec_decode.draft_window_eagle3_adapter import Eagle3GraphIntegrationMixin
-from vllm_ascend.worker.v2.spec_decode.target_dependent_ar.speculator import (
-    AscendTargetDependentARSpeculator,
-)
 
 
-class AscendEagleSpeculator(Eagle3GraphIntegrationMixin, AscendTargetDependentARSpeculator, EagleSpeculator):
+class AscendEagleSpeculator(Eagle3GraphIntegrationMixin):
     """Ascend Eagle speculator: the NPU loop from AscendTargetDependentARSpeculator
 
     layered on upstream EagleSpeculator (flat/GQA attention)."""

@@ -8,10 +8,26 @@ from typing import Any
 import numpy as np
 import pytest
 import torch
+from vllm.v1.worker.gpu.spec_decode.eagle.speculator import EagleSpeculator
 
 from vllm_ascend.worker.v2.spec_decode import draft_window_eager
 from vllm_ascend.worker.v2.spec_decode.draft_window_eager import AscendDraftAttentionReadInputs
+from vllm_ascend.worker.v2.spec_decode.draft_window_eagle3 import Eagle3DraftWindowMixin
 from vllm_ascend.worker.v2.spec_decode.draft_window_eagle3_adapter import Eagle3GraphIntegrationMixin
+from vllm_ascend.worker.v2.spec_decode.eagle.speculator import AscendEagleSpeculator
+from vllm_ascend.worker.v2.spec_decode.target_dependent_ar.speculator import AscendTargetDependentARSpeculator
+
+
+def test_eagle_integration_keeps_the_existing_execution_mro():
+    class PreviousBases(Eagle3DraftWindowMixin, AscendTargetDependentARSpeculator, EagleSpeculator):
+        pass
+
+    assert AscendEagleSpeculator.__mro__ == (
+        AscendEagleSpeculator,
+        Eagle3GraphIntegrationMixin,
+        *PreviousBases.__mro__[1:],
+    )
+    assert AscendEagleSpeculator.__init__ is AscendTargetDependentARSpeculator.__init__
 
 
 @pytest.fixture
@@ -73,19 +89,20 @@ def test_shared_assembler_preserves_uniform_full_capture_and_nonuniform_queries(
 
 
 @pytest.mark.parametrize("active,fail", [(False, False), (False, True), (True, False), (True, True)])
-def test_eager_forward_is_delegated_once_and_reader_retires_after_it(active, fail):
+def test_eager_forward_is_delegated_once_and_reader_retires_after_it(monkeypatch, active, fail):
     calls = []
     metadata = object()
     inputs = SimpleNamespace(identity=object())
 
-    class Base:
-        def _generate_draft(self, *args):
-            calls.append(("forward", args))
-            if fail:
-                raise ValueError("native forward failed")
-            return "result"
+    def forward(self, *args):
+        calls.append(("forward", args))
+        if fail:
+            raise ValueError("native forward failed")
+        return "result"
 
-    class Owner(Eagle3GraphIntegrationMixin, Base):
+    monkeypatch.setattr(AscendTargetDependentARSpeculator, "_generate_draft", forward)
+
+    class Owner(Eagle3GraphIntegrationMixin):
         def _eagle3_window_is_active(self):
             return active
 
@@ -93,7 +110,7 @@ def test_eager_forward_is_delegated_once_and_reader_retires_after_it(active, fai
             assert current is inputs
             calls.append(("retire", succeeded))
 
-    owner: Any = Owner()
+    owner: Any = object.__new__(Owner)
     owner._eagle3_window_live_inputs = inputs
     owner._draft_window_runtime_state = SimpleNamespace(read_metadata=lambda identity: metadata)
     args = (2, 4, metadata, object(), object())

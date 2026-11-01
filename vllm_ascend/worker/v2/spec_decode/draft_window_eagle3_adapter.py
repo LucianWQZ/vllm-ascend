@@ -15,6 +15,7 @@ from typing import Any
 import numpy as np
 import torch
 from vllm.config.compilation import CUDAGraphMode
+from vllm.v1.worker.gpu.spec_decode.eagle.speculator import EagleSpeculator
 
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.worker.v2.attn_utils import build_attn_metadata_factory
@@ -38,9 +39,10 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
     consume_draft_window_graph_metadata,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph_metadata import copy_draft_attention_metadata
+from vllm_ascend.worker.v2.spec_decode.target_dependent_ar.speculator import AscendTargetDependentARSpeculator
 
 
-class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin):
+class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentARSpeculator, EagleSpeculator):
     decode_cudagraph_manager: Any
 
     def _configure_draft_window(self, decision: DraftWindowPolicyDecision) -> None:
