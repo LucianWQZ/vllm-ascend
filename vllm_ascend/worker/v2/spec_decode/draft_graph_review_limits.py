@@ -109,7 +109,7 @@ def _consumer_profile(speculative):
         # Its target-feature projection is not the Qwen Full8 consumer.
         target = getattr(speculative, "target_model_config", None)
         target_hf = getattr(target, "hf_text_config", None)
-        if getattr(target_hf, "model_type", None) == "glm_moe_dsa":
+        if target is not None and target_hf is not None and getattr(target_hf, "model_type", None) == "glm_moe_dsa":
             dflash = getattr(hf, "dflash_config", None)
             aux = dflash.get("target_layer_ids", ()) if isinstance(dflash, dict) else ()
             layers = getattr(hf, "num_hidden_layers", None)
