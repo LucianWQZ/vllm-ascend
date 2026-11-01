@@ -6,91 +6,16 @@ V1 selection is checked without constructing a V1 engine. Device constructors
 are isolated; successful dispatch does not claim backend or runtime support.
 """
 
-import ast
 import importlib.util
 import sys
-from enum import Enum
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
-from unittest.mock import Mock
+from types import ModuleType
 
 import pytest
 
 
-@pytest.fixture
-def factory(monkeypatch):
-    spec_dir = Path(__file__).resolve().parents[4] / "vllm_ascend/worker/v2/spec_decode"
-    # Execute the actual Ascend model-boundary predicate, not a test replica.
-    utils_tree = ast.parse((spec_dir.parents[2] / "utils.py").read_text())
-    predicate = next(
-        node for node in utils_tree.body if isinstance(node, ast.FunctionDef) and node.name == "is_deepseek_v41"
-    )
-    utils = ModuleType("vllm_ascend.utils")
-    utils.__dict__["Any"] = object
-    exec(compile(ast.Module(body=[predicate], type_ignores=[]), "utils.py", "exec"), utils.__dict__)
-    monkeypatch.setitem(sys.modules, "vllm_ascend.utils", utils)
-    logging = ModuleType("vllm.logger")
-    logging.__dict__["logger"] = Mock()
-    monkeypatch.setitem(sys.modules, "vllm.logger", logging)
-    config = ModuleType("vllm.config")
-    CompilationMode = Enum("CompilationMode", ["NONE", "VLLM_COMPILE"])
-    config.__dict__["CompilationMode"] = CompilationMode
-    config.__dict__["VllmConfig"] = object
-    monkeypatch.setitem(sys.modules, "vllm.config", config)
-    ascend_config = ModuleType("vllm_ascend.ascend_config")
-    effective = SimpleNamespace(draft_window_size=None)
-    ascend_config.__dict__["get_ascend_config"] = lambda: effective
-    monkeypatch.setitem(sys.modules, "vllm_ascend.ascend_config", ascend_config)
-    name = "vllm_ascend.worker.v2.spec_decode.draft_window_policy"
-    spec = importlib.util.spec_from_file_location(name, spec_dir / "draft_window_policy.py")
-    assert spec is not None and spec.loader is not None
-    policy = importlib.util.module_from_spec(spec)
-    monkeypatch.setitem(sys.modules, name, policy)
-    spec.loader.exec_module(policy)
-    spec = importlib.util.spec_from_file_location("_draft_window_factory_under_test", spec_dir / "__init__.py")
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module, effective, CompilationMode
-
-
-def _config(method="dspark", *, eager=True, model_type="qwen3", draft_arch="Qwen3DSparkModel"):
-    target = SimpleNamespace(
-        model="target-weights", model_weights=None, revision="r1", hf_config=SimpleNamespace(model_type=model_type)
-    )
-    draft = SimpleNamespace(
-        model="independent-draft",
-        model_weights=None,
-        revision="r1",
-        hf_config=SimpleNamespace(model_type=model_type),
-        architectures=[draft_arch],
-    )
-    spec = SimpleNamespace(
-        method=method,
-        enforce_eager=eager,
-        draft_model_config=draft,
-        uses_dynamic_speculative_decoding=Mock(return_value=False),
-        use_dspark=lambda: method == "dspark",
-        use_dflash=lambda: method == "dflash",
-        use_eagle=lambda: method in {"eagle", "eagle3", "mtp"},
-        use_gemma4_mtp=lambda: False,
-        use_step3p5_mtp=lambda: False,
-        use_multi_module_mtp=lambda: False,
-    )
-    return SimpleNamespace(
-        model_config=target,
-        speculative_config=spec,
-        compilation_config=SimpleNamespace(mode="target-graph", cudagraph_mode="target-graph", context=object()),
-    )
-
-
-def _constructor(monkeypatch, route="dspark", class_name="AscendDSparkSpeculator"):
-    name = f"vllm_ascend.worker.v2.spec_decode.{route}.speculator"
-    module = ModuleType(name)
-    ctor = Mock(return_value=SimpleNamespace())
-    setattr(module, class_name, ctor)
-    monkeypatch.setitem(sys.modules, name, module)
-    return ctor
+from tests.ut.worker.v2.test_draft_window_factory import _config, _constructor
+from tests.ut.worker.v2.test_draft_window_factory import factory as factory
 
 
 @pytest.fixture

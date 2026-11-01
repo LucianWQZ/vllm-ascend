@@ -15,6 +15,10 @@ import pytest
 
 @pytest.fixture
 def factory(monkeypatch):
+    from vllm_ascend import envs
+
+    # The default entry contract must not depend on the test process runtime.
+    monkeypatch.setattr(envs, "VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH", False)
     spec_dir = Path(__file__).resolve().parents[4] / "vllm_ascend/worker/v2/spec_decode"
     # Execute the actual Ascend model-boundary predicate, not a test replica.
     utils_tree = ast.parse((spec_dir.parents[2] / "utils.py").read_text())
@@ -71,6 +75,7 @@ def _config(method="dspark", *, eager=True, model_type="qwen3", draft_arch="Qwen
         use_eagle=lambda: method in {"eagle", "eagle3", "mtp"},
         use_gemma4_mtp=lambda: False,
         use_step3p5_mtp=lambda: False,
+        use_multi_module_mtp=lambda: False,
     )
     return SimpleNamespace(
         model_config=target,
@@ -122,11 +127,11 @@ def test_on_attaches_policy_using_effective_config(factory, monkeypatch):
 
 
 @pytest.mark.parametrize("eager", [False, None])
-def test_on_requires_only_draft_eager(factory, monkeypatch, eager):
+def test_graph_window_requires_its_explicit_entry(factory, monkeypatch, eager):
     module, effective, _ = factory
     effective.draft_window_size = 1024
     ctor = _constructor(monkeypatch)
-    with pytest.raises(NotImplementedError, match="enforce_eager"):
+    with pytest.raises(NotImplementedError, match="explicit experimental Graph entry"):
         module.init_speculator(_config(eager=eager), "cpu")
     ctor.assert_not_called()
 
