@@ -10,6 +10,7 @@ from typing import Any
 
 import pytest
 
+from vllm_ascend.worker.v2.spec_decode.draft_window import _read_coordinate_semantics
 from vllm_ascend.worker.v2.spec_decode.draft_window_backends import (
     DraftWindowBackendTypes,
     DraftWindowGroupRoute,
@@ -169,65 +170,24 @@ def test_missing_native_window_is_a_missing_provider_not_an_implicit_full_reader
         require_draft_window_providers((route,))
 
 
-def _source_topology_fingerprint(groups, *, target_dsa_cp):
-    """Run the actual source-coordinate decision, without hardware imports."""
-    path = Path(__file__).resolve().parents[4] / "vllm_ascend/worker/v2/spec_decode/draft_window_eager_capability.py"
-    function = next(
-        n
-        for n in ast.parse(path.read_text()).body
-        if isinstance(n, ast.FunctionDef) and n.name == "_build_topology_fingerprint"
-    )
-    namespace = {"P7EagerTopologyFingerprint": lambda **values: SimpleNamespace(**values)}
-    module = ast.Module(
-        body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), function],
-        type_ignores=[],
-    )
-    exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
-    context = SimpleNamespace(
-        attention_backend_family=object(),
-        tensor_parallel_size=16,
-        tensor_parallel_rank=7,
-        data_parallel_size=1,
-        pipeline_parallel_size=1,
-        prefill_context_parallel_size=1,
-        decode_context_parallel_size=1,
-        sequence_parallel=True,
-        dsa_context_parallel=target_dsa_cp,
-        flashcomm=True,
-        graph_mode="FULL_DECODE_ONLY",
-        async_scheduling=True,
-        prefix_caching=True,
-    )
-    return namespace[function.name](
-        inventory=SimpleNamespace(groups=groups, method="dspark", runtime_route="dspark"),
-        runtime_context=context,
-        provider_version=1,
-        execution_lane=0,
-    )
-
-
 def test_target_dsa_cp_does_not_change_dense_draft_read_coordinates(types, topology):
     (route,) = inventory(types, replace(topology, dsa_cp_effective=True))
     assert route.topology.dsa_cp_effective is False  # Actual GQA builder, independent of Target flag.
-    result = _source_topology_fingerprint((route,), target_dsa_cp=True)
-    assert result.parallel_read_semantics == "replicated"
-    assert result.dsa_context_parallel is True  # Retain actual executor feature identity.
-    assert (result.tensor_parallel_size, result.tensor_parallel_rank) == (16, 7)
+    assert _read_coordinate_semantics((route,)) == "replicated"
 
 
 @pytest.mark.parametrize("dsa_cp,dcp,expected", [(True, 1, "dsa_cp_derived"), (False, 2, "dcp_interleaved")])
 def test_actual_consumer_cp_coordinates_are_not_erased(types, topology, dsa_cp, dcp, expected):
     (route,) = inventory(types, topology)
     route = replace(route, topology=replace(route.topology, dsa_cp_effective=dsa_cp, decode_context_parallel_size=dcp))
-    result = _source_topology_fingerprint((route,), target_dsa_cp=False)
-    assert result.parallel_read_semantics == expected
+    assert _read_coordinate_semantics((route,)) == expected
 
 
 def test_mixed_consumer_read_coordinate_contracts_are_not_silently_combined(types, topology):
     (route,) = inventory(types, topology)
     cp_route = replace(route, topology=replace(route.topology, dsa_cp_effective=True))
     with pytest.raises(NotImplementedError, match="one parallel read-coordinate contract"):
-        _source_topology_fingerprint((route, cp_route), target_dsa_cp=True)
+        _read_coordinate_semantics((route, cp_route))
 
 
 @pytest.mark.parametrize(

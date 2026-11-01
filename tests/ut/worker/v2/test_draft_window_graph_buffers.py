@@ -28,7 +28,6 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_backends import (
     DraftWindowProviderStatus,
     DraftWindowTopology,
 )
-from vllm_ascend.worker.v2.spec_decode.draft_window_eager_capability import _build_topology_fingerprint
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
     DraftWindowGraphBindingProvider,
     DraftWindowGraphRoute,
@@ -74,10 +73,9 @@ def graph_buffers():
     context = DraftWindowRuntimeContext(
         AttentionBackendFamily.STANDARD, "FULL", True, 1, 1, 1, 1, 1, False, False, False, False
     )
-    topology = _build_topology_fingerprint(
-        inventory=inventory, runtime_context=context, provider_version=1, execution_lane=0
+    runtime = build_draft_window_runtime_state(
+        DraftWindowSourceCapability(inventory, source, projection, runtime_context=context)
     )
-    runtime = build_draft_window_runtime_state(DraftWindowSourceCapability(inventory, source, projection, topology))
     provider = DraftWindowGraphBindingProvider(runtime_state=runtime)
     descriptor = BatchExecutionDescriptor(CUDAGraphMode.FULL, num_tokens=2, num_reqs=2, uniform_token_count=1)
     capture = provider.register_capture_identity(route=DraftWindowGraphRoute.DFLASH, descriptor=descriptor, num_reqs=2)
@@ -305,7 +303,6 @@ def test_eagle_serialized_steps_own_distinct_banks_and_preserve_previous_consume
             capability,
             inventory=inventory,
             provider=projection,
-            eager_topology_fingerprint=replace(capability.eager_topology_fingerprint, normalized_method="eagle3"),
         )
     )
     provider = DraftWindowGraphBindingProvider(runtime_state=runtime)
@@ -490,3 +487,10 @@ def test_parallel_capture_uses_exact_manager_descriptor_and_preserves_full_table
     assert torch.equal(read.window_block_table, full[:, :2])
     with pytest.raises(RuntimeError, match="does not resolve exactly one"):
         _build_capture_context(owner, buffers, {CUDAGraphMode.FULL: [replace(desc, max_query_len=1)]}, max_num_reqs=2)
+
+
+def test_materialization_rejects_actual_canonical_source_owner_replacement(graph_buffers):
+    case = graph_buffers
+    case.owner.input_block_tables[0] = case.owner.input_block_tables[0].clone()
+    with pytest.raises(RuntimeError, match="replaced after FullSource binding"):
+        _materialize(case)

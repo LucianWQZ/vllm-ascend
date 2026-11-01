@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Actual Graph metadata owner controls, with no framework or NPU imports.
+"""CPU Graph metadata and source-owner contracts; no NPU execution.
 
 These isolated CPU protocol tests establish exact-source/owner rejection;
 model, numerical, capture and lifetime evidence remains separate.
@@ -110,41 +110,90 @@ def test_window_off_without_graph_policy_does_not_construct_source(graph_source_
     assert not hasattr(c.owner, "_draft_window_runtime_state")
 
 
-@pytest.mark.parametrize("case", ["valid", "missing-source", "missing-runtime", "rank-drift", "invalid-world"])
-def test_graph_capture_requires_explicit_matching_source_topology(case):
+@pytest.fixture
+def source_contract():
+    from vllm_ascend.device.hardware_profile import AttentionBackendFamily
+    from vllm_ascend.worker.v2.spec_decode.draft_window import DraftWindowRuntimeContext
+
     path = SOURCE.with_name("draft_window_graph.py")
     provider = next(
         n
         for n in ast.parse(path.read_text()).body
         if isinstance(n, ast.ClassDef) and n.name == "DraftWindowGraphBindingProvider"
     )
-    method = next(n for n in provider.body if isinstance(n, ast.FunctionDef) and n.name == "_capture_topology")
+    methods = [
+        n
+        for n in provider.body
+        if isinstance(n, ast.FunctionDef) and n.name in ("_capture_topology", "_validate_source_contract")
+    ]
     namespace: dict[str, Any] = {}
-    exec(compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"), namespace)
-    source: SimpleNamespace | None = SimpleNamespace(
-        tensor_parallel_size=16, tensor_parallel_rank=7, parallel_read_semantics="replicated"
+    exec(compile(ast.Module(body=methods, type_ignores=[]), str(path), "exec"), namespace)
+    context = DraftWindowRuntimeContext(
+        AttentionBackendFamily.STANDARD,
+        "FULL",
+        True,
+        16,
+        1,
+        1,
+        1,
+        1,
+        True,
+        True,
+        True,
+        True,
+        tensor_parallel_rank=7,
     )
-    runtime: SimpleNamespace | None = SimpleNamespace(**vars(source))
-    if case == "missing-source":
-        source = None
-    elif case == "missing-runtime":
-        runtime = None
-    elif case == "rank-drift":
-        assert runtime is not None
-        runtime.tensor_parallel_rank = 8
-    elif case == "invalid-world":
-        assert source is not None
-        source.tensor_parallel_size = 0
+    capability = SimpleNamespace(runtime_context=context)
     owner = SimpleNamespace(
-        _runtime_state=SimpleNamespace(
-            capability=SimpleNamespace(eager_topology_fingerprint=source), topology_fingerprint=runtime
-        )
+        _runtime_state=SimpleNamespace(capability=capability), _capability=capability, _topology=context
     )
-    if case == "valid":
-        assert namespace[method.name](owner) == (16, 7, "replicated")
+    return owner, namespace
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        (None, None),
+        ("runtime_context", None),
+        ("tensor_parallel_size", 0),
+        ("tensor_parallel_size", True),
+        ("tensor_parallel_rank", None),
+        ("tensor_parallel_rank", True),
+        ("tensor_parallel_rank", -1),
+        ("tensor_parallel_rank", 16),
+    ],
+)
+def test_graph_capture_requires_real_explicit_world_and_rank(source_contract, field, value):
+    from dataclasses import replace
+
+    owner, methods = source_contract
+    if field == "runtime_context":
+        owner._capability.runtime_context = value
+    elif field is not None:
+        owner._capability.runtime_context = replace(owner._topology, **{field: value})
+    if field is None:
+        assert methods["_capture_topology"](owner) == (16, 7)
     else:
-        with pytest.raises(RuntimeError, match="source topology|world/rank|identity drift"):
-            namespace[method.name](owner)
+        with pytest.raises(RuntimeError, match="source topology|world/rank"):
+            methods["_capture_topology"](owner)
+
+
+@pytest.mark.parametrize("replacement", [None, "capability", "context", "rank-drift"])
+def test_graph_source_guard_keeps_actual_capability_and_context_identity(source_contract, replacement):
+    from dataclasses import replace
+
+    owner, methods = source_contract
+    if replacement == "capability":
+        owner._runtime_state.capability = SimpleNamespace(**vars(owner._capability))
+    elif replacement == "context":
+        owner._capability.runtime_context = replace(owner._topology)
+    elif replacement == "rank-drift":
+        owner._capability.runtime_context = replace(owner._topology, tensor_parallel_rank=8)
+    if replacement is None:
+        methods["_validate_source_contract"](owner)
+    else:
+        with pytest.raises(RuntimeError, match="capability changed|topology changed"):
+            methods["_validate_source_contract"](owner)
 
 
 class TensorProtocol:

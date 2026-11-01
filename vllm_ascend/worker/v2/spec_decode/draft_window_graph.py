@@ -27,6 +27,7 @@ from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftWindowGenerationIdentity,
     DraftWindowRuntimeState,
     DraftWindowWorkspace,
+    _read_coordinate_semantics,
 )
 
 
@@ -280,11 +281,11 @@ class DraftWindowGraphBindingProvider:
         self._capability = runtime_state.capability
         self.group = self._capability.inventory.require_single_group_direct_prefix()
         self.window_size = self._capability.inventory.window_size
-        self._topology = self._capability.eager_topology_fingerprint
+        self._topology = self._capability.runtime_context
         if self._topology is None:
             raise RuntimeError("Draft Graph provider requires the actual source topology")
         self._capture_topology()
-        if self._topology.parallel_read_semantics != "replicated" or any(
+        if _read_coordinate_semantics(self._capability.inventory.groups) != "replicated" or any(
             value != 1
             for value in (
                 self._topology.pipeline_parallel_size,
@@ -725,31 +726,21 @@ class DraftWindowGraphBindingProvider:
             if actual != expected:
                 raise RuntimeError(f"capture/runtime {diagnostic} mismatch")
 
-    def _capture_topology(self) -> tuple[int, int, str]:
-        topology = self._runtime_state.capability.eager_topology_fingerprint
+    def _capture_topology(self) -> tuple[int, int]:
+        topology = self._runtime_state.capability.runtime_context
         if topology is None:
             raise RuntimeError("Graph read banks require their actual source topology")
         world, rank = topology.tensor_parallel_size, topology.tensor_parallel_rank
         if type(world) is not int or world < 1 or type(rank) is not int or not 0 <= rank < world:
-            raise RuntimeError("Graph P2 TP world/rank must be explicit integers within range")
-        expected = world, rank, topology.parallel_read_semantics
-        runtime = self._runtime_state.topology_fingerprint
-        if (
-            runtime is None
-            or type(runtime.tensor_parallel_size) is not int
-            or type(runtime.tensor_parallel_rank) is not int
-            or expected != (runtime.tensor_parallel_size, runtime.tensor_parallel_rank, runtime.parallel_read_semantics)
-        ):
-            raise RuntimeError("Graph P2/runtime TP identity drift")
-        return expected
+            raise RuntimeError("Graph TP world/rank must be explicit integers within range")
+        return world, rank
 
     def _validate_source_contract(self) -> None:
-        """The fixed route/topology belongs to this provider, not every bucket."""
+        # Both are frozen construction facts, not per-proposal identities.
         if self._runtime_state.capability is not self._capability:
             raise RuntimeError("Draft Graph source capability changed after provider installation")
-        self._capture_topology()
-        if self._runtime_state.topology_fingerprint != self._topology:
-            raise RuntimeError("Draft Graph runtime features/topology changed after capture")
+        if self._capability.runtime_context is not self._topology:
+            raise RuntimeError("Draft Graph runtime topology changed after capture")
 
     def _validate_write_side_reference(
         self,

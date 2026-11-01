@@ -68,7 +68,7 @@ def build_eagle3_graph_source(owner: Any) -> tuple[Any, Any]:
         allow_parallel_prefix_graph_source=context.prefix_caching,
         allow_parallel_dp_graph_source=rank_local_dp,
     )
-    topology = capability.eager_topology_fingerprint
+    topology = capability.runtime_context
     if topology is None:
         raise RuntimeError("Eagle3 Graph has no installed-runtime topology identity")
     if context.prefix_caching:

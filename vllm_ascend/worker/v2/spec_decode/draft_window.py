@@ -43,9 +43,6 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_policy import (
 )
 
 if TYPE_CHECKING:
-    from vllm_ascend.worker.v2.spec_decode.draft_window_eager_capability import (
-        P7EagerTopologyFingerprint,
-    )
     from vllm_ascend.worker.v2.spec_decode.draft_window_swa_graph import NativeSWAGraphPlan
 
 
@@ -465,7 +462,7 @@ class DraftWindowSourceCapability:
     inventory: DraftWindowInventory
     full_source: FullDraftKVSource
     provider: SingleGroupDirectPrefixProvider
-    eager_topology_fingerprint: "P7EagerTopologyFingerprint | None" = None
+    runtime_context: DraftWindowRuntimeContext | None = None
     # P7-X mixed/prefix rows can require a full-resident row in the same
     # stable backing that carries narrow decode rows.  Existing P3 fixtures
     # omit this field and retain the original narrow capacity.
@@ -473,6 +470,21 @@ class DraftWindowSourceCapability:
     # Only a reviewed native-SWA/Full Graph route may retain its independent
     # native groups beside the single P3 extra-Window source.
     native_swa_graph: "NativeSWAGraphPlan | None" = None
+
+
+def _read_coordinate_semantics(groups: Sequence[DraftWindowGroupRoute]) -> str:
+    """Read coordinates belong to the actual Draft consumer, not Target flags."""
+    semantics = {
+        "dsa_cp_derived"
+        if group.topology.dsa_cp_effective
+        else "dcp_interleaved"
+        if group.topology.decode_context_parallel_size > 1
+        else "replicated"
+        for group in groups
+    }
+    if len(semantics) != 1:
+        raise NotImplementedError("Draft Graph source requires one parallel read-coordinate contract")
+    return semantics.pop()
 
 
 def _normalize_method(method: str) -> str:
@@ -947,14 +959,6 @@ def _build_draft_window_source_capability_for_context(
     if uses_dynamic_k:
         raise NotImplementedError("Draft Window Graph source requires static speculative decoding")
     group = inventory.require_single_group_direct_prefix()
-    from vllm_ascend.worker.v2.spec_decode.draft_window_eager_capability import _build_topology_fingerprint
-
-    eager_topology_fingerprint = _build_topology_fingerprint(
-        inventory=inventory,
-        runtime_context=runtime_context,
-        provider_version=DraftWindowRuntimeState.PROVIDER_VERSION,
-        execution_lane=0,
-    )
     full_source = build_full_draft_kv_source(
         inventory=inventory,
         block_tables=block_tables,
@@ -975,7 +979,7 @@ def _build_draft_window_source_capability_for_context(
         inventory=inventory,
         full_source=full_source,
         provider=provider,
-        eager_topology_fingerprint=eager_topology_fingerprint,
+        runtime_context=runtime_context,
         # Mixed/chunked rows may carry a canonical full-resident read beside
         # windowed decode rows. Reserve one stable full-width backing once;
         # active rows still copy only their descriptor columns.
@@ -1015,7 +1019,6 @@ class DraftWindowGenerationIdentity:
     execution_lane: int
     phase: DraftWindowExecutionPhase
     step: int
-    topology_fingerprint: "P7EagerTopologyFingerprint | None" = None
     row_phase_fingerprint: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
@@ -1423,16 +1426,12 @@ class DraftWindowRuntimeState:
         capability: DraftWindowSourceCapability,
         workspace: DraftWindowWorkspace | None = None,
         execution_lane: int = 0,
-        topology_fingerprint: "P7EagerTopologyFingerprint | None" = None,
     ) -> None:
         if execution_lane < 0:
             raise ValueError("execution lane must be nonnegative")
         self.capability = capability
         self._workspace = workspace
         self.execution_lane = execution_lane
-        self.topology_fingerprint = (
-            capability.eager_topology_fingerprint if topology_fingerprint is None else topology_fingerprint
-        )
         self._metadata: Any = None
         self._current_lease: DraftWindowLease | None = None
         self._active_inputs: DraftMetadataInputs | None = None
@@ -1534,7 +1533,6 @@ class DraftWindowRuntimeState:
             execution_lane=execution_lane,
             phase=phase,
             step=step,
-            topology_fingerprint=self.topology_fingerprint,
             row_phase_fingerprint=tuple(row_phase_fingerprint),
         )
         self._last_retired_identity = None
@@ -1574,7 +1572,6 @@ class DraftWindowRuntimeState:
         This models several Eagle3 forwards within one proposal without lying
         that the batch mapping changed between those forwards.
         """
-        self._validate_topology_fingerprint(previous_identity)
         self._reclaim_completed_reader()
         if self._active_inputs is not None:
             raise RuntimeError("cannot refresh a Draft Window while the previous reader is active")
@@ -1631,7 +1628,6 @@ class DraftWindowRuntimeState:
             execution_lane=execution_lane,
             phase=DraftWindowExecutionPhase.STEP,
             step=step,
-            topology_fingerprint=previous_identity.topology_fingerprint,
             row_phase_fingerprint=previous_identity.row_phase_fingerprint,
         )
         self._last_retired_identity = None
@@ -1659,7 +1655,6 @@ class DraftWindowRuntimeState:
         output_workspace: DraftWindowWorkspace | None = None,
     ) -> DraftMetadataInputs:
         """Acquire and populate the one serialized backing for an identity."""
-        self._validate_topology_fingerprint(identity)
         self._reclaim_completed_reader()
         if self._current_lease is not None:
             raise RuntimeError(f"draft-window execution lane {self.execution_lane} is still in use")
@@ -1869,22 +1864,13 @@ class DraftWindowRuntimeState:
     def _require_active_inputs(self, inputs: DraftMetadataInputs) -> None:
         if self._active_inputs is not inputs:
             raise RuntimeError("typed inputs are not the active runtime generation")
-        self._validate_topology_fingerprint(inputs.identity)
         inputs.validate_for(inputs.identity)
-
-    def _validate_topology_fingerprint(
-        self,
-        identity: DraftWindowGenerationIdentity,
-    ) -> None:
-        if identity.topology_fingerprint != self.topology_fingerprint:
-            raise RuntimeError("generation topology fingerprint does not match the runtime topology fingerprint")
 
 
 def build_draft_window_runtime_state(
     capability: DraftWindowSourceCapability,
     *,
     execution_lane: int = 0,
-    topology_fingerprint: "P7EagerTopologyFingerprint | None" = None,
 ) -> DraftWindowRuntimeState:
     """Allocate P3 state only after P2 has closed all capability gates."""
     group = capability.provider.source_group
@@ -1912,7 +1898,6 @@ def build_draft_window_runtime_state(
         capability=capability,
         workspace=None,
         execution_lane=execution_lane,
-        topology_fingerprint=topology_fingerprint,
     )
 
 

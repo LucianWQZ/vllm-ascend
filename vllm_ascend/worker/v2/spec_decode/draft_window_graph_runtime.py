@@ -174,7 +174,7 @@ def build_parallel_graph_source(
         allow_parallel_dp_graph_source=replicated_review and runtime_context.data_parallel_size == 2,
         dflash2_graph_contract=dflash2_graph_contract,
     )
-    topology = capability.eager_topology_fingerprint
+    topology = capability.runtime_context
     if topology is None:
         raise RuntimeError("Draft Graph source has no actual runtime topology")
     if runtime_context.prefix_caching:
