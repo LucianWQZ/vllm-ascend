@@ -49,17 +49,17 @@ def _batch(rows):
 
 
 @pytest.mark.parametrize(
-    "rows,phases,baseline,bypass",
+    "rows,full_rows,baseline,bypass",
     [
-        ([(0, 8, 2)], ("prefill_continuing",), (0,), True),
-        ([(6, 8, 2)], ("prefill_terminal",), (), False),
-        ([(0, 8, 2), (8, 8, 1)], ("prefill_continuing", "pure_decode"), (0,), False),
+        ([(0, 8, 2)], (True,), (0,), True),
+        ([(6, 8, 2)], (False,), (), False),
+        ([(0, 8, 2), (8, 8, 1)], (True, False), (0,), False),
         ([], (), (), False),
     ],
 )
-def test_bypass_requires_every_real_row_to_be_continuing(rows, phases, baseline, bypass):
+def test_bypass_requires_every_real_row_to_be_continuing(rows, full_rows, baseline, bypass):
     plan = classify_draft_window_batch_phase(_batch(rows))
-    assert plan.row_phase_fingerprint == phases
+    assert plan.full_read_rows == full_rows
     assert plan.baseline_only_rows == baseline
     assert plan.bypass_entire_batch is bypass
 

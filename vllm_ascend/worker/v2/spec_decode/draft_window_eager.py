@@ -124,8 +124,8 @@ class DraftWindowProposalContext:
             raise ValueError("proposal requires unique nonempty ordered request IDs")
         if len(self.idx_mapping_fingerprint) != len(requests):
             raise ValueError("proposal CPU mapping must match its ordered request count")
-        if self.phase_plan.ordered_request_fingerprint != requests:
-            raise ValueError("proposal row phases belong to another ordered request mapping")
+        if len(self.phase_plan.full_read_rows) != len(requests):
+            raise ValueError("proposal Full-read markers must match its ordered request count")
 
 
 class DraftWindowProposalEpochSource:

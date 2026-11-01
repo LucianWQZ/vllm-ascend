@@ -235,7 +235,6 @@ def test_real_proposal_rejects_unconsumed_or_misattributed_reader(proposal, dama
                 changes["proposal"] = replace(
                     context,
                     ordered_request_ids=("stale",),
-                    phase_plan=replace(context.phase_plan, ordered_request_fingerprint=("stale",)),
                 )
             elif damage == "cloned_proposal":
                 changes["proposal"] = replace(context)
