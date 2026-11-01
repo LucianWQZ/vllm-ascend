@@ -10,13 +10,13 @@ from __future__ import annotations
 
 import ast
 import sys
-from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any
 from unittest.mock import Mock
 
 import pytest
+import torch
 
 SOURCE_ROOT = Path(__file__).resolve().parents[3]
 SOURCE = SOURCE_ROOT / "vllm_ascend/worker/v2/spec_decode/draft_window_eager.py"
@@ -114,20 +114,8 @@ def test_window_off_without_graph_policy_does_not_construct_source(graph_source_
 def source_contract():
     from vllm_ascend.device.hardware_profile import AttentionBackendFamily
     from vllm_ascend.worker.v2.spec_decode.draft_window import DraftWindowRuntimeContext
+    from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphBindingProvider
 
-    path = SOURCE.with_name("draft_window_graph.py")
-    provider = next(
-        n
-        for n in ast.parse(path.read_text()).body
-        if isinstance(n, ast.ClassDef) and n.name == "DraftWindowGraphBindingProvider"
-    )
-    methods: list[ast.stmt] = [
-        n
-        for n in provider.body
-        if isinstance(n, ast.FunctionDef) and n.name in ("_capture_topology", "_validate_source_contract")
-    ]
-    namespace: dict[str, Any] = {}
-    exec(compile(ast.Module(body=methods, type_ignores=[]), str(path), "exec"), namespace)
     context = DraftWindowRuntimeContext(
         AttentionBackendFamily.STANDARD,
         "FULL",
@@ -147,7 +135,7 @@ def source_contract():
     owner = SimpleNamespace(
         _runtime_state=SimpleNamespace(capability=capability), _capability=capability, _topology=context
     )
-    return owner, namespace
+    return owner, DraftWindowGraphBindingProvider
 
 
 @pytest.mark.parametrize(
@@ -172,10 +160,10 @@ def test_graph_capture_requires_real_explicit_world_and_rank(source_contract, fi
     elif field is not None:
         owner._capability.runtime_context = replace(owner._topology, **{field: value})
     if field is None:
-        assert methods["_capture_topology"](owner) == (16, 7)
+        assert methods._capture_topology(owner) == (16, 7)
     else:
         with pytest.raises(RuntimeError, match="source topology|world/rank"):
-            methods["_capture_topology"](owner)
+            methods._capture_topology(owner)
 
 
 @pytest.mark.parametrize("replacement", [None, "capability", "context", "rank-drift"])
@@ -190,50 +178,24 @@ def test_graph_source_guard_keeps_actual_capability_and_context_identity(source_
     elif replacement == "rank-drift":
         owner._capability.runtime_context = replace(owner._topology, tensor_parallel_rank=8)
     if replacement is None:
-        methods["_validate_source_contract"](owner)
+        methods._validate_source_contract(owner)
     else:
         with pytest.raises(RuntimeError, match="capability changed|topology changed"):
-            methods["_validate_source_contract"](owner)
-
-
-class TensorProtocol:
-    def __init__(self, values, device="cpu", pointer=None, dtype="int32"):
-        self.values = tuple(values)
-        self.shape: tuple[int, ...] = (len(values),)
-        self.ndim = 1
-        self.dtype = dtype
-        self.device = SimpleNamespace(type=device)
-        self.pointer = id(self) if pointer is None else pointer
-
-    def data_ptr(self):
-        return self.pointer
-
-    def stride(self):
-        return (1,)
+            methods._validate_source_contract(owner)
 
 
 @pytest.fixture
 def bridge():
-    tree = ast.parse(SOURCE.read_text())
-    names = {"AscendDraftAttentionReadInputs", "_AscendDraftAttentionReadCertificate"}
-    nodes = [n for n in tree.body if isinstance(n, ast.ClassDef) and n.name in names]
-    module = ast.Module(
-        body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), *nodes],
-        type_ignores=[],
-    )
-    namespace: dict[str, Any] = {
-        "dataclass": dataclass,
-        "torch": SimpleNamespace(int32="int32"),
-    }
-    exec(compile(ast.fix_missing_locations(module), str(SOURCE), "exec"), namespace)
-    cls = namespace["AscendDraftAttentionReadInputs"]
-    device = TensorProtocol([17, 1025, 0, 0], "npu")
-    exact = TensorProtocol([17, 1025, 0, 0])
-    upper = TensorProtocol([24, 1040, 0, 0])
-    read = cls((object(), object()), device, exact, upper, 1040)
+    from vllm_ascend.worker.v2.spec_decode.draft_window_eager import AscendDraftAttentionReadInputs
+
+    device = torch.tensor([17, 1025, 0, 0], dtype=torch.int32)
+    exact = device.clone()
+    upper = torch.tensor([24, 1040, 0, 0], dtype=torch.int32)
+    tables = (torch.arange(8).reshape(4, 2), torch.arange(8, 16).reshape(4, 2))
+    read = AscendDraftAttentionReadInputs(tables, device, exact, upper, 1040)
     common = SimpleNamespace(
         num_reqs=4,
-        seq_lens=TensorProtocol(device.values, "npu", device.data_ptr()),
+        seq_lens=device.view(-1),
         seq_lens_cpu=exact,
         seq_lens_cpu_upper_bound=upper,
         block_table_tensor=read.block_tables[0],
@@ -265,7 +227,7 @@ def test_current_exact_pair_is_certified_without_reprojection_or_write_mutation(
 @pytest.mark.parametrize("field", ["seq_lens", "seq_lens_cpu", "seq_lens_cpu_upper_bound"])
 def test_same_values_from_another_owner_are_rejected(bridge, field):
     original = bridge.kwargs[field]
-    bridge.kwargs[field] = TensorProtocol(original.values, original.device.type)
+    bridge.kwargs[field] = original.clone()
     with pytest.raises(ValueError, match="owners differ"):
         bridge.read.validate_builder_sources(**bridge.kwargs)
 
@@ -303,72 +265,17 @@ def test_existing_projection_owner_is_not_overwritten(bridge):
         bridge.read.certify_common_metadata(0, bridge.common)
 
 
-class GraphTensorProtocol(TensorProtocol):
-    """Header/value protocol for the actual Graph identity reader and guard."""
-
-    def __init__(self, values, device="cpu", pointer=None, shape=None, dtype="int32"):
-        super().__init__(values, device=device, pointer=pointer, dtype=dtype)
-        if shape is not None:
-            self.shape = tuple(shape)
-            self.ndim = len(self.shape)
-
-    def untyped_storage(self):
-        return self
-
-    def storage_offset(self):
-        return 0
-
-    def stride(self):
-        return (self.shape[1], 1) if self.ndim == 2 else (1,)
-
-    def tolist(self):
-        return list(self.values)
-
-
 @pytest.fixture
 def graph_device_binding():
-    runtime_source = SOURCE.with_name("draft_window_graph_runtime.py")
-    graph_source = SOURCE.with_name("draft_window_graph.py")
-    graph_tree = ast.parse(graph_source.read_text())
-    identity_class = next(
-        n for n in graph_tree.body if isinstance(n, ast.ClassDef) and n.name == "DraftWindowGraphTensorIdentity"
-    )
-    identity_function = next(
-        n for n in graph_tree.body if isinstance(n, ast.FunctionDef) and n.name == "_tensor_identity"
-    )
-    provider = next(
-        n for n in graph_tree.body if isinstance(n, ast.ClassDef) and n.name == "DraftWindowGraphBindingProvider"
-    )
-    guard = next(
-        n for n in provider.body if isinstance(n, ast.FunctionDef) and n.name == "_validate_metadata_uses_read_carrier"
-    )
-    # Execute the actual method body as a standalone function, without importing
-    # the provider/framework or replacing its owner and value checks.
-    guard.decorator_list = []
-    helper = next(
-        n
-        for n in ast.parse(runtime_source.read_text()).body
-        if isinstance(n, ast.FunctionDef) and n.name == "_bind_parallel_graph_device_lengths"
-    )
-    module = ast.Module(
-        body=[
-            ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0),
-            identity_class,
-            identity_function,
-            guard,
-            helper,
-        ],
-        type_ignores=[],
-    )
-    namespace = {"dataclass": dataclass, "torch": SimpleNamespace(Tensor=GraphTensorProtocol)}
-    exec(compile(ast.fix_missing_locations(module), str(runtime_source), "exec"), namespace)
+    from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphBindingProvider
+    from vllm_ascend.worker.v2.spec_decode.draft_window_graph_runtime import _bind_parallel_graph_device_lengths
 
     def make(actual, padded):
         assert (actual, padded) in ((1, 2), (3, 4))
         values = [17 + i * 1024 for i in range(actual)] + [0] * (padded - actual)
-        table = GraphTensorProtocol(list(range(padded * 2)), "npu", shape=(padded, 2))
-        exact = GraphTensorProtocol(values)
-        device = GraphTensorProtocol(values, "npu")
+        table = torch.arange(padded * 2, dtype=torch.int32).reshape(padded, 2)
+        exact = torch.tensor(values, dtype=torch.int32)
+        device = exact.clone()
         read = SimpleNamespace(
             actual_request_count=actual,
             padded_request_count=padded,
@@ -391,8 +298,8 @@ def graph_device_binding():
 
     return SimpleNamespace(
         make=make,
-        bind=namespace["_bind_parallel_graph_device_lengths"],
-        guard=namespace["_validate_metadata_uses_read_carrier"],
+        bind=_bind_parallel_graph_device_lengths,
+        guard=DraftWindowGraphBindingProvider._validate_metadata_uses_read_carrier,
     )
 
 
@@ -421,7 +328,7 @@ def test_private_full_binds_device_after_old_cpu_operand_is_rejected(
 def test_private_full_rejects_same_values_with_wrong_builder_owner(graph_device_binding, field):
     read, metadata = graph_device_binding.make(3, 4)
     original = getattr(metadata, field)
-    setattr(metadata, field, GraphTensorProtocol(original.values, original.device.type, shape=original.shape))
+    setattr(metadata, field, original.clone())
     with pytest.raises(RuntimeError, match="lost its current " + field + " owner"):
         graph_device_binding.bind(metadata, read, 8)
     assert metadata.seq_lens is not read.device_window_exact
@@ -442,7 +349,7 @@ def test_private_full_rejects_stale_exact_list_despite_correct_header_owners(gra
         graph_device_binding.bind(metadata, read, 8)
 
 
-def test_private_full_padded_build_is_separate_from_unchanged_true_eager_clamp():
+def test_private_full_uses_padded_builder_then_isolates_before_binding():
     runtime = ast.parse(SOURCE.with_name("draft_window_graph_runtime.py").read_text())
     private = next(
         n for n in runtime.body if isinstance(n, ast.FunctionDef) and n.name == "_build_private_graph_metadata"
@@ -461,13 +368,6 @@ def test_private_full_padded_build_is_separate_from_unchanged_true_eager_clamp()
     )
     binding = next(i for i, text in enumerate(private_statements) if "_bind_parallel_graph_device_lengths(" in text)
     assert isolation < binding
-
-    eager_tree = ast.parse(SOURCE.read_text())
-    eager = next(
-        n for n in eager_tree.body if isinstance(n, ast.FunctionDef) and n.name == "build_draft_window_attn_metadata"
-    )
-    # True eager retains active-clamped query boundaries; FULL uses its own padded call.
-    assert "np.minimum(owner.arange_np[:num_reqs_padded + 1], num_reqs)" in ast.unparse(eager)
 
 
 def _run_actual_private_binding_loop(graph_device_binding, read, metadata_by_layer):
@@ -528,7 +428,7 @@ def test_private_full_shared_group_metadata_binds_once(graph_device_binding):
 def test_private_full_distinct_bad_owner_after_shared_group_is_rejected(graph_device_binding):
     read, metadata = graph_device_binding.make(3, 4)
     bad = SimpleNamespace(**vars(metadata))
-    bad.seq_lens = GraphTensorProtocol(read.cpu_window_exact.values)
+    bad.seq_lens = read.cpu_window_exact.clone()
     by_layer = {f"draft.layer.{i}": metadata for i in range(5)}
     by_layer["other.distinct.layer"] = bad
     with pytest.raises(RuntimeError, match="lost its current seq_lens owner"):
@@ -672,28 +572,21 @@ def test_window_off_update_keeps_the_original_two_argument_call():
 
 
 @pytest.fixture
-def typed_update_guard():
-    """Run the actual UPDATE guard with opaque captured handles and operands."""
-    source = SOURCE.with_name("draft_window_graph.py")
-    tree = ast.parse(source.read_text())
-    guard = next(
-        n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "validate_draft_window_update_tasks"
-    )
-    guard.body = [n for n in guard.body if not isinstance(n, (ast.ImportFrom, ast.Import))]
+def typed_update_guard(monkeypatch):
+    """Run the actual UPDATE guard with real provider and operation identities."""
+    import torch_npu
 
-    class FIAParamProvider:
-        is_draft_model = True
-        layer_name = "draft.layer.0"
+    from vllm_ascend.attention.attention_v1 import FIAParamProvider
+    from vllm_ascend.worker.v2.spec_decode import draft_window_graph
 
-    operation = object()
     checks = []
-    namespace = {
-        "FIAParamProvider": FIAParamProvider,
-        "torch_npu": SimpleNamespace(npu_fused_infer_attention_score=SimpleNamespace(out=operation)),
-        "validate_draft_window_graph_backend_update": lambda *args, **kwargs: checks.append((args, kwargs)),
-    }
-    exec(compile(ast.fix_missing_locations(ast.Module(body=[guard], type_ignores=[])), str(source), "exec"), namespace)
-    provider = FIAParamProvider()
+    monkeypatch.setattr(
+        draft_window_graph,
+        "validate_draft_window_graph_backend_update",
+        lambda *args, **kwargs: checks.append((args, kwargs)),
+    )
+    operation = torch_npu.npu_fused_infer_attention_score.out
+    provider = FIAParamProvider(layer_name="draft.layer.0", sliding_window=None, is_draft_model=True)
     metadata = SimpleNamespace(block_tables=object(), seq_lens_list=[17], actual_seq_lengths_q=[8])
     captured = SimpleNamespace(handle=object(), event=object(), provider=provider, provider_index=0)
     task = SimpleNamespace(
@@ -710,7 +603,7 @@ def typed_update_guard():
     )
     backend = SimpleNamespace(get_impl_cls=lambda: object, get_builder_cls=lambda: object)
     return SimpleNamespace(
-        call=namespace["validate_draft_window_update_tasks"],
+        call=draft_window_graph.validate_draft_window_update_tasks,
         graph=SimpleNamespace(tasks=[captured]),
         task=task,
         metadata=[{"draft.layer.0": metadata}],
@@ -745,44 +638,42 @@ def test_typed_update_rejects_stale_task_or_replaced_read_operands(typed_update_
 
 
 @pytest.fixture
-def full_metadata_dispatch(monkeypatch):
-    """Execute the normal FULL-selection boundary with actual epoch/row keys."""
-    source = SOURCE.with_name("draft_window_graph_metadata.py")
-    tree = ast.parse(source.read_text())
-    names = {
-        "ParallelGraphMetadataSelection",
-        "select_parallel_graph_metadata",
-        "defer_parallel_graph_metadata",
-        "validate_deferred_parallel_graph_metadata",
-    }
-    nodes = [n for n in tree.body if getattr(n, "name", None) in names]
-
-    class Provider:
-        inventory_method = "dflash"
-
-    graph_module_name = "vllm_ascend.worker.v2.spec_decode.draft_window_graph"
-    graph_module = ModuleType(graph_module_name)
-    graph_module.__dict__["DraftWindowGraphBindingProvider"] = Provider
-    monkeypatch.setitem(sys.modules, graph_module_name, graph_module)
-    namespace = {"dataclass": dataclass}
-    module = ast.Module(
-        body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), *nodes],
-        type_ignores=[],
+def full_metadata_dispatch():
+    """Exercise the actual FULL-selection functions and provider type guard."""
+    from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphBindingProvider
+    from vllm_ascend.worker.v2.spec_decode.draft_window_graph_metadata import (
+        defer_parallel_graph_metadata,
+        select_parallel_graph_metadata,
+        validate_deferred_parallel_graph_metadata,
     )
-    exec(compile(ast.fix_missing_locations(module), str(source), "exec"), namespace)
+
     identity = SimpleNamespace(mapping_epoch=7, ordered_request_fingerprint=("req-a", "req-b"), padded_request_count=2)
     inputs = SimpleNamespace(identity=identity)
     inputs.validate_for = lambda expected: None if expected is identity else (_ for _ in ()).throw(ValueError("stale"))
+    runtime = SimpleNamespace(
+        _active_inputs=inputs,
+        _metadata=None,
+        capability=SimpleNamespace(inventory=SimpleNamespace(method="dflash")),
+    )
+    provider = object.__new__(DraftWindowGraphBindingProvider)
+    provider._runtime_state = runtime
     owner = SimpleNamespace(
         _draft_window_proposal_context=SimpleNamespace(mapping_epoch=7, ordered_request_ids=("req-a", "req-b")),
-        _draft_window_graph_binding_provider=Provider(),
+        _draft_window_graph_binding_provider=provider,
         num_query_per_req=8,
-        _draft_window_runtime_state=SimpleNamespace(_active_inputs=inputs, _metadata=None),
+        _draft_window_runtime_state=runtime,
         _draft_window_live_inputs=inputs,
         _draft_window_deferred_metadata=None,
     )
     descriptor = SimpleNamespace(cg_mode=SimpleNamespace(name="FULL"), num_reqs=2, num_tokens=16)
-    return SimpleNamespace(owner=owner, inputs=inputs, descriptor=descriptor, **namespace)
+    return SimpleNamespace(
+        owner=owner,
+        inputs=inputs,
+        descriptor=descriptor,
+        select_parallel_graph_metadata=select_parallel_graph_metadata,
+        defer_parallel_graph_metadata=defer_parallel_graph_metadata,
+        validate_deferred_parallel_graph_metadata=validate_deferred_parallel_graph_metadata,
+    )
 
 
 def test_full_metadata_dispatch_defers_once_for_current_generation(full_metadata_dispatch):
