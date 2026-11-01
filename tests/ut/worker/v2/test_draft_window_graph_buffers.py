@@ -86,7 +86,7 @@ def graph_buffers():
     runtime = build_draft_window_runtime_state(projection)
     provider = DraftWindowGraphBindingProvider(runtime_state=runtime)
     descriptor = BatchExecutionDescriptor(CUDAGraphMode.FULL, num_tokens=2, num_reqs=2, uniform_token_count=1)
-    capture = provider.register_capture_identity(route=DraftWindowGraphRoute.DFLASH, descriptor=descriptor, num_reqs=2)
+    capture = provider.register_capture_identity(route=DraftWindowGraphRoute.DFLASH, descriptor=descriptor)
     return SimpleNamespace(
         runtime=runtime,
         provider=provider,
@@ -133,7 +133,7 @@ def _bank_tensors(bank):
 def _bind(case, inputs):
     actual = len(inputs.identity.proposal.ordered_request_ids)
     padded = inputs.identity.padded_request_count
-    query_width = case.capture.descriptor.num_tokens // case.capture.num_reqs
+    query_width = case.capture.descriptor.num_tokens // case.capture.descriptor.num_reqs
     tokens = actual * query_width
     query_lengths = tuple(row * query_width for row in range(1, actual + 1)) + (tokens,) * (padded - actual)
     reference = DraftWindowGraphWriteSideReference(
@@ -324,7 +324,6 @@ def test_eagle_serialized_steps_own_distinct_banks_and_preserve_previous_consume
         capture = provider.register_capture_identity(
             route=route,
             descriptor=descriptor,
-            num_reqs=padded,
             consumer_ordinal=max(step - 1, 0),
         )
         bank = provider.prepare_workspace(capture)
@@ -431,7 +430,6 @@ def test_unqualified_descriptor_variants_are_not_opened(graph_buffers, field, va
         graph_buffers.provider.register_capture_identity(
             route=DraftWindowGraphRoute.DFLASH,
             descriptor=replace(graph_buffers.capture.descriptor, **{field: value}),
-            num_reqs=2,
         )
 
 
@@ -440,7 +438,7 @@ def test_capture_token_cannot_be_forged_or_cross_provider(graph_buffers):
     with pytest.raises(RuntimeError, match="not registered"):
         case.provider.prepare_workspace(replace(case.capture))
     other = DraftWindowGraphBindingProvider(runtime_state=case.runtime)
-    foreign = other.register_capture_identity(route=case.capture.route, descriptor=case.capture.descriptor, num_reqs=2)
+    foreign = other.register_capture_identity(route=case.capture.route, descriptor=case.capture.descriptor)
     with pytest.raises(RuntimeError, match="not registered"):
         case.provider.prepare_workspace(foreign)
 
@@ -473,7 +471,7 @@ def test_startup_capture_exposes_the_real_bank_without_fake_generation(graph_buf
     carrier = case.provider._carriers[case.capture]
     bank = case.provider.startup_capture_workspace(case.capture)
     assert bank is carrier.workspace and bank.bound_identity is None
-    assert bank.max_num_reqs == case.capture.num_reqs
+    assert bank.max_num_reqs == case.capture.descriptor.num_reqs
     bank.max_num_reqs += 1
     with pytest.raises(RuntimeError, match="request geometry changed"):
         case.provider.startup_capture_workspace(case.capture)
@@ -492,9 +490,9 @@ def test_parallel_capture_uses_exact_manager_descriptor_and_preserves_full_table
         model_state=SimpleNamespace(attn_metadata=case.target_metadata),
     )
     desc = case.capture.descriptor
-    ctx = _build_capture_context(owner, buffers, {CUDAGraphMode.FULL: [desc]}, max_num_reqs=2)
+    ctx = _build_capture_context(owner, buffers, {CUDAGraphMode.FULL: [desc]})
     assert ctx is not None
-    identity, read = ctx.resolve(2, 2, False)
+    identity, read = ctx.resolve(2, 2)
     assert identity is case.capture
     full = case.source._input_block_tables[0]
     before = full.clone()
@@ -504,7 +502,37 @@ def test_parallel_capture_uses_exact_manager_descriptor_and_preserves_full_table
     assert torch.equal(full, before)
     assert torch.equal(read.window_block_table, full[:, :2])
     with pytest.raises(RuntimeError, match="does not resolve exactly one"):
-        _build_capture_context(owner, buffers, {CUDAGraphMode.FULL: [replace(desc, max_query_len=1)]}, max_num_reqs=2)
+        _build_capture_context(owner, buffers, {CUDAGraphMode.FULL: [replace(desc, max_query_len=1)]})
+
+
+def test_context_only_capture_preserves_upstream_preparation_without_a_read_bank(graph_buffers, monkeypatch):
+    from vllm_ascend.worker.v2.spec_decode.dflash import capture
+
+    case = graph_buffers
+    buffers = SimpleNamespace(_ascend_draft_window_capture_context=object())
+    arguments = (2, 2, buffers, object(), [], object(), 16, True, False)
+    expected = object()
+    received = []
+
+    def upstream(*args):
+        received.append(args)
+        return expected
+
+    monkeypatch.setattr(capture, "_ORIGINAL_PREPARE_DFLASH_INPUTS_TO_CAPTURE", upstream)
+    banks = tuple(case.provider._carriers)
+    assert capture.ascend_prepare_dflash_inputs_to_capture(*arguments) is expected
+    assert received == [arguments] and tuple(case.provider._carriers) == banks
+    assert case.runtime._active_inputs is None
+
+
+def test_piecewise_context_only_descriptor_does_not_register_an_attention_bank(graph_buffers):
+    case = graph_buffers
+    with pytest.raises(ValueError, match="FULL attention descriptor"):
+        case.provider.register_capture_identity(
+            route=case.capture.route,
+            descriptor=replace(case.capture.descriptor, cg_mode=CUDAGraphMode.PIECEWISE, num_reqs=None),
+        )
+    assert tuple(case.provider._carriers) == (case.capture,)
 
 
 def test_materialization_rejects_actual_canonical_source_owner_replacement(graph_buffers):
@@ -601,7 +629,9 @@ def typed_update_guard(graph_buffers):
     case = graph_buffers
     inputs = _materialize(case)
     carrier = _bind(case, inputs)
-    metadata = case.provider.consume_metadata(route=case.capture.route, expected_consumer_count=1)[0]["draft.layer"]
+    batch = case.provider.consume_metadata(route=case.capture.route, expected_consumer_count=1)
+    case.provider.assert_metadata_batch(route=case.capture.route, draft_attn_metadatas=batch)
+    metadata = batch[0]["draft.layer"]
     provider = FIAParamProvider(layer_name="draft.layer", sliding_window=None, is_draft_model=True)
     captured = SimpleNamespace(handle=object(), event=object(), provider=provider, provider_index=0)
     task = SimpleNamespace(
@@ -651,3 +681,17 @@ def test_source_rejects_plans_from_a_different_horizon_anchor_or_capacity(graph_
     plan = compute_draft_window_plan(full_exact_end=11, future_offset=0, window_size=4, block_span_tokens=4)
     with pytest.raises(ValueError, match="canonical method horizon, anchor and capacity"):
         graph_buffers.projection.describe(replace(plan, **{field: value}), valid_num_blocks=4)
+
+
+@pytest.mark.parametrize("field", ["slot_mapping", "query_start_loc", "block_tables", "seq_lens"])
+def test_pre_replay_rejects_replaced_canonical_writes_or_window_reads(graph_buffers, field):
+    case = graph_buffers
+    carrier = _bind(case, _materialize(case))
+    batch = case.provider.consume_metadata(route=case.capture.route, expected_consumer_count=1)
+    metadata = batch[0]["draft.layer"]
+    setattr(metadata, field, getattr(metadata, field).clone())
+    with pytest.raises(RuntimeError, match="preserve|carrier"):
+        case.provider.assert_metadata_batch(route=case.capture.route, draft_attn_metadatas=batch)
+    from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphCarrierState
+
+    assert carrier.state is DraftWindowGraphCarrierState.SUBMITTED

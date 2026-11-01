@@ -64,9 +64,6 @@ class DraftWindowGraphCaptureIdentity:
 
     route: DraftWindowGraphRoute
     descriptor: BatchExecutionDescriptor
-    # PIECEWISE descriptors omit request padding. Their owning manager resolves
-    # the count once; FULL descriptors must carry this same number directly.
-    num_reqs: int
     consumer_ordinal: int
 
 
@@ -88,41 +85,6 @@ class DraftWindowGraphWriteSideReference:
     num_actual_tokens: int
     causal: bool
 
-    def __post_init__(self) -> None:
-        for name, tensor in (
-            ("slot mapping", self.slot_mapping),
-            ("positions", self.positions),
-            ("query start", self.query_start_loc),
-        ):
-            if not isinstance(tensor, torch.Tensor):
-                raise TypeError(f"graph write-side {name} must be a Tensor")
-            if tensor.ndim != 1:
-                raise ValueError(f"graph write-side {name} must be one-dimensional")
-        if not isinstance(self.num_actual_tokens, int) or isinstance(self.num_actual_tokens, bool):
-            raise TypeError("graph write-side actual token count must be a Python int")
-        if self.num_actual_tokens < 0:
-            raise ValueError("graph write-side actual token count must be non-negative")
-        if self.slot_mapping.shape[0] != self.num_actual_tokens:
-            raise ValueError("graph write-side slot mapping must match the actual token count")
-        if self.positions.shape[0] < self.num_actual_tokens:
-            raise ValueError("graph write-side positions do not cover all actual tokens")
-        if any(
-            not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in self.actual_seq_lengths_q
-        ):
-            raise ValueError("graph write-side query lengths must be non-negative Python ints")
-        if not isinstance(self.causal, bool):
-            raise TypeError("graph write-side causal flag must be bool")
-
-
-@dataclass(frozen=True, slots=True)
-class _DraftWindowGraphWriteSideSnapshot:
-    """Clone-free mutation guard for full write/query owners."""
-
-    slot_mapping: DraftWindowGraphTensorIdentity
-    positions: DraftWindowGraphTensorIdentity
-    query_start_loc: DraftWindowGraphTensorIdentity
-    mutation_versions: tuple[int, int, int]
-
 
 @dataclass(slots=True)
 class DraftWindowGraphReadCarrier:
@@ -134,7 +96,6 @@ class DraftWindowGraphReadCarrier:
     runtime_identity: DraftWindowGenerationIdentity | None = None
     metadata: Mapping[str, Any] | None = None
     write_side_reference: DraftWindowGraphWriteSideReference | None = None
-    write_side_snapshot: _DraftWindowGraphWriteSideSnapshot | None = None
     state: DraftWindowGraphCarrierState = DraftWindowGraphCarrierState.EMPTY
 
 
@@ -178,21 +139,6 @@ def _tensor_identity(tensor: torch.Tensor) -> DraftWindowGraphTensorIdentity:
         stride=tuple(tensor.stride()),
         dtype=str(tensor.dtype),
         device=str(tensor.device),
-    )
-
-
-def _write_side_snapshot(
-    reference: DraftWindowGraphWriteSideReference,
-) -> _DraftWindowGraphWriteSideSnapshot:
-    return _DraftWindowGraphWriteSideSnapshot(
-        slot_mapping=_tensor_identity(reference.slot_mapping),
-        positions=_tensor_identity(reference.positions),
-        query_start_loc=_tensor_identity(reference.query_start_loc),
-        mutation_versions=(
-            int(reference.slot_mapping._version),
-            int(reference.positions._version),
-            int(reference.query_start_loc._version),
-        ),
     )
 
 
@@ -273,7 +219,7 @@ class DraftWindowGraphBindingProvider:
                 ),
                 key=lambda identity: (
                     identity.consumer_ordinal,
-                    (identity.num_reqs, identity.descriptor.num_tokens),
+                    (identity.descriptor.num_reqs, identity.descriptor.num_tokens),
                 ),
             )
         )
@@ -298,7 +244,6 @@ class DraftWindowGraphBindingProvider:
         *,
         route: DraftWindowGraphRoute,
         descriptor: BatchExecutionDescriptor,
-        num_reqs: int,
         consumer_ordinal: int = 0,
     ) -> DraftWindowGraphCaptureIdentity:
         """Bind the manager's exact frozen descriptor to one persistent bank."""
@@ -306,14 +251,13 @@ class DraftWindowGraphBindingProvider:
             raise ValueError("capture route does not match the actual Draft method")
         if type(descriptor) is not BatchExecutionDescriptor:
             raise TypeError("capture requires the actual BatchExecutionDescriptor")
-        if descriptor.cg_mode.name not in ("FULL", "PIECEWISE"):
-            raise ValueError("Draft Window capture requires FULL or context-only PIECEWISE")
+        if descriptor.cg_mode.name != "FULL":
+            raise ValueError("Draft Window read capture requires a FULL attention descriptor")
         if descriptor.num_active_loras or descriptor.num_ubatches != 1:
             raise NotImplementedError("Draft Window capture does not support LoRA or microbatch variants")
+        num_reqs = descriptor.num_reqs
         if type(num_reqs) is not int or num_reqs < 1 or type(consumer_ordinal) is not int or consumer_ordinal < 0:
             raise ValueError("capture request count and consumer ordinal must be valid integers")
-        if descriptor.num_reqs is not None and descriptor.num_reqs != num_reqs:
-            raise ValueError("capture request count differs from the actual descriptor")
         if type(descriptor.num_tokens) is not int or descriptor.num_tokens < 1 or descriptor.num_tokens % num_reqs:
             raise ValueError("capture token count must be positive and divisible by request count")
         query_width = descriptor.num_tokens // num_reqs
@@ -322,7 +266,7 @@ class DraftWindowGraphBindingProvider:
         if route is DraftWindowGraphRoute.EAGLE3_AR_STEP and query_width != 1:
             raise ValueError("Eagle3 AR capture requires query width 1")
         self._validate_source_contract()
-        identity = DraftWindowGraphCaptureIdentity(route, descriptor, num_reqs, consumer_ordinal)
+        identity = DraftWindowGraphCaptureIdentity(route, descriptor, consumer_ordinal)
         if identity in self._carriers:
             raise RuntimeError("capture consumer identity is already registered")
         source = self._capability.full_source
@@ -390,28 +334,22 @@ class DraftWindowGraphBindingProvider:
             raise RuntimeError("graph carrier inputs do not belong to the provider runtime")
         _validate_route(capture_identity.route, generation, self.method)
         self._validate_source_contract()
-        if generation.padded_request_count != capture_identity.num_reqs:
+        if generation.padded_request_count != capture_identity.descriptor.num_reqs:
             raise RuntimeError("capture/runtime padded request count mismatch")
         self._runtime_state.capability.full_source.validate_owner_bindings()
         if write_side_reference is None:
             raise RuntimeError("Draft Window graph carrier requires an explicit full write-side reference")
-        write_side_snapshot = self._validate_write_side_reference(
-            capture_identity,
-            write_side_reference,
-        )
 
         if inputs.workspace is not carrier.workspace:
             raise RuntimeError("Graph generation was not materialized into its exact capture bank")
         metadata = metadata_builder(carrier.workspace)
         if not isinstance(metadata, Mapping) or not metadata:
             raise RuntimeError("explicit Draft Window graph carrier produced no Draft metadata")
-        self._validate_metadata_uses_carrier(metadata, carrier.workspace, write_side_reference, write_side_snapshot)
         self._runtime_state.publish_metadata(inputs, metadata, target_metadata=target_metadata)
 
         carrier.runtime_identity = generation
         carrier.metadata = metadata
         carrier.write_side_reference = write_side_reference
-        carrier.write_side_snapshot = write_side_snapshot
         carrier.state = DraftWindowGraphCarrierState.BOUND
         self._submitted_carriers = ()
         return carrier
@@ -475,9 +413,16 @@ class DraftWindowGraphBindingProvider:
         expected_ids = tuple(id(carrier.metadata) for carrier in carriers)
         if actual_ids != expected_ids:
             raise RuntimeError("baseline or Target-derived metadata cannot replace the explicit graph read carrier")
+        self._validate_source_contract()
         for carrier in carriers:
             identity = carrier.capture_identity
-            if num_reqs is not None and identity.num_reqs != num_reqs:
+            self._require_registered_capture(identity)
+            reference, metadata = carrier.write_side_reference, carrier.metadata
+            if reference is None or metadata is None or not set(metadata).issubset(self.group.layers):
+                raise RuntimeError("Draft Graph replay lost its canonical Full inputs or actual layer group")
+            self._validate_write_side_reference(identity, reference)
+            self._validate_metadata_uses_carrier(metadata, carrier.workspace, reference)
+            if num_reqs is not None and identity.descriptor.num_reqs != num_reqs:
                 raise RuntimeError("graph replay capture bucket request count mismatch")
             if num_tokens is not None and identity.descriptor.num_tokens != num_tokens:
                 raise RuntimeError("graph replay capture bucket token count mismatch")
@@ -522,13 +467,6 @@ class DraftWindowGraphBindingProvider:
                 raise RuntimeError("Draft Window UPDATE operands are not the submitted metadata operands")
         for carrier in carriers:
             self._require_registered_capture(carrier.capture_identity)
-            if carrier.metadata is None or not set(carrier.metadata).issubset(self.group.layers):
-                raise RuntimeError("Draft graph metadata layer group does not match backend inventory")
-            if carrier.write_side_reference is None or carrier.write_side_snapshot is None:
-                raise RuntimeError("Draft graph carrier lost its full write-side reference")
-            self._validate_metadata_uses_carrier(
-                carrier.metadata, carrier.workspace, carrier.write_side_reference, carrier.write_side_snapshot
-            )
         for carrier in carriers:
             carrier.state = DraftWindowGraphCarrierState.UPDATED
 
@@ -550,7 +488,7 @@ class DraftWindowGraphBindingProvider:
         carrier = self._carriers.get(capture_identity)
         if carrier is None or carrier.capture_identity is not capture_identity:
             raise RuntimeError("capture identity/bucket is not registered by this Draft provider")
-        if carrier.workspace.max_num_reqs != capture_identity.num_reqs:
+        if carrier.workspace.max_num_reqs != capture_identity.descriptor.num_reqs:
             raise RuntimeError("Graph capture bank request geometry changed")
         if _bank_snapshot(carrier.workspace) != carrier.backing_snapshot:
             raise RuntimeError("Graph capture bank address or tensor geometry changed")
@@ -578,19 +516,28 @@ class DraftWindowGraphBindingProvider:
         self,
         capture_identity: DraftWindowGraphCaptureIdentity,
         reference: DraftWindowGraphWriteSideReference,
-    ) -> _DraftWindowGraphWriteSideSnapshot:
+    ) -> None:
         if not isinstance(reference, DraftWindowGraphWriteSideReference):
-            raise TypeError("graph carrier requires a DraftWindowGraphWriteSideReference")
-        if len(reference.actual_seq_lengths_q) != capture_identity.num_reqs:
+            raise TypeError("graph carrier requires its canonical Full write inputs")
+        tensors = (reference.slot_mapping, reference.positions, reference.query_start_loc)
+        tokens = reference.num_actual_tokens
+        if (
+            any(not isinstance(value, torch.Tensor) or value.ndim != 1 for value in tensors)
+            or type(tokens) is not int
+            or not 0 <= tokens <= capture_identity.descriptor.num_tokens
+            or reference.slot_mapping.shape[0] != tokens
+            or reference.positions.shape[0] < tokens
+            or type(reference.causal) is not bool
+        ):
+            raise RuntimeError("canonical Full write inputs do not cover this capture token shape")
+        if len(reference.actual_seq_lengths_q) != capture_identity.descriptor.num_reqs:
             raise RuntimeError("full query layout does not match the capture request bucket")
-        if reference.query_start_loc.shape[0] != capture_identity.num_reqs + 1:
+        if reference.query_start_loc.shape[0] != capture_identity.descriptor.num_reqs + 1:
             raise RuntimeError("full query-start carrier does not match the capture request bucket")
         if tuple(sorted(reference.actual_seq_lengths_q)) != reference.actual_seq_lengths_q:
             raise RuntimeError("full query layout must be monotonically non-decreasing")
         if reference.actual_seq_lengths_q and reference.actual_seq_lengths_q[-1] != reference.num_actual_tokens:
             raise RuntimeError("full query layout does not end at the actual token count")
-        if reference.num_actual_tokens > capture_identity.descriptor.num_tokens:
-            raise RuntimeError("full write-side token count exceeds the capture token bucket")
 
         full_source = self._runtime_state.capability.full_source
         slot_mappings = getattr(full_source._block_tables_owner, "slot_mappings", None)
@@ -608,24 +555,6 @@ class DraftWindowGraphBindingProvider:
             or reference.slot_mapping.shape[0] > canonical_row.shape[0]
         ):
             raise RuntimeError("graph write-side reference must use the canonical full slot mapping")
-        return _write_side_snapshot(reference)
-
-    @staticmethod
-    def _validate_write_side_unchanged(
-        reference: DraftWindowGraphWriteSideReference,
-        expected: _DraftWindowGraphWriteSideSnapshot,
-    ) -> None:
-        actual = _write_side_snapshot(reference)
-        fields = (
-            ("slot mapping", expected.slot_mapping, actual.slot_mapping),
-            ("positions", expected.positions, actual.positions),
-            ("query layout", expected.query_start_loc, actual.query_start_loc),
-        )
-        for diagnostic, expected_identity, actual_identity in fields:
-            if actual_identity != expected_identity:
-                raise RuntimeError(f"full {diagnostic} owner changed during graph metadata build")
-        if actual.mutation_versions != expected.mutation_versions:
-            raise RuntimeError("full write/query state changed during graph metadata build")
 
     @classmethod
     def _validate_metadata_uses_carrier(
@@ -633,14 +562,9 @@ class DraftWindowGraphBindingProvider:
         metadata: Mapping[str, Any],
         workspace: DraftWindowWorkspace,
         write_side_reference: DraftWindowGraphWriteSideReference,
-        write_side_snapshot: _DraftWindowGraphWriteSideSnapshot,
     ) -> None:
         identity = _tensor_identity
         cls._validate_metadata_uses_read_carrier(metadata, workspace, _identity=identity)
-        cls._validate_write_side_unchanged(
-            write_side_reference,
-            write_side_snapshot,
-        )
         expected_slot = identity(write_side_reference.slot_mapping)
         expected_query = identity(write_side_reference.query_start_loc)
         expected_positions = identity(write_side_reference.positions)

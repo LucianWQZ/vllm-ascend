@@ -364,7 +364,7 @@ def _run_actual_private_binding_loop(graph_device_binding, read, metadata_by_lay
         metadata=metadata_by_layer,
         workspace=read,
         capture_identity=SimpleNamespace(
-            descriptor=SimpleNamespace(num_tokens=read.max_num_reqs * 8), num_reqs=read.max_num_reqs
+            descriptor=SimpleNamespace(num_tokens=read.max_num_reqs * 8, num_reqs=read.max_num_reqs)
         ),
         _bind_parallel_graph_device_lengths=strict_bind,
     )

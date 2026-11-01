@@ -121,7 +121,6 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
             self.speculator,
             input_buffers,
             getattr(self, "_capture_descs", {}),
-            max_num_reqs=getattr(self, "max_num_reqs", 0),
         ) as capture_context:
             validate_draft_window_graph_capture(self.speculator, capture_context=capture_context)
             # Keep core544's preparation callback and canonical context slots;

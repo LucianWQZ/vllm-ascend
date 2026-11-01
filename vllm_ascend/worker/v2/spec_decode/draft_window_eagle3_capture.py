@@ -76,21 +76,23 @@ class Eagle3GraphSession:
                 for desc in descriptors:
                     if desc.cg_mode.name != "FULL":
                         raise NotImplementedError("Eagle3 Window capture requires an actual FULL descriptor")
-                    n = desc.num_reqs or min(desc.num_tokens, manager.max_num_reqs)
+                    n = desc.num_reqs
+                    if n is None:
+                        raise RuntimeError("Eagle3 FULL descriptor has no request count")
                     if desc.num_tokens != n * q:
                         raise RuntimeError("Eagle3 startup descriptor does not match its method-specific query width")
                     for ordinal in range(1 if first else owner.num_speculative_steps - 1):
                         key = route, desc, ordinal
                         if any(
                             identity.route is route
-                            and identity.num_reqs == n
+                            and identity.descriptor.num_reqs == n
                             and identity.descriptor.num_tokens == desc.num_tokens
                             and identity.consumer_ordinal == ordinal
                             for identity in self._captures.values()
                         ):
                             raise RuntimeError("ambiguous Eagle3 capture bank (including unsupported LoRA variants)")
                         self._captures[key] = self.provider.register_capture_identity(
-                            route=route, descriptor=desc, num_reqs=n, consumer_ordinal=ordinal
+                            route=route, descriptor=desc, consumer_ordinal=ordinal
                         )
                         # Seed dummy contents before any GLOBAL capture.
                         # Synchronous H2D is forbidden inside the callback.
@@ -124,7 +126,7 @@ class Eagle3GraphSession:
             identity
             for identity in self._captures.values()
             if identity.route is route
-            and identity.num_reqs == n
+            and identity.descriptor.num_reqs == n
             and identity.descriptor.num_tokens == tokens
             and identity.consumer_ordinal == ordinal
         )
@@ -187,7 +189,7 @@ class Eagle3GraphSession:
 
     def write_reference(self, identity: DraftWindowGraphCaptureIdentity, target: Mapping[str, Any]):
         desc = identity.descriptor
-        n, tokens = identity.num_reqs, desc.num_tokens
+        n, tokens = identity.descriptor.num_reqs, desc.num_tokens
         query_width = tokens // n
         state = next(v for v in target.values() if v is not None).attn_state
         if identity.route is DraftWindowGraphRoute.EAGLE3_AR_STEP:

@@ -59,22 +59,19 @@ class DraftWindowDFlashCaptureContext:
         if provider is not self.provider:
             raise RuntimeError("capture context belongs to another graph provider")
 
-    def resolve(
-        self, num_reqs: int, num_tokens: int, skip_attn: bool
-    ) -> tuple[DraftWindowGraphCaptureIdentity, DraftWindowWorkspace]:
+    def resolve(self, num_reqs: int, num_tokens: int) -> tuple[DraftWindowGraphCaptureIdentity, DraftWindowWorkspace]:
         self.validate_for_provider(self.provider)
-        mode = CUDAGraphMode.PIECEWISE if skip_attn else CUDAGraphMode.FULL
         matches = tuple(
             identity
             for identity in self.provider.registered_capture_identities(route=self.route)
-            if identity.num_reqs == num_reqs
+            if identity.descriptor.num_reqs == num_reqs
             and identity.descriptor.num_tokens == num_tokens
-            and identity.descriptor.cg_mode is mode
+            and identity.descriptor.cg_mode is CUDAGraphMode.FULL
         )
         if len(matches) != 1:
             raise RuntimeError(
                 "Draft Window capture bucket does not resolve exactly one persistent "
-                f"carrier: requests={num_reqs} tokens={num_tokens} mode={mode} matches={len(matches)}"
+                f"carrier: requests={num_reqs} tokens={num_tokens} mode=FULL matches={len(matches)}"
             )
         identity = matches[0]
         return identity, self.provider.startup_capture_workspace(identity)
@@ -84,8 +81,6 @@ def _build_capture_context(
     owner: Any,
     input_buffers: InputBuffers,
     capture_descs: Mapping[CUDAGraphMode, Sequence[BatchExecutionDescriptor]],
-    *,
-    max_num_reqs: int,
 ) -> DraftWindowDFlashCaptureContext | None:
     provider = getattr(owner, "_draft_window_graph_binding_provider", None)
     if provider is None:
@@ -99,7 +94,12 @@ def _build_capture_context(
     route = resolve_parallel_draft_window_graph_route(owner)
     if route is None:
         raise RuntimeError("Draft Window graph provider has no parallel capture route")
-    descriptors = tuple(descriptor for entries in capture_descs.values() for descriptor in entries)
+    descriptors = tuple(
+        descriptor
+        for entries in capture_descs.values()
+        for descriptor in entries
+        if descriptor.cg_mode is CUDAGraphMode.FULL
+    )
     identities = provider.registered_capture_identities(route=route)
     if not descriptors or len(descriptors) != len(identities):
         raise RuntimeError("Draft Window capture descriptor/carrier cardinality mismatch")
@@ -107,9 +107,9 @@ def _build_capture_context(
     # they select exactly one of the provider's real, fully qualified keys.
     keys = set()
     for descriptor in descriptors:
-        num_reqs = descriptor.num_reqs or min(descriptor.num_tokens, max_num_reqs)
+        num_reqs = descriptor.num_reqs
         matches = [
-            identity for identity in identities if identity.descriptor == descriptor and identity.num_reqs == num_reqs
+            identity for identity in identities if identity.descriptor == descriptor
         ]
         if len(matches) != 1:
             raise RuntimeError("Draft Window capture descriptor does not resolve exactly one registered carrier")
@@ -125,8 +125,6 @@ def draft_window_dflash_capture_scope(
     owner: Any,
     input_buffers: InputBuffers,
     capture_descs: Mapping[CUDAGraphMode, Sequence[BatchExecutionDescriptor]],
-    *,
-    max_num_reqs: int,
 ) -> Iterator[DraftWindowDFlashCaptureContext | None]:
     """Attach a capture context to one Draft-private input owner and clean it."""
     if hasattr(input_buffers, _CAPTURE_CONTEXT_ATTRIBUTE):
@@ -135,7 +133,6 @@ def draft_window_dflash_capture_scope(
         owner,
         input_buffers,
         capture_descs,
-        max_num_reqs=max_num_reqs,
     )
     if context is None:
         yield None
@@ -164,9 +161,9 @@ def _seed_capture_workspace(
     destination = workspace.window_block_table
     if source.ndim != 2 or destination.ndim != 2:
         raise RuntimeError("Draft Window capture tables must be two-dimensional")
-    if source.shape[0] != identity.num_reqs:
+    if source.shape[0] != identity.descriptor.num_reqs:
         raise RuntimeError("Draft Window capture full table row count is inconsistent")
-    if destination.shape[0] != identity.num_reqs:
+    if destination.shape[0] != identity.descriptor.num_reqs:
         raise RuntimeError("Draft Window capture backing row count is inconsistent")
 
     capture_upper = min(
@@ -199,7 +196,7 @@ def ascend_prepare_dflash_inputs_to_capture(
 ) -> AttentionState:
     """Preserve upstream OFF behavior or inject the explicit capture carrier."""
     context = getattr(input_buffers, _CAPTURE_CONTEXT_ATTRIBUTE, None)
-    if context is None:
+    if context is None or skip_attn:
         return _ORIGINAL_PREPARE_DFLASH_INPUTS_TO_CAPTURE(
             num_reqs,
             num_tokens,
@@ -215,7 +212,7 @@ def ascend_prepare_dflash_inputs_to_capture(
         raise TypeError("invalid Draft Window capture context on Draft input buffers")
     if context.input_buffers is not input_buffers:
         raise RuntimeError("Draft Window capture context owner mismatch")
-    identity, workspace = context.resolve(num_reqs, num_tokens, skip_attn)
+    identity, workspace = context.resolve(num_reqs, num_tokens)
 
     input_batch = InputBatch.make_dummy(num_reqs, num_tokens, input_buffers)
     input_block_tables = block_tables.get_dummy_block_tables(num_reqs)
@@ -224,9 +221,6 @@ def ascend_prepare_dflash_inputs_to_capture(
         slot_mappings,
         kv_cache_config,
     )
-    if skip_attn:
-        return AttentionState(None, slot_mappings_by_layer)
-
     max_seq_len = _seed_capture_workspace(
         identity, workspace, input_block_tables, max_model_len=max_model_len, provider=context.provider
     )

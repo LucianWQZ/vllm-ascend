@@ -135,11 +135,8 @@ def install_parallel_graph(owner: Any) -> DraftWindowGraphSession:
         raise RuntimeError("Draft Window Graph requires initialized P3 runtime state")
     manager = getattr(owner, "query_cudagraph_manager", None)
     capture_descs = getattr(manager, "_capture_descs", None)
-    max_num_reqs = getattr(manager, "max_num_reqs", None)
     if not isinstance(capture_descs, Mapping) or not capture_descs:
         raise RuntimeError("Draft Window Graph requires real manager capture descriptors")
-    if not isinstance(max_num_reqs, int) or max_num_reqs <= 0:
-        raise RuntimeError("Draft Window Graph manager has no valid request capacity")
 
     provider = install_draft_window_graph_binding_provider(owner)
     route = resolve_parallel_draft_window_graph_route(owner)
@@ -150,13 +147,18 @@ def install_parallel_graph(owner: Any) -> DraftWindowGraphSession:
         provider=provider,
         route=route,
     )
-    descriptors = tuple(descriptor for mode_descriptors in capture_descs.values() for descriptor in mode_descriptors)
+    descriptors = tuple(
+        descriptor
+        for mode_descriptors in capture_descs.values()
+        for descriptor in mode_descriptors
+        if descriptor.cg_mode is CUDAGraphMode.FULL
+    )
     if not descriptors:
         raise RuntimeError("Draft Window Graph manager has no capture descriptors")
     descriptor_keys = tuple(
         (
             descriptor.cg_mode.name,
-            _descriptor_request_count(descriptor, max_num_reqs=max_num_reqs),
+            descriptor.num_reqs,
             descriptor.num_tokens,
         )
         for descriptor in descriptors
@@ -170,7 +172,6 @@ def install_parallel_graph(owner: Any) -> DraftWindowGraphSession:
         provider.register_capture_identity(
             route=route,
             descriptor=descriptor,
-            num_reqs=_descriptor_request_count(descriptor, max_num_reqs=max_num_reqs),
         )
     owner._draft_window_graph_session = session
     return session
@@ -196,7 +197,7 @@ def prepare_parallel_graph(
     if proposal_context is not inputs.identity.proposal:
         raise RuntimeError("Draft Window Graph proposal identity is stale")
     capture_identity = session.resolve_capture_identity(descriptor)
-    if inputs.identity.padded_request_count != capture_identity.num_reqs:
+    if inputs.identity.padded_request_count != capture_identity.descriptor.num_reqs:
         raise RuntimeError("Draft Window Graph generation does not match the capture request bucket")
     target_metadata = owner.model_state.attn_metadata
     if not isinstance(target_metadata, Mapping) or not target_metadata:
@@ -311,7 +312,9 @@ def _build_private_graph_metadata(
         layer_metadata = metadata.get(layer_name)
         if layer_metadata is not None and id(layer_metadata) not in bound_metadata_ids:
             _bind_parallel_graph_device_lengths(
-                layer_metadata, workspace, (capture_identity.descriptor.num_tokens // capture_identity.num_reqs)
+                layer_metadata,
+                workspace,
+                (capture_identity.descriptor.num_tokens // capture_identity.descriptor.num_reqs),
             )
             bound_metadata_ids.add(id(layer_metadata))
     for layer_metadata in metadata.values():
@@ -334,8 +337,8 @@ def _build_write_side_reference(
 ) -> DraftWindowGraphWriteSideReference:
     gid = owner._draft_window_graph_binding_provider.group.gid
     token_count = capture_identity.descriptor.num_tokens
-    request_count = capture_identity.num_reqs
-    query_width = capture_identity.descriptor.num_tokens // capture_identity.num_reqs
+    request_count = capture_identity.descriptor.num_reqs
+    query_width = capture_identity.descriptor.num_tokens // capture_identity.descriptor.num_reqs
     target_layer = next((value for value in target_metadata.values() if value is not None), None)
     if target_layer is None:
         raise RuntimeError("Draft Window Graph Target metadata contains no layer state")
@@ -351,11 +354,3 @@ def _build_write_side_reference(
         num_actual_tokens=token_count,
         causal=bool(causal),
     )
-
-
-def _descriptor_request_count(
-    descriptor: BatchExecutionDescriptor,
-    *,
-    max_num_reqs: int,
-) -> int:
-    return descriptor.num_reqs or min(descriptor.num_tokens, max_num_reqs)
