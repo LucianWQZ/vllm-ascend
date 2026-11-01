@@ -118,15 +118,6 @@ def _group_diagnostic_context(
 
 
 @dataclass(frozen=True, slots=True)
-class DraftWindowSourceIdentity:
-    """Stable canonical owner identity, independent of request generations."""
-
-    block_tables_owner_id: int
-    input_block_table_ptrs: tuple[int, ...]
-    persistent_num_blocks_ptr: int
-
-
-@dataclass(frozen=True, slots=True)
 class FullDraftKVSource:
     """Borrowed, read-only references to canonical full BlockTables state.
 
@@ -136,7 +127,6 @@ class FullDraftKVSource:
 
     logical_block_sizes: tuple[int, ...]
     kernel_block_sizes: tuple[int, ...]
-    source_identity: DraftWindowSourceIdentity
     _block_tables_owner: Any = field(repr=False, compare=False)
     _input_block_tables: tuple[torch.Tensor, ...] = field(
         repr=False,
@@ -729,13 +719,6 @@ def build_full_draft_kv_source(
     return FullDraftKVSource(
         logical_block_sizes=logical_block_sizes,
         kernel_block_sizes=kernel_block_sizes,
-        source_identity=DraftWindowSourceIdentity(
-            block_tables_owner_id=id(block_tables),
-            input_block_table_ptrs=tuple(table.data_ptr() for table in input_block_tables),
-            # UvaBackedTensor rotates its accelerator view. The CPU source of
-            # truth is the stable owner; its pointer belongs in source identity.
-            persistent_num_blocks_ptr=persistent_num_blocks_cpu.data_ptr(),
-        ),
         _block_tables_owner=block_tables,
         _input_block_tables=input_block_tables,
         _persistent_num_blocks_cpu=persistent_num_blocks_cpu,
@@ -994,27 +977,22 @@ class DraftWindowExecutionPhase(Enum):
     STEP = "step"
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, eq=False)
 class DraftWindowGenerationIdentity:
     """Immutable freshness identity for one materialized Draft read state.
 
     ``mapping_epoch`` belongs to the caller.  Pointer and Python-object
     identity are allocation guards only; neither substitutes for the epoch
-    or ordered stable request IDs.
+    or ordered stable request IDs. Equal fields from another runtime do not
+    identify this generation; its owner retains the actual immutable handle.
     """
 
     mapping_epoch: int
     ordered_request_fingerprint: tuple[str, ...]
     actual_request_count: int
     padded_request_count: int
-    normalized_method: str
-    global_group_id: int
     read_descriptor_fingerprint: tuple[DraftWindowReadDescriptor, ...]
-    provider_id: int
-    provider_version: int
-    source_identity: DraftWindowSourceIdentity
     idx_mapping_ptr: int
-    execution_lane: int
     phase: DraftWindowExecutionPhase
     step: int
     row_phase_fingerprint: tuple[str, ...] = ()
@@ -1023,27 +1001,17 @@ class DraftWindowGenerationIdentity:
         _require_nonnegative_python_int(self.mapping_epoch, "mapping epoch")
         _require_nonnegative_python_int(self.actual_request_count, "actual request count")
         _require_nonnegative_python_int(self.padded_request_count, "padded request count")
-        _require_nonnegative_python_int(self.global_group_id, "global group id")
-        _require_nonnegative_python_int(self.execution_lane, "execution lane")
         _require_nonnegative_python_int(self.step, "step")
-        if self.provider_id <= 0:
-            raise ValueError("provider id must be greater than 0")
-        if self.provider_version <= 0:
-            raise ValueError("provider version must be greater than 0")
         if self.actual_request_count != len(self.ordered_request_fingerprint):
             raise ValueError("actual request count must match the ordered request fingerprint")
         if self.padded_request_count < self.actual_request_count:
             raise ValueError("padded request count must be at least the actual request count")
         if len(self.read_descriptor_fingerprint) != self.actual_request_count:
             raise ValueError("read descriptor fingerprint must match the actual request count")
-        if any(descriptor.global_group_id != self.global_group_id for descriptor in self.read_descriptor_fingerprint):
-            raise ValueError("read descriptor fingerprint must use the generation global gid")
         if any(not isinstance(request_id, str) or not request_id for request_id in self.ordered_request_fingerprint):
             raise ValueError("request fingerprint must contain non-empty stable request IDs")
         if len(set(self.ordered_request_fingerprint)) != len(self.ordered_request_fingerprint):
             raise ValueError("request fingerprint must contain unique stable request IDs")
-        if not self.normalized_method or self.normalized_method != _normalize_method(self.normalized_method):
-            raise ValueError("normalized method must be a non-empty canonical method name")
         if not isinstance(self.phase, DraftWindowExecutionPhase):
             raise TypeError("phase must be a DraftWindowExecutionPhase")
         if self.row_phase_fingerprint and len(self.row_phase_fingerprint) != self.actual_request_count:
@@ -1095,6 +1063,7 @@ class DraftWindowWorkspace:
         *,
         identity: DraftWindowGenerationIdentity,
         full_source: FullDraftKVSource,
+        global_group_id: int,
         read_descriptors: Sequence[DraftWindowReadDescriptor],
         cpu_window_exact: torch.Tensor,
         cpu_window_upper: torch.Tensor,
@@ -1157,10 +1126,8 @@ class DraftWindowWorkspace:
             raise ValueError("CPU Window upper must be greater than or equal to exact")
 
         full_source.validate_owner_bindings()
-        full_source._validate_global_group_id(identity.global_group_id)
-        if full_source.source_identity != identity.source_identity:
-            raise RuntimeError("materialization source identity does not match generation identity")
-        source_table = full_source._input_block_tables[identity.global_group_id]
+        full_source._validate_global_group_id(global_group_id)
+        source_table = full_source._input_block_tables[global_group_id]
         if source_table.device != self.window_block_table.device:
             raise ValueError("canonical source table and Window workspace must share a device")
         if source_table.dtype != self.window_block_table.dtype:
@@ -1173,8 +1140,8 @@ class DraftWindowWorkspace:
                 self.valid_num_blocks[:actual].copy_(cpu_valid_num_blocks[:actual])
             active_columns: list[int] = []
             for row, descriptor in enumerate(read_descriptors):
-                if descriptor.global_group_id != identity.global_group_id:
-                    raise ValueError("read descriptor global gid does not match generation identity")
+                if descriptor.global_group_id != global_group_id:
+                    raise ValueError("read descriptor global gid does not match the runtime source")
                 if (
                     descriptor.source_start_column < 0
                     or descriptor.required_columns < 0
@@ -1288,20 +1255,15 @@ class DraftMetadataInputs:
 class DraftWindowRuntimeState:
     """The single speculator-owned P3 lifecycle and retirement owner."""
 
-    PROVIDER_VERSION = 1
-
     def __init__(
         self,
         *,
         capability: DraftWindowSourceCapability,
         workspace: DraftWindowWorkspace | None = None,
-        execution_lane: int = 0,
     ) -> None:
-        if execution_lane < 0:
-            raise ValueError("execution lane must be nonnegative")
         self.capability = capability
         self._workspace = workspace
-        self.execution_lane = execution_lane
+        self._source = capability.full_source
         self._metadata: Any = None
         self._current_workspace: DraftWindowWorkspace | None = None
         self._quarantine_on_failure = False
@@ -1359,7 +1321,6 @@ class DraftWindowRuntimeState:
         num_reqs_padded: int,
         phase: DraftWindowExecutionPhase,
         step: int,
-        execution_lane: int,
         row_phase_fingerprint: Sequence[str] = (),
         quarantine_on_failure: bool = False,
         output_workspace: DraftWindowWorkspace | None = None,
@@ -1393,14 +1354,8 @@ class DraftWindowRuntimeState:
             ordered_request_fingerprint=request_fingerprint,
             actual_request_count=actual_request_count,
             padded_request_count=num_reqs_padded,
-            normalized_method=self.capability.inventory.method,
-            global_group_id=self.capability.provider.global_group_id,
             read_descriptor_fingerprint=descriptor_fingerprint,
-            provider_id=id(self.capability.provider),
-            provider_version=self.PROVIDER_VERSION,
-            source_identity=bound_source.source_identity,
             idx_mapping_ptr=idx_mapping.data_ptr(),
-            execution_lane=execution_lane,
             phase=phase,
             step=step,
             row_phase_fingerprint=tuple(row_phase_fingerprint),
@@ -1429,7 +1384,6 @@ class DraftWindowRuntimeState:
         cpu_valid_num_blocks: torch.Tensor,
         num_reqs_padded: int,
         step: int,
-        execution_lane: int,
         quarantine_on_failure: bool = False,
         output_workspace: DraftWindowWorkspace | None = None,
     ) -> DraftMetadataInputs:
@@ -1448,7 +1402,7 @@ class DraftWindowRuntimeState:
             raise RuntimeError("serialized step does not continue the most recently retired generation")
         if previous_identity.mapping_epoch != self._last_mapping_epoch:
             raise RuntimeError("serialized step mapping epoch is not the active proposal epoch")
-        if previous_identity.normalized_method != "eagle3":
+        if self.capability.inventory.method != "eagle3":
             raise RuntimeError("serialized per-step continuation is supported only for Eagle3")
         if previous_identity.phase not in (
             DraftWindowExecutionPhase.PROPOSAL,
@@ -1471,30 +1425,19 @@ class DraftWindowRuntimeState:
             raise ValueError("serialized step padding must be an integer covering active requests")
         if num_reqs_padded > (self.workspace if output_workspace is None else output_workspace).max_num_reqs:
             raise RuntimeError("serialized step padded request capacity exceeded")
-        if execution_lane != previous_identity.execution_lane:
-            raise RuntimeError("serialized step execution lane changed within one proposal")
 
         descriptor_fingerprint = tuple(read_descriptors)
         _validate_idx_mapping(idx_mapping)
         bound_source = self.capability.full_source
-        if (
-            bound_source.source_identity != previous_identity.source_identity
-            or idx_mapping.data_ptr() != previous_identity.idx_mapping_ptr
-        ):
+        if bound_source is not self._source or idx_mapping.data_ptr() != previous_identity.idx_mapping_ptr:
             raise RuntimeError("serialized step FullSource or request mapping changed within one proposal")
         identity = DraftWindowGenerationIdentity(
             mapping_epoch=previous_identity.mapping_epoch,
             ordered_request_fingerprint=request_fingerprint,
             actual_request_count=len(request_fingerprint),
             padded_request_count=num_reqs_padded,
-            normalized_method=previous_identity.normalized_method,
-            global_group_id=previous_identity.global_group_id,
             read_descriptor_fingerprint=descriptor_fingerprint,
-            provider_id=previous_identity.provider_id,
-            provider_version=previous_identity.provider_version,
-            source_identity=bound_source.source_identity,
             idx_mapping_ptr=idx_mapping.data_ptr(),
-            execution_lane=execution_lane,
             phase=DraftWindowExecutionPhase.STEP,
             step=step,
             row_phase_fingerprint=previous_identity.row_phase_fingerprint,
@@ -1525,9 +1468,9 @@ class DraftWindowRuntimeState:
     ) -> DraftMetadataInputs:
         """Acquire and populate the one serialized backing for an identity."""
         if self._current_workspace is not None:
-            raise RuntimeError(f"draft-window execution lane {self.execution_lane} is still in use")
-        if identity.execution_lane != self.execution_lane:
-            raise RuntimeError("draft-window generation lane does not match its owner")
+            raise RuntimeError("draft-window runtime still owns an active read bank")
+        if bound_source is not self._source:
+            raise RuntimeError("draft-window canonical source changed after runtime initialization")
         workspace = self.workspace if output_workspace is None else output_workspace
         self._current_workspace = workspace
         self._quarantine_on_failure = quarantine_on_failure
@@ -1536,6 +1479,7 @@ class DraftWindowRuntimeState:
             workspace.materialize(
                 identity=identity,
                 full_source=bound_source,
+                global_group_id=self.capability.provider.global_group_id,
                 read_descriptors=read_descriptors,
                 cpu_window_exact=cpu_window_exact,
                 cpu_window_upper=cpu_window_upper,
@@ -1636,8 +1580,6 @@ class DraftWindowRuntimeState:
 
 def build_draft_window_runtime_state(
     capability: DraftWindowSourceCapability,
-    *,
-    execution_lane: int = 0,
 ) -> DraftWindowRuntimeState:
     """Allocate P3 state only after P2 has closed all capability gates."""
     group = capability.provider.source_group
@@ -1664,7 +1606,6 @@ def build_draft_window_runtime_state(
     return DraftWindowRuntimeState(
         capability=capability,
         workspace=None,
-        execution_lane=execution_lane,
     )
 
 

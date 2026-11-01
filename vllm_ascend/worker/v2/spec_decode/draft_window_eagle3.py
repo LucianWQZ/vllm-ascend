@@ -312,7 +312,6 @@ class Eagle3DraftWindowMixin:
             num_reqs_padded=num_reqs_padded,
             phase=DraftWindowExecutionPhase.PROPOSAL,
             step=0,
-            execution_lane=0,
             row_phase_fingerprint=step_plan.row_phase_fingerprint,
             quarantine_on_failure=hasattr(self, "_eagle3_graph_session"),
             output_workspace=output_workspace,
@@ -438,7 +437,6 @@ class Eagle3DraftWindowMixin:
             cpu_valid_num_blocks=step_plan.cpu_valid_num_blocks,
             num_reqs_padded=num_reqs_padded,
             step=step,
-            execution_lane=0,
             quarantine_on_failure=hasattr(self, "_eagle3_graph_session"),
             output_workspace=output_workspace,
         )
@@ -463,7 +461,7 @@ class Eagle3DraftWindowMixin:
         inputs.validate_for(expected_identity)
         workspace = inputs.workspace
         padded = expected_identity.padded_request_count
-        gid = expected_identity.global_group_id
+        gid = inputs._owner.capability.provider.global_group_id
         block_tables = tuple(
             workspace.window_block_table[:padded] if group_id == gid else full_table[:padded]
             for group_id, full_table in enumerate(self.block_tables.input_block_tables)

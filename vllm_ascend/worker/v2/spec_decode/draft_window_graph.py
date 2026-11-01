@@ -239,12 +239,13 @@ def _class_path(value: type[Any] | Any) -> str:
 def _validate_route(
     route: DraftWindowGraphRoute,
     generation: DraftWindowGenerationIdentity,
+    method: str,
 ) -> None:
     if not isinstance(route, DraftWindowGraphRoute):
         raise TypeError("graph route must be a DraftWindowGraphRoute")
-    method, phase, zero_step = _ROUTE_CONTRACTS[route]
-    if generation.normalized_method != method:
-        raise ValueError(f"graph route method mismatch: route={route.value} method={generation.normalized_method}")
+    expected_method, phase, zero_step = _ROUTE_CONTRACTS[route]
+    if method != expected_method:
+        raise ValueError(f"graph route method mismatch: route={route.value} method={method}")
     if generation.phase is not phase:
         raise ValueError(f"graph route phase mismatch: route={route.value} phase={generation.phase.value}")
     if zero_step and generation.step != 0:
@@ -446,8 +447,10 @@ class DraftWindowGraphBindingProvider:
         inputs.validate_for(generation)
         if inputs._owner is not self._runtime_state:
             raise RuntimeError("graph carrier inputs do not belong to the provider runtime")
-        _validate_route(capture_identity.route, generation)
-        self._validate_runtime_capture_compatibility(capture_identity, generation)
+        _validate_route(capture_identity.route, generation, self.inventory_method)
+        self._validate_source_contract()
+        if generation.padded_request_count != capture_identity.num_reqs:
+            raise RuntimeError("capture/runtime padded request count mismatch")
         self._runtime_state.capability.full_source.validate_owner_bindings()
         if write_side_reference is None:
             raise RuntimeError("Draft Window graph carrier requires an explicit full write-side reference")
@@ -519,8 +522,6 @@ class DraftWindowGraphBindingProvider:
                 raise RuntimeError("graph read carriers have different mapping_epoch values")
             if identity.ordered_request_fingerprint != first.ordered_request_fingerprint:
                 raise RuntimeError("graph read carriers have different request fingerprints")
-            if identity.global_group_id != first.global_group_id:
-                raise RuntimeError("graph read carriers have different global gids")
         metadata = tuple(carrier.metadata for carrier in carriers)
         if any(entry is None for entry in metadata):
             raise RuntimeError("graph read carrier has no Draft-private metadata")
@@ -653,22 +654,6 @@ class DraftWindowGraphBindingProvider:
         if _bank_snapshot(carrier.workspace) != carrier.backing_snapshot:
             raise RuntimeError("Graph capture bank address or tensor geometry changed")
         return carrier
-
-    def _validate_runtime_capture_compatibility(
-        self,
-        capture_identity: DraftWindowGraphCaptureIdentity,
-        generation: DraftWindowGenerationIdentity,
-    ) -> None:
-        self._validate_source_contract()
-        comparisons = (
-            (generation.normalized_method, self.inventory_method, "method"),
-            (generation.global_group_id, self.group.gid, "global gid"),
-            (generation.padded_request_count, capture_identity.num_reqs, "padded request count"),
-            (generation.execution_lane, self._runtime_state.execution_lane, "lane"),
-        )
-        for actual, expected, diagnostic in comparisons:
-            if actual != expected:
-                raise RuntimeError(f"capture/runtime {diagnostic} mismatch")
 
     def _capture_topology(self) -> tuple[int, int]:
         topology = self._runtime_state.capability.runtime_context

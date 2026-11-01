@@ -17,7 +17,6 @@ from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftWindowInventory,
     DraftWindowRuntimeContext,
     DraftWindowSourceCapability,
-    DraftWindowSourceIdentity,
     DraftWindowWorkspace,
     FullDraftKVSource,
     SingleGroupDirectPrefixProvider,
@@ -48,7 +47,6 @@ def graph_buffers():
     source = FullDraftKVSource(
         logical_block_sizes=(4,),
         kernel_block_sizes=(4,),
-        source_identity=DraftWindowSourceIdentity(id(owner), (table.data_ptr(),), owner.num_blocks.cpu.data_ptr()),
         _block_tables_owner=owner,
         _input_block_tables=(table,),
         _persistent_num_blocks_cpu=owner.num_blocks.cpu,
@@ -108,7 +106,6 @@ def _materialize(case, *, epoch=0, ends=(11, 14), quarantine=False):
         num_reqs_padded=2,
         phase=DraftWindowExecutionPhase.PROPOSAL,
         step=0,
-        execution_lane=0,
         quarantine_on_failure=quarantine,
         output_workspace=case.provider.prepare_workspace(case.capture),
     )
@@ -216,7 +213,7 @@ def test_active_generation_blocks_reuse_and_preserves_all_backing(graph_buffers)
     snapshots = [tensor.clone() for tensor in _bank_tensors(first.workspace)]
     assert not first.retired
     assert case.runtime._current_workspace is first.workspace
-    with pytest.raises(RuntimeError, match="still in use"):
+    with pytest.raises(RuntimeError, match="still owns an active read bank"):
         _materialize(case, epoch=1, ends=(4,))
     assert all(torch.equal(tensor, old) for tensor, old in zip(_bank_tensors(first.workspace), snapshots))
     first.validate_for(first.identity)
@@ -286,7 +283,6 @@ def test_cpu_valid_counts_are_required_before_any_bank_materialization(graph_buf
             num_reqs_padded=2,
             phase=DraftWindowExecutionPhase.PROPOSAL,
             step=0,
-            execution_lane=0,
             output_workspace=bank,
         )
     assert bank.bound_identity is None
@@ -335,7 +331,6 @@ def test_eagle_serialized_steps_own_distinct_banks_and_preserve_previous_consume
             cpu_valid_num_blocks=torch.tensor([4] + [0] * (padded - 1), dtype=torch.int32),
             num_reqs_padded=padded,
             step=step,
-            execution_lane=0,
             output_workspace=bank,
         )
         if previous is None:
@@ -527,7 +522,6 @@ def test_nonfull_scratch_narrows_the_actual_bank_only_at_the_ascend_read_seam(gr
         num_reqs_padded=1,
         phase=DraftWindowExecutionPhase.PROPOSAL,
         step=0,
-        execution_lane=0,
     )
     assert inputs.workspace.window_block_table.shape[0] == 2
     owner: Any = SimpleNamespace(block_tables=SimpleNamespace(input_block_tables=[case.source._input_block_tables[0]]))
@@ -540,3 +534,43 @@ def test_nonfull_scratch_narrows_the_actual_bank_only_at_the_ascend_read_seam(gr
     case.runtime.retire_generation(inputs.identity)
     with pytest.raises(RuntimeError, match="retired Draft inputs"):
         DraftWindowGraphInputMixin._validated_draft_attention_read_inputs(owner, inputs, inputs.identity)
+
+
+def test_equal_dynamic_fields_cannot_forge_an_actual_generation(graph_buffers):
+    case = graph_buffers
+    current = _materialize(case)
+    forged = replace(current.identity)
+    assert current.identity != forged
+    with pytest.raises(RuntimeError, match="generation identity"):
+        current.validate_for(forged)
+    with pytest.raises(RuntimeError, match="generation identity"):
+        case.runtime.retire_generation(forged)
+    current.validate_for(current.identity)
+
+
+def test_runtime_rejects_replacing_its_fixed_canonical_source(graph_buffers):
+    case = graph_buffers
+    case.runtime.capability = replace(case.runtime.capability, full_source=replace(case.source))
+    with pytest.raises(RuntimeError, match="canonical source changed"):
+        _materialize(case)
+    assert case.runtime._active_inputs is None
+    assert case.runtime._current_workspace is None
+
+
+def test_runtime_group_rejects_a_descriptor_for_another_cache_group(graph_buffers):
+    case = graph_buffers
+    plan = compute_draft_window_plan(full_exact_end=11, future_offset=0, window_size=4, block_span_tokens=4)
+    descriptor = replace(case.projection.describe(plan, valid_num_blocks=4), global_group_id=1)
+    with pytest.raises(ValueError, match="global gid does not match the runtime source"):
+        case.runtime.materialize(
+            mapping_epoch=0,
+            ordered_request_ids=("request-a",),
+            idx_mapping=case.mapping,
+            read_descriptors=[descriptor],
+            cpu_window_exact=torch.tensor([plan.window_visible_length], dtype=torch.int32),
+            cpu_window_upper=torch.tensor([plan.window_visible_length], dtype=torch.int32),
+            cpu_valid_num_blocks=torch.tensor([4], dtype=torch.int32),
+            num_reqs_padded=1,
+            phase=DraftWindowExecutionPhase.PROPOSAL,
+            step=0,
+        )

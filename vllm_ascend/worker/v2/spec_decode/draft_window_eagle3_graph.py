@@ -125,7 +125,6 @@ class Eagle3GraphStagingOwner:
                 or self._next_step != 0
                 or self.runtime._last_retired_identity != identity
                 or identity.step != 0
-                or identity.normalized_method != "eagle3"
                 or identity.mapping_epoch != self._proposal_epoch
                 or identity.ordered_request_fingerprint != self._request_fingerprint
             ):
@@ -162,7 +161,6 @@ class Eagle3GraphStagingOwner:
                 self._proposal_epoch is None
                 or identity.mapping_epoch != self._proposal_epoch
                 or identity.ordered_request_fingerprint != self._request_fingerprint
-                or identity.normalized_method != "eagle3"
                 or identity.step != self._next_step
                 or identity.step >= self._expected_steps
             ):

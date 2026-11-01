@@ -501,7 +501,7 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin):
         return self._draft_window_runtime_state.read_metadata(inputs.identity)
 
     def _build_eagle3_graph_metadata(self, *, workspace: DraftWindowWorkspace, **kwargs: Any) -> dict[str, Any]:
-        gid = kwargs["inputs"].identity.global_group_id
+        gid = kwargs["inputs"]._owner.capability.provider.global_group_id
         upper = workspace.cpu_window_upper[: kwargs["num_reqs"]]
         view = AscendDraftAttentionReadInputs(
             block_tables=tuple(

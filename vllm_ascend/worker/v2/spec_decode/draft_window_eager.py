@@ -489,7 +489,6 @@ class DraftWindowGraphInputMixin:
             num_reqs_padded=num_reqs_padded,
             phase=DraftWindowExecutionPhase.PROPOSAL,
             step=0,
-            execution_lane=0,
             row_phase_fingerprint=plan.row_phase_fingerprint,
             quarantine_on_failure=hasattr(self, "_draft_window_graph_session"),
             output_workspace=output_workspace,
@@ -518,7 +517,7 @@ class DraftWindowGraphInputMixin:
         inputs.validate_for(expected_identity)
         workspace = inputs.workspace
         padded = expected_identity.padded_request_count
-        global_group_id = expected_identity.global_group_id
+        global_group_id = inputs._owner.capability.provider.global_group_id
         block_tables = tuple(
             (workspace.window_block_table[:padded] if gid == global_group_id else full_table[:padded])
             for gid, full_table in enumerate(self.block_tables.input_block_tables)
