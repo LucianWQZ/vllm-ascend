@@ -70,6 +70,7 @@ class DraftGraphSupportTest(unittest.TestCase):
                 uses_dynamic_speculative_decoding=lambda: False,
                 enable_adaptive_verification=False,
                 draft_model_config=draft,
+                target_model_config=NS(hf_text_config=NS(model_type="qwen3_moe")),
                 draft_parallel_config=NS(
                     tensor_parallel_size=4,
                     data_parallel_size=1,
@@ -178,6 +179,44 @@ class DraftGraphSupportTest(unittest.TestCase):
             wrapped.hidden_size += 1
             with self.assertRaisesRegex(NotImplementedError, "hidden_size"):
                 self.resolve(config)
+
+    def test_glm_dflash_uses_target_feature_contract_not_qwen_full8_profile(self):
+        from transformers import AutoConfig
+        from vllm.transformers_utils.configs.eagle import EAGLEConfig
+
+        config = self.config(method="dflash")
+        speculative = config.speculative_config
+        inner = AutoConfig.for_model(
+            model_type="qwen3",
+            architectures=["DFlashDraftModel"],
+            hidden_size=6144,
+            num_hidden_layers=5,
+            layer_types=["full_attention"] * 5,
+            target_hidden_size=6144,
+            num_target_layers=78,
+            dflash_config={"target_layer_ids": [1, 20, 38, 56, 75]},
+        )
+        hf = EAGLEConfig(inner, method="dflash", model_type="eagle")
+        speculative.draft_model_config.hf_config = hf
+        target_hf = NS(model_type="glm_moe_dsa", num_hidden_layers=78)
+        speculative.target_model_config = NS(hf_text_config=target_hf, get_hidden_size=lambda: 6144)
+        self.assertIsNone(self.resolve(config))
+        for field, bad in (
+            ("target_hidden_size", 2048),
+            ("num_target_layers", 40),
+            ("layer_types", ["sliding_attention"] * 5),
+            ("dflash_config", {"target_layer_ids": [1, 78]}),
+            ("dflash_config", {"target_layer_ids": [1, 1]}),
+        ):
+            before = getattr(hf, field)
+            setattr(hf, field, bad)
+            with self.subTest(field=field, bad=bad), self.assertRaisesRegex(NotImplementedError, "GLM DFlash"):
+                self.resolve(config)
+            setattr(hf, field, before)
+        # The same shared architecture does not open an unqualified Qwen draft.
+        target_hf.model_type = "qwen3_moe"
+        with self.assertRaisesRegex(NotImplementedError, "hidden_size"):
+            self.resolve(config)
 
     def test_startup_reuses_the_frozen_support_without_reparsing(self):
         config = self.config(rows=2)

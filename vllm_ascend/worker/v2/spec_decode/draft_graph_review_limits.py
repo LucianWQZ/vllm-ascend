@@ -105,6 +105,29 @@ def _consumer_profile(speculative):
             and getattr(hf, "sliding_window", None) == 4096
         ):
             return "dflash_swa6"
+        # DFlashDraftModel is also the fixed GLM draft's upstream model class.
+        # Its target-feature projection is not the Qwen Full8 consumer.
+        target = getattr(speculative, "target_model_config", None)
+        target_hf = getattr(target, "hf_text_config", None)
+        if getattr(target_hf, "model_type", None) == "glm_moe_dsa":
+            dflash = getattr(hf, "dflash_config", None)
+            aux = dflash.get("target_layer_ids", ()) if isinstance(dflash, dict) else ()
+            layers = getattr(hf, "num_hidden_layers", None)
+            if not (
+                type(layers) is int
+                and layers > 0
+                and getattr(hf, "layer_types", None) == ["full_attention"] * layers
+                and getattr(hf, "sliding_window", None) is None
+                and getattr(hf, "use_sliding_window", False) is False
+                and getattr(hf, "target_hidden_size", None) == target.get_hidden_size()
+                and getattr(hf, "num_target_layers", None) == target_hf.num_hidden_layers
+                and isinstance(aux, list)
+                and aux
+                and all(type(layer) is int and 0 <= layer < target_hf.num_hidden_layers for layer in aux)
+                and len(set(aux)) == len(aux)
+            ):
+                raise NotImplementedError("GLM DFlash Graph requires its Full draft and matching Target feature layout")
+            return "glm_dflash"
         profile = "dflash_full8"
     elif architectures == ["LlamaForCausalLMEagle3"]:
         profile = "eagle3"
@@ -172,7 +195,7 @@ def resolve_draft_graph_review_limit(vllm_config, *, experimental_graph_review=F
     scope = None
     if profile in ("dflash_full8", "eagle3"):
         scope = _validate_qualified_graph_config(vllm_config, profile)
-    else:
+    elif profile != "glm_dflash":
         hf = speculative.draft_model_config.hf_config
         # Familiar names do not open an unknown normalized consumer geometry.
         architectures = getattr(hf, "architectures", ()) or ()
