@@ -83,12 +83,6 @@ def _eagle_ar_capture_config(vllm_config: VllmConfig, cudagraph_mode: CUDAGraphM
     dp = vllm_config.parallel_config.data_parallel_size
     if type(dp) is not int or dp not in (1, 2):
         return vllm_config
-    if dp == 2:
-        from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import eagle_dp2_graph_review_enabled
-
-        if not eagle_dp2_graph_review_enabled(vllm_config):
-            return vllm_config
-
     if not envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH or not _eagle3_tp4_graph_review(vllm_config):
         return vllm_config
     draft_parallel = speculative.draft_parallel_config

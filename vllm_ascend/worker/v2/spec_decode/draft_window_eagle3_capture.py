@@ -46,7 +46,7 @@ def build_eagle3_graph_source(owner: Any) -> tuple[Any, Any]:
     from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import eagle_dp2_graph_review_enabled
 
     context = build_draft_window_runtime_context(owner.vllm_config, owner.block_tables)
-    rank_local_dp = eagle_dp2_graph_review_enabled(owner.vllm_config)
+    rank_local_dp = eagle_dp2_graph_review_enabled(owner)
     replicated_review = validate_graph_context(context, owner.vllm_config)
     if context.graph_mode != "FULL_DECODE_ONLY":
         raise NotImplementedError("Eagle3 Graph first implementation requires FULL_DECODE_ONLY")

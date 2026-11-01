@@ -119,11 +119,43 @@ class DraftGraphSupportTest(unittest.TestCase):
             config.speculative_config.enforce_eager = False
             self.assertIsNone(GUARD.resolve_draft_graph_review_limit(config, experimental_graph_review=False))
 
-    def test_startup_contract_is_reused_without_file_io(self):
-        config = self.config(rows=2)
-        scope = self.resolve(config)
-        with patch.object(Path, "read_text", side_effect=AssertionError("duplicate startup parse")):
-            self.assertIs(self.resolve(config), scope)
+    def test_startup_parser_does_not_add_fields_to_upstream_config(self):
+        for method in ("eagle3", "dflash"):
+            config = self.config(method=method, rows=2)
+            fields = vars(config).copy()
+            scope = self.resolve(config)
+            self.assertEqual(vars(config), fields)
+            self.assertEqual(self.resolve(config), scope)
+            self.assertEqual(vars(config), fields)
+
+    def test_owner_contract_is_reused_without_file_io(self):
+        for dp in (1, 2):
+            scope = self.resolve(self.config(dp=dp))
+            owner = NS(_draft_graph_review_limit=scope)
+            with patch.object(Path, "read_text", side_effect=AssertionError("capture re-parsed startup config")):
+                self.assertEqual(GUARD.eagle_dp2_graph_review_enabled(owner), dp == 2)
+                self.assertEqual(GUARD.eagle_dp2_graph_review_enabled(owner), dp == 2)
+        self.assertFalse(GUARD.eagle_dp2_graph_review_enabled(NS()))
+
+    def test_unscoped_dflash_loading_and_dflash2_super_config_stay_unmodified(self):
+        config = self.config(method="dflash")
+        path = Path(config.speculative_config.draft_model_config.model) / "config.json"
+        # Unscoped DFlash startup must not pollute copies used by the shared
+        # DFlash/DFlash2 load_dflash_model path, even when support is None.
+        for model in (
+            {"architectures": ["GlmDFlashDraftModel"], "model_type": "glm_moe_dsa"},
+            {"architectures": ["DFlash2DraftModel"], "model_type": "qwen3"},
+        ):
+            path.write_text(json.dumps(model))
+            config.speculative_config.draft_model_config.hf_config = NS(**model)
+            fields = vars(config).copy()
+            # The real DFlash2 service selects method=dflash too.
+            self.assertIsNone(self.resolve(config))
+            self.assertEqual(vars(config), fields)
+            # The upstream DFlash constructor makes a shallow VllmConfig copy.
+            parent_config = copy.copy(config)
+            self.assertEqual(vars(parent_config), fields)
+            self.assertNotIn("_ascend_draft_graph_support", vars(parent_config))
 
     def test_config_packaging_changes_do_not_change_support(self):
         config = self.config()

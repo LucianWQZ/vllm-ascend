@@ -12,6 +12,7 @@ import json
 from dataclasses import dataclass
 from operator import index
 from pathlib import Path
+from typing import TypeGuard
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,12 +160,16 @@ def full8_graph_review_max_requests(limit):
     return limit.max_requests if isinstance(limit, DraftGraphSupport) and limit.method == "dflash" else None
 
 
-def _is_eagle_support(limit):
+def _is_eagle_support(limit: object) -> TypeGuard[DraftGraphSupport]:
     return isinstance(limit, DraftGraphSupport) and limit.method == "eagle3"
 
 
 def resolve_draft_graph_review_limit(vllm_config, *, experimental_graph_review=False):
-    """Resolve the selected owner once; leave ordinary eager/native OFF alone."""
+    """Parse startup support without changing the upstream configuration.
+
+    The speculator owns the returned frozen contract. VllmConfig must contain
+    only declared fields because upstream DFlash loading copies it with replace.
+    """
     speculative = vllm_config.speculative_config
     if (
         speculative is None
@@ -178,8 +183,6 @@ def resolve_draft_graph_review_limit(vllm_config, *, experimental_graph_review=F
     effective = decode() if callable(decode) else mode
     if getattr(effective, "name", effective) == "NONE":
         return None
-    if hasattr(vllm_config, "_ascend_draft_graph_support"):
-        return vllm_config._ascend_draft_graph_support
     profile = _checkpoint_profile(speculative)
     if profile == "dflash_swa6":
         raise NotImplementedError(
@@ -219,7 +222,6 @@ def resolve_draft_graph_review_limit(vllm_config, *, experimental_graph_review=F
             and getattr(hf, "model_type", None) == "qwen3"
         ):
             raise NotImplementedError("This dense Draft Graph model configuration has not been qualified")
-    vllm_config._ascend_draft_graph_support = scope
     return scope
 
 
@@ -293,12 +295,9 @@ def _validate_qualified_graph_config(vllm_config, profile):
     return DraftGraphSupport(maximum, k, rows, dp, method, query)
 
 
-def eagle_dp2_graph_review_enabled(vllm_config):
-    from vllm_ascend import envs
-
-    scope = resolve_draft_graph_review_limit(
-        vllm_config, experimental_graph_review=envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH
-    )
+def eagle_dp2_graph_review_enabled(owner):
+    """Read the actual owner's startup contract; never reparse during capture."""
+    scope = getattr(owner, "_draft_graph_review_limit", None)
     return _is_eagle_support(scope) and scope.data_parallel_size == 2
 
 
@@ -492,18 +491,18 @@ def _full8_review_capacity(vllm_config):
     target = vllm_config.model_config
     draft = vllm_config.speculative_config.draft_model_config
     capacity = getattr(target, "max_model_len", None)
-    ceilings = []
+    ceilings: list[int] = []
     for config in (target, draft):
         text = getattr(config, "hf_text_config", None)
         if text is None:
             text = getattr(config, "hf_config", None)
-        ceilings.append(getattr(text, "max_position_embeddings", None))
-    if (
-        type(capacity) is not int
-        or capacity <= _FULL8_QUERY_TOKENS
-        or any(type(value) is not int or value <= 0 for value in ceilings)
-        or capacity > min(ceilings)
-    ):
+        ceiling = getattr(text, "max_position_embeddings", None)
+        if type(ceiling) is not int or ceiling <= 0:
+            raise NotImplementedError(
+                "Full8 review requires an exact positive configured capacity within both model position ceilings"
+            )
+        ceilings.append(ceiling)
+    if type(capacity) is not int or capacity <= _FULL8_QUERY_TOKENS or capacity > min(ceilings):
         raise NotImplementedError(
             "Full8 review requires an exact positive configured capacity within both model position ceilings"
         )

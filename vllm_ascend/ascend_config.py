@@ -169,8 +169,9 @@ def validate_draft_window_graph_config(vllm_config: Any) -> bool:
         raise ValueError("replicated TP Graph review requires matching actual Target/Draft TP in (2, 4, 16)")
     if native_swa_window and tp != 4:
         raise ValueError("native SWA Graph review first requires actual TP4")
+    eagle_tp4 = speculative.method == "eagle3" and tp == 4 and _eagle3_tp4_graph_review(vllm_config)
     if speculative.method == "eagle3" and (
-        not (tp == 2 or _eagle3_tp4_graph_review(vllm_config))
+        not (tp == 2 or eagle_tp4)
         or type(getattr(speculative, "num_speculative_tokens", None)) is not int
         or speculative.num_speculative_tokens != 3
     ):
@@ -178,11 +179,7 @@ def validate_draft_window_graph_config(vllm_config: Any) -> bool:
     dp = getattr(vllm_config.parallel_config, "data_parallel_size", 1)
     if type(dp) is not int or dp not in (1, 2):
         raise ValueError("replicated Graph review requires integer DP1 or the explicit DFlash TP4/DP2 route")
-    eagle_dp2 = False
-    if dp == 2 and speculative.method == "eagle3":
-        from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import eagle_dp2_graph_review_enabled
-
-        eagle_dp2 = eagle_dp2_graph_review_enabled(vllm_config)
+    eagle_dp2 = dp == 2 and eagle_tp4
     if dp == 2 and (
         (speculative.method != "dflash" and not eagle_dp2)
         or tp != 4
