@@ -9,14 +9,103 @@ model, numerical, capture and lifetime evidence remains separate.
 from __future__ import annotations
 
 import ast
+import sys
 from dataclasses import dataclass
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
 SOURCE_ROOT = Path(__file__).resolve().parents[3]
 SOURCE = SOURCE_ROOT / "vllm_ascend/worker/v2/spec_decode/draft_window_eager.py"
+
+
+@pytest.fixture(params=["dspark", "dflash", "dflash2", "eagle3"])
+def graph_source_initialization(request, monkeypatch):
+    """Exercise actual owner initialization without loading a device model."""
+    method = request.param
+    paths = {
+        "dspark": ("dspark/speculator.py", "AscendDSparkSpeculator"),
+        "dflash": ("dflash/speculator.py", "AscendDFlashSpeculator"),
+        "dflash2": ("dflash/speculator.py", "AscendDFlashSpeculator"),
+        "eagle3": ("draft_window_eagle3_adapter.py", "Eagle3GraphIntegrationMixin"),
+    }
+    relative, class_name = paths[method]
+    path = SOURCE.parent / relative
+    cls = next(n for n in ast.parse(path.read_text()).body if isinstance(n, ast.ClassDef) and n.name == class_name)
+    initialize = next(
+        n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "_initialize_draft_window_source_capability"
+    )
+    capability, context, state = object(), object(), object()
+    build_source = Mock(return_value=(capability, context))
+    build_state = Mock(return_value=state)
+    capture_name = "vllm_ascend.worker.v2.spec_decode.draft_window_eagle3_capture"
+    capture = ModuleType(capture_name)
+    capture.__dict__["build_eagle3_graph_source"] = build_source
+    monkeypatch.setitem(sys.modules, capture_name, capture)
+    namespace = {"build_parallel_graph_source": build_source, "build_draft_window_runtime_state": build_state}
+    exec(compile(ast.Module(body=[initialize], type_ignores=[]), str(path), "exec"), namespace)
+    owner = SimpleNamespace(
+        _draft_window_policy=object(),
+        _speculator_name=method,
+        attn_groups=object(),
+        block_tables=object(),
+        _group_causal=False,
+        vllm_config=object(),
+        input_buffers=object(),
+        _initialize_draft_window_graph_inputs=Mock(),
+        _initialize_eagle3_draft_window_state=Mock(),
+    )
+    return SimpleNamespace(
+        owner=owner,
+        initialize=namespace[initialize.name],
+        build_source=build_source,
+        build_state=build_state,
+        capability=capability,
+        context=context,
+        state=state,
+        context_attr="_eagle3_graph_runtime_context" if method == "eagle3" else "_draft_window_graph_context",
+    )
+
+
+def test_graph_owner_installs_only_its_admitted_source(graph_source_initialization):
+    c = graph_source_initialization
+    c.initialize(c.owner)
+    c.build_source.assert_called_once()
+    c.build_state.assert_called_once_with(c.capability)
+    assert c.owner._draft_window_source_capability is c.capability
+    assert c.owner._draft_window_runtime_state is c.state
+    assert getattr(c.owner, c.context_attr) is c.context
+    assert not hasattr(c.owner, "_draft_window_runtime")
+
+
+def test_graph_source_rejection_has_no_eager_fallback_or_partial_owner(graph_source_initialization):
+    c = graph_source_initialization
+    failure = NotImplementedError("unsupported actual Graph source")
+    c.build_source.side_effect = failure
+    with pytest.raises(NotImplementedError) as seen:
+        c.initialize(c.owner)
+    assert seen.value is failure
+    c.build_state.assert_not_called()
+    assert not hasattr(c.owner, "_draft_window_source_capability")
+    assert not hasattr(c.owner, "_draft_window_runtime_state")
+
+
+def test_graph_owner_reinitialization_rejects_before_source_build(graph_source_initialization):
+    c = graph_source_initialization
+    c.owner._draft_window_runtime_state = c.state
+    with pytest.raises(RuntimeError, match="already initialized"):
+        c.initialize(c.owner)
+    c.build_source.assert_not_called()
+
+
+def test_window_off_without_graph_policy_does_not_construct_source(graph_source_initialization):
+    c = graph_source_initialization
+    del c.owner._draft_window_policy
+    c.initialize(c.owner)
+    c.build_source.assert_not_called()
+    assert not hasattr(c.owner, "_draft_window_runtime_state")
 
 
 class TensorProtocol:

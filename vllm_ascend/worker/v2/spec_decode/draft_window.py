@@ -94,14 +94,12 @@ class DraftWindowGroupInventory:
     """One executable ``AttentionGroup`` with its global cache-group id."""
 
     global_group_id: int
-    local_consumer_index: int
     layer_names: tuple[str, ...]
     backend_class: type[Any]
     builder_class: type[Any]
     logical_block_size: int
     kernel_block_size: int
     block_span_tokens: int | None
-    causal: bool
     layout_category: DraftWindowLayoutCategory
     capability_failures: tuple[str, ...]
     # Geometry facts are kept separate from phase-specific capability gates.
@@ -126,7 +124,6 @@ class DraftWindowInventory:
     runtime_route: str
     window_size: int
     groups: tuple[DraftWindowGroupInventory, ...]
-    empty_global_group_ids: tuple[int, ...]
     capability_failures: tuple[str, ...]
     dflash2_graph_source: bool = False
 
@@ -223,30 +220,6 @@ class FullDraftKVSource:
     def input_block_table_row_width(self, global_group_id: int) -> int:
         self._validate_global_group_id(global_group_id)
         return self._input_block_tables[global_group_id].shape[1]
-
-    def references_input_block_table(
-        self,
-        global_group_id: int,
-        tensor: torch.Tensor,
-    ) -> bool:
-        self._validate_global_group_id(global_group_id)
-        return self._input_block_tables[global_group_id] is tensor
-
-    def references_current_num_blocks_gpu_view(self, tensor: torch.Tensor) -> bool:
-        """Return whether ``tensor`` is the accelerator view active right now.
-
-        ``UvaBackedTensor`` may rotate this view, so it is intentionally not a
-        persistent source identity. The stable owner check is the CPU method
-        below.
-        """
-        return self._block_tables_owner.num_blocks.gpu is tensor
-
-    def references_persistent_num_blocks_cpu(self, tensor: torch.Tensor) -> bool:
-        return self._persistent_num_blocks_cpu is tensor
-
-    def references_same_idx_mapping_tensor(self, tensor: torch.Tensor) -> bool:
-        """Return whether ``tensor`` is the same object, not whether it is fresh."""
-        return self._idx_mapping is tensor
 
     def shares_canonical_storage(self, tensor: torch.Tensor) -> bool:
         """Return whether a tensor aliases any canonical FullSource backing."""
@@ -843,10 +816,8 @@ def build_draft_window_inventory(
         )
 
     groups: list[DraftWindowGroupInventory] = []
-    empty_global_group_ids: list[int] = []
     for outer_global_group_id, consumers in enumerate(attn_groups):
         if not consumers:
-            empty_global_group_ids.append(outer_global_group_id)
             continue
         if outer_global_group_id >= len(block_sizes) or outer_global_group_id >= len(kernel_block_sizes):
             failures.append(
@@ -857,7 +828,7 @@ def build_draft_window_inventory(
             continue
         logical_block_size = int(block_sizes[outer_global_group_id])
         kernel_block_size = int(kernel_block_sizes[outer_global_group_id])
-        for local_consumer_index, consumer in enumerate(consumers):
+        for consumer in consumers:
             backend_class = consumer.backend
             metadata_builder = consumer.get_metadata_builder(0)
             builder_class = type(metadata_builder)
@@ -907,18 +878,15 @@ def build_draft_window_inventory(
                 raw_ratio = getattr(metadata_builder, "compressor_ratio", None)
                 if isinstance(raw_ratio, int) and not isinstance(raw_ratio, bool):
                     drafting_compression_ratio = raw_ratio
-            group_causal = causal if isinstance(causal, bool) else bool(causal.get(outer_global_group_id, True))
             groups.append(
                 DraftWindowGroupInventory(
                     global_group_id=actual_global_group_id,
-                    local_consumer_index=local_consumer_index,
                     layer_names=tuple(consumer.layer_names),
                     backend_class=backend_class,
                     builder_class=builder_class,
                     logical_block_size=logical_block_size,
                     kernel_block_size=kernel_block_size,
                     block_span_tokens=block_span_tokens,
-                    causal=group_causal,
                     layout_category=layout_category,
                     capability_failures=tuple(group_failures),
                     source_geometry_failures=tuple(source_geometry_failures),
@@ -964,7 +932,6 @@ def build_draft_window_inventory(
         runtime_route=runtime_route,
         window_size=policy.effective_window_size,
         groups=tuple(groups),
-        empty_global_group_ids=tuple(empty_global_group_ids),
         capability_failures=tuple(failures),
         dflash2_graph_source=dflash2_graph_contract is not None,
     )
@@ -1273,31 +1240,6 @@ def _get_tensor_parallel_rank(parallel_config: Any) -> int:
     if rank < 0 or rank >= world_size:
         raise ValueError(f"TP rank {rank} is outside [0, {world_size})")
     return rank
-
-
-def build_draft_window_source_capability(
-    *,
-    policy: DraftWindowPolicyDecision,
-    runtime_route: str,
-    attn_groups: Sequence[Sequence[AttentionGroup]],
-    block_tables: Any,
-    causal: bool | Mapping[int, bool],
-    vllm_config: Any,
-) -> DraftWindowSourceCapability:
-    """Build P2 state after ``set_attn`` and before any Window allocation."""
-    runtime_context = build_draft_window_runtime_context(
-        vllm_config,
-        block_tables,
-    )
-    return _build_draft_window_source_capability_for_context(
-        policy=policy,
-        runtime_route=runtime_route,
-        attn_groups=attn_groups,
-        block_tables=block_tables,
-        causal=causal,
-        vllm_config=vllm_config,
-        runtime_context=runtime_context,
-    )
 
 
 def _build_draft_window_source_capability_for_context(

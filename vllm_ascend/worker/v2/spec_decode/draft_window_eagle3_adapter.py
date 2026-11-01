@@ -24,7 +24,6 @@ from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftWindowPolicyDecision,
     DraftWindowPolicyState,
     build_draft_window_runtime_state,
-    build_draft_window_source_capability,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_eager import (
     AscendDraftAttentionReadInputs,
@@ -63,35 +62,15 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin):
             "_draft_window_runtime_state",
         ):
             raise RuntimeError("draft-window runtime ownership is already initialized")
-        from vllm_ascend.worker.v2.spec_decode.draft_window import build_draft_window_runtime_context
-        from vllm_ascend.worker.v2.spec_decode.draft_window_graph_runtime import (
-            draft_window_graph_enabled,
-        )
+        from vllm_ascend.worker.v2.spec_decode.draft_window_eagle3_capture import build_eagle3_graph_source
 
-        graph_context = None
-        if (
-            draft_window_graph_enabled()
-            and build_draft_window_runtime_context(self.vllm_config, self.block_tables).graph_mode != "NONE"
-        ):
-            from vllm_ascend.worker.v2.spec_decode.draft_window_eagle3_capture import build_eagle3_graph_source
-
-            capability, graph_context = build_eagle3_graph_source(self)
-        else:
-            capability = build_draft_window_source_capability(
-                policy=policy,
-                runtime_route=policy.normalized_method,
-                attn_groups=self.attn_groups,
-                block_tables=self.block_tables,
-                causal=True,
-                vllm_config=self.vllm_config,
-            )
+        capability, graph_context = build_eagle3_graph_source(self)
         runtime_state = build_draft_window_runtime_state(capability)
         self._draft_window_source_capability = capability
         self._draft_window_runtime_state = runtime_state
         try:
             self._initialize_eagle3_draft_window_state()
-            if graph_context is not None:
-                self._eagle3_graph_runtime_context = graph_context
+            self._eagle3_graph_runtime_context = graph_context
         except BaseException:
             del self._draft_window_source_capability
             del self._draft_window_runtime_state

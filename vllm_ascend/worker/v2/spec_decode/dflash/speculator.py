@@ -24,7 +24,6 @@ from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftWindowPolicyDecision,
     DraftWindowPolicyState,
     build_draft_window_runtime_state,
-    build_draft_window_source_capability,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowGraphInputMixin
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
@@ -313,44 +312,21 @@ class AscendDFlashSpeculator(DraftWindowGraphInputMixin, LmheadTPDraftSamplingMi
         if hasattr(self, "_draft_window_runtime"):
             raise RuntimeError("Graph Window cannot replace the typed eager runtime")
         runtime_route = self._speculator_name.lower()
-        graph_context = None
-        if draft_window_graph_enabled():
-            from vllm_ascend.worker.v2.spec_decode.draft_window import (
-                build_draft_window_runtime_context,
-            )
-
-            runtime_context = build_draft_window_runtime_context(
-                self.vllm_config,
-                self.block_tables,
-            )
-        else:
-            runtime_context = None
-        if runtime_context is not None and runtime_context.graph_mode != "NONE":
-            capability, graph_context = build_parallel_graph_source(
-                policy=policy,
-                runtime_route=runtime_route,
-                attn_groups=self.attn_groups,
-                block_tables=self.block_tables,
-                causal=self._group_causal,
-                vllm_config=self.vllm_config,
-                input_buffers=self.input_buffers,
-                dflash2_graph_contract=getattr(self, "_dflash2_graph_contract", None),
-            )
-        else:
-            capability = build_draft_window_source_capability(
-                policy=policy,
-                runtime_route=runtime_route,
-                attn_groups=self.attn_groups,
-                block_tables=self.block_tables,
-                causal=self._group_causal,
-                vllm_config=self.vllm_config,
-            )
+        capability, graph_context = build_parallel_graph_source(
+            policy=policy,
+            runtime_route=runtime_route,
+            attn_groups=self.attn_groups,
+            block_tables=self.block_tables,
+            causal=self._group_causal,
+            vllm_config=self.vllm_config,
+            input_buffers=self.input_buffers,
+            dflash2_graph_contract=getattr(self, "_dflash2_graph_contract", None),
+        )
         runtime_state = build_draft_window_runtime_state(capability)
         self._draft_window_source_capability = capability
         self._draft_window_runtime_state = runtime_state
         self._initialize_draft_window_graph_inputs()
-        if graph_context is not None:
-            self._draft_window_graph_context = graph_context
+        self._draft_window_graph_context = graph_context
 
     def _run_model(
         self, num_tokens, attn_metadata, slot_mappings, num_tokens_across_dp, cudagraph_runtime_mode=CUDAGraphMode.NONE
