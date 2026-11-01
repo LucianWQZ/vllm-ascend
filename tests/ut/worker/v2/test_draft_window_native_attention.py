@@ -9,10 +9,12 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[4]
 MODULE = ROOT / "vllm_ascend/worker/v2/spec_decode/draft_window_native_attention.py"
 spec = importlib.util.spec_from_file_location("_native_attention_host_test", MODULE)
+assert spec is not None and spec.loader is not None
 native = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = native
 spec.loader.exec_module(native)
@@ -21,7 +23,7 @@ Dense = type("AscendAttentionBackendImpl", (), {})
 Dense.__module__ = "vllm_ascend.attention.attention_v1"
 
 
-def config(*, kinds=None, window=2048, architecture="DFlash2DraftModel", count=2, dflash=None):
+def config(*, kinds=None, window=2048, architecture="DFlash2DraftModel", count=2, dflash=None) -> dict[str, Any]:
     result = {"architectures": [architecture], "num_hidden_layers": count, "sliding_window": window}
     if kinds is not None:
         result["layer_types"] = kinds
@@ -100,7 +102,7 @@ class NativeAttentionTests(unittest.TestCase):
             nested = config(kinds=kinds, architecture="Qwen3DSparkModel")
             nested.pop("architectures")
             nested.update(model_type="qwen3", use_sliding_window=expected != "FULL")
-            raw = dict(
+            raw: dict[str, Any] = dict(
                 architectures=["DSparkDraftModel"], speculators_model_type="dspark", transformer_layer_config=nested
             )
             normalized = dict(nested, architectures=["Qwen3DSparkModel"])
@@ -110,7 +112,7 @@ class NativeAttentionTests(unittest.TestCase):
             self.assertTrue(result.actual_complete)
 
     def test_legacy_dspark_unknown_wrapper_or_missing_layer_config_stays_unknown(self):
-        raw = dict(
+        raw: dict[str, Any] = dict(
             architectures=["DSparkDraftModel"],
             speculators_model_type="dspark",
             transformer_layer_config=dict(
@@ -146,7 +148,9 @@ class NativeAttentionTests(unittest.TestCase):
             use_sliding_window=True,
             sliding_window=2048,
         )
-        raw = dict(architectures=["DSparkDraftModel"], speculators_model_type="dspark", transformer_layer_config=nested)
+        raw: dict[str, Any] = dict(
+            architectures=["DSparkDraftModel"], speculators_model_type="dspark", transformer_layer_config=nested
+        )
         for key, value in (
             ("model_type", "other"),
             ("num_hidden_layers", 3),

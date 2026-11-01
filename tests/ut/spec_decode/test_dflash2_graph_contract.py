@@ -80,6 +80,7 @@ def module(monkeypatch):
     path = Path(__file__).parents[3] / "vllm_ascend/worker/v2/spec_decode/draft_window_dflash2_graph.py"
     name = "_test_dflash2_graph_contract"
     spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
     loaded = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, name, loaded)
     spec.loader.exec_module(loaded)

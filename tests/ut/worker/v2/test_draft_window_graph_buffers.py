@@ -496,7 +496,7 @@ def test_context_only_capture_preserves_upstream_preparation_without_a_read_bank
 
     case = graph_buffers
     buffers = SimpleNamespace(_ascend_draft_window_capture_context=object())
-    arguments = (2, 2, buffers, object(), [], object(), 16, True, False)
+    arguments: tuple[Any, ...] = (2, 2, buffers, object(), [], object(), 16, True, False)
     expected = object()
     received = []
 

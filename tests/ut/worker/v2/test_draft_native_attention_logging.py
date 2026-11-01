@@ -7,6 +7,7 @@ import unittest
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch
 
 from transformers.utils import logging as transformers_logging
@@ -49,8 +50,9 @@ class DraftNativeAttentionLoggingTests(unittest.TestCase):
                 for node in tree.body
             )
         )
-        namespace = {}
-        exec(compile(ast.Module(body=imports, type_ignores=[]), str(AR), "exec"), namespace)
+        namespace: dict[str, Any] = {}
+        statements: list[ast.stmt] = list(imports)
+        exec(compile(ast.Module(body=statements, type_ignores=[]), str(AR), "exec"), namespace)
         self.assertIs(namespace["logger"], vllm_logging.logger)
         # Keep each case's handler and once-key independent while exercising
         # the same installed adapter class as the shared production logger.
