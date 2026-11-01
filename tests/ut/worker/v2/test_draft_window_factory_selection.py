@@ -13,9 +13,7 @@ from types import ModuleType
 
 import pytest
 
-
 from tests.ut.worker.v2.test_draft_window_factory import _config, _constructor
-from tests.ut.worker.v2.test_draft_window_factory import factory as factory
 
 
 @pytest.fixture
