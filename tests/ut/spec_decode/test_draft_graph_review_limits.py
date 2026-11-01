@@ -46,6 +46,7 @@ class DraftGraphSupportTest(unittest.TestCase):
     def config(self, *, method="eagle3", rows=1, dp=1, window=True):
         profile = "eagle3" if method == "eagle3" else "dflash_full8"
         model = copy.deepcopy(GUARD._CONSUMER_CONFIGS[profile])
+        model["max_position_embeddings"] = 262144
         directory = Path(self.directory.name) / f"{method}-{rows}-{dp}-{window}"
         directory.mkdir(exist_ok=True)
         parallel = dict(
@@ -163,13 +164,33 @@ class DraftGraphSupportTest(unittest.TestCase):
         with patch.object(Path, "read_text", side_effect=AssertionError("unexpected config IO")):
             self.assertEqual(self.resolve(config).method, "eagle3")
 
+    def test_model_loader_settings_do_not_redefine_window_geometry(self):
+        for method in ("eagle3", "dflash"):
+            config = self.config(method=method)
+            hf = config.speculative_config.draft_model_config.hf_config
+            expected = self.resolve(config)
+            # These are parsed/executed by the model implementation. They do
+            # not change row count, KV layout, window alignment or Graph bank.
+            for field, value in (
+                ("hidden_act", "gelu"),
+                ("intermediate_size", 8192),
+                ("rms_norm_eps", 1e-5),
+                ("tie_word_embeddings", True),
+                ("vocab_size", 256000),
+            ):
+                setattr(hf, field, value)
+                with self.subTest(method=method, field=field):
+                    self.assertEqual(self.resolve(config), expected)
+
     def test_worker_wrapped_config_keeps_actual_consumer_geometry(self):
         from transformers import AutoConfig
         from vllm.transformers_utils.configs.eagle import EAGLEConfig
 
         for method, profile in (("dflash", "dflash_full8"), ("eagle3", "eagle3")):
             config = self.config(method=method)
-            inner = AutoConfig.for_model(**copy.deepcopy(GUARD._CONSUMER_CONFIGS[profile]))
+            fields = copy.deepcopy(GUARD._CONSUMER_CONFIGS[profile])
+            fields["max_position_embeddings"] = 262144
+            inner = AutoConfig.for_model(**fields)
             wrapped = EAGLEConfig(inner, method=method, model_type="eagle")
             config.speculative_config.draft_model_config.hf_config = wrapped
             self.assertEqual(wrapped.model_type, "eagle")
@@ -224,7 +245,7 @@ class DraftGraphSupportTest(unittest.TestCase):
         validator = actual_source_function(
             MODULE_PATH.parents[3] / "ascend_config.py",
             "validate_draft_window_graph_config",
-            {"Any": Any, "_native_swa_graph_window_review": lambda *_: False},
+            {"Any": Any},
         )
         package = types.ModuleType("vllm_ascend")
         package.__dict__["envs"] = NS(VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH=True)

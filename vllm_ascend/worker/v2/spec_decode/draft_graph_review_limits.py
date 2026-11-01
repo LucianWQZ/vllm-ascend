@@ -23,17 +23,12 @@ class DraftGraphSupport:
     query_tokens: int
 
 
-# Match only fields consumed by the fixed model's projection, attention, aux
-# selection or absolute-position path. Packaging and unconsumed config keys do
-# not define a new Graph geometry. Runtime dtype/capacity are checked below.
+# Keep the qualified attention/projection, auxiliary and position geometry.
+# Model norm/activation/vocabulary settings belong to the actual model loader,
+# not a second Window allowlist. Actual dtype/capacity are checked below.
 _COMMON_CONSUMER_CONFIG = {
     "attention_bias": False,
-    "hidden_act": "silu",
     "hidden_size": 2048,
-    "max_position_embeddings": 262144,
-    "rms_norm_eps": 1e-06,
-    "tie_word_embeddings": False,
-    "vocab_size": 248320,
 }
 _CONSUMER_CONFIGS = {
     "dflash_full8": {
@@ -43,7 +38,6 @@ _CONSUMER_CONFIGS = {
             "block_size": 16,
             "dflash_config": {"mask_token_id": 248070, "target_layer_ids": [1, 10, 19, 28, 37]},
             "head_dim": 128,
-            "intermediate_size": 6144,
             "layer_types": ["full_attention"] * 8,
             "model_type": "qwen3",
             "num_attention_heads": 32,
@@ -66,14 +60,9 @@ _CONSUMER_CONFIGS = {
         **_COMMON_CONSUMER_CONFIG,
         **{
             "architectures": ["LlamaForCausalLMEagle3"],
-            "draft_vocab_size": 32000,
             "eagle_config": {"eagle_aux_hidden_state_layer_ids": [3, 19, 35]},
-            "fc_norm": True,
             "head_dim": 256,
-            "intermediate_size": 16384,
-            "mlp_bias": False,
             "model_type": "llama",
-            "norm_output": True,
             "num_attention_heads": 16,
             "num_hidden_layers": 1,
             "num_key_value_heads": 2,
@@ -287,7 +276,7 @@ def eagle_dp2_graph_review_enabled(owner):
 def note_eagle_single_request_review_lifecycle(owner, scheduler_output):
     """Keep only authoritative preemption IDs until real request completion.
 
-    a982 v2 resumption is re-emitted as scheduled_new_reqs, including the case
+    Fixed MRV2 resumption is re-emitted as scheduled_new_reqs, including the case
     where no output token exists yet. prefill_len==prompt_len cannot detect
     that case. No scheduler, request state, or device object is modified.
     """
