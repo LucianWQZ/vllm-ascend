@@ -12,6 +12,7 @@ import unittest
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace as NS
+from typing import Any
 from unittest.mock import patch
 
 MODULE_PATH = Path(__file__).resolve().parents[3] / "vllm_ascend/worker/v2/spec_decode/draft_graph_review_limits.py"
@@ -292,10 +293,15 @@ class DraftGraphSupportTest(unittest.TestCase):
         )
         batch = self.batch()
         batch.num_reqs_after_padding = 2
-        seen = []
+        seen: list[str] = []
+
+        def context_kv_scope(_owner, _batch):
+            seen.append("context-KV-only")
+            return nullcontext()
+
         namespace = {
             "nullcontext": nullcontext,
-            "_draft_window_context_kv_scope": lambda o, b: (seen.append("context-KV-only"), nullcontext())[1],
+            "_draft_window_context_kv_scope": context_kv_scope,
         }
         entry = actual_source_function(
             MODULE_PATH.with_name("dflash") / "speculator.py", "_draft_window_owner_scope", namespace
@@ -386,10 +392,23 @@ def actual_ar_replay_method():
 
 class ActualGraphDescriptorControls(unittest.TestCase):
     def manager(self, owner, *, first=False, session=None):
-        seen = []
+        seen: list[tuple[str, tuple[Any, ...]]] = []
+
+        def build_metadata(*args):
+            seen.append(("metadata", args))
+            return {}
+
+        def replay(*args):
+            seen.append(("replay", args))
+            return "legacy-result"
+
+        def run_window(*args):
+            seen.append(("window", args))
+            return "window-result"
+
         owner.attn_backend = "actual-test-backend"
         owner.draft_vllm_config = object()
-        owner.build_draft_attn_metadatas = lambda *args: (seen.append(("metadata", args)), {})[1]
+        owner.build_draft_attn_metadatas = build_metadata
         if session is not None:
             owner._eagle3_graph_session = session
             owner._eagle3_window_is_active = lambda: True
@@ -397,8 +416,8 @@ class ActualGraphDescriptorControls(unittest.TestCase):
             speculator=owner,
             is_draft_model_prefill=first,
             update_stream=object(),
-            _graph_replay=lambda *args: (seen.append(("replay", args)), "legacy-result")[1],
-            _run_eagle_window_fullgraph=lambda *args: (seen.append(("window", args)), "window-result")[1],
+            _graph_replay=replay,
+            _run_eagle_window_fullgraph=run_window,
         )
         return manager, seen
 
@@ -475,19 +494,20 @@ def eagle_graph_protocol():
     graph = ast.parse((base / "draft_window_eagle3_graph.py").read_text())
     nodes = [scheduled] + [n for n in graph.body if isinstance(n, ast.ClassDef) and n.name == "Eagle3GraphStagingOwner"]
     states = N(BOUND=object(), UPDATED=object())
-    ns = dict(
-        __name__="_r8_eagle_protocol",
+    module_name = "_r8_eagle_protocol"
+    ns: dict[str, Any] = dict(
+        __name__=module_name,
         DraftWindowGraphCarrierState=states,
         _current_stream_identity=lambda: 7,
     )
-    sys.modules[ns["__name__"]] = types.ModuleType(ns["__name__"])
+    sys.modules[module_name] = types.ModuleType(module_name)
     tree = ast.Module(
         body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), *nodes],
         type_ignores=[],
     )
     exec(compile(ast.fix_missing_locations(tree), "<actual-eagle-owner-source>", "exec"), ns)
     helper_module = types.ModuleType("vllm_ascend.worker.v2.spec_decode.draft_window_eagle3")
-    helper_module._eagle3_graph_scheduled_consumers = ns["_eagle3_graph_scheduled_consumers"]
+    helper_module.__dict__["_eagle3_graph_scheduled_consumers"] = ns["_eagle3_graph_scheduled_consumers"]
     owner_type = ns["Eagle3GraphStagingOwner"]
 
     def make(scheduled_count, first_graph=False):
@@ -702,11 +722,15 @@ class EagleMixedRequestControls(unittest.TestCase):
         # length constructor on that state, without importing the model runner.
         path = ROOT / "vllm_ascend/worker/v2/model_runner.py"
         module = ast.parse(path.read_text())
-        runner = next(node for node in module.body if isinstance(node, ast.ClassDef) and node.name == "NPUModelRunner")
-        function = next(
-            node for node in runner.body if isinstance(node, ast.FunctionDef) and node.name == "_update_seq_lens_cpu"
+        runner_class = next(
+            node for node in module.body if isinstance(node, ast.ClassDef) and node.name == "NPUModelRunner"
         )
-        namespace = {}
+        function = next(
+            node
+            for node in runner_class.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_update_seq_lens_cpu"
+        )
+        namespace: dict[str, Any] = {}
         code = ast.Module(
             body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), function],
             type_ignores=[],
