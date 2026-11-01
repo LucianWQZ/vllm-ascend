@@ -299,20 +299,11 @@ def prepare_dense_draft_read(
         if not bool((widths == query_width).all()):
             query_offsets = _copy_owned_read_tensor(query_start_loc_device, retain)
             total = int(query_start_loc_cpu[-1])
-            if exact.device.type == "npu":
-                from vllm_ascend.ops.triton.v2.spec_decode.draft_window import pack_draft_query_indices
+            from vllm_ascend.ops.triton.v2.spec_decode.draft_window import pack_draft_query_indices
 
-                query_indices, output_indices = pack_draft_query_indices(
-                    query_offsets, total, query_width, retain=retain
-                )
-            else:
-                local = torch.arange(query_width, device=exact.device)[None, :]
-                row_widths = query_offsets.diff()
-                padding = query_width - row_widths
-                query_indices = query_offsets[:-1, None] + (local - padding[:, None]).clamp(min=0)
-                output_indices = torch.cat(
-                    [row * query_width + padding[row] + torch.arange(int(width)) for row, width in enumerate(widths)]
-                )
+            query_indices, output_indices = pack_draft_query_indices(
+                query_offsets, total, query_width, retain=retain
+            )
             retain(query_offsets, query_indices, output_indices)
     # Both are allocation bounds: V <= E <= U and V <= W+B-1. Avoid
     # window-sized padding on short contexts without using U to choose S/V.
@@ -320,55 +311,24 @@ def prepare_dense_draft_read(
     if full_rows is not None:
         capacity_bound = max(capacity_bound, int(upper_cpu[full_rows_cpu].max()))
     capacity = (capacity_bound + DENSE_KV_ALIGNMENT - 1) // DENSE_KV_ALIGNMENT * DENSE_KV_ALIGNMENT
-    if exact.device.type == "npu":
-        from vllm_ascend.ops.triton.v2.spec_decode.draft_window import plan_draft_window
+    from vllm_ascend.ops.triton.v2.spec_decode.draft_window import plan_draft_window
 
-        slots, starts, visible, mask = plan_draft_window(
-            source.table,
-            row_indices,
-            exact,
-            frozen_starts,
-            block_span=source.block_span,
-            anchor_span=anchor_span,
-            window=window_size,
-            capacity=capacity,
-            query_width=query_width,
-            causal=causal,
-            query_ends=query_ends,
-            full_rows=full_rows,
-            query_offsets=query_offsets,
-            retain=retain,
-        )
-    else:
-        # Keep a CPU execution path for geometry/ownership contract tests.
-        starts = (
-            torch.div(torch.clamp(exact - window_size, min=0), anchor_span, rounding_mode="floor") * anchor_span
-            if frozen_starts is None
-            else frozen_starts.clone()
-        )
-        visible = exact - starts
-        if full_rows is not None:
-            starts = torch.where(full_rows, 0, starts)
-            visible = exact - starts
-        columns = torch.arange(capacity, device=exact.device, dtype=torch.int64)
-        absolute = starts[:, None] + torch.minimum(columns[None, :], visible[:, None] - 1)
-        block_columns = torch.div(absolute, source.block_span, rounding_mode="floor")
-        table_indices = row_indices[:, None] * source.table.shape[1] + block_columns
-        blocks = source.table.reshape(-1).index_select(0, table_indices.reshape(-1)).reshape(n, capacity)
-        slots = blocks.to(torch.int64) * source.block_span + absolute % source.block_span
-        mask = (columns[None, None, :] >= visible[:, None, None]).expand(n, query_width, capacity)
-        if causal:
-            queries = (
-                query_ends[:, None]
-                - starts[:, None]
-                - query_width
-                + torch.arange(query_width, device=exact.device)[None, :]
-            )
-            mask = mask | (columns[None, None, :] > queries[:, :, None])
-        if query_offsets is not None:
-            padding = query_width - query_offsets.diff()
-            mask = mask | (torch.arange(query_width)[None, :, None] < padding[:, None, None])
-        mask = mask[:, None].contiguous()
+    slots, starts, visible, mask = plan_draft_window(
+        source.table,
+        row_indices,
+        exact,
+        frozen_starts,
+        block_span=source.block_span,
+        anchor_span=anchor_span,
+        window=window_size,
+        capacity=capacity,
+        query_width=query_width,
+        causal=causal,
+        query_ends=query_ends,
+        full_rows=full_rows,
+        query_offsets=query_offsets,
+        retain=retain,
+    )
     read = DenseDraftRead(
         slots,
         visible,

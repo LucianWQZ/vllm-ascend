@@ -5,6 +5,7 @@
 import pytest
 import torch
 
+from tests.ut.worker.v2.draft_window_cpu import cpu_dense_planning as cpu_dense_planning
 from vllm_ascend.worker.v2.spec_decode.draft_window_dense import (
     DenseDraftRead,
     prepare_dense_draft_read,
