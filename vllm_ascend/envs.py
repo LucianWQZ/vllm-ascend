@@ -84,16 +84,6 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH": lambda: _strict_binary_env(
         "VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH"
     ),
-    # Optional private observer artifact path, default None, non-sensitive.
-    # Used only after the private Graph gate installs an instance recorder.
-    "VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH_ARTIFACT": lambda: os.getenv(
-        "VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH_ARTIFACT"
-    ),
-    # Observer only: default 1, valid 0/1, non-sensitive. 0 keeps all provider,
-    # binding and lifetime protection while disabling diagnostic artifact work.
-    "VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH_OBSERVE": lambda: _strict_binary_env(
-        "VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH_OBSERVE", "1"
-    ),
 }
 
 # end-env-vars-definition

@@ -167,6 +167,42 @@ def test_no_draft_placeholders_and_invalid_scheduled_counts():
         continuing_prefill_rows(batch(drafts=(8, 2)), 2)
 
 
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("num_draft_tokens_per_req", np.array([-1, 2])),
+        ("num_draft_tokens_per_req", np.array([3])),
+        ("num_scheduled_tokens", np.array([7.5, 3.0])),
+        ("prefill_len_np", np.array([-1, 16])),
+    ],
+)
+def test_shared_phase_rejects_invalid_active_row_counters(field, value):
+    state = batch()
+    setattr(state, field, value)
+    with pytest.raises((ValueError, TypeError)):
+        continuing_prefill_rows(state, 2)
+
+
+def test_graph_phase_uses_the_same_prompt_progress_as_eager():
+    from vllm_ascend.worker.v2.spec_decode.draft_window_nongraph import (
+        DraftWindowRowPhase,
+        classify_draft_window_batch_phase,
+    )
+
+    state = batch(computed=(8, 24), prompt=(16, 16), scheduled=(10, 3), drafts=(3, 2))
+    state.has_prefill = True
+    # Total scheduled tokens cross the prompt boundary, but three are Draft
+    # placeholders. The first row must retain Full reads until prompt ends.
+    phases = classify_draft_window_batch_phase(state)
+    assert phases.row_phases == (DraftWindowRowPhase.PREFILL_CONTINUING, DraftWindowRowPhase.PURE_DECODE)
+    state.num_computed_prefill_tokens_np[0] = 9
+    phases = classify_draft_window_batch_phase(state)
+    assert phases.row_phases == (DraftWindowRowPhase.PREFILL_TERMINAL, DraftWindowRowPhase.PURE_DECODE)
+    state.is_prefilling_np[0] = False
+    with pytest.raises(RuntimeError, match="is_prefilling"):
+        classify_draft_window_batch_phase(state)
+
+
 def test_callback_reads_canonical_source_and_preserves_write_query_objects(setup):
     runtime, spec, canonical, completions = setup
     metadata = common()

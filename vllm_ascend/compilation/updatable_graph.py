@@ -122,8 +122,6 @@ class UpdatableGraph(torch.npu.NPUGraph):
         operation: Callable[..., Any],
         kwargs: dict[str, Any],
         provider: ParamProvider,
-        *,
-        capture_callback: Callable[[GraphUpdateTask, Any], None] | None = None,
     ) -> None:
         stream = torch.npu.current_stream()
         event = torch.npu.ExternalEvent()
@@ -135,17 +133,16 @@ class UpdatableGraph(torch.npu.NPUGraph):
         weak_kwargs = weak_ref_tensors(kwargs)
         provider_index = self.provider_sizes.get(provider, 0)
         self.provider_sizes[provider] = provider_index + 1
-        task = GraphUpdateTask(
-            operation,
-            weak_kwargs,
-            provider,
-            provider_index,
-            handle,
-            event,
+        self.tasks.append(
+            GraphUpdateTask(
+                operation,
+                weak_kwargs,
+                provider,
+                provider_index,
+                handle,
+                event,
+            )
         )
-        self.tasks.append(task)
-        if capture_callback is not None:
-            capture_callback(task, stream)
 
     def resolve_tasks(
         self,
@@ -160,25 +157,12 @@ class UpdatableGraph(torch.npu.NPUGraph):
         self,
         update_stream,
         resolved_tasks: tuple[GraphUpdateTask, ...],
-        *,
-        draft_window_graph_update_binding=None,
-        draft_attn_metadatas=None,
-        attn_backend=None,
-        num_tokens: int | None = None,
     ) -> None:
-        if draft_window_graph_update_binding is not None:
-            self._validate_draft_window_tasks(
-                resolved_tasks,
-                draft_window_graph_update_binding,
-                draft_attn_metadatas,
-                attn_backend,
-                num_tokens,
-            )
         logger.debug_once("Updating host-side attention metadata with UpdatableGraph.")
         with torch.npu.stream(update_stream):
             # This is specially designed for PA.
             ws_buffer: dict[Hashable, Any] = {}
-            for task_index, task in enumerate(resolved_tasks):
+            for task in resolved_tasks:
                 if task.operation == torch_npu._npu_paged_attention:
                     ws_key = _get_ws_key(task.kwargs)
                     if ws_buffer.get(ws_key) is None:
@@ -188,96 +172,18 @@ class UpdatableGraph(torch.npu.NPUGraph):
                         ws_buffer[ws_key] = workspace
                     task.kwargs["workspace"] = ws_buffer[ws_key]
                 task.apply(update_stream)
-                if draft_window_graph_update_binding is not None:
-                    self._record_draft_window_update(
-                        task_index,
-                        task,
-                        update_stream,
-                        draft_window_graph_update_binding,
-                        draft_attn_metadatas,
-                        attn_backend,
-                        num_tokens,
-                    )
-
-    def _validate_draft_window_tasks(self, tasks, binding, metadata_batch, backend, num_tokens):
-        """Validate the actual typed UPDATE entrance, without observing device completion."""
-        from vllm_ascend.attention.attention_v1 import FIAParamProvider
-        from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
-            validate_draft_window_graph_backend_update,
-        )
-
-        if backend is None or num_tokens is None or metadata_batch is None:
-            raise RuntimeError("Draft Window UPDATE lost its backend, token count or metadata owner")
-        if len(tasks) != len(self.tasks) or not tasks:
-            raise RuntimeError("Draft Window UPDATE task inventory changed")
-        for captured, task in zip(self.tasks, tasks):
-            if (
-                task.handle is not captured.handle
-                or task.event is not captured.event
-                or task.provider != captured.provider
-                or task.provider_index != captured.provider_index
-            ):
-                raise RuntimeError("Draft Window UPDATE task does not belong to this captured graph")
-            if not isinstance(task.provider, FIAParamProvider) or not task.provider.is_draft_model:
-                raise RuntimeError("Draft Window typed UPDATE requires its inventoried Draft FIA consumer")
-            if task.operation != torch_npu.npu_fused_infer_attention_score.out:
-                raise RuntimeError("Draft Window typed UPDATE operation differs from its inventoried FIA path")
-            index = task.provider_index
-            if index >= len(metadata_batch):
-                raise RuntimeError("Draft Window UPDATE consumer index exceeds its metadata batch")
-            layer_metadata = metadata_batch[index].get(task.provider.layer_name)
-            if layer_metadata is None:
-                raise RuntimeError("Draft Window UPDATE lost its actual layer metadata")
-            if (
-                task.kwargs.get("block_table") is not layer_metadata.block_tables
-                or task.kwargs.get("actual_seq_lengths_kv") is not layer_metadata.seq_lens_list
-                or task.kwargs.get("actual_seq_lengths") is not layer_metadata.actual_seq_lengths_q
-            ):
-                raise RuntimeError("Draft Window UPDATE operands are not the submitted metadata operands")
-        validate_draft_window_graph_backend_update(
-            binding,
-            attn_backend=backend,
-            impl_cls=backend.get_impl_cls(),
-            builder_cls=backend.get_builder_cls(),
-            draft_attn_metadatas=metadata_batch,
-            update_function_path="vllm_ascend.compilation.updatable_graph.UpdatableGraph.update",
-        )
-
-    def _record_draft_window_update(self, task_index, task, stream, binding, metadata_batch, backend, num_tokens):
-        # Optional Host submission evidence only: event.record is not a device-completion observation.
-        if not getattr(getattr(binding.provider, "observer", None), "enabled", False):
-            return
-        from vllm_ascend.worker.v2.spec_decode.draft_window_graph_characterization import (
-            record_parallel_graph_update_operator_operand,
-        )
-
-        record_parallel_graph_update_operator_operand(
-            binding,
-            draft_metadata=metadata_batch[task.provider_index],
-            layer_name=task.provider.layer_name,
-            captured_block_table=self.tasks[task_index].kwargs.get("block_table"),
-            actual_block_table=task.kwargs["block_table"],
-            seq_lengths=task.kwargs["actual_seq_lengths_kv"],
-            num_tokens=num_tokens,
-            handle=task.handle,
-            event=task.event,
-            stream=stream,
-            backend_impl=backend.get_impl_cls(),
-        )
 
 
 def register_task(
     operation: Callable[..., Any],
     kwargs: dict[str, Any],
     provider: ParamProvider,
-    *,
-    capture_callback: Callable[[GraphUpdateTask, Any], None] | None = None,
 ) -> None:
     graph = _ACTIVE_GRAPH.get()
     if graph is None:
         operation(**kwargs)
     else:
-        graph.register_task(operation, kwargs, provider, capture_callback=capture_callback)
+        graph.register_task(operation, kwargs, provider)
 
 
 def get_capture_resource(

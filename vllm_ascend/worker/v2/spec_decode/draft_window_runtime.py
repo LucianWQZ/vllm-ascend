@@ -51,14 +51,28 @@ def continuing_prefill_rows(input_batch: Any, num_reqs: int) -> np.ndarray:
     rows already have computed_prefill >= prefill_len. A terminal chunk may
     therefore use a Window even while the input row is marked is_prefilling.
     """
-    computed = input_batch.num_computed_prefill_tokens_np[:num_reqs]
-    prompt = input_batch.prefill_len_np[:num_reqs]
-    scheduled = input_batch.num_scheduled_tokens[:num_reqs]
-    drafts = input_batch.num_draft_tokens_per_req
-    if drafts is not None:
-        scheduled = scheduled - drafts[:num_reqs]
+    computed, prompt, scheduled = (
+        np.asarray(values)[:num_reqs]
+        for values in (
+            input_batch.num_computed_prefill_tokens_np,
+            input_batch.prefill_len_np,
+            input_batch.num_scheduled_tokens,
+        )
+    )
     if any(array.shape != (num_reqs,) for array in (computed, prompt, scheduled)):
         raise ValueError("Draft Window phase state does not cover the active requests")
+    if any(not np.issubdtype(array.dtype, np.integer) for array in (computed, prompt, scheduled)):
+        raise TypeError("Draft Window phase counters must contain integers")
+    if any(bool(np.any(array < 0)) for array in (computed, prompt, scheduled)):
+        raise ValueError("Draft Window phase counters must be nonnegative")
+    drafts = input_batch.num_draft_tokens_per_req
+    if drafts is not None:
+        drafts = np.asarray(drafts)[:num_reqs]
+        if drafts.shape != (num_reqs,) or not np.issubdtype(drafts.dtype, np.integer):
+            raise ValueError("Draft placeholders must contain one integer per active request")
+        if bool(np.any(drafts < 0)):
+            raise ValueError("Draft placeholders must be nonnegative")
+        scheduled = scheduled - drafts
     if np.any(scheduled < 0):
         raise ValueError("Speculative placeholders exceed scheduled tokens")
     return computed + scheduled < prompt

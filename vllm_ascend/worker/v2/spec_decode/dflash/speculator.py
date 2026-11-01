@@ -18,7 +18,6 @@ from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.spec_decode.dflash import speculator as dflash_speculator
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 
-from vllm_ascend.ascend_config import validate_additional_config_bool
 from vllm_ascend.ops.triton.v2.spec_decode.prepare_dflash_inputs import prepare_dflash_inputs_triton
 from vllm_ascend.worker.v2.attn_utils import build_attn_metadata_factory, build_attn_metadata_wrapper
 from vllm_ascend.worker.v2.spec_decode.draft_window import (
@@ -27,15 +26,15 @@ from vllm_ascend.worker.v2.spec_decode.draft_window import (
     build_draft_window_runtime_state,
     build_draft_window_source_capability,
 )
-from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowEagerMixin
+from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowGraphInputMixin
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
     DraftWindowGraphRoute,
     consume_draft_window_graph_metadata,
 )
-from vllm_ascend.worker.v2.spec_decode.draft_window_graph_characterization import (
-    build_parallel_draft_window_graph_characterization_source,
-    experimental_draft_window_graph_characterization_enabled,
-    install_parallel_draft_window_graph_characterization,
+from vllm_ascend.worker.v2.spec_decode.draft_window_graph_runtime import (
+    build_parallel_graph_source,
+    draft_window_graph_enabled,
+    install_parallel_graph,
 )
 from vllm_ascend.worker.v2.spec_decode.lmhead_tp_utils import LmheadTPDraftSamplingMixin
 from vllm_ascend.worker.v2.spec_decode.pcp_utils import (
@@ -195,7 +194,8 @@ def _draft_window_owner_scope(owner, input_batch, dummy_run=False, is_profile=Fa
     graph_runtime = getattr(owner, "_draft_window_runtime_state", None)
     limit = getattr(owner, "_draft_graph_review_limit", None)
     context_only_full8 = (
-        limit in ("full8_local_active_at_most_one", "full8_local_active_at_most_two")
+        limit is not None
+        and limit.method == "dflash"
         and type(num_speculative_tokens) is int
         and num_speculative_tokens == 0
     )
@@ -276,7 +276,7 @@ def _build_graph_uniform_metadata(
         raise RuntimeError("Draft Graph metadata must retain the canonical Full write slots")
     # The existing builder reconstructs this same uniform CPU query layout.
     # Supplying None follows its declared uniform seam only after validation.
-    return DraftWindowEagerMixin._build_draft_attn_metadata(
+    return DraftWindowGraphInputMixin._build_draft_attn_metadata(
         owner,
         num_reqs=num_reqs,
         num_reqs_padded=padded_reqs,
@@ -289,7 +289,7 @@ def _build_graph_uniform_metadata(
     )
 
 
-class AscendDFlashSpeculator(DraftWindowEagerMixin, LmheadTPDraftSamplingMixin, DFlashSpeculator):
+class AscendDFlashSpeculator(DraftWindowGraphInputMixin, LmheadTPDraftSamplingMixin, DFlashSpeculator):
     def _configure_draft_window(self, decision: DraftWindowPolicyDecision) -> None:
         """Attach the eligible P1 policy contract without enabling a window."""
         if decision.state is not DraftWindowPolicyState.ELIGIBLE_ON:
@@ -314,7 +314,7 @@ class AscendDFlashSpeculator(DraftWindowEagerMixin, LmheadTPDraftSamplingMixin, 
             raise RuntimeError("Graph Window cannot replace the typed eager runtime")
         runtime_route = self._speculator_name.lower()
         graph_context = None
-        if experimental_draft_window_graph_characterization_enabled():
+        if draft_window_graph_enabled():
             from vllm_ascend.worker.v2.spec_decode.draft_window import (
                 build_draft_window_runtime_context,
             )
@@ -326,7 +326,7 @@ class AscendDFlashSpeculator(DraftWindowEagerMixin, LmheadTPDraftSamplingMixin, 
         else:
             runtime_context = None
         if runtime_context is not None and runtime_context.graph_mode != "NONE":
-            capability, graph_context = build_parallel_draft_window_graph_characterization_source(
+            capability, graph_context = build_parallel_graph_source(
                 policy=policy,
                 runtime_route=runtime_route,
                 attn_groups=self.attn_groups,
@@ -348,53 +348,16 @@ class AscendDFlashSpeculator(DraftWindowEagerMixin, LmheadTPDraftSamplingMixin, 
         runtime_state = build_draft_window_runtime_state(capability)
         self._draft_window_source_capability = capability
         self._draft_window_runtime_state = runtime_state
-        self._initialize_draft_window_eager_state()
+        self._initialize_draft_window_graph_inputs()
         if graph_context is not None:
-            self._draft_window_graph_characterization_context = graph_context
-
-    def capture(self) -> None:
-        diagnostic = validate_additional_config_bool(
-            self.vllm_config.additional_config.get("draft_window_graph_numeric_diagnostic", False),
-            "additional_config.draft_window_graph_numeric_diagnostic",
-        )
-        if diagnostic:
-            if not experimental_draft_window_graph_characterization_enabled():
-                raise RuntimeError("numeric capture diagnostic requires the experimental Graph gate")
-            from vllm_ascend.worker.v2.spec_decode.draft_window_graph_diagnostics import DraftGraphOutputReferences
-
-            if hasattr(self, "_draft_graph_output_references"):
-                raise RuntimeError("numeric capture diagnostic already installed")
-            owned = validate_additional_config_bool(
-                self.vllm_config.additional_config.get("draft_window_graph_numeric_owned_output", False),
-                "additional_config.draft_window_graph_numeric_owned_output",
-            )
-            self._draft_graph_output_references = DraftGraphOutputReferences(self, owned=owned)
-            if owned:
-                from vllm_ascend.worker.v2.spec_decode.draft_window_graph_diagnostics import owned_attention_probe_layer
-
-                name = owned_attention_probe_layer(self)
-                layer = self.vllm_config.compilation_config.static_forward_context[name]
-                self._draft_graph_output_references.attention_layer_name = name
-                self._draft_graph_output_references.install_attention_probe(layer.impl)
-            self._draft_graph_output_references.collecting = True
-        try:
-            super().capture()
-        finally:
-            if diagnostic:
-                self._draft_graph_output_references.collecting = False
-        if diagnostic:
-            self._draft_graph_output_references.freeze(d.num_tokens for d in self.query_cudagraph_manager.graphs)
+            self._draft_window_graph_context = graph_context
 
     def _run_model(
         self, num_tokens, attn_metadata, slot_mappings, num_tokens_across_dp, cudagraph_runtime_mode=CUDAGraphMode.NONE
     ):
-        self._mark_draft_window_async_reader_started()
         output = super()._run_model(
             num_tokens, attn_metadata, slot_mappings, num_tokens_across_dp, cudagraph_runtime_mode
         )
-        sink = getattr(self, "_draft_graph_output_references", None)
-        if sink is not None and sink.collecting:
-            sink.retain(self, num_tokens, output)
         return output
 
     def load_draft_model(
@@ -472,11 +435,11 @@ class AscendDFlashSpeculator(DraftWindowEagerMixin, LmheadTPDraftSamplingMixin, 
         # It needs this speculator to update full-graph params, so set it here.
         self.query_cudagraph_manager.speculator = self
         self.query_cudagraph_manager.update_stream = self.update_stream
-        graph_context = getattr(self, "_draft_window_graph_characterization_context", None)
+        graph_context = getattr(self, "_draft_window_graph_context", None)
         if graph_context is not None:
-            if not experimental_draft_window_graph_characterization_enabled():
-                raise RuntimeError("Graph characterization flag changed during initialization")
-            install_parallel_draft_window_graph_characterization(self, runtime_context=graph_context)
+            if not draft_window_graph_enabled():
+                raise RuntimeError("Draft Graph configuration changed during initialization")
+            install_parallel_graph(self, runtime_context=graph_context)
 
     def set_attn(
         self,

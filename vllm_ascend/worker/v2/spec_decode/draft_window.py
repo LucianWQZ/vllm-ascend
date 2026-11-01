@@ -1,18 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
-"""Policy, source, and generation-scoped read-plane contracts for draft windows.
+"""Canonical Draft KV sources and generation-owned Graph read buffers.
 
-P1 decides whether a configured window is eligible and describes its scalar
-interval. P2 inventories the actual draft attention consumers and records how
-that interval projects onto the canonical full block tables. P3 owns the
-materialized read state and its lifetime, but still does not connect it to
-attention.
+Method policy and interval arithmetic are shared with the ordinary eager
+runtime. This module owns only source geometry and persistent Graph backing;
+Full write tables and Target state remain owned by the existing runner.
 """
 
 import os
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, field, fields, is_dataclass, replace
+from dataclasses import dataclass, field, fields, is_dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -30,7 +28,6 @@ from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_ascend.ascend_config import (
     validate_additional_config_bool,
-    validate_draft_window_parallel_eager_review,
 )
 from vllm_ascend.attention.attention_v1 import (
     AscendAttentionBackend,
@@ -44,58 +41,22 @@ from vllm_ascend.device.hardware_profile import (
     AttentionBackendFamily,
     get_current_hardware_profile,
 )
+from vllm_ascend.worker.v2.spec_decode.draft_window_plan import (
+    DraftWindowPlan,
+    compute_draft_window_plan,
+    project_draft_window_interval,
+    window_capacity_tokens,
+)
+from vllm_ascend.worker.v2.spec_decode.draft_window_policy import (
+    DraftWindowPolicyDecision,
+    DraftWindowPolicyState,
+)
 
 if TYPE_CHECKING:
     from vllm_ascend.worker.v2.spec_decode.draft_window_eager_capability import (
         P7EagerTopologyFingerprint,
     )
     from vllm_ascend.worker.v2.spec_decode.draft_window_swa_graph import NativeSWAGraphPlan
-
-
-class DraftWindowPolicyState(Enum):
-    """Result of resolving a configured MRV2 draft-window request."""
-
-    CONFIG_OFF = "config_off"
-    FORCED_OFF = "forced_off"
-    ELIGIBLE_ON = "eligible_on"
-
-
-@dataclass(frozen=True, slots=True)
-class DraftWindowPolicyDecision:
-    """Immutable result of method/model policy resolution."""
-
-    state: DraftWindowPolicyState
-    requested_window_size: int | None
-    effective_window_size: int | None
-    normalized_method: str
-    target_model_type: str
-    reason: str | None
-
-
-@dataclass(frozen=True, slots=True)
-class DraftWindowScalarPlan:
-    """Scalar view of one draft window; no storage is owned by this value."""
-
-    full_exact_end: int
-    full_horizon_end: int
-    window_start: int
-    window_visible_length: int
-    window_capacity_tokens: int
-
-
-@dataclass(frozen=True, slots=True)
-class DirectPrefixProjection:
-    """Projection of an absolute token interval onto a direct-paged row."""
-
-    source_start_column: int
-    first_token_offset: int
-    required_columns: int
-    safe_extent_tokens: int
-
-    @property
-    def source_end_column(self) -> int:
-        """Exclusive source column after the projected prefix."""
-        return self.source_start_column + self.required_columns
 
 
 class DraftWindowLayoutCategory(Enum):
@@ -484,7 +445,7 @@ class SingleGroupDirectPrefixProvider:
 
     def describe(
         self,
-        plan: DraftWindowScalarPlan,
+        plan: DraftWindowPlan,
         *,
         valid_num_blocks: int,
     ) -> DraftWindowReadDescriptor:
@@ -507,29 +468,23 @@ class SingleGroupDirectPrefixProvider:
                 f"method={self.inventory.method} "
                 f"offset={future_offset} expected={self.expected_future_offset}"
             )
-        expected_start = compute_legacy_anchor(
-            full_context_length=plan.full_exact_end,
+        expected_start = compute_draft_window_plan(
+            full_exact_end=plan.full_exact_end,
             future_offset=future_offset,
             window_size=self.inventory.window_size,
-            legacy_block_size=self.legacy_block_size,
-        )
+            block_span_tokens=self.legacy_block_size,
+        ).window_start
         if plan.window_start != expected_start:
             raise ValueError(
                 f"scalar plan does not use the canonical P1 anchor: {plan.window_start} != {expected_start}"
             )
-        expected_visible_length = compute_visible_length(
-            full_exact_end=plan.full_exact_end,
-            window_start=plan.window_start,
-        )
+        expected_visible_length = plan.full_exact_end - plan.window_start
         if plan.window_visible_length != expected_visible_length:
             raise ValueError(
                 "scalar plan visible length is inconsistent with its exact end: "
                 f"{plan.window_visible_length} != {expected_visible_length}"
             )
-        expected_capacity = compute_window_capacity_tokens(
-            window_size=self.inventory.window_size,
-            legacy_block_size=self.legacy_block_size,
-        )
+        expected_capacity = window_capacity_tokens(self.inventory.window_size, self.legacy_block_size)
         if plan.window_capacity_tokens != expected_capacity:
             raise ValueError(
                 "scalar plan capacity does not match provider geometry: "
@@ -543,7 +498,7 @@ class SingleGroupDirectPrefixProvider:
 
     def describe_frozen_step(
         self,
-        proposal_plan: DraftWindowScalarPlan,
+        proposal_plan: DraftWindowPlan,
         *,
         full_exact_end: int,
         valid_num_blocks: int,
@@ -569,12 +524,12 @@ class SingleGroupDirectPrefixProvider:
                 "proposal future offset does not match configured static future offset: "
                 f"offset={proposal_offset} expected={self.expected_future_offset}"
             )
-        expected_start = compute_legacy_anchor(
-            full_context_length=proposal_plan.full_exact_end,
+        expected_start = compute_draft_window_plan(
+            full_exact_end=proposal_plan.full_exact_end,
             future_offset=proposal_offset,
             window_size=self.inventory.window_size,
-            legacy_block_size=self.legacy_block_size,
-        )
+            block_span_tokens=self.legacy_block_size,
+        ).window_start
         if proposal_plan.window_start != expected_start:
             raise ValueError(
                 "proposal plan does not use the canonical frozen anchor: "
@@ -586,10 +541,7 @@ class SingleGroupDirectPrefixProvider:
                 f"start={proposal_plan.window_start} end={full_exact_end} "
                 f"horizon={proposal_plan.full_horizon_end}"
             )
-        expected_capacity = compute_window_capacity_tokens(
-            window_size=self.inventory.window_size,
-            legacy_block_size=self.legacy_block_size,
-        )
+        expected_capacity = window_capacity_tokens(self.inventory.window_size, self.legacy_block_size)
         if proposal_plan.window_capacity_tokens != expected_capacity:
             raise ValueError(
                 "proposal plan capacity does not match provider geometry: "
@@ -597,10 +549,7 @@ class SingleGroupDirectPrefixProvider:
             )
         return self._describe_interval(
             window_start=proposal_plan.window_start,
-            window_visible_length=compute_visible_length(
-                full_exact_end=full_exact_end,
-                window_start=proposal_plan.window_start,
-            ),
+            window_visible_length=full_exact_end - proposal_plan.window_start,
             valid_num_blocks=valid_num_blocks,
         )
 
@@ -613,9 +562,9 @@ class SingleGroupDirectPrefixProvider:
     ) -> DraftWindowReadDescriptor:
         """Project a previously validated absolute interval onto FullSource."""
         span = self._block_span_tokens
-        projection = project_direct_prefix(
+        projection = project_draft_window_interval(
             window_start=window_start,
-            window_visible_length=window_visible_length,
+            full_exact_end=window_start + window_visible_length,
             block_span_tokens=span,
         )
         if projection.first_token_offset != 0:
@@ -680,78 +629,6 @@ def _normalize_method(method: str) -> str:
     return method.strip().lower()
 
 
-def _normalize_model_type(model_type: str) -> str:
-    return model_type.strip().lower()
-
-
-def _is_deepseek_v4_target(normalized_model_type: str) -> bool:
-    """Match the explicit DeepSeek-V4 model-type family used by config."""
-    return normalized_model_type.startswith("deepseek_v4")
-
-
-def resolve_draft_window_policy(
-    *,
-    requested_window_size: int | None,
-    method: str,
-    target_model_type: str,
-) -> DraftWindowPolicyDecision:
-    """Resolve method/model policy before any numeric or runtime work.
-
-    ``None`` is the only OFF value.  MTP and DeepSeek-V4 co-trained DSpark
-    requests are forced OFF even when their configured number is otherwise
-    invalid; this ordering is part of the feature contract.
-    """
-    normalized_method = _normalize_method(method)
-    normalized_model_type = _normalize_model_type(target_model_type)
-
-    if requested_window_size is None:
-        return DraftWindowPolicyDecision(
-            state=DraftWindowPolicyState.CONFIG_OFF,
-            requested_window_size=None,
-            effective_window_size=None,
-            normalized_method=normalized_method,
-            target_model_type=normalized_model_type,
-            reason=None,
-        )
-
-    if normalized_method == "mtp":
-        return DraftWindowPolicyDecision(
-            state=DraftWindowPolicyState.FORCED_OFF,
-            requested_window_size=requested_window_size,
-            effective_window_size=None,
-            normalized_method=normalized_method,
-            target_model_type=normalized_model_type,
-            reason="mtp",
-        )
-
-    if normalized_method == "dspark" and _is_deepseek_v4_target(normalized_model_type):
-        return DraftWindowPolicyDecision(
-            state=DraftWindowPolicyState.FORCED_OFF,
-            requested_window_size=requested_window_size,
-            effective_window_size=None,
-            normalized_method=normalized_method,
-            target_model_type=normalized_model_type,
-            reason="deepseek_v4_cotrained_dspark",
-        )
-
-    if normalized_method == "eagle":
-        raise NotImplementedError("draft_window_size is not supported for plain Eagle in MRV2")
-
-    if normalized_method not in {"eagle3", "dflash", "dspark"}:
-        raise NotImplementedError(
-            f"draft_window_size is not supported for MRV2 speculative method {normalized_method!r}"
-        )
-
-    return DraftWindowPolicyDecision(
-        state=DraftWindowPolicyState.ELIGIBLE_ON,
-        requested_window_size=requested_window_size,
-        effective_window_size=requested_window_size,
-        normalized_method=normalized_method,
-        target_model_type=normalized_model_type,
-        reason=None,
-    )
-
-
 def resolve_static_future_offset(
     *,
     normalized_method: str,
@@ -780,120 +657,6 @@ def validate_eligible_window_numbers(*, window_size: int, future_offset: int) ->
         raise ValueError("draft_window_size must be at least the static future offset")
 
 
-def _validate_scalar_inputs(
-    *,
-    full_exact_end: int,
-    future_offset: int,
-    window_size: int,
-    legacy_block_size: int,
-) -> None:
-    if full_exact_end < 0:
-        raise ValueError("full exact end must be greater than or equal to 0")
-    if future_offset < 0:
-        raise ValueError("future offset must be greater than or equal to 0")
-    if window_size <= 0:
-        raise ValueError("window size must be greater than 0")
-    if legacy_block_size <= 0:
-        raise ValueError("legacy block size must be greater than 0")
-
-
-def compute_legacy_anchor(
-    *,
-    full_context_length: int,
-    future_offset: int,
-    window_size: int,
-    legacy_block_size: int,
-) -> int:
-    """Compute ``B * floor(max(L + K - W, 0) / B)`` exactly."""
-    _validate_scalar_inputs(
-        full_exact_end=full_context_length,
-        future_offset=future_offset,
-        window_size=window_size,
-        legacy_block_size=legacy_block_size,
-    )
-    full_horizon_end = full_context_length + future_offset
-    raw_start = max(full_horizon_end - window_size, 0)
-    return (raw_start // legacy_block_size) * legacy_block_size
-
-
-def compute_visible_length(*, full_exact_end: int, window_start: int) -> int:
-    """Return the exact visible length and reject a negative interval."""
-    if full_exact_end < 0:
-        raise ValueError("full exact end must be greater than or equal to 0")
-    if window_start < 0:
-        raise ValueError("window start must be greater than or equal to 0")
-    if window_start > full_exact_end:
-        raise ValueError(f"window start {window_start} exceeds full exact end {full_exact_end}")
-    return full_exact_end - window_start
-
-
-def compute_window_capacity_tokens(*, window_size: int, legacy_block_size: int) -> int:
-    """Return the Frozen scalar capacity upper bound ``W + B - 1``."""
-    if window_size <= 0:
-        raise ValueError("window size must be greater than 0")
-    if legacy_block_size <= 0:
-        raise ValueError("legacy block size must be greater than 0")
-    return window_size + legacy_block_size - 1
-
-
-def compute_draft_window_scalar_plan(
-    *,
-    full_exact_end: int,
-    future_offset: int,
-    window_size: int,
-    legacy_block_size: int,
-) -> DraftWindowScalarPlan:
-    """Build an immutable scalar plan from exact, not upper-bound, length."""
-    window_start = compute_legacy_anchor(
-        full_context_length=full_exact_end,
-        future_offset=future_offset,
-        window_size=window_size,
-        legacy_block_size=legacy_block_size,
-    )
-    return DraftWindowScalarPlan(
-        full_exact_end=full_exact_end,
-        full_horizon_end=full_exact_end + future_offset,
-        window_start=window_start,
-        window_visible_length=compute_visible_length(
-            full_exact_end=full_exact_end,
-            window_start=window_start,
-        ),
-        window_capacity_tokens=compute_window_capacity_tokens(
-            window_size=window_size,
-            legacy_block_size=legacy_block_size,
-        ),
-    )
-
-
-def project_direct_prefix(
-    *,
-    window_start: int,
-    window_visible_length: int,
-    block_span_tokens: int,
-) -> DirectPrefixProjection:
-    """Project ``[S, S + V)`` without changing the absolute anchor."""
-    if window_start < 0:
-        raise ValueError("window start must be greater than or equal to 0")
-    if window_visible_length < 0:
-        raise ValueError("window visible length must be greater than or equal to 0")
-    if block_span_tokens <= 0:
-        raise ValueError("block span must be greater than 0")
-
-    source_start_column, first_token_offset = divmod(window_start, block_span_tokens)
-    required_columns = 0
-    if window_visible_length:
-        required_columns = (first_token_offset + window_visible_length + block_span_tokens - 1) // block_span_tokens
-    safe_extent_tokens = 0
-    if required_columns:
-        safe_extent_tokens = required_columns * block_span_tokens - first_token_offset
-    return DirectPrefixProjection(
-        source_start_column=source_start_column,
-        first_token_offset=first_token_offset,
-        required_columns=required_columns,
-        safe_extent_tokens=safe_extent_tokens,
-    )
-
-
 def compute_direct_prefix_capacity(
     *,
     window_size: int,
@@ -909,10 +672,7 @@ def compute_direct_prefix_capacity(
     """
     if block_span_tokens <= 0:
         raise ValueError("block span must be greater than 0")
-    capacity_tokens = compute_window_capacity_tokens(
-        window_size=window_size,
-        legacy_block_size=legacy_block_size,
-    )
+    capacity_tokens = window_capacity_tokens(window_size, legacy_block_size)
     if legacy_block_size % block_span_tokens != 0:
         raise ValueError("zero-offset direct-prefix capacity requires block span to divide legacy block size")
     return (capacity_tokens + block_span_tokens - 1) // block_span_tokens
@@ -967,12 +727,8 @@ def _runtime_capability_failures(
     allow_parallel_dp_graph_source: bool = False,
 ) -> list[str]:
     failures: list[str] = []
-    if runtime_context.graph_mode != "NONE":
-        failures.append(
-            f"gid=none backend=none layout=runtime reason=Graph mode {runtime_context.graph_mode} is not verified in P2"
-        )
-    if runtime_context.async_scheduling:
-        failures.append("gid=none backend=none layout=runtime reason=Async scheduling is not verified in P2")
+    if runtime_context.attention_backend_family is not AttentionBackendFamily.STANDARD:
+        failures.append("Draft Window source requires the STANDARD attention backend family")
     topology = (
         ("TP", runtime_context.tensor_parallel_size),
         ("DP", runtime_context.data_parallel_size),
@@ -1002,12 +758,6 @@ def _runtime_capability_failures(
         or not 0 <= runtime_context.tensor_parallel_rank < runtime_context.tensor_parallel_size
     ):
         failures.append("gid=none backend=none layout=runtime reason=replicated TP source requires a real integer rank")
-    if runtime_context.sequence_parallel:
-        failures.append("gid=none backend=none layout=runtime reason=sequence parallel is not verified in P2")
-    if runtime_context.dsa_context_parallel:
-        failures.append("gid=none backend=none layout=runtime reason=DSA-CP is not verified in P2")
-    if runtime_context.flashcomm:
-        failures.append("gid=none backend=none layout=runtime reason=FlashComm is not verified in P2")
     if runtime_context.prefix_caching and not allow_parallel_prefix_graph_source:
         failures.append("gid=none backend=none layout=runtime reason=prefix cache is not verified for Window ON")
     return failures
@@ -1539,16 +1289,6 @@ def build_draft_window_source_capability(
         vllm_config,
         block_tables,
     )
-    if validate_draft_window_parallel_eager_review(vllm_config):
-        return _build_parallel_eager_review_source(
-            policy=policy,
-            runtime_route=runtime_route,
-            attn_groups=attn_groups,
-            block_tables=block_tables,
-            causal=causal,
-            vllm_config=vllm_config,
-            runtime_context=runtime_context,
-        )
     return _build_draft_window_source_capability_for_context(
         policy=policy,
         runtime_route=runtime_route,
@@ -1557,95 +1297,6 @@ def build_draft_window_source_capability(
         causal=causal,
         vllm_config=vllm_config,
         runtime_context=runtime_context,
-    )
-
-
-def _build_parallel_eager_review_source(
-    *,
-    policy: DraftWindowPolicyDecision,
-    runtime_route: str,
-    attn_groups: Sequence[Sequence[AttentionGroup]],
-    block_tables: Any,
-    causal: bool | Mapping[int, bool],
-    vllm_config: Any,
-    runtime_context: DraftWindowRuntimeContext,
-) -> DraftWindowSourceCapability:
-    """Reuse dense rank-local reads while retaining real executor ownership.
-
-    SP/legacy DSA-CP/FlashComm belong to the Target executor in this reviewed
-    route. They do not change the separate dense Draft's canonical KV geometry.
-    Normalization is limited to source inventory construction. Every actual
-    dimension is restored before P3 or the existing Async completion-lane pool
-    is created; no Target metadata or public non-Graph gate is changed.
-    """
-    if (
-        runtime_context.attention_backend_family is not AttentionBackendFamily.STANDARD
-        or runtime_context.graph_mode != "NONE"
-        or runtime_route not in {"dspark", "dflash", "eagle3"}
-        or runtime_route != policy.normalized_method
-    ):
-        raise NotImplementedError("parallel eager review requires an actual STANDARD parallel Draft eager route")
-    # Eagle's matching control retains its proposal/step P4b owner. Async
-    # output delivery and the Target's SP/FlashComm do not shard this separately
-    # inventoried dense Draft cache. Keep the actual flags in the returned
-    # topology; the generic P2/non-Graph gates below remain closed elsewhere.
-    if runtime_route == "eagle3" and (
-        runtime_context.tensor_parallel_size != 4 or causal is not True or runtime_context.dsa_context_parallel
-    ):
-        raise NotImplementedError("Eagle3 eager review requires the named causal TP4 context without DSA-CP")
-    parallel = vllm_config.parallel_config
-    rank_local_dp = (
-        runtime_route == "dflash"
-        and runtime_context.tensor_parallel_size == 4
-        and runtime_context.data_parallel_size == 2
-    )
-    if (
-        runtime_context.tensor_parallel_size != parallel.tensor_parallel_size
-        or runtime_context.data_parallel_size != parallel.data_parallel_size
-        or (
-            runtime_context.data_parallel_size,
-            runtime_context.pipeline_parallel_size,
-            runtime_context.prefill_context_parallel_size,
-            runtime_context.decode_context_parallel_size,
-        )
-        != (2 if rank_local_dp else 1, 1, 1, 1)
-    ):
-        raise NotImplementedError("parallel eager source topology differs from the reviewed executor")
-    if policy.effective_window_size != vllm_config.additional_config.get(
-        "draft_window_size"
-    ) or policy.effective_window_size not in ((1024, 32768) if rank_local_dp else (1024,)):
-        raise NotImplementedError("parallel eager source Window differs from the reviewed configured policy")
-    source_context = replace(
-        runtime_context, async_scheduling=False, sequence_parallel=False, dsa_context_parallel=False, flashcomm=False
-    )
-    capability = _build_draft_window_source_capability_for_context(
-        policy=policy,
-        runtime_route=runtime_route,
-        attn_groups=attn_groups,
-        block_tables=block_tables,
-        causal=causal,
-        vllm_config=vllm_config,
-        runtime_context=source_context,
-        allow_replicated_tp_graph_source=True,
-        allow_parallel_prefix_graph_source=runtime_context.prefix_caching,
-        allow_parallel_dp_graph_source=rank_local_dp,
-    )
-    group = capability.inventory.require_single_group_direct_prefix()
-    if group.layout_category is not DraftWindowLayoutCategory.DENSE_GQA_DIRECT_PREFIX:
-        raise NotImplementedError("parallel eager review requires the actual dense GQA/FIA Draft provider")
-    capability.full_source.validate_owner_bindings()
-    topology = capability.eager_topology_fingerprint
-    if topology is None:
-        raise RuntimeError("parallel eager source has no immutable topology")
-    return replace(
-        capability,
-        eager_topology_fingerprint=replace(
-            topology,
-            async_scheduling=runtime_context.async_scheduling,
-            sequence_parallel=runtime_context.sequence_parallel,
-            dsa_context_parallel=runtime_context.dsa_context_parallel,
-            flashcomm=runtime_context.flashcomm,
-        ),
     )
 
 
@@ -1663,14 +1314,11 @@ def _build_draft_window_source_capability_for_context(
     allow_parallel_dp_graph_source: bool = False,
     dflash2_graph_contract: Any = None,
 ) -> DraftWindowSourceCapability:
-    """Build the source plane from an already-validated runtime context.
+    """Build source geometry after the caller validates its real Graph executor.
 
-    The normal production entry supplies the exact configured context. The
-    internal Graph and explicit parallel eager review callers validate their
-    real executor first and normalize only source-independent dimensions.
-    The actual rank domain and canonical source geometry remain intact; the
-    completed capability restores the exact executor identity before any
-    ownership state is allocated. Public default gates remain unchanged.
+    Executor features do not turn a dense Draft cache into a sharded provider.
+    Keep the actual context in the owner identity and check the source layout
+    directly, without constructing an artificial eager capability decision.
     """
     inventory = build_draft_window_inventory(
         policy=policy,
@@ -1685,32 +1333,33 @@ def _build_draft_window_source_capability_for_context(
         dflash2_graph_contract=dflash2_graph_contract,
     )
     uses_dynamic_k = bool(vllm_config.speculative_config.uses_dynamic_speculative_decoding())
-    from vllm_ascend.worker.v2.spec_decode.draft_window_nongraph import (
-        evaluate_p7x_nongraph_capability,
-    )
+    if uses_dynamic_k:
+        raise NotImplementedError("Draft Window Graph source requires static speculative decoding")
+    if len(inventory.groups) != 1:
+        raise NotImplementedError("Draft Window Graph source requires one executable cache-group consumer")
+    group = inventory.groups[0]
+    failures = list(inventory.capability_failures) + list(group.source_geometry_failures)
+    if group.layout_category is DraftWindowLayoutCategory.DENSE_GQA_DIRECT_PREFIX:
+        failures.extend(group.capability_failures)
+    elif group.layout_category is DraftWindowLayoutCategory.DSA:
+        # The native, uncompressed DSA provider has its own metadata contract.
+        # Compressed storage cannot inherit a direct-prefix read projection.
+        if group.drafting_compression_ratio != 1:
+            failures.append("DSA source requires an explicit uncompressed drafting provider")
+        if runtime_context.async_scheduling:
+            failures.append("DSA source has no lane-owned Async metadata provider")
+    else:
+        failures.append(f"layout {group.layout_category.value} has no direct-prefix source provider")
+    if failures:
+        raise NotImplementedError("Draft Window source is not supported: " + "; ".join(failures))
+    from vllm_ascend.worker.v2.spec_decode.draft_window_eager_capability import _build_topology_fingerprint
 
-    eager_decision = evaluate_p7x_nongraph_capability(
-        policy=policy,
+    eager_topology_fingerprint = _build_topology_fingerprint(
         inventory=inventory,
         runtime_context=runtime_context,
-        uses_dynamic_k=uses_dynamic_k,
         provider_version=DraftWindowRuntimeState.PROVIDER_VERSION,
         execution_lane=0,
-        allow_parallel_dp_graph_source=allow_parallel_dp_graph_source,
     )
-    eager_topology_fingerprint = eager_decision.require_local_materialization()
-    if len(inventory.groups) != 1:
-        raise NotImplementedError("P7-X live source currently requires one executable group")
-    group = inventory.groups[0]
-    if (
-        group.layout_category
-        not in (
-            DraftWindowLayoutCategory.DENSE_GQA_DIRECT_PREFIX,
-            DraftWindowLayoutCategory.DSA,
-        )
-        or group.source_geometry_failures
-    ):
-        raise NotImplementedError("P7-X live source requires one source-safe dense or uncompressed DSA prefix provider")
     full_source = build_full_draft_kv_source(
         inventory=inventory,
         block_tables=block_tables,
@@ -1852,65 +1501,6 @@ class DraftWindowWorkspace:
         self.cpu_window_upper = torch.zeros(max_num_reqs, dtype=torch.int32)
         self._bound_identity: DraftWindowGenerationIdentity | None = None
         self._active_table_columns: tuple[int, ...] = ()
-        self._pinned_h2d_staging_review = False
-        self._pending_pinned_h2d_sources: list[tuple[DraftWindowGenerationIdentity, torch.Tensor]] = []
-        self._pinned_h2d_submissions = 0
-
-    def configure_pinned_h2d_staging_review(self, enabled: bool) -> None:
-        """Opt in only for the separately admitted Eagle Graph experiment."""
-        if type(enabled) is not bool:
-            raise TypeError("pinned H2D review requires an explicit bool")
-        if self._bound_identity is not None or self._pending_pinned_h2d_sources:
-            raise RuntimeError("cannot change the copy policy of live or uncertain backing")
-        if enabled and self.window_block_table.device.type != "npu":
-            raise ValueError("pinned H2D review requires an already admitted NPU workspace")
-        self._pinned_h2d_staging_review = enabled
-
-    def _copy_length_source(
-        self,
-        destination: torch.Tensor,
-        source: torch.Tensor,
-        identity: DraftWindowGenerationIdentity,
-    ) -> None:
-        if not self._pinned_h2d_staging_review or source.device.type != "cpu":
-            destination.copy_(source)
-            return
-        if source.dtype != destination.dtype or source.shape != destination.shape:
-            raise ValueError("pinned length source must preserve exact dtype and geometry")
-        # Fresh, independently owned CPU values for this generation. Reusing a
-        # mutable CPU workspace as an async source would race its Host reset.
-        snapshot = torch.empty(source.shape, dtype=source.dtype, device="cpu", pin_memory=True)
-        snapshot.copy_(source)
-        if not snapshot.is_pinned() or _shares_storage(snapshot, source):
-            raise RuntimeError("H2D staging requires an independent framework-pinned CPU snapshot")
-        self._pending_pinned_h2d_sources.append((identity, snapshot))
-        # TorchNPU records successful copies with its caching Host allocator;
-        # allocator stream events protect deallocation, not a mutable source.
-        # On an exception after possible submission, retain the source along
-        # with the quarantined workspace. No query, drain or recovery here.
-        destination.copy_(snapshot, non_blocking=True)
-        self._pending_pinned_h2d_sources.pop()
-        self._pinned_h2d_submissions += 1
-
-    def pinned_h2d_review_state(self) -> dict[str, Any]:
-        """Host-only experiment headers, never a DMA/device completion claim."""
-        return dict(
-            enabled=self._pinned_h2d_staging_review,
-            submitted_copies=self._pinned_h2d_submissions,
-            pending_sources=[
-                dict(
-                    generation=identity.generation_id,
-                    epoch=identity.mapping_epoch,
-                    shape=list(tensor.shape),
-                    dtype=str(tensor.dtype),
-                    device=str(tensor.device),
-                    data_ptr=tensor.data_ptr(),
-                )
-                for identity, tensor in self._pending_pinned_h2d_sources
-            ],
-            successful_source_owner="FRAMEWORK_PINNED_ALLOCATOR_STREAM_RECORD",
-            completion="NOT_INFERRED_FROM_COPY_RETURN",
-        )
 
     @property
     def storage_pointers(self) -> tuple[int, ...]:
@@ -1940,10 +1530,6 @@ class DraftWindowWorkspace:
         preserve_on_failure: bool = False,
     ) -> None:
         """Rewrite all active and inert state from the canonical full source."""
-        if self._pending_pinned_h2d_sources:
-            raise RuntimeError("cannot reuse backing after an uncertain pinned H2D submission")
-        if self._pinned_h2d_staging_review and not preserve_on_failure:
-            raise RuntimeError("pinned H2D review requires Graph failure-preserving ownership")
         if self._bound_identity is not None:
             raise RuntimeError("workspace is already bound to an active generation")
         actual = identity.actual_request_count
@@ -2036,7 +1622,7 @@ class DraftWindowWorkspace:
                     out=self.valid_num_blocks,
                 )
             elif actual:
-                self._copy_length_source(self.valid_num_blocks[:actual], cpu_valid_num_blocks[:actual], identity)
+                self.valid_num_blocks[:actual].copy_(cpu_valid_num_blocks[:actual])
             active_columns: list[int] = []
             for row, descriptor in enumerate(read_descriptors):
                 if descriptor.global_group_id != identity.global_group_id:
@@ -2086,7 +1672,7 @@ class DraftWindowWorkspace:
                 active_columns.append(required)
             if actual:
                 device_exact_source = cpu_window_exact if device_window_exact is None else device_window_exact
-                self._copy_length_source(self.device_window_exact[:actual], device_exact_source[:actual], identity)
+                self.device_window_exact[:actual].copy_(device_exact_source[:actual])
                 self.cpu_window_exact[:actual].copy_(cpu_window_exact[:actual])
                 self.cpu_window_upper[:actual].copy_(cpu_window_upper[:actual])
             self._active_table_columns = tuple(active_columns)
@@ -2128,8 +1714,6 @@ class DraftWindowWorkspace:
         self._zero_all()
 
     def _zero_all(self) -> None:
-        if self._pending_pinned_h2d_sources:
-            raise RuntimeError("cannot clear backing or CPU sources after an uncertain pinned H2D submission")
         self.window_block_table.zero_()
         self.valid_num_blocks.zero_()
         self.device_window_exact.zero_()
@@ -2908,23 +2492,26 @@ def validate_draft_metadata_isolation(
     target_metadata: Any,
     subject: str = "Draft metadata",
 ) -> None:
-    """Reject any mutable object or storage shared with Target metadata.
-
-    P3's store and P6's graph carrier intentionally share this oracle.  The
-    latter builds metadata before graph replay and therefore must enforce the
-    same nested Tensor/NumPy/object isolation contract without publishing
-    through a Target-owned store.
-    """
+    """Reject Target aliases before publishing the Draft-private metadata view."""
     if target_metadata is None:
         raise ValueError("Target metadata is required for Draft isolation validation")
-    shared = _mutable_reference_keys(metadata) & _mutable_reference_keys(target_metadata)
+    draft_keys, _ = collect_mutable_references(metadata)
+    target_keys, _ = collect_mutable_references(target_metadata)
+    shared = draft_keys & target_keys
     if shared:
         raise ValueError(f"{subject} mutable storage aliases Target metadata")
 
 
-def _mutable_reference_keys(value: Any) -> set[tuple[str, Any]]:
-    """Collect mutable object/storage identities without retaining Target state."""
+def collect_mutable_references(value: Any) -> tuple[set[tuple[str, Any]], tuple[np.ndarray, ...]]:
+    """Index metadata aliases for isolation and selective Draft-side copies.
+
+    NumPy backing identities keep the isolation check conservative for views;
+    the arrays also let the copy boundary test actual memory overlap. Empty
+    independent tensors share the zero address but do not alias storage.
+    The result is local to a build/validation call, never a Target owner.
+    """
     keys: set[tuple[str, Any]] = set()
+    numpy_arrays: list[np.ndarray] = []
     seen: set[int] = set()
 
     def visit(current: Any) -> None:
@@ -2961,6 +2548,7 @@ def _mutable_reference_keys(value: Any) -> set[tuple[str, Any]]:
         if isinstance(current, np.ndarray):
             keys.add(("object", current_id))
             keys.add(("numpy_storage", _numpy_storage_owner_id(current)))
+            numpy_arrays.append(current)
             return
         if isinstance(current, Mapping):
             keys.add(("object", current_id))
@@ -3005,7 +2593,7 @@ def _mutable_reference_keys(value: Any) -> set[tuple[str, Any]]:
                     continue
 
     visit(value)
-    return keys
+    return keys, tuple(numpy_arrays)
 
 
 def _numpy_storage_owner_id(array: np.ndarray) -> int:

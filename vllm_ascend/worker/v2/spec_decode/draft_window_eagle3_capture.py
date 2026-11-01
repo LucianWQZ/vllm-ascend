@@ -13,7 +13,6 @@ from __future__ import annotations
 from collections.abc import Mapping
 from contextlib import contextmanager
 from copy import copy
-from dataclasses import replace
 from typing import Any
 
 import torch
@@ -35,35 +34,29 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
     DraftWindowGraphWriteSideReference,
     install_draft_window_graph_binding_provider,
 )
-from vllm_ascend.worker.v2.spec_decode.draft_window_graph_characterization import (
-    experimental_draft_window_graph_characterization_enabled,
-    validate_parallel_graph_characterization_context,
+from vllm_ascend.worker.v2.spec_decode.draft_window_graph_runtime import (
+    draft_window_graph_enabled,
+    validate_graph_context,
 )
 
 
 def build_eagle3_graph_source(owner: Any) -> tuple[Any, Any]:
     """Account for Graph explicitly before using the existing P2 inventory."""
-    if not experimental_draft_window_graph_characterization_enabled():
+    if not draft_window_graph_enabled():
         raise RuntimeError("Eagle3 Graph Window requires the default-off experimental gate")
     from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import eagle_dp2_graph_review_enabled
 
     context = build_draft_window_runtime_context(owner.vllm_config, owner.block_tables)
     rank_local_dp = eagle_dp2_graph_review_enabled(owner.vllm_config)
-    replicated_review = validate_parallel_graph_characterization_context(context, owner.vllm_config)
+    replicated_review = validate_graph_context(context, owner.vllm_config)
     if context.graph_mode != "FULL_DECODE_ONLY":
         raise NotImplementedError("Eagle3 Graph first implementation requires FULL_DECODE_ONLY")
     if owner.method != "eagle3" or owner.speculative_config.uses_dynamic_speculative_decoding():
         raise NotImplementedError("Eagle3 Graph requires normalized Eagle3 and static K")
-    # Qualified TP4 executor features do not change the independent dense
-    # Draft cache's source geometry. Validate the real executor above, then
-    # remove only those source-independent dimensions during P2 inventory.
-    # The complete actual topology is restored before runtime/owners exist.
-    reviewed_tp4 = replicated_review and context.tensor_parallel_size == 4
-    if reviewed_tp4 and context.dsa_context_parallel:
-        raise NotImplementedError("Eagle3 TP4 Graph review does not include DSA-CP")
-    source_context = replace(context, graph_mode="NONE")
-    if reviewed_tp4:
-        source_context = replace(source_context, async_scheduling=False, sequence_parallel=False, flashcomm=False)
+    # Executor features and the rank-local Draft consumer are validated
+    # separately, while the source retains the actual runtime identity.
+    if context.dsa_context_parallel:
+        raise NotImplementedError("Eagle3 Draft Graph does not support DSA-CP")
     capability = _build_draft_window_source_capability_for_context(
         policy=owner._draft_window_policy,
         runtime_route="eagle3",
@@ -71,9 +64,9 @@ def build_eagle3_graph_source(owner: Any) -> tuple[Any, Any]:
         block_tables=owner.block_tables,
         causal=True,
         vllm_config=owner.vllm_config,
-        runtime_context=source_context,
+        runtime_context=context,
         allow_replicated_tp_graph_source=replicated_review,
-        allow_parallel_prefix_graph_source=reviewed_tp4 and context.prefix_caching,
+        allow_parallel_prefix_graph_source=context.prefix_caching,
         allow_parallel_dp_graph_source=rank_local_dp,
     )
     group = capability.inventory.require_single_group_direct_prefix()
@@ -86,18 +79,6 @@ def build_eagle3_graph_source(owner: Any) -> tuple[Any, Any]:
         capability.full_source.validate_owner_bindings()
         if topology.prefix_caching is not True:
             raise RuntimeError("Eagle3 prefix Graph source lost the actual caching identity")
-    capability = replace(
-        capability,
-        eager_topology_fingerprint=replace(
-            topology,
-            graph_mode=context.graph_mode,
-            async_scheduling=context.async_scheduling,
-            sequence_parallel=context.sequence_parallel,
-            dsa_context_parallel=context.dsa_context_parallel,
-            flashcomm=context.flashcomm,
-            prefix_caching=context.prefix_caching,
-        ),
-    )
     return capability, context
 
 
@@ -109,7 +90,7 @@ class Eagle3GraphSession:
     """Separate persistent bank per descriptor x real AR consumer ordinal."""
 
     def __init__(self, owner: Any, context: Any) -> None:
-        validate_parallel_graph_characterization_context(context, getattr(owner, "vllm_config", None))
+        validate_graph_context(context, getattr(owner, "vllm_config", None))
         if context.graph_mode != "FULL_DECODE_ONLY":
             raise NotImplementedError("Eagle3 Graph session requires FULL_DECODE_ONLY")
         self.owner = owner
@@ -121,8 +102,6 @@ class Eagle3GraphSession:
         self._captures: dict[tuple[DraftWindowGraphRoute, int, int, int], DraftWindowGraphCaptureIdentity] = {}
         self._capture_call: tuple[DraftWindowGraphRoute, int, int] | None = None
         self._capture_ordinal = 0
-        self.captured_outputs: dict[DraftWindowGraphCaptureIdentity, Any] = {}
-        self.numeric_snapshots = None
         for first, manager in ((True, owner.prefill_cudagraph_manager), (False, owner.decode_cudagraph_manager)):
             route = DraftWindowGraphRoute.EAGLE3_FIRST_PASS if first else DraftWindowGraphRoute.EAGLE3_AR_STEP
             q = owner.num_speculative_steps + 1 if first else 1
@@ -181,20 +160,6 @@ class Eagle3GraphSession:
                         read.cpu_window_exact.fill_(capacity)
                         read.cpu_window_upper.fill_(capacity)
                         read.device_window_exact.copy_(read.cpu_window_exact)
-
-    def initialize_numeric_capture(self) -> None:
-        from vllm_ascend.ascend_config import validate_additional_config_bool
-
-        enabled = validate_additional_config_bool(
-            self.owner.vllm_config.additional_config.get("draft_window_graph_numeric_diagnostic", False),
-            "additional_config.draft_window_graph_numeric_diagnostic",
-        )
-        if enabled:
-            if self.numeric_snapshots is not None:
-                raise RuntimeError("Eagle3 numeric capture is already initialized")
-            from vllm_ascend.worker.v2.spec_decode.draft_window_eagle3_diagnostics import Eagle3CaptureSnapshots
-
-            self.numeric_snapshots = Eagle3CaptureSnapshots(self.owner, self._captures)
 
     def validate_for_provider(self, provider: Any) -> None:
         if provider is not self.provider or not self._captures:
@@ -262,12 +227,6 @@ class Eagle3GraphSession:
             layer.query_start_loc = query[: n + 1]
             result[name] = layer
         return result, identity
-
-    def retain_capture_output(self, identity: Any, output: Any) -> None:
-        if identity is not None:
-            if self.numeric_snapshots is not None:
-                output = self.numeric_snapshots.retain_output(identity, output)
-            self.captured_outputs[identity] = output
 
     def write_reference(self, identity: DraftWindowGraphCaptureIdentity, target: Mapping[str, Any]):
         fp = identity.fingerprint

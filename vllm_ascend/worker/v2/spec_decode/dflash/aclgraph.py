@@ -28,17 +28,14 @@ from vllm_ascend.utils import use_updatable_graph
 from vllm_ascend.worker.v2.aclgraph_utils import collect_sorted_captured_token_sizes, model_capture_wrapper
 from vllm_ascend.worker.v2.spec_decode.dflash.capture import draft_window_dflash_capture_scope
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
-    DraftWindowGraphStage,
     assert_draft_window_graph_metadata_batch,
     build_draft_window_graph_update_binding,
-    observe_draft_window_graph_capture,
-    observe_draft_window_graph_source,
     resolve_parallel_draft_window_graph_route,
+    validate_draft_window_graph_capture,
+    validate_draft_window_update_tasks,
 )
-from vllm_ascend.worker.v2.spec_decode.draft_window_graph_characterization import (
-    prepare_parallel_draft_window_graph_characterization,
-    record_parallel_graph_output,
-    record_parallel_graph_replay_submission,
+from vllm_ascend.worker.v2.spec_decode.draft_window_graph_runtime import (
+    prepare_parallel_graph,
 )
 from vllm_ascend.worker.v2.utils import communicator_switch
 
@@ -129,7 +126,7 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
             getattr(self, "_capture_descs", {}),
             max_num_reqs=getattr(self, "max_num_reqs", 0),
         ) as capture_context:
-            observe_draft_window_graph_capture(self.speculator, capture_context=capture_context)
+            validate_draft_window_graph_capture(self.speculator, capture_context=capture_context)
             # Keep core544's preparation callback and canonical context slots;
             # it receives both num_reqs and the actual built metadata.
             with communicator_switch(), model_capture_wrapper(self.speculator, False):
@@ -160,7 +157,7 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
             # reading the draft's persistent device buffers on every replay.
             return super().run_fullgraph(desc)
         if not dp_dummy:
-            prepare_parallel_draft_window_graph_characterization(self.speculator, desc)
+            prepare_parallel_graph(self.speculator, desc)
         draft_attn_metadatas = self.speculator.build_draft_attn_metadatas(
             desc.num_reqs,
             self.speculator.input_batch.seq_lens_cpu_upper_bound,
@@ -223,30 +220,24 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
         dp_dummy = is_parallel_graph_dp_dummy(self.speculator)
         graph_route = None if dp_dummy else resolve_parallel_draft_window_graph_route(self.speculator)
         self.update_stream.wait_stream(torch.npu.current_stream())
-        if graph_route is not None:
-            observe_draft_window_graph_source(self.speculator, DraftWindowGraphStage.REPLAY)
         ret = super().run_fullgraph(desc)
         if graph_route is None:
             # Exact existing OFF updatable call; no Window-only construction.
             graph.update(self.update_stream, resolved_tasks)
         else:
-            record_parallel_graph_replay_submission(self.speculator)
-            observe_draft_window_graph_source(self.speculator, DraftWindowGraphStage.CONSUMER)
             binding = build_draft_window_graph_update_binding(
                 self.speculator, route=graph_route, draft_attn_metadatas=draft_attn_metadatas
             )
             # Backend dispatch resolves CP classes from the captured manager's
             # configuration, also when this path is entered outside a model forward.
             with set_current_vllm_config(self.vllm_config):
-                graph.update(
-                    self.update_stream,
+                validate_draft_window_update_tasks(
+                    graph,
                     resolved_tasks,
-                    draft_window_graph_update_binding=binding,
-                    draft_attn_metadatas=draft_attn_metadatas,
-                    attn_backend=list(self.speculator.attn_backends.values())[0],
-                    num_tokens=desc.num_tokens,
+                    binding,
+                    draft_attn_metadatas,
+                    list(self.speculator.attn_backends.values())[0],
+                    desc.num_tokens,
                 )
-            # Diagnostics, when explicitly enabled, run only after UPDATE was
-            # submitted. A Host return/record here is not device completion.
-            record_parallel_graph_output(self.speculator, ret)
+                graph.update(self.update_stream, resolved_tasks)
         return ret

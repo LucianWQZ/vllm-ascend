@@ -106,50 +106,21 @@ def _resolve_window_policy(vllm_config: VllmConfig) -> DraftWindowPolicyDecision
 
 
 def _use_graph_window_owner(vllm_config: VllmConfig, policy: DraftWindowPolicyDecision | None) -> bool:
-    """Select one ownership implementation without changing eager policy.
-
-    The ordinary PR eager path retains its typed runtime. The private matched
-    eager control uses the Graph source/buffer contract deliberately, while
-    Graph execution always uses that persistent owner rather than an eager pool.
-    """
-    if policy is None or not policy.enabled:
-        return False
-    speculative = vllm_config.speculative_config
-    graph_requested = speculative.enforce_eager is not True
-    eager_review = get_ascend_config().draft_window_parallel_eager_review
-    if "DFlash2DraftModel" in speculative.draft_model_config.architectures:
-        if eager_review:
-            raise NotImplementedError(
-                "DFlash2 matching eager uses its ordinary typed Draft eager path, "
-                "not the Graph-owner eager review control. Target Graph is independent."
-            )
-        if not graph_requested:
-            return False
-    if not graph_requested and not eager_review:
+    """Keep the ordinary eager runtime and persistent Graph owner exclusive."""
+    if policy is None or not policy.enabled or vllm_config.speculative_config.enforce_eager:
         return False
     from vllm_ascend import envs
 
     if not envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH:
-        raise NotImplementedError(
-            "MRV2 Draft Window Graph requires the default-off private Graph review gate; "
-            "public Draft Window Graph support remains frozen."
-        )
+        raise NotImplementedError("Draft Window Graph requires its explicit experimental Graph entry")
+    from vllm_ascend.ascend_config import validate_draft_window_graph_config
+
+    validate_draft_window_graph_config(vllm_config)
     return True
 
 
 def _configure_graph_window_owner(speculator, policy: DraftWindowPolicyDecision, vllm_config: VllmConfig) -> None:
-    """Bridge policy types explicitly; Graph consumers compare enum identity.
-
-    The PR resolver remains authoritative for built-in versus external DSpark
-    policy. Re-resolving with the older Graph resolver would wrongly force OFF
-    an identified external draft just because its Target is a V4 model.
-    """
-    from vllm_ascend.worker.v2.spec_decode.draft_window import (
-        DraftWindowPolicyDecision as GraphPolicyDecision,
-    )
-    from vllm_ascend.worker.v2.spec_decode.draft_window import (
-        DraftWindowPolicyState as GraphPolicyState,
-    )
+    """Pass the authoritative policy to the persistent Graph owner."""
     from vllm_ascend.worker.v2.spec_decode.draft_window import (
         resolve_static_future_offset,
         validate_eligible_window_numbers,
@@ -159,28 +130,17 @@ def _configure_graph_window_owner(speculator, policy: DraftWindowPolicyDecision,
         raise ValueError("only an enabled Draft Window policy may configure a Graph owner")
     if hasattr(speculator, "draft_window_policy") or hasattr(speculator, "_draft_window_runtime"):
         raise RuntimeError("Graph owner and typed eager runtime must be mutually exclusive")
-    graph_policy = GraphPolicyDecision(
-        state=GraphPolicyState.ELIGIBLE_ON,
-        requested_window_size=policy.requested_window_size,
-        effective_window_size=policy.effective_window_size,
-        normalized_method=policy.normalized_method,
-        target_model_type=policy.target_model_type,
-        reason=policy.reason,
-    )
     speculative = vllm_config.speculative_config
     future_offset = resolve_static_future_offset(
-        normalized_method=graph_policy.normalized_method,
+        normalized_method=policy.normalized_method,
         configured_k=speculative.num_speculative_tokens,
         uses_dynamic_k=speculative.uses_dynamic_speculative_decoding(),
     )
-    validate_eligible_window_numbers(window_size=graph_policy.effective_window_size, future_offset=future_offset)
+    validate_eligible_window_numbers(window_size=policy.effective_window_size, future_offset=future_offset)
     configure = getattr(speculator, "_configure_draft_window", None)
     if not callable(configure):
-        raise NotImplementedError(
-            "This private integration has not connected the selected speculator's Graph owner; "
-            "its independent Graph candidate and outstanding method validation remain separate."
-        )
-    configure(graph_policy)
+        raise NotImplementedError("the selected speculator has no Draft Window Graph owner")
+    configure(policy)
 
 
 def init_speculator(vllm_config: VllmConfig, device: torch.device, req_states: "RequestState | None" = None):

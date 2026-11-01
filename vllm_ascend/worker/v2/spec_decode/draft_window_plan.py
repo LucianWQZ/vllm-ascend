@@ -75,6 +75,13 @@ class DraftWindowPlan:
         return replace(self, full_exact_end=exact_end)
 
 
+def window_capacity_tokens(window_size: int, block_span_tokens: int) -> int:
+    """Capacity for any interval whose start is aligned to this block span."""
+    _positive_integer("window_size", window_size)
+    _positive_integer("block_span_tokens", block_span_tokens)
+    return window_size + block_span_tokens - 1
+
+
 def compute_draft_window_plan(
     *,
     full_exact_end: int,
@@ -96,7 +103,7 @@ def compute_draft_window_plan(
     start = max(horizon - window_size, 0) // block_span_tokens * block_span_tokens
     if start > full_exact_end:
         raise ValueError("window start exceeds exact end; window is smaller than the proposal horizon requires")
-    return DraftWindowPlan(full_exact_end, horizon, start, window_size + block_span_tokens - 1)
+    return DraftWindowPlan(full_exact_end, horizon, start, window_capacity_tokens(window_size, block_span_tokens))
 
 
 def freeze_eagle_window_plan(
@@ -132,10 +139,27 @@ class DirectPrefixProjection:
     source_start_column: int
     first_token_offset: int
     required_columns: int
+    safe_extent_tokens: int
 
     @property
     def source_end_column(self) -> int:
         return self.source_start_column + self.required_columns
+
+
+def project_draft_window_interval(
+    *, window_start: int, full_exact_end: int, block_span_tokens: int
+) -> DirectPrefixProjection:
+    """Describe columns for one interval; the provider verifies residency."""
+    _nonnegative_integer("window_start", window_start)
+    _nonnegative_integer("full_exact_end", full_exact_end)
+    _positive_integer("block_span_tokens", block_span_tokens)
+    if full_exact_end < window_start:
+        raise ValueError("window start exceeds exact end")
+    column, offset = divmod(window_start, block_span_tokens)
+    visible = full_exact_end - window_start
+    columns = (offset + visible + block_span_tokens - 1) // block_span_tokens if visible else 0
+    safe_extent = columns * block_span_tokens - offset if columns else 0
+    return DirectPrefixProjection(column, offset, columns, safe_extent)
 
 
 def project_direct_prefix(
@@ -173,11 +197,11 @@ def project_direct_prefix(
         raise ValueError("resident interval is reversed")
     if window_start < resident_start or full_exact_end > resident_end:
         raise ValueError("requested read interval is not fully resident")
-    column, offset = divmod(window_start, block_span_tokens)
-    if offset and not supports_first_token_offset:
+    projection = project_draft_window_interval(
+        window_start=window_start, full_exact_end=full_exact_end, block_span_tokens=block_span_tokens
+    )
+    if projection.first_token_offset and not supports_first_token_offset:
         raise NotImplementedError("group cannot represent the logical window start without a first-token offset")
-    visible = full_exact_end - window_start
-    columns = (offset + visible + block_span_tokens - 1) // block_span_tokens if visible else 0
-    if columns and column + columns > valid_columns:
+    if projection.required_columns and projection.source_end_column > valid_columns:
         raise ValueError("requested read interval exceeds valid source columns")
-    return DirectPrefixProjection(column, offset, columns)
+    return projection

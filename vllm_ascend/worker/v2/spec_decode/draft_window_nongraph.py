@@ -1,11 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
-"""P7-X typed contracts for mandatory non-Graph Draft Window routes.
-
-The module deliberately contains no graph transport and no scheduler mutation.
-It converts source-owned batch/topology facts into immutable contracts consumed
-by the existing P1-P4 read plane.
-"""
+"""Request phases and source-owned projections used by the Graph read bank."""
 
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -15,38 +10,14 @@ from typing import Any
 import numpy as np
 import torch
 
-from vllm_ascend.attention.context_parallel.dsa_cp import (
-    AscendDSACPMetadataBuilder,
-)
-from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
-from vllm_ascend.device.hardware_profile import AttentionBackendFamily
 from vllm_ascend.worker.v2.spec_decode.draft_window import (
-    DraftWindowInventory,
-    DraftWindowLayoutCategory,
-    DraftWindowPolicyDecision,
-    DraftWindowPolicyState,
     DraftWindowReadDescriptor,
-    DraftWindowRuntimeContext,
     FullDraftKVSource,
     SingleGroupDirectPrefixProvider,
-    compute_draft_window_scalar_plan,
     gather_valid_num_blocks_cpu,
 )
-from vllm_ascend.worker.v2.spec_decode.draft_window_eager_capability import (
-    P7EagerTopologyFingerprint,
-    _build_topology_fingerprint,
-)
-
-
-class P7XCapabilityStatus(Enum):
-    """Only statuses permitted by the P7-X capability matrix."""
-
-    CONFIG_OFF = "CONFIG_OFF"
-    FORCED_OFF = "FORCED_OFF"
-    LOCAL_STATIC_READY = "LOCAL_STATIC_READY"
-    REPORT1_RUNTIME_DEPENDENT = "REPORT1_RUNTIME_DEPENDENT"
-    SOURCE_BLOCKED = "SOURCE_BLOCKED"
-    GRAPH_FROZEN = "GRAPH_FROZEN"
+from vllm_ascend.worker.v2.spec_decode.draft_window_plan import compute_draft_window_plan
+from vllm_ascend.worker.v2.spec_decode.draft_window_runtime import continuing_prefill_rows
 
 
 class DraftWindowRowPhase(Enum):
@@ -62,15 +33,6 @@ class DraftWindowBatchPhase(Enum):
     PURE_PREFILL_CONTINUING = "pure_prefill_continuing"
     PURE_PREFILL_TERMINAL = "pure_prefill_terminal"
     MIXED = "mixed"
-
-
-class DraftWindowBackendProviderKind(Enum):
-    """How a cache group derives its final Draft read visibility."""
-
-    DENSE_DIRECT_PREFIX = "dense_direct_prefix"
-    DSA_NATIVE_SWA = "dsa_native_swa"
-    DSA_CP_NATIVE_SWA = "dsa_cp_native_swa"
-    UNRESOLVED = "unresolved"
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,24 +88,6 @@ class DraftWindowResidentSetSnapshot:
     valid_num_blocks: torch.Tensor
 
 
-@dataclass(frozen=True, slots=True)
-class P7XCapabilityDecision:
-    status: P7XCapabilityStatus
-    reason: str
-    topology_fingerprint: P7EagerTopologyFingerprint | None
-    backend_provider_kinds: tuple[DraftWindowBackendProviderKind, ...] = ()
-
-    def require_local_materialization(self) -> P7EagerTopologyFingerprint:
-        if self.status is not P7XCapabilityStatus.LOCAL_STATIC_READY:
-            raise NotImplementedError(
-                "MRV2 Draft Window P7-X route rejected before materialization: "
-                f"status={self.status.value}; {self.reason}"
-            )
-        if self.topology_fingerprint is None:
-            raise RuntimeError("LOCAL_STATIC_READY decision has no topology fingerprint")
-        return self.topology_fingerprint
-
-
 def classify_draft_window_batch_phase(input_batch: Any) -> DraftWindowBatchPhasePlan:
     """Classify every active row from pinned ``InputBatch`` source fields."""
     num_reqs = int(input_batch.num_reqs)
@@ -172,12 +116,13 @@ def classify_draft_window_batch_phase(input_batch: Any) -> DraftWindowBatchPhase
         raise RuntimeError("InputBatch is_prefilling rows disagree with computed/prefill lengths")
     if bool(getattr(input_batch, "has_prefill", False)) != bool(np.any(actual_prefill)):
         raise RuntimeError("InputBatch has_prefill disagrees with row phase state")
+    continuing = continuing_prefill_rows(input_batch, num_reqs)
 
     phases: list[DraftWindowRowPhase] = []
     for row in range(num_reqs):
         if not bool(actual_prefill[row]):
             phases.append(DraftWindowRowPhase.PURE_DECODE)
-        elif int(computed[row]) + int(scheduled[row]) < int(prefill_len[row]):
+        elif bool(continuing[row]):
             phases.append(DraftWindowRowPhase.PREFILL_CONTINUING)
         else:
             phases.append(DraftWindowRowPhase.PREFILL_TERMINAL)
@@ -279,11 +224,11 @@ def build_phase_aware_materialization_plan(
             visible = full_exact
             visible_upper = min(max(full_upper, visible), safe_extent)
         else:
-            scalar = compute_draft_window_scalar_plan(
+            scalar = compute_draft_window_plan(
                 full_exact_end=full_exact,
                 future_offset=0,
                 window_size=provider.inventory.window_size,
-                legacy_block_size=provider.legacy_block_size,
+                block_span_tokens=provider.legacy_block_size,
             )
             descriptor = provider.describe(scalar, valid_num_blocks=valid)
             visible = scalar.window_visible_length
@@ -302,222 +247,4 @@ def build_phase_aware_materialization_plan(
         cpu_window_upper=upper,
         cpu_valid_num_blocks=cpu_valid_num_blocks,
         row_phase_fingerprint=phase_plan.row_phase_fingerprint,
-    )
-
-
-def _is_subclass(candidate: type[Any], parent: type[Any]) -> bool:
-    try:
-        return issubclass(candidate, parent)
-    except TypeError:
-        return False
-
-
-def _provider_kind(
-    group: Any,
-    *,
-    dsa_context_parallel: bool,
-) -> DraftWindowBackendProviderKind:
-    layout = group.layout_category
-    if layout is DraftWindowLayoutCategory.DENSE_GQA_DIRECT_PREFIX:
-        return DraftWindowBackendProviderKind.DENSE_DIRECT_PREFIX
-    if layout is DraftWindowLayoutCategory.DSA:
-        if dsa_context_parallel and _is_subclass(group.builder_class, AscendDSACPMetadataBuilder):
-            return DraftWindowBackendProviderKind.DSA_CP_NATIVE_SWA
-        if not dsa_context_parallel and _is_subclass(group.builder_class, AscendDSAMetadataBuilder):
-            return DraftWindowBackendProviderKind.DSA_NATIVE_SWA
-    return DraftWindowBackendProviderKind.UNRESOLVED
-
-
-def evaluate_p7x_nongraph_capability(
-    *,
-    policy: DraftWindowPolicyDecision,
-    inventory: DraftWindowInventory | None,
-    runtime_context: DraftWindowRuntimeContext | None,
-    uses_dynamic_k: bool,
-    provider_version: int,
-    execution_lane: int,
-    allow_parallel_dp_graph_source: bool = False,
-) -> P7XCapabilityDecision:
-    """Classify the mandatory non-Graph scope without allocating read state."""
-    if policy.state is DraftWindowPolicyState.CONFIG_OFF:
-        return P7XCapabilityDecision(P7XCapabilityStatus.CONFIG_OFF, "draft_window_size is not configured", None)
-    if policy.state is DraftWindowPolicyState.FORCED_OFF:
-        return P7XCapabilityDecision(
-            P7XCapabilityStatus.FORCED_OFF,
-            f"method/model policy forced Window OFF: {policy.reason}",
-            None,
-        )
-    if inventory is None or runtime_context is None:
-        raise ValueError("eligible P7-X evaluation requires inventory and runtime context")
-    if type(allow_parallel_dp_graph_source) is not bool:
-        raise TypeError("parallel DP source allowance must be an explicit boolean")
-    if allow_parallel_dp_graph_source and (
-        inventory.runtime_route not in ("dflash", "eagle3")
-        or (inventory.runtime_route == "eagle3" and inventory.window_size != 1024)
-        or runtime_context.tensor_parallel_size != 4
-        or runtime_context.data_parallel_size != 2
-    ):
-        raise ValueError("parallel DP source allowance is limited to reviewed rank-local DFlash TP4/DP2")
-    fingerprint = _build_topology_fingerprint(
-        inventory=inventory,
-        runtime_context=runtime_context,
-        provider_version=provider_version,
-        execution_lane=execution_lane,
-    )
-    kinds = tuple(
-        _provider_kind(
-            group,
-            dsa_context_parallel=runtime_context.dsa_context_parallel,
-        )
-        for group in inventory.groups
-    )
-    if runtime_context.graph_mode != "NONE":
-        return P7XCapabilityDecision(
-            P7XCapabilityStatus.GRAPH_FROZEN,
-            f"Graph mode {runtime_context.graph_mode} belongs to the frozen Graph Track",
-            fingerprint,
-            kinds,
-        )
-    if runtime_context.attention_backend_family is not AttentionBackendFamily.STANDARD:
-        return P7XCapabilityDecision(
-            P7XCapabilityStatus.SOURCE_BLOCKED,
-            f"hardware family {runtime_context.attention_backend_family.name} has no P7-X carrier",
-            fingerprint,
-            kinds,
-        )
-    if uses_dynamic_k:
-        return P7XCapabilityDecision(
-            P7XCapabilityStatus.SOURCE_BLOCKED,
-            "dynamic-K Eagle3 is outside the mandatory static-K contract",
-            fingerprint,
-            kinds,
-        )
-    if inventory.runtime_route == "dflash2" and not inventory.dflash2_graph_source:
-        return P7XCapabilityDecision(
-            P7XCapabilityStatus.SOURCE_BLOCKED,
-            "DFlash2 has no verified explicit read consumer",
-            fingerprint,
-            kinds,
-        )
-    if runtime_context.async_scheduling and inventory.method == "eagle3":
-        return P7XCapabilityDecision(
-            P7XCapabilityStatus.REPORT1_RUNTIME_DEPENDENT,
-            "Eagle3 multi-step async needs a proposal/step live binding before it may allocate a Window source",
-            fingerprint,
-            kinds,
-        )
-    if not inventory.groups:
-        return P7XCapabilityDecision(
-            P7XCapabilityStatus.SOURCE_BLOCKED,
-            "no executable Draft attention consumer exists",
-            fingerprint,
-            kinds,
-        )
-    if any(kind is DraftWindowBackendProviderKind.UNRESOLVED for kind in kinds):
-        return P7XCapabilityDecision(
-            P7XCapabilityStatus.REPORT1_RUNTIME_DEPENDENT,
-            "one or more backend layouts need an actual runtime consumer/provider identity",
-            fingerprint,
-            kinds,
-        )
-    if any(group.source_geometry_failures for group in inventory.groups):
-        failures = tuple(failure for group in inventory.groups for failure in group.source_geometry_failures)
-        return P7XCapabilityDecision(
-            P7XCapabilityStatus.SOURCE_BLOCKED,
-            "source geometry is not safe: " + "; ".join(failures),
-            fingerprint,
-            kinds,
-        )
-    dsa_groups = tuple(group for group in inventory.groups if group.layout_category is DraftWindowLayoutCategory.DSA)
-    if any(group.drafting_compression_ratio is None for group in dsa_groups):
-        return P7XCapabilityDecision(
-            P7XCapabilityStatus.REPORT1_RUNTIME_DEPENDENT,
-            "DSA builder did not expose an actual drafting compression ratio",
-            fingerprint,
-            kinds,
-        )
-    if any((group.drafting_compression_ratio or 0) > 1 for group in dsa_groups):
-        return P7XCapabilityDecision(
-            P7XCapabilityStatus.SOURCE_BLOCKED,
-            "compressed DSA/QLI drafting has no safe Window source contract",
-            fingerprint,
-            kinds,
-        )
-    if runtime_context.async_scheduling and dsa_groups:
-        return P7XCapabilityDecision(
-            P7XCapabilityStatus.REPORT1_RUNTIME_DEPENDENT,
-            "DSA async requires lane-owned SAS/local/index buffers before live materialization",
-            fingerprint,
-            kinds,
-        )
-    if any(
-        group.capability_failures and group.layout_category is DraftWindowLayoutCategory.DENSE_GQA_DIRECT_PREFIX
-        for group in inventory.groups
-    ):
-        return P7XCapabilityDecision(
-            P7XCapabilityStatus.SOURCE_BLOCKED,
-            "dense provider inventory contains unresolved source/geometry failures",
-            fingerprint,
-            kinds,
-        )
-    if len({group.global_group_id for group in inventory.groups}) != len(inventory.groups):
-        return P7XCapabilityDecision(
-            P7XCapabilityStatus.SOURCE_BLOCKED,
-            "multiple executable consumers share a global gid",
-            fingerprint,
-            kinds,
-        )
-    if len(inventory.groups) > 1:
-        signatures = {
-            (group.layout_category, group.logical_block_size, group.kernel_block_size) for group in inventory.groups
-        }
-        status = P7XCapabilityStatus.REPORT1_RUNTIME_DEPENDENT
-        return P7XCapabilityDecision(
-            status,
-            "homogeneous groups have a source-safe canonical-anchor contract "
-            "but the live P3/P4 carrier is not yet bundled"
-            if len(signatures) == 1
-            else "heterogeneous per-layout consumers require Report1 runtime identity",
-            fingerprint,
-            kinds,
-        )
-    unsupported_parallel: list[str] = []
-    for name, size in (
-        ("DP", runtime_context.data_parallel_size),
-        ("PP", runtime_context.pipeline_parallel_size),
-        ("PCP", runtime_context.prefill_context_parallel_size),
-        ("DCP", runtime_context.decode_context_parallel_size),
-    ):
-        if size != 1 and not (name == "DP" and allow_parallel_dp_graph_source):
-            unsupported_parallel.append(f"{name}={size}")
-    if runtime_context.sequence_parallel:
-        unsupported_parallel.append("SP")
-    if runtime_context.flashcomm and not runtime_context.dsa_context_parallel:
-        unsupported_parallel.append("FlashComm")
-    if runtime_context.dsa_context_parallel and kinds != (DraftWindowBackendProviderKind.DSA_CP_NATIVE_SWA,):
-        unsupported_parallel.append("DSA-CP-without-DSA-provider")
-    if unsupported_parallel:
-        return P7XCapabilityDecision(
-            P7XCapabilityStatus.REPORT1_RUNTIME_DEPENDENT,
-            "parallel route requires a runtime-specific carrier: " + ", ".join(unsupported_parallel),
-            fingerprint,
-            kinds,
-        )
-    supported_single_kinds = {
-        DraftWindowBackendProviderKind.DENSE_DIRECT_PREFIX,
-        DraftWindowBackendProviderKind.DSA_NATIVE_SWA,
-        DraftWindowBackendProviderKind.DSA_CP_NATIVE_SWA,
-    }
-    if len(kinds) != 1 or kinds[0] not in supported_single_kinds:
-        return P7XCapabilityDecision(
-            P7XCapabilityStatus.REPORT1_RUNTIME_DEPENDENT,
-            "backend-derived provider is source-specified but not installed in the live P3/P4 carrier",
-            fingerprint,
-            kinds,
-        )
-    return P7XCapabilityDecision(
-        P7XCapabilityStatus.LOCAL_STATIC_READY,
-        "non-Graph route has explicit topology, residency, and backend-provider contracts",
-        fingerprint,
-        kinds,
     )

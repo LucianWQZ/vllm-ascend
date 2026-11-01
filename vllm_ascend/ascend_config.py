@@ -61,39 +61,6 @@ def validate_additional_config_bool(value: Any, path: str) -> bool:
         raise ValueError(f"{path} must be a boolean, got {value!r}.") from exc
 
 
-def validate_draft_window_eagle_pinned_h2d_review(vllm_config: Any) -> bool:
-    """Admit a bounded copy-policy experiment without changing the Graph gate."""
-    additional = getattr(vllm_config, "additional_config", None) or {}
-    enabled = validate_additional_config_bool(
-        additional.get("draft_window_graph_eagle_pinned_h2d_review", False),
-        "additional_config.draft_window_graph_eagle_pinned_h2d_review",
-    )
-    if not enabled:
-        return False
-    from vllm_ascend import envs
-
-    speculative = vllm_config.speculative_config
-    tp = vllm_config.parallel_config.tensor_parallel_size
-    k = getattr(speculative, "num_speculative_tokens", None)
-    if (
-        speculative is None
-        or speculative.method != "eagle3"
-        or speculative.enforce_eager
-        or speculative.uses_dynamic_speculative_decoding()
-        or type(k) is not int
-        or k <= 1
-        or additional.get("draft_window_size") != 1024
-        or type(tp) is not int
-        or tp != 1
-        or not envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH
-        or getattr(vllm_config.compilation_config.cudagraph_mode, "name", None) != "FULL_DECODE_ONLY"
-    ):
-        raise ValueError(
-            "pinned H2D review requires experimental static Eagle3 Graph, K>1, TP1, W1024 and FULL_DECODE_ONLY"
-        )
-    return True
-
-
 def _native_swa_graph_window_review(speculative: Any, window_size: Any) -> bool:
     """Configuration eligibility only; actual groups/owners are checked at set_attn.
 
@@ -122,135 +89,56 @@ def _native_swa_graph_window_review(speculative: Any, window_size: Any) -> bool:
 
 
 def _dense_dp_graph_window_review(vllm_config: Any, window_size: Any) -> bool:
-    """Eligibility for the fixed wide-Window dense rank-local DP control.
+    """Use the same startup contract as the DFlash Graph owner."""
+    from vllm_ascend import envs
+    from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import resolve_draft_graph_review_limit
 
-    This does not infer a backend or allocate/crop any state. set_attn still
-    inventories the real dense GQA provider and validates each canonical owner.
-    """
-    speculative = vllm_config.speculative_config
-    parallel = vllm_config.parallel_config
-    hf = getattr(getattr(speculative, "draft_model_config", None), "hf_config", None)
-    layers = getattr(hf, "layer_types", None)
-    dense = (
-        type(window_size) is int
-        and window_size == 32768
-        and getattr(speculative, "method", None) == "dflash"
-        and type(parallel.tensor_parallel_size) is int
-        and parallel.tensor_parallel_size == 4
-        and isinstance(layers, (list, tuple))
-        and bool(layers)
-        and set(layers) == {"full_attention"}
-        and getattr(hf, "use_sliding_window", False) is False
-        and getattr(hf, "sliding_window", None) is None
+    scope = resolve_draft_graph_review_limit(
+        vllm_config, experimental_graph_review=envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH
     )
-    if not dense or type(parallel.data_parallel_size) is not int:
-        return False
-    if parallel.data_parallel_size == 2:
-        return True
-    if parallel.data_parallel_size != 1:
-        return False
-    additional = vllm_config.additional_config or {}
-    if validate_additional_config_bool(
-        additional.get("draft_window_graph_numeric_diagnostic", False),
-        "additional_config.draft_window_graph_numeric_diagnostic",
-    ):
-        # Preserve the independent serialized canonical numerical reference.
-        return True
-    # Ordinary DP1 is a separate, checkpoint-scoped bounded request review.
-    # Reuse its shared config/capacity checks rather than removing the DP gate.
-    # This helper only admits configuration; set_attn validates the real
-    # provider and the proposal boundary validates the admitted actual/padded bank.
-    from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import (
-        full8_graph_review_max_requests,
-        resolve_draft_graph_review_limit,
+    return scope is not None and scope.method == "dflash" and window_size in (None, 32768)
+
+
+def _eagle3_tp4_graph_review(vllm_config: Any) -> bool:
+    """Use the qualified actual Eagle consumer geometry, not an architecture name."""
+    from vllm_ascend import envs
+    from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import resolve_draft_graph_review_limit
+
+    scope = resolve_draft_graph_review_limit(
+        vllm_config, experimental_graph_review=envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH
     )
+    return (
+        scope is not None
+        and scope.method == "eagle3"
+        and vllm_config.parallel_config.tensor_parallel_size == 4
+        and vllm_config.parallel_config.data_parallel_size == scope.data_parallel_size
+        and vllm_config.scheduler_config.max_num_seqs == scope.max_requests
+    )
+
+
+def _single_request_graph_off_review(vllm_config: Any) -> bool:
+    """A qualified Graph owner may also execute without the additional Window."""
+    if (vllm_config.additional_config or {}).get("draft_window_size") is not None:
+        return False
+    from vllm_ascend import envs
+    from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import resolve_draft_graph_review_limit
 
     return (
-        full8_graph_review_max_requests(
-            resolve_draft_graph_review_limit(
-                vllm_config,
-                experimental_graph_review=True,
-            )
+        resolve_draft_graph_review_limit(
+            vllm_config, experimental_graph_review=envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH
         )
         is not None
     )
 
 
-def _eagle3_tp4_graph_review(vllm_config: Any) -> bool:
-    """Admit the named dense K3 TP4 geometry under the existing review gate.
+def validate_draft_window_graph_config(vllm_config: Any) -> bool:
+    """Validate the actual selected Draft Graph topology and provider geometry."""
+    from vllm_ascend import envs
 
-    The pinned QKV loader replicates each of two KV heads over two TP ranks.
-    Runtime inventory still validates actual rank-local cache and reader owners;
-    this predicate neither partitions logical lengths nor changes capture.
-    """
     speculative = vllm_config.speculative_config
-    hf = getattr(getattr(speculative, "draft_model_config", None), "hf_config", None)
-    expected = dict(hidden_size=2048, num_hidden_layers=1, head_dim=256, num_attention_heads=16, num_key_value_heads=2)
-    return (
-        getattr(speculative, "method", None) == "eagle3"
-        and type(vllm_config.parallel_config.tensor_parallel_size) is int
-        and vllm_config.parallel_config.tensor_parallel_size == 4
-        and getattr(hf, "architectures", None) == ["LlamaForCausalLMEagle3"]
-        and all(type(getattr(hf, key, None)) is int and getattr(hf, key) == value for key, value in expected.items())
-        and getattr(hf, "fc_norm", None) is True
-        and getattr(hf, "use_sliding_window", False) is False
-        and getattr(hf, "sliding_window", None) is None
-    )
-
-
-def _single_request_graph_off_review(vllm_config: Any) -> bool:
-    """Keep the named finite Graph guards when no extra window is requested.
-
-    This is startup admission only. Resolve the same checkpoint, topology,
-    capacity and capture contract used by the ordinary execution owner; a
-    review flag by itself must not open the replicated Graph route.
-    """
-    additional = getattr(vllm_config, "additional_config", None) or {}
-    if additional.get("draft_window_size") is not None or vllm_config.speculative_config is None:
+    if not envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH or speculative is None or speculative.enforce_eager:
         return False
-    enabled = any(
-        validate_additional_config_bool(additional.get(name, False), "additional_config." + name)
-        for name in (
-            "draft_window_graph_full8_single_request_review",
-            "draft_window_graph_full8_two_request_review",
-            "draft_window_graph_eagle_single_request_review",
-            "draft_window_graph_eagle_two_request_review",
-            "draft_window_graph_eagle_dp2_review",
-        )
-    )
-    if not enabled:
-        return False
-    # Circular dependency: the shared resolver imports this module's bool
-    # validator. It also checks the exact local checkpoint configuration.
-    from vllm_ascend import envs
-    from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import (
-        EagleSingleRequestReviewScope,
-        full8_graph_review_max_requests,
-        resolve_draft_graph_review_limit,
-    )
-
-    limit = resolve_draft_graph_review_limit(
-        vllm_config,
-        experimental_graph_review=envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH,
-    )
-    return full8_graph_review_max_requests(limit) is not None or isinstance(limit, EagleSingleRequestReviewScope)
-
-
-def validate_draft_window_replicated_tp_review(vllm_config: Any) -> bool:
-    """Admit explicit replicated TP review profiles without changing public defaults."""
-    additional = getattr(vllm_config, "additional_config", None) or {}
-    enabled = validate_additional_config_bool(
-        additional.get("draft_window_graph_replicated_tp_review", False),
-        "additional_config.draft_window_graph_replicated_tp_review",
-    )
-    if not enabled:
-        return False
-    from vllm_ascend import envs
-
-    if not envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH:
-        raise ValueError("replicated TP Graph review requires the default-off experimental Graph gate")
-    if envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH_OBSERVE:
-        raise ValueError("replicated TP Graph review requires observer OFF; shared-file observer is not rank isolated")
+    additional = vllm_config.additional_config or {}
     speculative = vllm_config.speculative_config
     native_swa_window = _native_swa_graph_window_review(speculative, additional.get("draft_window_size"))
     dense_dp_window = _dense_dp_graph_window_review(vllm_config, additional.get("draft_window_size"))
@@ -311,64 +199,6 @@ def validate_draft_window_replicated_tp_review(vllm_config: Any) -> bool:
         )
     if getattr(vllm_config.compilation_config.cudagraph_mode, "name", None) != "FULL_DECODE_ONLY":
         raise ValueError("replicated TP Graph review requires FULL_DECODE_ONLY")
-    return True
-
-
-def validate_draft_window_parallel_eager_review(vllm_config: Any) -> bool:
-    """Gate the matching eager control for the reviewed parallel Graph route."""
-    additional = getattr(vllm_config, "additional_config", None) or {}
-    enabled = validate_additional_config_bool(
-        additional.get("draft_window_parallel_eager_review", False),
-        "additional_config.draft_window_parallel_eager_review",
-    )
-    if not enabled:
-        return False
-    from vllm_ascend import envs
-
-    if not envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH or envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH_OBSERVE:
-        raise ValueError("parallel eager review requires the experimental gate and observer OFF")
-    speculative = vllm_config.speculative_config
-    if (
-        speculative is None
-        or speculative.method not in ("dspark", "dflash", "eagle3")
-        or speculative.enforce_eager is not True
-        or speculative.uses_dynamic_speculative_decoding()
-    ):
-        raise ValueError("parallel eager review requires static DSpark/DFlash or named Eagle3 Draft eager")
-    parallel = vllm_config.parallel_config
-    draft_parallel = speculative.draft_parallel_config
-    tp = parallel.tensor_parallel_size
-    if (
-        type(tp) is not int
-        or tp not in (2, 4, 16)
-        or draft_parallel is None
-        or type(draft_parallel.tensor_parallel_size) is not int
-        or draft_parallel.tensor_parallel_size != tp
-    ):
-        raise ValueError("parallel eager review requires matching actual Target/Draft TP in (2, 4, 16)")
-    if speculative.method == "eagle3" and (
-        not _eagle3_tp4_graph_review(vllm_config)
-        or type(getattr(speculative, "num_speculative_tokens", None)) is not int
-        or speculative.num_speculative_tokens != 3
-    ):
-        raise ValueError("parallel Eagle3 eager review requires the named dense TP4 static K3 geometry")
-    dp = parallel.data_parallel_size
-    rank_local_dp = speculative.method == "dflash" and tp == 4 and type(dp) is int and dp == 2
-    if (
-        type(dp) is not int
-        or dp != 1
-        and not rank_local_dp
-        or any(
-            getattr(parallel, name, None) != 1
-            for name in ("pipeline_parallel_size", "prefill_context_parallel_size", "decode_context_parallel_size")
-        )
-    ):
-        raise ValueError("parallel eager review requires DP1 or rank-local DFlash TP4/DP2, and PP=PCP=DCP=1")
-    window = additional.get("draft_window_size")
-    if type(window) is not int or window not in ((1024, 32768) if rank_local_dp else (1024,)):
-        raise ValueError("parallel eager review requires W1024, or W32768 for rank-local DFlash TP4/DP2")
-    if getattr(vllm_config.compilation_config.cudagraph_mode, "name", None) != "FULL_DECODE_ONLY":
-        raise ValueError("parallel eager review keeps the Target in FULL_DECODE_ONLY")
     return True
 
 
@@ -899,33 +729,6 @@ class AscendConfig:
     enable_pcp_o_proj_weight_sharding: bool = True
     enable_pcp_embedding_lmhead_weight_sharding: bool = True
     draft_window_size: int | None = None
-    # Internal parallel-Draft capture-output diagnostic; does not open the Graph gate.
-    draft_window_graph_numeric_diagnostic: bool = False
-    # Explicit, disposable Eagle numeric diagnostic: retain attention Q/O and
-    # capture-call headers. Disabled in normal execution and performance runs.
-    draft_window_graph_eagle_attention_probe: bool = False
-    # Separate default-off diagnosis: copied output and one named native/Full attention boundary.
-    draft_window_graph_numeric_owned_output: bool = False
-    # Internal default-off experiment: one real P6 metadata build per parallel FULL replay.
-    draft_window_graph_single_metadata: bool = False
-    # Default-off review experiment: Tensor headers memoized within one validation call only.
-    draft_window_graph_validation_memo: bool = False
-    # Controlled finite Eagle single-request product review; not a PASS receipt.
-    draft_window_graph_eagle_single_request_review: bool = False
-    # Separate default-off exact n1/n2 Eagle ordinary qualification entry.
-    draft_window_graph_eagle_two_request_review: bool = False
-    # Exact TP4xDP2 local1/padded1 entry; device qualification is separate.
-    draft_window_graph_eagle_dp2_review: bool = False
-    # Controlled Full8 active1/padded1 ordinary qualification; default still closed.
-    draft_window_graph_full8_single_request_review: bool = False
-    # Separate controlled Full8 actual/padded1-or-2 qualification; never opens larger batches.
-    draft_window_graph_full8_two_request_review: bool = False
-    # Default-off Eagle Graph experiment: owned pinned sources for length H2D.
-    draft_window_graph_eagle_pinned_h2d_review: bool = False
-    # Default-off, rank-owned TP2 dense Graph review; does not open the public gate.
-    draft_window_graph_replicated_tp_review: bool = False
-    # Default-off matched eager control; retains actual Target executor features.
-    draft_window_parallel_eager_review: bool = False
     mix_placement: bool = False
     # When non-zero, force the MC2 combine stage's comm quant_mode to this
     # value (e.g. 4 = MXFP float8_e4m3 communication quantization) regardless of the
@@ -2263,7 +2066,33 @@ def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
         "profiling_chunk_config",
         "batch_job_sched_config",
     }
-    kwargs = {k: v for k, v in additional_config.items() if k not in _NON_USER_INPUT_KEYS}
+    retired_window_experiments = {
+        "draft_window_graph_replicated_tp_review",
+        "draft_window_graph_single_metadata",
+        "draft_window_graph_eagle_dp2_review",
+        "draft_window_parallel_eager_review",
+        "draft_window_graph_validation_memo",
+        "draft_window_graph_full8_single_request_review",
+        "draft_window_graph_numeric_owned_output",
+        "draft_window_graph_eagle_pinned_h2d_review",
+        "draft_window_graph_full8_two_request_review",
+        "draft_window_graph_eagle_attention_probe",
+        "draft_window_graph_eagle_two_request_review",
+        "draft_window_graph_eagle_single_request_review",
+        "draft_window_graph_numeric_diagnostic",
+    }
+    obsolete = sorted(key for key in retired_window_experiments if additional_config.get(key, False) is not False)
+    if obsolete:
+        raise ValueError(
+            "Removed Draft Window experiment options: "
+            + ", ".join(obsolete)
+            + ". Use the ordinary Draft Graph entry; support follows actual model, max_num_seqs and capture capacity."
+        )
+    kwargs = {
+        k: v
+        for k, v in additional_config.items()
+        if k not in _NON_USER_INPUT_KEYS and k not in retired_window_experiments
+    }
     unknown_keys = sorted(set(kwargs) - AscendConfig.__dataclass_fields__.keys())
     # vLLM-Omni shares this mapping with the platform plugin. Preserve its
     # extension keys on VllmConfig while excluding them from Ascend validation.
@@ -2291,143 +2120,22 @@ def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
     # vllm_config run here, explicitly, before the instance is usable. This is
     # the single legitimate entry point — bypassing the factory leaves derived
     # fields at their sentinel defaults.
-    validate_draft_window_replicated_tp_review(vllm_config)
-    validate_draft_window_parallel_eager_review(vllm_config)
-    validate_draft_window_eagle_pinned_h2d_review(vllm_config)
-    if (
-        new_config.draft_window_graph_full8_single_request_review
-        or new_config.draft_window_graph_full8_two_request_review
-    ):
-        from vllm_ascend import envs
-        from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import (
-            validate_full8_single_request_review_entry,
-        )
+    from vllm_ascend import envs
+    from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import resolve_draft_graph_review_limit
 
-        validate_full8_single_request_review_entry(
-            vllm_config,
-            experimental_graph_review=envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH,
+    support = resolve_draft_graph_review_limit(
+        vllm_config, experimental_graph_review=envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH
+    )
+    if support is not None:
+        logger.info_once(
+            "Draft Graph support: %s, TP4/DP%d, local request capacity %d, static K%d, "
+            "configured model capacity %d; actual request/padded shapes are checked before execution.",
+            support.method,
+            support.data_parallel_size,
+            support.max_requests,
+            support.static_k,
+            support.max_model_len,
         )
-        logger.warning_once(
-            "Controlled Full8 Draft Graph qualification: exact checkpoint, TP4/DP1-or-2, "
-            "static K7, Window OFF or W32768, actual=padded within the explicit local row limit, "
-            "matching capture[8] or [8,16]; "
-            "not a device PASS or release qualification."
-        )
-    if new_config.draft_window_graph_eagle_single_request_review:
-        from vllm_ascend import envs
-        from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import (
-            validate_eagle_single_request_review_config,
-        )
-
-        validate_eagle_single_request_review_config(
-            vllm_config,
-            experimental_graph_review=envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH,
-        )
-        logger.warning_once(
-            "Controlled Eagle Draft Graph review: capacity-bounded single actual request, "
-            "TP4/DP1 static K3, Window OFF or W1024 only; "
-            "this flag is not a numerical or release qualification."
-        )
-    if new_config.draft_window_graph_eagle_two_request_review:
-        from vllm_ascend import envs
-        from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import (
-            resolve_draft_graph_review_limit,
-        )
-
-        resolve_draft_graph_review_limit(
-            vllm_config,
-            experimental_graph_review=envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH,
-        )
-        logger.warning_once(
-            "Controlled Eagle two-request Draft Graph qualification: exact checkpoint, TP4/DP1, static K3, "
-            "max_num_seqs=2, Window OFF or W1024, exact n1/n2 first Q4 and AR Q1 banks only; "
-            "ordinary device qualification is separate."
-        )
-    if new_config.draft_window_graph_eagle_dp2_review:
-        from vllm_ascend import envs
-        from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import resolve_draft_graph_review_limit
-
-        resolve_draft_graph_review_limit(
-            vllm_config, experimental_graph_review=envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH
-        )
-        logger.warning_once(
-            "Controlled Eagle TP4xDP2 Graph review: local actual1/padded1, max_num_seqs=1, static K3, "
-            "Window OFF or W1024 and separate first Q4/AR Q1 banks; device qualification is pending."
-        )
-    if new_config.draft_window_graph_single_metadata:
-        speculative = vllm_config.speculative_config
-        if (
-            speculative is None
-            or speculative.method not in ("dspark", "dflash")
-            or speculative.enforce_eager
-            or new_config.draft_window_size != 1024
-        ):
-            raise ValueError("single Graph metadata requires parallel Draft Graph and draft_window_size=1024")
-        from vllm_ascend import envs
-
-        if not envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH:
-            raise ValueError("single Graph metadata requires the default-off experimental Graph gate")
-        if getattr(vllm_config.compilation_config.cudagraph_mode, "name", None) not in ("FULL", "FULL_DECODE_ONLY"):
-            raise ValueError("single Graph metadata requires a real FULL Graph configuration")
-    if new_config.draft_window_graph_validation_memo:
-        speculative = vllm_config.speculative_config
-        from vllm_ascend import envs
-
-        if (
-            speculative is None
-            or speculative.method not in ("dspark", "dflash", "eagle3")
-            or speculative.enforce_eager
-            or new_config.draft_window_size != 1024
-            or not envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH
-            or getattr(vllm_config.compilation_config.cudagraph_mode, "name", None) != "FULL_DECODE_ONLY"
-        ):
-            raise ValueError(
-                "Graph validation memo requires experimental static Draft Graph, W1024 and FULL_DECODE_ONLY"
-            )
-    if new_config.draft_window_graph_numeric_diagnostic:
-        speculative = vllm_config.speculative_config
-        if (
-            speculative is None
-            or speculative.method not in ("dspark", "dflash", "eagle3")
-            or not (
-                new_config.draft_window_size == 1024
-                or _native_swa_graph_window_review(speculative, new_config.draft_window_size)
-                or _dense_dp_graph_window_review(vllm_config, new_config.draft_window_size)
-            )
-        ):
-            raise ValueError(
-                "numeric Graph diagnostic requires DSpark/DFlash/Eagle3 and W1024, "
-                "a contained native SWA band, or the dense TP4 W32768 review"
-            )
-    if new_config.draft_window_graph_numeric_owned_output:
-        speculative = vllm_config.speculative_config
-        hf = getattr(getattr(speculative, "draft_model_config", None), "hf_config", None)
-        layers = getattr(hf, "layer_types", None)
-        # An owned first-reader diagnostic is also needed for the existing
-        # dense DFlash TP4 review. It changes diagnostics only; the actual
-        # noncausal reader and source inventory are checked during capture.
-        dense_dflash = (
-            getattr(speculative, "method", None) == "dflash"
-            and (
-                new_config.draft_window_size == 1024
-                or _dense_dp_graph_window_review(vllm_config, new_config.draft_window_size)
-            )
-            and vllm_config.parallel_config.tensor_parallel_size == 4
-            and isinstance(layers, (list, tuple))
-            and bool(layers)
-            and set(layers) == {"full_attention"}
-            and getattr(hf, "use_sliding_window", False) is not True
-        )
-        if (
-            not new_config.draft_window_graph_numeric_diagnostic
-            or not (dense_dflash or _native_swa_graph_window_review(speculative, new_config.draft_window_size))
-            or not new_config.draft_window_graph_replicated_tp_review
-            or vllm_config.parallel_config.data_parallel_size != 1
-        ):
-            raise ValueError(
-                "owned numeric output requires the reviewed TP4/DP1 dense DFlash "
-                "or contained native SWA Graph diagnostic"
-            )
     new_config.derive_and_validate(vllm_config)
     new_config.rl_config.apply(new_config)
     new_config.finegrained_tp_config._validate_preconditions(vllm_config)

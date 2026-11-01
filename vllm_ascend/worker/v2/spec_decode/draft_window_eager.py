@@ -1,15 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
-"""Serialized eager consumer for the MRV2 Draft Window read plane.
+"""Graph-owned proposal inputs for the MRV2 Draft Window read plane.
 
-This module is intentionally limited to the P4a dense, single-group route. It
+This module owns the parallel Graph proposal read view. It
 connects P1/P2/P3 read state through an Ascend-owned metadata-assembly seam,
 while leaving positions, query layout, slot mappings, and Target metadata
 untouched. The upstream vLLM checkout remains unmodified.
 """
 
 import copy
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, fields, is_dataclass
 from enum import Enum
@@ -26,21 +26,9 @@ from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftWindowExecutionPhase,
     DraftWindowGenerationIdentity,
     DraftWindowLeaseState,
-    DraftWindowReadDescriptor,
     DraftWindowRuntimeState,
     DraftWindowSourceCapability,
-    SingleGroupDirectPrefixProvider,
-    compute_draft_window_scalar_plan,
-)
-from vllm_ascend.worker.v2.spec_decode.draft_window_async import (
-    DraftWindowEagerAsyncHandle,
-    DraftWindowEagerAsyncPool,
-    DraftWindowEagerAsyncState,
-    DraftWindowNPUEventCompletionToken,
-)
-from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
-    DraftWindowGraphStage,
-    observe_draft_window_graph_source,
+    collect_mutable_references,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_nongraph import (
     DraftWindowBatchPhasePlan,
@@ -212,87 +200,8 @@ class DraftWindowProposalEpochSource:
         self._active = None
 
 
-@dataclass(frozen=True, slots=True)
-class DraftWindowMaterializationPlan:
-    """Host-side P4a plan whose tensors share one proposal generation."""
-
-    read_descriptors: tuple[DraftWindowReadDescriptor, ...]
-    cpu_window_exact: torch.Tensor
-    cpu_window_upper: torch.Tensor
-    cpu_valid_num_blocks: torch.Tensor
-
-
-def build_eager_window_materialization_plan(
-    *,
-    provider: SingleGroupDirectPrefixProvider,
-    cpu_full_exact: torch.Tensor,
-    cpu_apply_time_full_upper: torch.Tensor,
-    cpu_valid_num_blocks: torch.Tensor,
-    actual_request_count: int,
-    padded_request_count: int,
-) -> DraftWindowMaterializationPlan:
-    """Build descriptors and exact/upper Window lengths from one CPU snapshot."""
-    if actual_request_count < 0:
-        raise ValueError("actual request count must be greater than or equal to 0")
-    if padded_request_count < actual_request_count:
-        raise ValueError("padded request count must be at least the actual request count")
-    for name, tensor in (
-        ("full exact", cpu_full_exact),
-        ("apply-time full upper", cpu_apply_time_full_upper),
-        ("valid block counts", cpu_valid_num_blocks),
-    ):
-        if tensor.device.type != "cpu":
-            raise ValueError(f"CPU {name} must live on CPU")
-        if tensor.dtype != torch.int32:
-            raise TypeError(f"CPU {name} must use int32")
-        if tensor.ndim != 1 or tensor.shape[0] != padded_request_count:
-            raise ValueError(f"CPU {name} must match the padded request count")
-
-    cpu_window_exact = torch.zeros(padded_request_count, dtype=torch.int32)
-    cpu_window_upper = torch.zeros(padded_request_count, dtype=torch.int32)
-    descriptors: list[DraftWindowReadDescriptor] = []
-    for row in range(actual_request_count):
-        full_exact = int(cpu_full_exact[row].item())
-        full_upper = int(cpu_apply_time_full_upper[row].item())
-        valid_num_blocks = int(cpu_valid_num_blocks[row].item())
-        if full_exact < 0:
-            raise ValueError("prepared full exact length must be non-negative")
-        if full_upper < full_exact:
-            raise ValueError("apply-time full upper must be greater than or equal to prepared exact")
-        scalar_plan = compute_draft_window_scalar_plan(
-            full_exact_end=full_exact,
-            future_offset=0,
-            window_size=provider.inventory.window_size,
-            legacy_block_size=provider.legacy_block_size,
-        )
-        descriptor = provider.describe(
-            scalar_plan,
-            valid_num_blocks=valid_num_blocks,
-        )
-        visible = scalar_plan.window_visible_length
-        if descriptor.safe_extent_tokens < visible:
-            raise RuntimeError("provider safe extent is shorter than Window exact")
-        raw_upper = max(
-            full_upper - scalar_plan.window_start,
-            visible,
-        )
-        window_upper = min(raw_upper, descriptor.safe_extent_tokens)
-        if window_upper < visible:
-            raise RuntimeError("Window upper is shorter than Window exact")
-        cpu_window_exact[row] = visible
-        cpu_window_upper[row] = window_upper
-        descriptors.append(descriptor)
-
-    return DraftWindowMaterializationPlan(
-        read_descriptors=tuple(descriptors),
-        cpu_window_exact=cpu_window_exact,
-        cpu_window_upper=cpu_window_upper,
-        cpu_valid_num_blocks=cpu_valid_num_blocks,
-    )
-
-
-class DraftWindowEagerMixin:
-    """Shared P4a integration for Ascend DFlash and eligible DSpark."""
+class DraftWindowGraphInputMixin:
+    """Proposal input ownership for DFlash, DFlash2 and eligible DSpark Graph."""
 
     _draft_window_runtime_state: DraftWindowRuntimeState
     _draft_window_source_capability: DraftWindowSourceCapability
@@ -302,9 +211,6 @@ class DraftWindowEagerMixin:
     _draft_window_bypass_active: bool
     _draft_window_prefill_bypass_active: bool
     _draft_window_dp_dummy_active: bool
-    _draft_window_async_pool: DraftWindowEagerAsyncPool | None
-    _draft_window_async_handle: DraftWindowEagerAsyncHandle | None
-    _draft_window_completion_token_factory: Callable[[], Any]
     input_batch: InputBatch
     input_buffers: Any
     block_tables: Any
@@ -317,7 +223,7 @@ class DraftWindowEagerMixin:
     num_query_per_req: int
     max_model_len: int
 
-    def _initialize_draft_window_eager_state(self) -> None:
+    def _initialize_draft_window_graph_inputs(self) -> None:
         if not hasattr(self, "_draft_window_runtime_state"):
             raise RuntimeError("P4a eager state requires initialized P3 runtime state")
         if hasattr(self, "_draft_window_epoch_source"):
@@ -328,44 +234,9 @@ class DraftWindowEagerMixin:
         self._draft_window_bypass_active = False
         self._draft_window_prefill_bypass_active = False
         self._draft_window_dp_dummy_active = False
-        from vllm_ascend.ascend_config import validate_additional_config_bool
-
-        additional = getattr(getattr(self, "vllm_config", None), "additional_config", None) or {}
-        self._draft_window_single_metadata_enabled = validate_additional_config_bool(
-            additional.get("draft_window_graph_single_metadata", False),
-            "additional_config.draft_window_graph_single_metadata",
-        )
         self._draft_window_selected_metadata = None
         self._draft_window_deferred_metadata = None
         self._draft_window_native_full_snapshot = None
-        topology = getattr(
-            self._draft_window_source_capability,
-            "eager_topology_fingerprint",
-            None,
-        )
-        self._draft_window_async_pool = None
-        self._draft_window_async_handle = None
-        self._draft_window_completion_token_factory = DraftWindowNPUEventCompletionToken.record_current_stream
-        # The eager pool owns independent device-completion lanes.  A Graph
-        # route instead owns persistent capture backing and orders the next
-        # generation's current-stream writes after the prior replay.  Building
-        # an eager pool here would both reject Graph mode and split ownership.
-        if topology is not None and topology.async_scheduling and topology.graph_mode == "NONE":
-            additional_config = getattr(self.vllm_config, "additional_config", None) or {}
-            host_batch_depth = int(self.vllm_config.max_concurrent_batches)
-            if host_batch_depth <= 0:
-                raise ValueError("max_concurrent_batches must be greater than zero")
-            capacity = int(additional_config.get("draft_window_async_lanes", host_batch_depth))
-            if capacity < host_batch_depth:
-                raise ValueError(
-                    "draft_window_async_lanes must be at least max_concurrent_batches "
-                    f"({host_batch_depth}), got {capacity}"
-                )
-            self._draft_window_async_pool = DraftWindowEagerAsyncPool(
-                capability=self._draft_window_source_capability,
-                topology_template=topology,
-                capacity=capacity,
-            )
 
     @contextmanager
     def _draft_window_proposal_scope(
@@ -383,9 +254,6 @@ class DraftWindowEagerMixin:
         if epoch_source is None:
             yield
             return
-        async_pool = self._draft_window_async_pool
-        if async_pool is not None and async_pool.has_uncertain_submission:
-            raise RuntimeError("draft-window eager async backing is quarantined after uncertain reader submission")
         if self._draft_window_runtime_state.quarantined_identity is not None or getattr(
             self, "_draft_window_graph_submission_uncertain", False
         ):
@@ -409,7 +277,7 @@ class DraftWindowEagerMixin:
                 and not is_profile
                 and type(dp_size) is int
                 and dp_size > 1
-                and hasattr(self, "_draft_window_graph_characterization")
+                and hasattr(self, "_draft_window_graph_session")
             )
             try:
                 # Startup/profile and pure-prefill proposals exercise the
@@ -433,120 +301,37 @@ class DraftWindowEagerMixin:
         self._draft_window_proposal_context = context
         self._draft_window_selected_metadata = None
         self._draft_window_deferred_metadata = None
-        async_pool = self._draft_window_async_pool
         succeeded = False
         try:
-            if async_pool is not None:
-                self._draft_window_async_handle = async_pool.acquire_with_backpressure(
-                    mapping_epoch=context.mapping_epoch,
-                    ordered_request_ids=context.ordered_request_ids,
-                    phase=DraftWindowExecutionPhase.PROPOSAL,
-                    step=0,
-                )
-                # The proposal body can submit input preparation before a
-                # Window generation exists. Mark its conservative Host boundary
-                # once, before entering that body; no device operation is added.
-                async_pool.mark_preparation_started(self._draft_window_async_handle)
             yield
             succeeded = True
         finally:
-            if not succeeded and hasattr(self, "_draft_window_graph_characterization"):
-                # Failure can precede typed inputs (e.g. native length copy or
-                # partial materialization). Do not allow another proposal just
-                # because live-input publication was never reached.
+            if not succeeded:
+                # Native work may have been submitted before a carrier exists.
                 self._draft_window_graph_submission_uncertain = True
             live_inputs = self._draft_window_live_inputs
             try:
-                async_handle = self._draft_window_async_handle
-                if async_pool is not None:
-                    try:
-                        if async_handle is None:
-                            if succeeded:
-                                raise RuntimeError("eligible async proposal did not acquire a Draft Window lane")
-                        elif succeeded:
-                            if live_inputs is None:
-                                raise RuntimeError(
-                                    "eligible async proposal completed without consuming Draft Window inputs"
-                                )
-                            if async_handle.state is not DraftWindowEagerAsyncState.BOUND:
-                                raise RuntimeError(
-                                    "async Draft Window proposal did not bind metadata before submission"
-                                )
-                            completion = self._draft_window_completion_token_factory()
-                            async_pool.submit(async_handle, completion)
-                    except BaseException:
-                        if async_handle is not None:
-                            self._discard_unsubmitted_async_handle(async_pool, async_handle)
-                        raise
-                    if not succeeded and async_handle is not None:
-                        self._discard_unsubmitted_async_handle(async_pool, async_handle)
-                elif live_inputs is not None and live_inputs.lease.state is not DraftWindowLeaseState.RETIRED:
+                if live_inputs is not None and live_inputs.lease.state is not DraftWindowLeaseState.RETIRED:
                     if succeeded:
                         try:
                             self._draft_window_runtime_state.retire_generation(live_inputs.identity)
-                            if hasattr(self, "_draft_window_graph_characterization"):
-                                from vllm_ascend.worker.v2.spec_decode.draft_window_graph_characterization import (
-                                    record_parallel_graph_retirement,
-                                )
-
-                                record_parallel_graph_retirement(self, live_inputs)
                         except BaseException:
-                            # Reset can fail after a partial native write, while
-                            # a later Host recorder can fail after the lease is
-                            # already retired. Preserve owners and the original
-                            # error; never retry reset or inspect device state.
                             self._draft_window_graph_submission_uncertain = True
                             succeeded = False
                             raise
                     else:
-                        if hasattr(self, "_draft_window_graph_characterization"):
-                            # A native Graph replay or UPDATE can have submitted
-                            # device work before raising. Never zero or reuse its
-                            # read backing during exception unwinding.
-                            self._draft_window_graph_submission_uncertain = True
-                            self._draft_window_runtime_state.quarantine_generation(live_inputs.identity)
-                        else:
-                            self._draft_window_runtime_state.abort_generation(live_inputs.identity)
+                        # Retain uncertain backing without device RPC on unwind.
+                        self._draft_window_runtime_state.quarantine_generation(live_inputs.identity)
                 elif succeeded:
-                    raise RuntimeError("eligible P4a proposal completed without consuming Draft Window inputs")
+                    raise RuntimeError("Draft Graph proposal completed without consuming its current inputs")
             finally:
                 self._draft_window_live_inputs = None
-                self._draft_window_async_handle = None
                 self._draft_window_proposal_context = None
                 self._draft_window_selected_metadata = None
                 self._draft_window_deferred_metadata = None
                 if succeeded:
-                    # FIA owns its Host length-vector copy. The bound Graph
-                    # carrier also retains this snapshot until its bank is
-                    # rebound. On unknown submission, retain it in quarantine.
                     self._draft_window_native_full_snapshot = None
                 epoch_source.finish(context)
-
-    @staticmethod
-    def _discard_unsubmitted_async_handle(
-        pool: DraftWindowEagerAsyncPool,
-        handle: DraftWindowEagerAsyncHandle,
-    ) -> None:
-        """Release host-owned failure state without touching submitted work."""
-        if handle.state in (
-            DraftWindowEagerAsyncState.SUBMITTED,
-            DraftWindowEagerAsyncState.QUARANTINED,
-            DraftWindowEagerAsyncState.FREE,
-        ):
-            return
-        if handle.state is not DraftWindowEagerAsyncState.RETIRED:
-            pool.abort(handle)
-        if handle.state is DraftWindowEagerAsyncState.RETIRED:
-            pool.release(handle)
-
-    def _mark_draft_window_async_reader_started(self) -> None:
-        """Host-only marker before the actual eager model invocation."""
-        handle = getattr(self, "_draft_window_async_handle", None)
-        if handle is not None:
-            pool = self._draft_window_async_pool
-            if pool is None:
-                raise RuntimeError("async Draft reader has no backing owner")
-            pool.mark_consumer_started(handle)
 
     def _snapshot_prepared_draft_seq_lens(
         self,
@@ -605,22 +390,6 @@ class DraftWindowEagerMixin:
         )
         # Recheck freshness after the controlled length snapshot and host plan.
         self._draft_window_epoch_source.validate(context, input_batch)
-        async_pool = self._draft_window_async_pool
-        if async_pool is not None:
-            handle = self._draft_window_async_handle
-            if handle is None:
-                raise RuntimeError("async proposal has no acquired Draft Window lane")
-            return async_pool.materialize(
-                handle,
-                idx_mapping=input_batch.idx_mapping,
-                read_descriptors=plan.read_descriptors,
-                device_window_exact=None,
-                cpu_window_exact=plan.cpu_window_exact,
-                cpu_window_upper=plan.cpu_window_upper,
-                cpu_valid_num_blocks=plan.cpu_valid_num_blocks,
-                num_reqs_padded=num_reqs_padded,
-                row_phase_fingerprint=plan.row_phase_fingerprint,
-            )
         inputs = self._draft_window_runtime_state.materialize(
             mapping_epoch=context.mapping_epoch,
             ordered_request_ids=context.ordered_request_ids,
@@ -635,7 +404,7 @@ class DraftWindowEagerMixin:
             step=0,
             execution_lane=0,
             row_phase_fingerprint=plan.row_phase_fingerprint,
-            quarantine_on_failure=hasattr(self, "_draft_window_graph_characterization"),
+            quarantine_on_failure=hasattr(self, "_draft_window_graph_session"),
         )
         if capability.native_swa_graph is not None:
             from vllm_ascend.worker.v2.spec_decode.draft_window_swa_graph import NativeSWAFullSnapshot
@@ -659,22 +428,6 @@ class DraftWindowEagerMixin:
     ) -> AscendDraftAttentionReadInputs:
         """The single formal P4a validation and transport-narrowing boundary."""
         inputs.validate_for(expected_identity)
-        characterization = getattr(
-            self,
-            "_draft_window_graph_characterization",
-            None,
-        )
-        if characterization is not None:
-            observe_materialized = getattr(
-                characterization,
-                "observe_materialized",
-                None,
-            )
-            if not callable(observe_materialized):
-                raise TypeError("invalid Draft Window graph characterization session")
-            observe_materialized(inputs)
-        else:
-            observe_draft_window_graph_source(self, DraftWindowGraphStage.LIVE)
         global_group_id = expected_identity.global_group_id
         block_tables = tuple(
             (inputs.window_block_table if gid == global_group_id else full_table[: inputs.padded_request_count])
@@ -744,11 +497,6 @@ class DraftWindowEagerMixin:
             # The pinned FULL branch does not consume this temporary value.
             # P6 builds/publishes the real bank metadata once before replay.
             return None
-        async_pool = self._draft_window_async_pool
-        if async_pool is not None:
-            handle = self._draft_window_async_handle
-            if handle is None or handle.inputs is not inputs:
-                raise RuntimeError("async metadata builder has no current Draft Window owner")
         metadata = self._build_ascend_draft_attn_metadata(
             num_reqs=num_reqs,
             num_reqs_padded=num_reqs_padded,
@@ -758,10 +506,6 @@ class DraftWindowEagerMixin:
             query_start_loc_np=query_start_loc_np,
             dcp_local_seq_lens=dcp_local_seq_lens,
         )
-        if async_pool is not None:
-            # Keep a returned builder result even when validation/publication
-            # subsequently fails after possible native metadata work.
-            handle.bound_metadata = metadata
         if metadata is None:
             raise RuntimeError("eligible P4a route produced no Draft metadata")
         if self.model_state.attn_metadata is not target_metadata:
@@ -770,16 +514,6 @@ class DraftWindowEagerMixin:
             metadata,
             target_metadata,
         )
-        if async_pool is not None:
-            handle = self._draft_window_async_handle
-            if handle is None or handle.inputs is not inputs:
-                raise RuntimeError("async metadata does not belong to the active Draft Window handle")
-            async_pool.bind(
-                handle,
-                metadata=metadata,
-                target_metadata=target_metadata,
-            )
-            return async_pool.read_bound_metadata(handle)
         runtime_state.publish_metadata(
             inputs,
             metadata,
@@ -931,7 +665,7 @@ def _isolate_draft_metadata_from_target(
     target_metadata: Any,
 ) -> Any:
     """Clone only Draft-side mutable references that alias real Target state."""
-    target_object_ids, target_tensor_storage, target_numpy_arrays = _collect_mutable_identity(target_metadata)
+    target_keys, target_numpy_arrays = collect_mutable_references(target_metadata)
     memo: dict[int, Any] = {}
 
     def isolate(value: Any) -> Any:
@@ -955,13 +689,14 @@ def _isolate_draft_metadata_from_target(
         if value_id in memo:
             return memo[value_id]
         if isinstance(value, torch.Tensor):
-            if value_id in target_object_ids or _tensor_storage_key(value) in target_tensor_storage:
+            storage = (str(value.device), value.untyped_storage().data_ptr())
+            if ("object", value_id) in target_keys or ("tensor_storage", storage) in target_keys:
                 cloned = value.clone()
                 memo[value_id] = cloned
                 return cloned
             return value
         if isinstance(value, np.ndarray):
-            if value_id in target_object_ids or any(
+            if ("object", value_id) in target_keys or any(
                 np.shares_memory(value, target_array) for target_array in target_numpy_arrays
             ):
                 cloned_array = value.copy()
@@ -969,7 +704,7 @@ def _isolate_draft_metadata_from_target(
                 return cloned_array
             return value
         if isinstance(value, dict):
-            result = {} if value_id in target_object_ids else value
+            result = {} if ("object", value_id) in target_keys else value
             memo[value_id] = result
             items = list(value.items())
             if result is value:
@@ -979,7 +714,7 @@ def _isolate_draft_metadata_from_target(
                 result.update((key, isolate(item)) for key, item in items)
             return result
         if isinstance(value, list):
-            result_list: list[Any] = [] if value_id in target_object_ids else value
+            result_list: list[Any] = [] if ("object", value_id) in target_keys else value
             memo[value_id] = result_list
             isolated_items = [isolate(item) for item in value]
             result_list[:] = isolated_items
@@ -990,7 +725,7 @@ def _isolate_draft_metadata_from_target(
             return result_tuple
         if isinstance(value, set):
             result_set = {isolate(item) for item in value}
-            if value_id not in target_object_ids:
+            if ("object", value_id) not in target_keys:
                 value.clear()
                 value.update(result_set)
                 result_set = value
@@ -1011,7 +746,7 @@ def _isolate_draft_metadata_from_target(
                 )
             return result_dataclass
         values = getattr(value, "__dict__", None)
-        result_object = copy.copy(value) if value_id in target_object_ids else value
+        result_object = copy.copy(value) if ("object", value_id) in target_keys else value
         memo[value_id] = result_object
         if isinstance(values, dict):
             for name, item in list(values.items()):
@@ -1030,82 +765,3 @@ def _isolate_draft_metadata_from_target(
         return result_object
 
     return isolate(draft_metadata)
-
-
-def _collect_mutable_identity(
-    value: Any,
-) -> tuple[set[int], set[tuple[str, int]], tuple[np.ndarray, ...]]:
-    object_ids: set[int] = set()
-    tensor_storage: set[tuple[str, int]] = set()
-    numpy_arrays: list[np.ndarray] = []
-    seen: set[int] = set()
-
-    def visit(current: Any) -> None:
-        if current is None or isinstance(
-            current,
-            (
-                bool,
-                int,
-                float,
-                complex,
-                str,
-                bytes,
-                type,
-                Enum,
-                torch.dtype,
-                torch.device,
-            ),
-        ):
-            return
-        current_id = id(current)
-        if current_id in seen:
-            return
-        seen.add(current_id)
-        if isinstance(current, torch.Tensor):
-            object_ids.add(current_id)
-            tensor_storage.add(_tensor_storage_key(current))
-            return
-        if isinstance(current, np.ndarray):
-            object_ids.add(current_id)
-            numpy_arrays.append(current)
-            return
-        if isinstance(current, Mapping):
-            object_ids.add(current_id)
-            for key, item in current.items():
-                visit(key)
-                visit(item)
-            return
-        if isinstance(current, (list, set, bytearray, tuple)):
-            if not isinstance(current, tuple):
-                object_ids.add(current_id)
-            for item in current:
-                visit(item)
-            return
-        if is_dataclass(current) and not isinstance(current, type):
-            object_ids.add(current_id)
-            for data_field in fields(current):
-                visit(getattr(current, data_field.name))
-            return
-        values = getattr(current, "__dict__", None)
-        if isinstance(values, dict):
-            object_ids.add(current_id)
-            for item in values.values():
-                visit(item)
-        for owner_type in type(current).__mro__:
-            slots = owner_type.__dict__.get("__slots__", ())
-            if isinstance(slots, str):
-                slots = (slots,)
-            for name in slots:
-                if name in ("__dict__", "__weakref__"):
-                    continue
-                try:
-                    visit(getattr(current, name))
-                except AttributeError:
-                    continue
-
-    visit(value)
-    return object_ids, tensor_storage, tuple(numpy_arrays)
-
-
-def _tensor_storage_key(tensor: torch.Tensor) -> tuple[str, int]:
-    return str(tensor.device), tensor.untyped_storage().data_ptr()

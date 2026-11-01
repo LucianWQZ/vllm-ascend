@@ -18,7 +18,7 @@ at 32k, up to +381% end-to-end throughput in the original evaluation).
 
 The window is enabled through `additional_config` for supported
 EAGLE3 / DFlash / DSpark draft consumers. The MRV2 default entry requires an
-explicitly eager Draft model; limited, default-off Graph review routes are
+explicitly eager Draft model; limited, default-off Graph routes are
 described below. Target Graph selection remains independent. See the MRV2
 consumer and validation limits below before choosing a configuration.
 
@@ -101,119 +101,52 @@ category is identified from normalized model configuration, including Ascend's
 V4.1 architecture normalization. This disables only the window; the original
 speculative method is still constructed.
 
-### Bounded Eagle ordinary qualification
+### Explicit Graph support and capacity
 
-The fixed Eagle checkpoint has an explicit single-request review entry behind
-`VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH=1` and
-`draft_window_graph_eagle_single_request_review=true`. It is a qualification
-entry, not a product support or service-PASS declaration. The exact existing
-config guard remains required: TP4/DP1/PP1/PCP1/DCP1, static K3,
-Window OFF (the extra-window setting omitted) or Window ON with W1024,
-FULL_DECODE_ONLY, the reviewed Target EP topology with the exact pre-normalization
-pair (`allgather_reducescatter`, SP on) or normalized pair
-(`flashinfer_all2allv`, SP off). The independent dense Draft descriptor has
-EP/SP off; the Target-derived runtime clone's flags are a separate fact and
-do not prove how every loaded Draft module executes. Boolean Async, prefix
-and Target FlashComm settings remain in the Graph fingerprint; legacy DSA-CP
-stays disabled.
-The runtime requires actual/padded rows 1/1, positive original prompt and
-output lengths whose sum plus static-K lookahead fits the configured model
-capacity, and no preemption resumption. The capacity is frozen when the entry is constructed;
-an owner with a different capacity is rejected. Reserving K positions also
-keeps the last first-pass Q4 write grid within the configured Full capacity.
-Each Window consumer's exact
-length must fit both the request's static-K horizon and that model capacity.
-The actual capture descriptor must still match first Q4 or either AR Q1
-consumer. Prompt length is not a Graph capture bucket.
-Other checkpoint identities and the default ordinary entry stay
-closed; the private numerical diagnostic flag cannot admit this service entry.
+`VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH=1` selects the experimental
+Graph integration. Draft `enforce_eager=false` selects actual capture/replay;
+Target Graph is configured independently. `draft_window_size` remains optional
+and disabled by default. The same Graph support checks apply to additional
+Window OFF, because a Graph integration error can also affect that arm.
+Ordinary eager Window OFF bypasses this new Graph admission and creates no
+Graph owner. No implicit eager fallback is used.
 
-The earlier prompt257/2051, output32 qualification remains evidence only for
-those actual executions. A capacity check does not itself establish device
-qualification for a different length, output budget, cache capacity or mode.
-Ordinary service execution and normal reader completion are qualified
-separately from comparable-state numeric/Full-write and Target noninterference
-checks. Existing multiple-request failures are retained;
-this entry does not qualify multi-request shapes, business quality,
-performance, release approval or the public Graph gate.
+The startup contract recognizes the actual Draft configuration and consumer,
+not a directory name or a raw configuration-file hash. Unsupported or changed
+semantic profiles remain rejected. One immutable support contract is shared by
+configuration, owner and execution checks. Historical single/two-request/DP2,
+recorder, oracle and matched-eager experiment flags are no longer product APIs.
 
-A separate default-off `draft_window_graph_eagle_two_request_review=true`
-entry keeps that same checkpoint, TP4/DP1 and static-K3 contract, with
-`max_num_seqs=2` and legal first-pass capture token sizes 4 and 8. It is
-mutually exclusive with the single-request flag and the private numerical
-diagnostic. Only actual/padded1 or actual/padded2 is admitted: each request
-retains its own authoritative identity, capacity and CPU exact length; first
-consumers use Q4 per request and both later AR consumers use Q1 per request.
-The AR manager derives its 1/2-token buckets from those legal first-pass
-request buckets without changing Target SP alignment. Finish, preemption
-and persistent-bank completion protections remain in place. This entry
-requires separate ordinary-service qualification; the existing paired
-numerical result does not open unqualified multi-request service. Actual3,
-padded4, DP2 and the historical TP2 four-request route remain excluded.
+For the qualified Qwen3.6 eight-layer Full DFlash and Eagle3 profiles:
 
-The separately selected `draft_window_graph_eagle_dp2_review=true` entry
-keeps TP4 and static K3 but permits two actual parent DP replicas. Each replica
-has `max_num_seqs=1`, actual1/padded1 and its own request, Full KV source,
-first-Q4 bank and two AR-Q1 banks; it does not enable a local two-request
-batch. The fixed vLLM's independent Draft descriptor remains TP4/DP1 while
-the actual executor, DP synchronization and captured identity remain TP4xDP2.
-Target/first-pass SP alignment stays unchanged; the AR-only compilation
-sizes are derived from the real admitted first-pass request bucket. Idle
-replicas keep the fixed Full/PAD dummy computation and UPDATE/event order,
-without creating or reusing a business Window generation. A failed idle
-submission quarantines its owner. A normal K0 request still has a real first
-consumer and is not idle. This default-off entry requires separate eight-rank
-numeric/Full/Target and ordinary idle/active reuse qualification; it is not a
-PASS or release approval. The other Eagle finite flags are mutually exclusive
-with this entry. The existing explicitly gated private numeric diagnostic
-retains its separate meaning and cannot qualify ordinary service by itself.
+| Consumer | TP / parent DP | Local capacity | Query / extra Window |
+| --- | --- | --- | --- |
+| Full DFlash | TP4 / DP1 | `max_num_seqs` 1 or 2 | static K7/Q8; OFF or W32768 |
+| Full DFlash | TP4 / DP2 | `max_num_seqs=1` per replica | static K7/Q8; OFF or W32768 |
+| Eagle3 | TP4 / DP1 | `max_num_seqs` 1 or 2 | static K3; first Q4, later Q1; OFF or W1024 |
+| Eagle3 | TP4 / DP2 | `max_num_seqs=1` per replica | same static first/AR geometry |
 
-The designated Full8 checkpoint has a separate, default-off
-`draft_window_graph_full8_single_request_review=true` qualification entry.
-It requires its exact checkpoint config, TP4 with parent DP1 or DP2, static K7,
-`max_num_seqs=1` per replica and capture size `[8]`. Async, prefix and Target
-FlashComm settings must be booleans. Qualification uses the jointly enabled
-applicable features, without requiring a toggle permutation or an independent
-speedup from each feature. Legacy DSA-CP remains disabled. In DP2 the fixed vLLM creates a TP-only Draft
-configuration with DP1 inside each parent replica; that descriptor does not
-collapse two actual replicas into one. Each replica retains its independent
-request mapping, KV source and captured bank. Idle replicas use the existing
-explicit dummy Graph scope without creating a business Window generation.
-This DP2 configuration entry still requires separate eight-worker device
-qualification; it does not enable local active2 or larger batches. Additional
-Window OFF retains the original Draft Graph; Window ON uses W32768. Both arms
-keep the same request guard and Target Graph remains independently configured.
-The real local request count and query descriptor must be actual1/padded1/Q8
-before submission. Client concurrency alone is not the guard. Configured
-`max_model_len` must fit both Target and Draft model position ceilings; the
-runtime capacity must still equal that allocating configuration. Authoritative
-original request state must satisfy positive prompt and output lengths,
-`prefill_len == prompt_len`, and `prompt_len + max_tokens + Q8 <= max_model_len`.
-The previous prompt33025/output64 pair is a tested point, not an operator
-capacity limit. New lengths still require candidate-specific numerical and
-ordinary-service qualification; this capacity entry is not a PASS receipt.
-Missing or changed request identity and resumption after preemption remain
-rejected before owner handoff. Context-only prefill writes keep their Target
-padding and the same identity/capacity limits in both arms; OFF creates no
-additional Window owner. Unresolved multiple-request failures remain blocked.
-Default ordinary entry and larger local batch or padding shapes
-remain rejected, without an eager fallback. This entry is not a service or
-numerical PASS; its candidate-specific ordinary qualification must complete
-before that scope is described as usable.
+Actual active and padded request counts must match an admitted capture bank.
+Each row retains its original request ID, source row, prompt and maximum-output
+capacity; static-query lookahead must fit both configured and allocated model
+capacity. Preempted/resumed requests, larger local batches and unqualified
+padding remain rejected before modifying Graph state. A capacity check does not
+by itself qualify a new model, backend or shape. The former fixed prompt/output
+numbers are test points, not permanent APIs.
 
-A separate default-off `draft_window_graph_full8_two_request_review=true`
-entry admits only local actual/padded1 or actual/padded2, with
-`max_num_seqs=2` and capture sizes `[8,16]`. The two Full8 review flags are
-mutually exclusive. Each actual row must satisfy the same authoritative
-identity, capacity and preemption checks, with unique request IDs and source
-rows. The execution guard checks Q8 per row before Graph metadata or bank
-submission; active3, padded4 and other unqualified descriptors remain
-rejected. This explicit entry is for bounded qualification and does not
-convert saved numerical samples into a multi-request service PASS. This
-two-request entry requires parent DP1. Parent DP2 must use the separate
-single-request entry with `max_num_seqs=1` per replica; local two-request
-DP2 batches remain rejected. Actual execution and numerical qualification
-remain separate from configuration admission.
+The parent DP2 executor retains independent local requests, Full KV and capture
+banks; its fixed upstream Draft descriptor is TP4/DP1. Idle replicas use the
+existing Full/PAD dummy computation without creating a business generation.
+Failures quarantine the owner. Eagle zero proposals still execute a first
+attention consumer; parallel DFlash/DSpark zero proposals instead retain their
+context-KV-only completion owner. Neither case enables dynamic K.
+
+All applicable features are verified together. Target SP/FlashComm does not
+make an independent dense Draft a sharded consumer; GLM legacy DSA-CP is not
+applied to these Qwen profiles. The specifically blocked mixed-SWA DFlash
+checkpoint remains blocked for correctness reasons, independently of the
+native-SWA performance warning. Device numerical, ordinary-service and reader
+qualification remain separate from startup admission.
 
 ### Canonical reads and method phases
 

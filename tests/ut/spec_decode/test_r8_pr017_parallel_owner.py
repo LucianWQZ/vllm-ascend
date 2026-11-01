@@ -48,15 +48,13 @@ def extract(path, names, namespace):
 
 def load_seam(completion):
     runtime = SimpleNamespace(_NPUCompletion=completion)
-    guard_namespace = {"EagleSingleRequestReviewScope": type("EagleSingleRequestReviewScope", (), {})}
-    extract(
-        ROOT / "vllm_ascend/worker/v2/spec_decode/draft_graph_review_limits.py",
-        {"validate_draft_graph_review_requests"},
-        guard_namespace,
+    name = "_parallel_owner_graph_support"
+    spec = importlib.util.spec_from_file_location(
+        name, ROOT / "vllm_ascend/worker/v2/spec_decode/draft_graph_review_limits.py"
     )
-    guard_module = SimpleNamespace(
-        validate_draft_graph_review_requests=guard_namespace["validate_draft_graph_review_requests"]
-    )
+    guard_module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = guard_module
+    spec.loader.exec_module(guard_module)
     original_import = builtins.__import__
 
     def importing(name, globals=None, locals=None, fromlist=(), level=0):
@@ -97,7 +95,6 @@ class ParallelOwnerTests(unittest.TestCase):
         self.batch = SimpleNamespace(is_dummy=False)
         self.owner = SimpleNamespace(
             _draft_window_runtime_state=SimpleNamespace(quarantined_identity=None),
-            _draft_window_async_pool=None,
             _draft_window_epoch_source=object(),
             _draft_window_bypass_active=False,
             _draft_window_proposal_context=None,
@@ -228,24 +225,33 @@ class ParallelOwnerTests(unittest.TestCase):
         self.assertFalse(hasattr(self.owner, "_draft_window_context_kv_pool"))
 
     def test_full8_target_padding_is_not_a_zero_branch_draft_query(self):
-        self.owner._draft_graph_review_limit = "full8_local_active_at_most_one"
+        # Use the actual immutable support type required by the production guard.
+        guard_name = "_parallel_owner_graph_support"
+        self.owner._draft_graph_review_limit = sys.modules[guard_name].DraftGraphSupport(40960, 7, 1, 1, "dflash", 8)
+        self.owner.max_model_len = 40960
+        self.owner.num_query_per_req = 8
+        self.owner.vllm_config.model_config = SimpleNamespace(max_model_len=40960)
         self.batch.num_reqs = 1
         self.batch.num_reqs_after_padding = 2
+        self.batch.req_ids = ["a"]
+        self.batch.idx_mapping_np = [0]
+        self.batch.prefill_len_np = [33025]
+        self.batch.draft_graph_review_request_rows = (("a", 0, 33025, 33089, 33025),)
         with self.scope(0):
             pass
         self.assertEqual(self.normal, [])
         for tokens in (None, 8):
-            with self.assertRaisesRegex(NotImplementedError, "actual=1/padded=1"):
+            with self.assertRaisesRegex(NotImplementedError, "admitted actual rows"):
                 self.scope(tokens)
         self.batch.num_reqs_after_padding = 1
         with self.scope(8):
             pass
+        # Context-only skips query padding, never the actual request capacity.
         self.batch.num_reqs = 3
         self.batch.num_reqs_after_padding = 4
-        with self.scope(0):
-            pass
-        with self.assertRaisesRegex(NotImplementedError, "at most"):
-            self.scope(8)
+        for tokens in (0, 8):
+            with self.assertRaisesRegex(NotImplementedError, "admitted actual rows"):
+                self.scope(tokens)
         self.assertEqual(len(self.normal), 1)
 
     def test_double_owner_is_rejected(self):

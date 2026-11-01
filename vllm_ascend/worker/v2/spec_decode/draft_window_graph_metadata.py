@@ -1,11 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Default-off single-build experiment for parallel Draft FULL metadata.
+"""Bind one metadata build to the parallel Draft FULL dispatch.
 
-The pinned DFlash proposal builds metadata after actual dispatch even for FULL,
-where that temporary object is not consumed. P6 then builds the real bank
-metadata. The dense FIA builder still runs once before replay in this variant;
-we retain current exact materialization, Target checks, isolation and publish.
-This is not a cached length, skipped dependency or missing-bucket fallback.
+The fixed MRV2 proposal requests metadata before invoking its Graph manager.
+That temporary result is not consumed by FULL replay: build once against the
+selected persistent bank instead, after checking the proposal and bucket.
+Non-FULL and prefill bypasses retain their original metadata path.
 """
 
 from __future__ import annotations
@@ -52,8 +51,6 @@ def is_parallel_graph_dp_dummy(owner: Any) -> bool:
 
 
 def select_parallel_graph_metadata(owner: Any, descriptor: Any) -> None:
-    if not getattr(owner, "_draft_window_single_metadata_enabled", False):
-        return
     context = getattr(owner, "_draft_window_proposal_context", None)
     owner._draft_window_selected_metadata = None
     if context is None or getattr(descriptor.cg_mode, "name", None) != "FULL":
@@ -63,7 +60,7 @@ def select_parallel_graph_metadata(owner: Any, descriptor: Any) -> None:
         "dspark",
         "dflash",
     ):
-        raise RuntimeError("single-metadata experiment requires the real parallel Graph provider")
+        raise RuntimeError("FULL metadata selection requires the real parallel Graph provider")
     n, tokens = descriptor.num_reqs, descriptor.num_tokens
     if type(n) is not int or n < len(context.ordered_request_ids) or tokens != n * owner.num_query_per_req:
         raise RuntimeError("single-metadata selection does not match actual FULL dispatch geometry")
@@ -73,8 +70,6 @@ def select_parallel_graph_metadata(owner: Any, descriptor: Any) -> None:
 
 
 def defer_parallel_graph_metadata(owner: Any, inputs: Any, *, padded_requests: int, padded_tokens: int) -> bool:
-    if not getattr(owner, "_draft_window_single_metadata_enabled", False):
-        return False
     selected = getattr(owner, "_draft_window_selected_metadata", None)
     if selected is None:
         return False  # Eager/phase bypass retains its actual metadata build.
@@ -98,8 +93,6 @@ def defer_parallel_graph_metadata(owner: Any, inputs: Any, *, padded_requests: i
 
 
 def validate_deferred_parallel_graph_metadata(owner: Any, inputs: Any, descriptor: Any) -> None:
-    if not getattr(owner, "_draft_window_single_metadata_enabled", False):
-        return
     selected = getattr(owner, "_draft_window_selected_metadata", None)
     if selected is None:
         raise RuntimeError("single-build FULL replay has no actual dispatch selection")

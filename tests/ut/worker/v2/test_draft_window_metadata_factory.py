@@ -4,11 +4,14 @@
 
 import ast
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
+import torch
 
 from vllm_ascend.worker.v2.spec_decode.draft_window_lifetime import (
     DraftWindowOwnerPool,
@@ -16,6 +19,106 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_lifetime import (
 )
 
 CALLBACK_NAMES = ("common_metadata_callback", "metadata_builder_callback")
+
+
+@pytest.fixture
+def metadata_isolation():
+    from vllm_ascend.worker.v2.spec_decode.draft_window import (
+        DraftMetadataStore,
+        validate_draft_metadata_isolation,
+    )
+    from vllm_ascend.worker.v2.spec_decode.draft_window_eager import _isolate_draft_metadata_from_target
+
+    return _isolate_draft_metadata_from_target, validate_draft_metadata_isolation, DraftMetadataStore
+
+
+def test_metadata_copy_is_selective_and_isolates_shared_tensor_and_numpy_views(metadata_isolation):
+    isolate, validate, _ = metadata_isolation
+    tensor = torch.arange(12)
+    array = np.arange(12)
+    private_table = torch.arange(20).view(4, 5)
+    target = {"tensor": tensor, "array": array}
+    draft = {"read_table": private_table, "tensor": tensor[2:6], "array": array[3:8]}
+    with pytest.raises(ValueError, match="aliases Target"):
+        validate(draft, target_metadata=target)
+    private = isolate(draft, target)
+    assert private["read_table"] is private_table  # No unrelated Full table copy.
+    validate(private, target_metadata=target)
+    private["tensor"].fill_(-1)
+    private["array"][:] = -1
+    assert tensor.tolist() == list(range(12))
+    assert array.tolist() == list(range(12))
+
+
+def test_empty_tensors_do_not_alias_only_because_both_have_zero_address(metadata_isolation):
+    isolate, validate, _ = metadata_isolation
+    target, independent = torch.empty(0), torch.empty(0)
+    assert target.data_ptr() == independent.data_ptr() == 0
+    validate({"read": independent}, target_metadata={"read": target})
+    assert isolate({"read": independent}, {"read": target})["read"] is independent
+    with pytest.raises(ValueError, match="aliases Target"):
+        validate({"read": target}, target_metadata={"read": target})
+
+
+def test_frozen_slotted_metadata_keeps_layer_aliases_without_mutating_target(metadata_isolation):
+    isolate, validate, _ = metadata_isolation
+
+    @dataclass(frozen=True, slots=True)
+    class Metadata:
+        lengths: torch.Tensor
+        nested: tuple
+
+    target_layer = Metadata(torch.tensor([3]), ([np.arange(3)],))
+    target = {"layer": target_layer}
+    private = isolate({"a": target_layer, "b": target_layer}, target)
+    assert private["a"] is private["b"] and private["a"] is not target_layer
+    validate(private, target_metadata=target)
+    private["a"].lengths.fill_(9)
+    private["a"].nested[0][0][:] = 9
+    assert target_layer.lengths.item() == 3
+    assert target_layer.nested[0][0].tolist() == [0, 1, 2]
+
+
+def test_mutable_metadata_cycles_bytearrays_and_inherited_slots_remain_isolated(metadata_isolation):
+    isolate, validate, _ = metadata_isolation
+
+    class Base:
+        __slots__ = ("lengths",)
+
+    class Layer(Base):
+        __slots__ = ("unused",)
+
+    layer = Layer()
+    layer.lengths = torch.tensor([4])
+    cycle = []
+    cycle.append(cycle)
+    target = {"cycle": cycle, "state": bytearray(b"ab"), "tags": {1}, "layer": layer}
+    private = isolate(target, target)
+    assert private["cycle"][0] is private["cycle"]
+    assert not hasattr(private["layer"], "unused")
+    validate(private, target_metadata=target)
+    private["layer"].lengths.fill_(7)
+    private["state"][0] = ord("z")
+    private["tags"].add(2)
+    assert layer.lengths.item() == 4 and target["state"] == b"ab" and target["tags"] == {1}
+
+
+def test_numpy_memoryview_backing_and_publication_reject_remaining_aliases(metadata_isolation):
+    isolate, validate, store_type = metadata_isolation
+    backing = bytearray(range(12))
+    target = {"array": np.frombuffer(backing, dtype=np.uint8)}
+    draft = {"array": np.frombuffer(memoryview(backing)[2:], dtype=np.uint8)}
+    with pytest.raises(ValueError, match="aliases Target"):
+        validate(draft, target_metadata=target)
+    private = isolate(draft, target)
+    validate(private, target_metadata=target)
+    identity = object()
+    inputs = SimpleNamespace(identity=identity, validate_for=Mock())
+    store = store_type()
+    with pytest.raises(ValueError, match="aliases Target"):
+        store.publish(inputs, {"array": target["array"][2:]}, target_metadata=target)
+    store.publish(inputs, private, target_metadata=target)
+    assert store.read(identity) is private
 
 
 @pytest.fixture

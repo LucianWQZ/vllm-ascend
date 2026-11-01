@@ -42,7 +42,8 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
     DraftWindowGraphRoute,
     assert_draft_window_graph_metadata_batch,
     build_draft_window_graph_update_binding,
-    observe_draft_window_graph_capture,
+    validate_draft_window_graph_capture,
+    validate_draft_window_update_tasks,
 )
 from vllm_ascend.worker.v2.utils import communicator_switch
 
@@ -66,11 +67,6 @@ def _eagle_ar_capture_config(vllm_config: VllmConfig, cudagraph_mode: CUDAGraphM
         or speculative.enforce_eager
         or speculative.num_speculative_tokens != 3
         or speculative.uses_dynamic_speculative_decoding()
-        or (vllm_config.additional_config or {}).get("draft_window_graph_replicated_tp_review") is not True
-        or (
-            vllm_config.parallel_config.use_sequence_parallel_moe is not True
-            and (vllm_config.additional_config or {}).get("draft_window_graph_eagle_dp2_review", False) is not True
-        )
         or any(
             getattr(vllm_config.parallel_config, name) != 1
             for name in (
@@ -88,8 +84,6 @@ def _eagle_ar_capture_config(vllm_config: VllmConfig, cudagraph_mode: CUDAGraphM
     if type(dp) is not int or dp not in (1, 2):
         return vllm_config
     if dp == 2:
-        if (vllm_config.additional_config or {}).get("draft_window_graph_eagle_dp2_review", False) is False:
-            return vllm_config
         from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import eagle_dp2_graph_review_enabled
 
         if not eagle_dp2_graph_review_enabled(vllm_config):
@@ -190,7 +184,7 @@ class AutoRegressiveAclGraphManager(SpeculatorCudaGraphManager):
 
         session = getattr(self.speculator, "_eagle3_graph_session", None)
         if session is not None:
-            observe_draft_window_graph_capture(self.speculator, capture_context=session)
+            validate_draft_window_graph_capture(self.speculator, capture_context=session)
             actual_forward = forward_fn
 
             def forward_fn(*args, **kwargs):
@@ -442,14 +436,10 @@ class AutoRegressiveAclGraphManager(SpeculatorCudaGraphManager):
             # Keep typed backend validation and optional UPDATE observations in
             # the same configuration that owns this captured graph manager.
             with set_current_vllm_config(self.vllm_config):
-                graph.update(
-                    self.update_stream,
-                    resolved,
-                    draft_window_graph_update_binding=binding,
-                    draft_attn_metadatas=metadata_batch,
-                    attn_backend=owner.attn_backend,
-                    num_tokens=desc.num_tokens,
+                validate_draft_window_update_tasks(
+                    graph, resolved, binding, metadata_batch, owner.attn_backend, desc.num_tokens
                 )
+                graph.update(self.update_stream, resolved)
             return ret
         except BaseException as error:
             session.controller.quarantine(type(error).__name__ + ": " + str(error))

@@ -40,7 +40,7 @@ def bridge():
     tree = ast.parse(SOURCE.read_text())
     names = {"AscendDraftAttentionReadInputs", "_AscendDraftAttentionReadCertificate"}
     nodes = [n for n in tree.body if isinstance(n, ast.ClassDef) and n.name in names]
-    mixin = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "DraftWindowEagerMixin")
+    mixin = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "DraftWindowGraphInputMixin")
     call = next(
         n for n in mixin.body if isinstance(n, ast.FunctionDef) and n.name == "_call_ascend_draft_attn_metadata_builder"
     )
@@ -166,7 +166,7 @@ class GraphTensorProtocol(TensorProtocol):
 
 @pytest.fixture
 def graph_device_binding():
-    characterization_source = SOURCE.with_name("draft_window_graph_characterization.py")
+    runtime_source = SOURCE.with_name("draft_window_graph_runtime.py")
     graph_source = SOURCE.with_name("draft_window_graph.py")
     graph_tree = ast.parse(graph_source.read_text())
     identity_class = next(
@@ -186,7 +186,7 @@ def graph_device_binding():
     guard.decorator_list = []
     helper = next(
         n
-        for n in ast.parse(characterization_source.read_text()).body
+        for n in ast.parse(runtime_source.read_text()).body
         if isinstance(n, ast.FunctionDef) and n.name == "_bind_parallel_graph_device_lengths"
     )
     module = ast.Module(
@@ -200,7 +200,7 @@ def graph_device_binding():
         type_ignores=[],
     )
     namespace = {"dataclass": dataclass, "torch": SimpleNamespace(Tensor=GraphTensorProtocol)}
-    exec(compile(ast.fix_missing_locations(module), str(characterization_source), "exec"), namespace)
+    exec(compile(ast.fix_missing_locations(module), str(runtime_source), "exec"), namespace)
 
     def make(actual, padded):
         assert (actual, padded) in ((1, 2), (3, 4))
@@ -282,9 +282,9 @@ def test_private_full_rejects_stale_exact_list_despite_correct_header_owners(gra
 
 
 def test_private_full_padded_build_is_separate_from_unchanged_true_eager_clamp():
-    characterization = ast.parse(SOURCE.with_name("draft_window_graph_characterization.py").read_text())
+    runtime = ast.parse(SOURCE.with_name("draft_window_graph_runtime.py").read_text())
     private = next(
-        n for n in characterization.body if isinstance(n, ast.FunctionDef) and n.name == "_build_private_graph_metadata"
+        n for n in runtime.body if isinstance(n, ast.FunctionDef) and n.name == "_build_private_graph_metadata"
     )
     calls = [
         n
@@ -306,7 +306,7 @@ def test_private_full_padded_build_is_separate_from_unchanged_true_eager_clamp()
     assert isolation < binding
 
     eager_tree = ast.parse(SOURCE.read_text())
-    mixin = next(n for n in eager_tree.body if isinstance(n, ast.ClassDef) and n.name == "DraftWindowEagerMixin")
+    mixin = next(n for n in eager_tree.body if isinstance(n, ast.ClassDef) and n.name == "DraftWindowGraphInputMixin")
     eager = next(
         n for n in mixin.body if isinstance(n, ast.FunctionDef) and n.name == "_build_ascend_draft_attn_metadata"
     )
@@ -316,7 +316,7 @@ def test_private_full_padded_build_is_separate_from_unchanged_true_eager_clamp()
 
 def _run_actual_private_binding_loop(graph_device_binding, read, metadata_by_layer):
     """Execute only the actual caller loop, using the existing strict binder."""
-    source = SOURCE.with_name("draft_window_graph_characterization.py")
+    source = SOURCE.with_name("draft_window_graph_runtime.py")
     tree = ast.parse(source.read_text())
     private = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_build_private_graph_metadata")
     loop = next(
@@ -386,9 +386,9 @@ def test_private_full_distinct_bad_owner_after_shared_group_is_rejected(graph_de
         ("target_dependent_ar/aclgraph.py", "_run_eagle_window_fullgraph"),
     ],
 )
-@pytest.mark.parametrize("fail_update", [False, True])
-def test_typed_update_uses_manager_config_and_restores_context(relative, method_name, fail_update):
-    """Execute the actual UPDATE statement with context-sensitive API stand-ins."""
+@pytest.mark.parametrize("failure", [None, "validation", "update"])
+def test_typed_update_uses_manager_config_and_restores_context(relative, method_name, failure):
+    """Strict Window validation and original UPDATE share the actual owner config."""
     from contextlib import contextmanager
     from contextvars import ContextVar
 
@@ -403,17 +403,16 @@ def test_typed_update_uses_manager_config_and_restores_context(relative, method_
     ]
     assert len(statements) == 1
     statement = statements[0]
-    assert len(statement.body) == 1
-    call = statement.body[0]
-    assert isinstance(call, ast.Expr) and isinstance(call.value, ast.Call)
-    assert ast.unparse(call.value.func) == "graph.update"
-    assert "draft_window_graph_update_binding" in {k.arg for k in call.value.keywords}
+    assert len(statement.body) == 2
+    validation, update_call = statement.body
+    assert ast.unparse(validation.value.func) == "validate_draft_window_update_tasks"
+    assert ast.unparse(update_call.value.func) == "graph.update"
+    assert len(update_call.value.args) == 2 and not update_call.value.keywords
     current = ContextVar("current_vllm_config", default=None)
     manager_config, ambient_config = object(), object()
     context_entries, observations = [], []
-    backend = object()
-    binding = object()
-    metadata = [object()]
+    backend, binding = object(), object()
+    metadata, resolved = [object()], object()
 
     @contextmanager
     def set_current_vllm_config(config):
@@ -424,18 +423,20 @@ def test_typed_update_uses_manager_config_and_restores_context(relative, method_
         finally:
             current.reset(token)
 
-    def require_actual_config():
+    def validate(graph_owner, tasks, actual_binding, actual_metadata, actual_backend, tokens):
         assert current.get() is manager_config, "Current vLLM config is not set"
-        return current.get()
+        assert graph_owner is graph and tasks is resolved and actual_binding is binding
+        assert actual_metadata is metadata and actual_backend is backend and tokens == 16
+        observations.append("validated")
+        if failure == "validation":
+            raise RuntimeError("original validation failure")
 
-    def update(stream, tasks, **kwargs):
+    def update(stream, tasks):
+        assert current.get() is manager_config
         assert stream is self.update_stream and tasks is resolved
-        assert kwargs["draft_window_graph_update_binding"] is binding
-        assert kwargs["draft_attn_metadatas"] is metadata
-        assert kwargs["attn_backend"] is backend and kwargs["num_tokens"] == 16
-        # The getter and optional observer execute under the same actual owner.
-        observations.append((require_actual_config(), require_actual_config()))
-        if fail_update:
+        assert observations == ["validated"]
+        observations.append("updated")
+        if failure == "update":
             raise RuntimeError("original UPDATE failure")
 
     self = SimpleNamespace(
@@ -443,10 +444,10 @@ def test_typed_update_uses_manager_config_and_restores_context(relative, method_
         update_stream=object(),
         speculator=SimpleNamespace(attn_backends={"draft": backend}),
     )
-    resolved = object()
+    graph = SimpleNamespace(update=update)
     namespace = dict(
         self=self,
-        graph=SimpleNamespace(update=update),
+        graph=graph,
         desc=SimpleNamespace(num_tokens=16),
         resolved=resolved,
         resolved_tasks=resolved,
@@ -455,20 +456,20 @@ def test_typed_update_uses_manager_config_and_restores_context(relative, method_
         metadata_batch=metadata,
         owner=SimpleNamespace(attn_backend=backend),
         set_current_vllm_config=set_current_vllm_config,
+        validate_draft_window_update_tasks=validate,
     )
 
     def execute(nodes):
         module = ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[]))
         exec(compile(module, str(source), "exec"), namespace)
 
-    # The actual old unwrapped statement reproduces the saved first failure.
     with pytest.raises(AssertionError, match="Current vLLM config is not set"):
-        execute([call])
+        execute([validation])
     assert observations == [] and context_entries == []
     token = current.set(ambient_config)
     try:
-        if fail_update:
-            with pytest.raises(RuntimeError, match="original UPDATE failure"):
+        if failure:
+            with pytest.raises(RuntimeError, match="original"):
                 execute([statement])
         else:
             execute([statement])
@@ -477,7 +478,7 @@ def test_typed_update_uses_manager_config_and_restores_context(relative, method_
         current.reset(token)
     assert current.get() is None
     assert context_entries == [manager_config]
-    assert observations == [(manager_config, manager_config)]
+    assert observations == (["validated"] if failure == "validation" else ["validated", "updated"])
 
 
 def test_window_off_update_keeps_the_original_two_argument_call():
@@ -492,9 +493,235 @@ def test_window_off_update_keeps_the_original_two_argument_call():
             )
             actual = branch.body
         else:
-            assert not any(isinstance(n, ast.With) for n in ast.walk(method))
-            actual = [n for n in method.body if isinstance(n, ast.Expr) and ast.unparse(n).startswith("graph.update(")]
+            branch = next(n for n in method.body if isinstance(n, ast.If) and ast.unparse(n.test) == "dp_dummy")
+            # The actual idle-DP branch needs the pinned manager config while
+            # preserving the same UPDATE/event API. Business OFF remains the
+            # original two-argument call without a Window binding.
+            actual = branch.orelse
+            dummy_update = branch.body[0]
+            assert isinstance(dummy_update, ast.With)
+            assert ast.unparse(dummy_update.items[0].context_expr) == "set_current_vllm_config(self.vllm_config)"
+            assert ast.dump(ast.Module(body=dummy_update.body, type_ignores=[])) == ast.dump(
+                ast.Module(body=ast.parse("graph.update(self.update_stream, resolved_tasks)").body, type_ignores=[])
+            )
         expected = ast.parse("graph.update(self.update_stream, resolved_tasks)").body
         assert ast.dump(ast.Module(body=actual, type_ignores=[])) == ast.dump(
             ast.Module(body=expected, type_ignores=[])
         )
+
+
+@pytest.fixture
+def typed_update_guard():
+    """Run the actual UPDATE guard with opaque captured handles and operands."""
+    source = SOURCE.with_name("draft_window_graph.py")
+    tree = ast.parse(source.read_text())
+    guard = next(
+        n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "validate_draft_window_update_tasks"
+    )
+    guard.body = [n for n in guard.body if not isinstance(n, (ast.ImportFrom, ast.Import))]
+
+    class FIAParamProvider:
+        is_draft_model = True
+        layer_name = "draft.layer.0"
+
+    operation = object()
+    checks = []
+    namespace = {
+        "FIAParamProvider": FIAParamProvider,
+        "torch_npu": SimpleNamespace(npu_fused_infer_attention_score=SimpleNamespace(out=operation)),
+        "validate_draft_window_graph_backend_update": lambda *args, **kwargs: checks.append((args, kwargs)),
+    }
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[guard], type_ignores=[])), str(source), "exec"), namespace)
+    provider = FIAParamProvider()
+    metadata = SimpleNamespace(block_tables=object(), seq_lens_list=[17], actual_seq_lengths_q=[8])
+    captured = SimpleNamespace(handle=object(), event=object(), provider=provider, provider_index=0)
+    task = SimpleNamespace(
+        handle=captured.handle,
+        event=captured.event,
+        provider=provider,
+        provider_index=0,
+        operation=operation,
+        kwargs={
+            "block_table": metadata.block_tables,
+            "actual_seq_lengths_kv": metadata.seq_lens_list,
+            "actual_seq_lengths": metadata.actual_seq_lengths_q,
+        },
+    )
+    backend = SimpleNamespace(get_impl_cls=lambda: object, get_builder_cls=lambda: object)
+    return SimpleNamespace(
+        call=namespace["validate_draft_window_update_tasks"],
+        graph=SimpleNamespace(tasks=[captured]),
+        task=task,
+        metadata=[{"draft.layer.0": metadata}],
+        backend=backend,
+        checks=checks,
+    )
+
+
+def test_typed_update_keeps_actual_captured_handles_and_current_metadata(typed_update_guard):
+    case = typed_update_guard
+    binding = object()
+    case.call(case.graph, [case.task], binding, case.metadata, case.backend, 8)
+    assert len(case.checks) == 1
+    assert case.checks[0][0] == (binding,)
+    assert case.checks[0][1]["draft_attn_metadatas"] is case.metadata
+
+
+@pytest.mark.parametrize(
+    "field", ["handle", "event", "provider_index", "operation", "block_table", "actual_seq_lengths_kv"]
+)
+def test_typed_update_rejects_stale_task_or_replaced_read_operands(typed_update_guard, field):
+    case = typed_update_guard
+    if field == "provider_index":
+        case.task.provider_index = 1
+    elif field in case.task.kwargs:
+        case.task.kwargs[field] = object()
+    else:
+        setattr(case.task, field, object())
+    with pytest.raises(RuntimeError):
+        case.call(case.graph, [case.task], object(), case.metadata, case.backend, 8)
+    assert not case.checks
+
+
+@pytest.fixture
+def full_metadata_dispatch():
+    """Execute the normal FULL-selection boundary with actual epoch/row keys."""
+    source = SOURCE.with_name("draft_window_graph_metadata.py")
+    tree = ast.parse(source.read_text())
+    names = {
+        "ParallelGraphMetadataSelection",
+        "select_parallel_graph_metadata",
+        "defer_parallel_graph_metadata",
+        "validate_deferred_parallel_graph_metadata",
+    }
+    nodes = [n for n in tree.body if getattr(n, "name", None) in names]
+
+    class Provider:
+        inventory_method = "dflash"
+
+    namespace = {"dataclass": dataclass, "DraftWindowGraphBindingProvider": Provider}
+    module = ast.Module(
+        body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), *nodes],
+        type_ignores=[],
+    )
+    exec(compile(ast.fix_missing_locations(module), str(source), "exec"), namespace)
+    identity = SimpleNamespace(mapping_epoch=7, ordered_request_fingerprint=("req-a", "req-b"), padded_request_count=2)
+    inputs = SimpleNamespace(identity=identity)
+    inputs.validate_for = lambda expected: None if expected is identity else (_ for _ in ()).throw(ValueError("stale"))
+    owner = SimpleNamespace(
+        _draft_window_proposal_context=SimpleNamespace(mapping_epoch=7, ordered_request_ids=("req-a", "req-b")),
+        _draft_window_graph_binding_provider=Provider(),
+        num_query_per_req=8,
+        _draft_window_runtime_state=SimpleNamespace(_active_inputs=inputs, metadata_store=SimpleNamespace(_entry=None)),
+        _draft_window_live_inputs=inputs,
+        _draft_window_deferred_metadata=None,
+    )
+    descriptor = SimpleNamespace(cg_mode=SimpleNamespace(name="FULL"), num_reqs=2, num_tokens=16)
+    return SimpleNamespace(owner=owner, inputs=inputs, descriptor=descriptor, **namespace)
+
+
+def test_full_metadata_dispatch_defers_once_for_current_generation(full_metadata_dispatch):
+    c = full_metadata_dispatch
+    c.select_parallel_graph_metadata(c.owner, c.descriptor)
+    assert c.defer_parallel_graph_metadata(c.owner, c.inputs, padded_requests=2, padded_tokens=16)
+    c.validate_deferred_parallel_graph_metadata(c.owner, c.inputs, c.descriptor)
+    assert c.owner._draft_window_deferred_metadata is c.inputs.identity
+    with pytest.raises(RuntimeError, match="existing publication"):
+        c.defer_parallel_graph_metadata(c.owner, c.inputs, padded_requests=2, padded_tokens=16)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [("mapping_epoch", 8), ("ordered_request_fingerprint", ("req-b", "req-a")), ("padded_request_count", 4)],
+)
+def test_full_metadata_dispatch_rejects_stale_generation_or_rows(full_metadata_dispatch, field, value):
+    c = full_metadata_dispatch
+    c.select_parallel_graph_metadata(c.owner, c.descriptor)
+    setattr(c.inputs.identity, field, value)
+    with pytest.raises(RuntimeError, match="stale or wrong-bucket"):
+        c.defer_parallel_graph_metadata(c.owner, c.inputs, padded_requests=2, padded_tokens=16)
+    assert c.owner._draft_window_deferred_metadata is None
+
+
+@pytest.mark.parametrize("tokens,requests", [(8, 2), (16, 4)])
+def test_full_metadata_dispatch_rejects_wrong_actual_bucket(full_metadata_dispatch, tokens, requests):
+    c = full_metadata_dispatch
+    c.select_parallel_graph_metadata(c.owner, c.descriptor)
+    with pytest.raises(RuntimeError, match="stale or wrong-bucket"):
+        c.defer_parallel_graph_metadata(c.owner, c.inputs, padded_requests=requests, padded_tokens=tokens)
+
+
+def test_eager_dispatch_keeps_ordinary_metadata_build(full_metadata_dispatch):
+    c = full_metadata_dispatch
+    c.descriptor.cg_mode.name = "NONE"
+    c.select_parallel_graph_metadata(c.owner, c.descriptor)
+    assert c.owner._draft_window_selected_metadata is None
+    assert not c.defer_parallel_graph_metadata(c.owner, c.inputs, padded_requests=2, padded_tokens=16)
+
+
+def test_full_metadata_dispatch_does_not_replace_published_metadata(full_metadata_dispatch):
+    c = full_metadata_dispatch
+    c.select_parallel_graph_metadata(c.owner, c.descriptor)
+    c.owner._draft_window_runtime_state.metadata_store._entry = object()
+    with pytest.raises(RuntimeError, match="existing publication"):
+        c.defer_parallel_graph_metadata(c.owner, c.inputs, padded_requests=2, padded_tokens=16)
+
+
+def test_full_graph_final_metadata_reuses_groups_without_mixing_native_reads():
+    """The actual finalization loop shares per-group objects, not reader semantics."""
+    import copy
+
+    source = SOURCE.with_name("draft_window_graph_runtime.py")
+    tree = ast.parse(source.read_text())
+    function = next(
+        n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_build_private_graph_metadata"
+    )
+    loop = next(
+        n for n in function.body if isinstance(n, ast.For) and ast.unparse(n.iter) == "private_isolation_view.items()"
+    )
+    shared = SimpleNamespace(attn_state=object())
+    writes = SimpleNamespace(
+        slot_mapping=object(),
+        positions=object(),
+        query_start_loc=object(),
+        actual_seq_lengths_q=(8,),
+        attn_state=object(),
+        num_actual_tokens=8,
+        causal=False,
+    )
+    validates = []
+    snapshot = SimpleNamespace(
+        validate=lambda *args: validates.append(args),
+        device_exact=object(),
+        cpu_exact=SimpleNamespace(tolist=lambda: [17]),
+    )
+
+    class Slots:
+        def __getitem__(self, key):
+            return key[0], "canonical-full-slots"
+
+    namespace = dict(
+        copy=copy,
+        private_isolation_view={"full.a": shared, "full.b": shared, "swa.a": shared, "swa.b": shared},
+        final_metadata={},
+        finalized_groups={},
+        native_gids={"swa.a": 0, "swa.b": 1},
+        native_snapshot=snapshot,
+        native_swa=object(),
+        write_side=writes,
+        read_inputs=SimpleNamespace(padded_request_count=1),
+        fingerprint=SimpleNamespace(padded_token_count=8),
+        owner=SimpleNamespace(
+            _draft_window_live_inputs=SimpleNamespace(identity=object()),
+            block_tables=SimpleNamespace(input_block_tables=[[10], [20]], slot_mappings=Slots()),
+        ),
+    )
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[loop], type_ignores=[])), str(source), "exec"), namespace)
+    result = namespace["final_metadata"]
+    assert result["full.a"] is result["full.b"]
+    assert result["full.a"] is not shared and result["full.a"].causal is False
+    assert result["swa.a"] is not result["swa.b"] and result["swa.a"] is not result["full.a"]
+    assert result["swa.a"].block_tables == [10] and result["swa.b"].block_tables == [20]
+    assert result["swa.a"].causal is result["swa.b"].causal is True
+    assert len(validates) == 2
+    assert not hasattr(shared, "slot_mapping")

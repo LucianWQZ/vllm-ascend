@@ -748,29 +748,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
             ),
             use_max_workspace,
         )
-        # Capture observations use the actual registered task operands and its
-        # real native handle/event. The default path retains the typed provider;
-        # Window binding/ownership validation also runs with observation off.
-        callback = None
-        if getattr(attn_metadata, "_draft_window_graph_capture_operand_context", None) is not None:
-
-            def callback(task, stream):
-                from vllm_ascend.worker.v2.spec_decode.draft_window_graph_characterization import (
-                    record_parallel_graph_capture_operator_operand,
-                )
-
-                record_parallel_graph_capture_operator_operand(
-                    attn_metadata,
-                    block_table=task.kwargs["block_table"],
-                    seq_lengths=task.kwargs["actual_seq_lengths_kv"],
-                    layer_name=layer.layer_name if layer is not None else self._layer_name,
-                    num_tokens=num_tokens,
-                    handle=task.handle,
-                    event=task.event,
-                    stream=stream,
-                    backend_impl=AscendAttentionBackendImpl,
-                )
-
         register_task(
             torch_npu.npu_fused_infer_attention_score.out,
             {
@@ -799,7 +776,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 _EXTRA_CTX.is_draft_model,
                 is_non_pa=block_table is None,
             ),
-            capture_callback=callback,
         )
         return output, num_tokens
 

@@ -22,10 +22,8 @@ from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftWindowLeaseState,
     DraftWindowReadDescriptor,
     DraftWindowRuntimeState,
-    DraftWindowScalarPlan,
     DraftWindowSourceCapability,
     SingleGroupDirectPrefixProvider,
-    compute_draft_window_scalar_plan,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_eager import (
     AscendDraftAttentionReadInputs,
@@ -33,15 +31,12 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_eager import (
     DraftWindowProposalEpochSource,
     _requires_prefill_baseline_bypass,
 )
-from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
-    DraftWindowGraphStage,
-    observe_draft_window_graph_source,
-)
 from vllm_ascend.worker.v2.spec_decode.draft_window_nongraph import (
     DraftWindowBatchPhasePlan,
     DraftWindowRowPhase,
     build_prefix_resident_snapshot,
 )
+from vllm_ascend.worker.v2.spec_decode.draft_window_plan import DraftWindowPlan, compute_draft_window_plan
 
 
 def _eagle3_graph_scheduled_consumers(static_k: int, scheduled: int | None) -> int:
@@ -63,7 +58,7 @@ class Eagle3FrozenProposalPlan:
     """Per-row ``L0/H/S`` values frozen for one static-K proposal."""
 
     static_k: int
-    row_plans: tuple[DraftWindowScalarPlan, ...]
+    row_plans: tuple[DraftWindowPlan, ...]
     actual_request_count: int
     padded_request_count: int
 
@@ -149,19 +144,6 @@ class Eagle3DraftWindowMixin:
         self._eagle3_window_static_k = static_k
         self._eagle3_window_scheduled_tokens = None
         self._eagle3_window_expected_steps = static_k
-        additional = getattr(getattr(self, "vllm_config", None), "additional_config", None) or {}
-        staging = additional.get("draft_window_graph_eagle_pinned_h2d_review", False)
-        if staging is not False:
-            from vllm_ascend.ascend_config import validate_additional_config_bool
-
-            staging = validate_additional_config_bool(
-                staging, "additional_config.draft_window_graph_eagle_pinned_h2d_review"
-            )
-        if staging:
-            from vllm_ascend.ascend_config import validate_draft_window_eagle_pinned_h2d_review
-
-            validate_draft_window_eagle_pinned_h2d_review(self.vllm_config)
-            self._draft_window_runtime_state.workspace.configure_pinned_h2d_staging_review(True)
         # Fused decode builds metadata once and mutates it for later steps.
         # P4b must rematerialize every step from canonical FullSource.
         self.supports_decode_metadata_update = False
@@ -481,8 +463,6 @@ class Eagle3DraftWindowMixin:
     ) -> AscendDraftAttentionReadInputs:
         """The one formal P4b validation/narrowing boundary before building."""
         inputs.validate_for(expected_identity)
-        if not hasattr(self, "_eagle3_graph_session"):
-            observe_draft_window_graph_source(self, DraftWindowGraphStage.LIVE)
         gid = expected_identity.global_group_id
         block_tables = tuple(
             inputs.window_block_table if group_id == gid else full_table[: inputs.padded_request_count]
@@ -583,15 +563,15 @@ def build_eagle3_frozen_proposal_plan(
     if static_k <= 0:
         raise ValueError("Eagle3 proposal planning requires a positive configured static K")
 
-    row_plans: list[DraftWindowScalarPlan] = []
+    row_plans: list[DraftWindowPlan] = []
     for row in range(actual_request_count):
         l0 = int(cpu_proposal_l0[row].item())
         row_plans.append(
-            compute_draft_window_scalar_plan(
+            compute_draft_window_plan(
                 full_exact_end=l0,
                 future_offset=static_k,
                 window_size=provider.inventory.window_size,
-                legacy_block_size=provider.legacy_block_size,
+                block_span_tokens=provider.legacy_block_size,
             )
         )
     return Eagle3FrozenProposalPlan(

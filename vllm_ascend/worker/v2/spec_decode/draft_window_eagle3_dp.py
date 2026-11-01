@@ -13,12 +13,16 @@ def _validate_eagle_dp_dummy(owner, session):
     session.controller.require_reusable()
     provider = getattr(owner, "_draft_window_graph_binding_provider", None)
     runtime = getattr(owner, "_draft_window_runtime_state", None)
+    support = getattr(owner, "_draft_graph_review_limit", None)
     if (
         getattr(owner, "method", None) != "eagle3"
         or getattr(owner, "dp_size", None) != 2
         or getattr(owner, "num_speculative_steps", None) != 3
         or getattr(owner, "max_num_reqs", None) != 1
-        or (owner.vllm_config.additional_config or {}).get("draft_window_graph_eagle_dp2_review") is not True
+        or support is None
+        or support.method != "eagle3"
+        or support.data_parallel_size != 2
+        or support.max_requests != 1
         or owner.input_batch.is_dummy is not True
         or getattr(owner, "_eagle3_window_bypass_active", False) is not True
         or getattr(owner, "_eagle3_window_continuing_prefill", False) is not False

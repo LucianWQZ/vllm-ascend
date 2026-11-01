@@ -254,14 +254,6 @@ def draft_window_dflash_capture_scope(
         context._state.active = False
         if hasattr(input_buffers, _CAPTURE_CONTEXT_ATTRIBUTE):
             delattr(input_buffers, _CAPTURE_CONTEXT_ATTRIBUTE)
-        # The final per-layer callback ran inside hardware capture. Flush only
-        # after leaving it, including failures; do not detach closure metadata.
-        from vllm_ascend.worker.v2.spec_decode.draft_window_graph_characterization import (
-            DraftWindowGraphCharacterizationRecorder,
-        )
-
-        if isinstance(context.provider.observer, DraftWindowGraphCharacterizationRecorder):
-            context.provider.observer.write_artifact()
 
 
 def _seed_capture_read_inputs(
@@ -416,26 +408,4 @@ def ascend_prepare_dflash_inputs_to_capture(
         if set(native_metadata) != set(native_swa.native_layers) or set(window_metadata) != set(native_swa.full_layers):
             raise RuntimeError("native SWA capture metadata does not cover the admitted readers")
         attn_metadata = {**native_metadata, **window_metadata}
-    # Optional, bounded G1/G3/G4 evidence.  The recorder exists only when the
-    # strict characterization flag installed an instance-owned provider.
-    from vllm_ascend.worker.v2.spec_decode.draft_window_graph_characterization import (
-        attach_parallel_graph_capture_operand_observer,
-        record_parallel_graph_capture,
-    )
-
-    record_parallel_graph_capture(
-        context.provider,
-        identity=identity,
-        read_inputs=read_inputs,
-        slot_mapping=slot_mappings,
-        positions=input_batch.positions,
-        query_start_loc=input_batch.query_start_loc,
-        metadata=window_metadata,
-    )
-    attach_parallel_graph_capture_operand_observer(
-        context.provider,
-        identity=identity,
-        metadata=window_metadata,
-        target_metadata=context.target_metadata,
-    )
     return AttentionState(attn_metadata, slot_mappings_by_layer)

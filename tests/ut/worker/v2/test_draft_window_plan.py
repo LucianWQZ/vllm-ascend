@@ -8,6 +8,8 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_plan import (
     compute_draft_window_plan,
     freeze_eagle_window_plan,
     project_direct_prefix,
+    project_draft_window_interval,
+    window_capacity_tokens,
 )
 
 
@@ -104,6 +106,25 @@ def test_valid_columns_are_not_residency_proof():
 def test_empty_request_does_not_invent_padding_or_read_columns():
     projection = _project(window_start=0, full_exact_end=0, valid_columns=0, resident_end=0)
     assert projection.required_columns == 0
+    assert projection.safe_extent_tokens == 0
+
+
+def test_owned_graph_and_checked_eager_projection_share_the_same_interval():
+    for start, end, span in ((96, 137, 16), (96, 137, 64), (0, 0, 128), (0, 7, 8)):
+        owned = project_draft_window_interval(window_start=start, full_exact_end=end, block_span_tokens=span)
+        checked = project_direct_prefix(
+            window_start=start,
+            full_exact_end=end,
+            block_span_tokens=span,
+            valid_columns=(end + span - 1) // span,
+            resident_start=0,
+            resident_end=end,
+            supports_first_token_offset=True,
+        )
+        assert owned == checked
+        assert owned.safe_extent_tokens >= end - start
+        assert owned.safe_extent_tokens < end - start + span or end == start
+    assert window_capacity_tokens(1024, 128) == 1151
 
 
 @pytest.mark.parametrize(

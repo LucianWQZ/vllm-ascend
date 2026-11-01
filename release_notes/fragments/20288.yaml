@@ -7,28 +7,12 @@ entries:
   - category: feature
     text: Added a global-first-rank startup warning when an additional MRV2 Draft window narrows certified native SWA groups. Supported settings remain opt-in and are not automatically disabled.
   - category: feature
-    text: Added default-off, controlled Draft Window Graph review entry points with explicit checkpoint and topology limits, including experimental static TP2 DFlash2 Graph plumbing that preserves its native SWA and selector semantics. Unqualified combinations remain blocked; ordinary typed DFlash2 eager remains available.
+    text: Added default-off Draft Window Graph entry points with explicit model and topology limits, including experimental static TP2 DFlash2 Graph plumbing that preserves its native SWA and selector semantics. Unqualified combinations remain blocked; ordinary typed DFlash2 eager remains available.
   - category: feature
     text: Reported loaded Draft Full, native SWA, mixed or unknown attention semantics at startup, independently of full KV retention. Unconfirmed extra-window Graph combinations are rejected explicitly.
   - category: feature
-    text: Replaced the controlled single-request Eagle Graph review entry's fixed prompt and output whitelist with model-capacity checks for Window OFF and W1024. Checkpoint, topology, actual-row and capture-shape protections remain in effect; device qualification is reported separately.
+    text: Applied model-capacity, actual-request and capture-shape checks to qualified TP4 Eagle3 and eight-layer Full DFlash Graph profiles, including two local requests with DP1 and one local request per DP2 replica. Unsupported shapes and preempted requests remain rejected without an eager fallback.
   - category: bugfix
-    text: Replaced the Full8 single-request Graph review's exact prompt/output whitelist with checked model and allocated-capacity bounds for additional Window OFF or W32768 ON. Static TP4/DP1, actual1/padded1/Q8 and preemption/identity protections remain; new lengths require separate qualification and multiple-request failures stay blocked.
-  - category: bugfix
-    text: Reject unsupported padded Eagle3 Graph consumer descriptors before replay in the explicit single-request review, including Window OFF.
-  - category: bugfix
-    text: Connected the identified Full8 and Eagle single-request Graph review contracts to ordinary Window OFF startup. Checkpoint, topology, capacity and capture protections still apply; the review flags do not imply device qualification.
-  - category: feature
-    text: Added an explicit Full8 TP4/DP2 single-request-per-replica Graph review entry, retaining max_num_seqs=1, actual1/padded1/Q8 and the existing idle-replica protocol. Combined-feature device qualification is separate.
-  - category: feature
-    text: Connected boolean Async, prefix-cache and Target FlashComm settings to the checkpoint-scoped single-request Full8 and Eagle Graph review entries. Existing Graph ownership, resident canonical KV and actual-row/capacity protections remain; combined-feature model execution is qualified separately, without enabling DSA-CP.
-  - category: feature
-    text: Added a separate default-off Full8 two-request Graph review with exact local active/padded one-or-two banks, independent original request identities and capacity checks. The single-request entry and larger-batch protections remain intact; ordinary two-request device qualification is separate.
-  - category: bugfix
-    text: Kept the admitted dense Eagle AR capture descriptor independent of Target SP-aligned capture sizes. The Q1 AR buckets are derived from legal Q4 first-pass request buckets without changing Target SP, Draft topology or default Graph behavior; device qualification remains separate.
-  - category: feature
-    text: Added a separate default-off TP4/DP1 Eagle two-request Graph review with max_num_seqs=2, independent request identities and exact n1/n2 first-Q4 and AR-Q1 descriptors. Existing single-request behavior and larger-batch protections remain; ordinary service qualification is separate from the paired numerical check.
-  - category: feature
-    text: Added a separate default-off Eagle TP4xDP2 local-one-request Graph review entry, preserving actual DP synchronization, Target SP alignment, independent first/AR capture banks and Full/PAD idle computation. Idle submission failures quarantine the owner; numerical and ordinary device qualification remain separate and unclaimed.
-  - category: bugfix
-    text: Checked continuing rows in mixed Eagle chunked prefills against their canonical prefill progress and consumer step instead of requiring the full prompt to be present. Terminal/decode capacity, request identity, preemption and Graph ownership protections remain unchanged; ordinary device requalification is separate.
+    text: Preserved independent Eagle first-pass and autoregressive capture buckets with Target SP, and checked continuing chunked prefills against canonical progress after excluding speculative placeholders.
+  - category: config
+    text: Unified eager and Graph window policy and interval math, removed private single/two-request and diagnostic configuration flags, and separated Graph buffer ownership from experimental recorders. Experimental Graph enablement remains explicit and disabled by default.

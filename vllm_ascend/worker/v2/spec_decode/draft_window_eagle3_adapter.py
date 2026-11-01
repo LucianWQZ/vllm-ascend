@@ -64,13 +64,13 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin):
         ):
             raise RuntimeError("draft-window runtime ownership is already initialized")
         from vllm_ascend.worker.v2.spec_decode.draft_window import build_draft_window_runtime_context
-        from vllm_ascend.worker.v2.spec_decode.draft_window_graph_characterization import (
-            experimental_draft_window_graph_characterization_enabled,
+        from vllm_ascend.worker.v2.spec_decode.draft_window_graph_runtime import (
+            draft_window_graph_enabled,
         )
 
         graph_context = None
         if (
-            experimental_draft_window_graph_characterization_enabled()
+            draft_window_graph_enabled()
             and build_draft_window_runtime_context(self.vllm_config, self.block_tables).graph_mode != "NONE"
         ):
             from vllm_ascend.worker.v2.spec_decode.draft_window_eagle3_capture import build_eagle3_graph_source
@@ -181,25 +181,6 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin):
         ):
             return super().propose(*args, **kwargs)
 
-    def capture(self):
-        session = getattr(self, "_eagle3_graph_session", None)
-        if session is not None:
-            from vllm_ascend.ascend_config import validate_additional_config_bool
-
-            config = self.vllm_config.additional_config or {}
-            attention_probe = validate_additional_config_bool(
-                config.get("draft_window_graph_eagle_attention_probe", False),
-                "additional_config.draft_window_graph_eagle_attention_probe",
-            )
-            if attention_probe:
-                raise NotImplementedError(
-                    "Eagle attention discriminator still requires typed registered-task capture adaptation; "
-                    "keep this default-off probe disabled for ordinary numeric capture; "
-                    "this discriminator is not qualified"
-                )
-            session.initialize_numeric_capture()
-        return super().capture()
-
     def _run_model(
         self,
         num_tokens,
@@ -210,11 +191,8 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin):
         mm_inputs=None,
     ):
         session = getattr(self, "_eagle3_graph_session", None)
-        capture_identity = None
         if session is not None and session._capture_call is not None:
-            attn_metadata, capture_identity = session.capture_metadata(attn_metadata)
-        if session is not None and session.numeric_snapshots is not None:
-            session.numeric_snapshots.before_model(capture_identity, attn_metadata, slot_mappings)
+            attn_metadata, _ = session.capture_metadata(attn_metadata)
         output = super()._run_model(
             num_tokens,
             attn_metadata,
@@ -223,10 +201,6 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin):
             cudagraph_runtime_mode,
             mm_inputs,
         )
-        if session is not None:
-            if session.numeric_snapshots is not None:
-                session.numeric_snapshots.after_model(capture_identity)
-            session.retain_capture_output(capture_identity, output)
         return output
 
     def _generate_draft(
