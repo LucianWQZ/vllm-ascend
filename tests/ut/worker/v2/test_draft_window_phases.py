@@ -14,7 +14,11 @@ from vllm_ascend.worker.v2.spec_decode.draft_window import (
     build_full_draft_kv_source,
     gather_valid_num_blocks_cpu,
 )
-from vllm_ascend.worker.v2.spec_decode.draft_window_backends import DraftWindowProviderStatus
+from vllm_ascend.worker.v2.spec_decode.draft_window_backends import (
+    DraftWindowGroupRoute,
+    DraftWindowProviderStatus,
+    DraftWindowTopology,
+)
 from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowProposalEpochSource
 from vllm_ascend.worker.v2.spec_decode.draft_window_nongraph import (
     build_phase_aware_materialization_plan,
@@ -74,12 +78,8 @@ def test_epoch_still_rejects_changed_requests_mapping_or_phases(field):
 
 @pytest.fixture
 def full_source():
-    group = SimpleNamespace(
-        gid=0,
-        backend="dense",
-        status=DraftWindowProviderStatus.DIRECT_DENSE,
-        scheduler_block_size=4,
-        table_column_span=4,
+    group = DraftWindowGroupRoute(
+        0, ("draft.layer",), 4, 4, DraftWindowTopology(1, 1), DraftWindowProviderStatus.DIRECT_DENSE, "CPU resident row"
     )
     counts = torch.tensor([[4, 3]], dtype=torch.int32)
     owner = SimpleNamespace(
@@ -132,12 +132,8 @@ def test_shared_row_projection_keeps_eagle_anchor_and_full_prefill(full_source, 
         build_eagle3_step_materialization_plan,
     )
 
-    group = SimpleNamespace(
-        gid=0,
-        backend="dense",
-        status=DraftWindowProviderStatus.DIRECT_DENSE,
-        scheduler_block_size=4,
-        table_column_span=4,
+    group = DraftWindowGroupRoute(
+        0, ("draft.layer",), 4, 4, DraftWindowTopology(1, 1), DraftWindowProviderStatus.DIRECT_DENSE, "CPU resident row"
     )
     from vllm_ascend.worker.v2.spec_decode.draft_window_policy import resolve_draft_window_policy
 

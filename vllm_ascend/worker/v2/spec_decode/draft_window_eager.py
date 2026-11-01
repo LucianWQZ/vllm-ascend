@@ -122,8 +122,7 @@ class DraftWindowProposalContext:
             raise ValueError("proposal mapping epoch must be a nonnegative Python int")
         requests = self.ordered_request_ids
         if (
-            not requests
-            or any(not isinstance(request, str) or not request for request in requests)
+            any(not isinstance(request, str) or not request for request in requests)
             or len(set(requests)) != len(requests)
         ):
             raise ValueError("proposal requires unique nonempty ordered request IDs")

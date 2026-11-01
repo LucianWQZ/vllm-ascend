@@ -112,6 +112,7 @@ def contract(request, monkeypatch):
         uses_turboquant_groups=lambda _: False,
         vllm_version_is=lambda _: False,
         LmheadTPDraftSamplingMixin=type("LmheadTPDraftSamplingMixin", (), {}),
+        logger=SimpleNamespace(info_once=Mock(), warning_once=Mock()),
     )
     for name in (
         "AscendDSAMetadataBuilder",
@@ -177,6 +178,11 @@ def contract(request, monkeypatch):
         "dspark": "AscendDSparkSpeculator",
         "autoregressive": "AscendTargetDependentARSpeculator",
     }[request.param]
+    if not is_ar:
+        shared_path = ROOT / "vllm_ascend/worker/v2/spec_decode/draft_window_eager.py"
+        parallel_path = ROOT / "vllm_ascend/worker/v2/spec_decode/dflash/speculator.py"
+        _execute([_node(shared_path, "DraftWindowGraphInputMixin")], scope, shared_path)
+        _execute([_node(parallel_path, "_draft_window_owner_scope")], scope, parallel_path)
     _execute([_node(source_path, class_name)], scope, source_path)
     cls = scope[class_name]
     obj = object.__new__(cls)
