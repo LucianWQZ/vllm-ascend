@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 import torch
 from vllm.v1.worker.gpu.spec_decode.eagle.speculator import EagleSpeculator
+from vllm.v1.worker.gpu.spec_decode.target_dependent_ar.speculator import TargetDependentARSpeculator
 
 from vllm_ascend.worker.v2.spec_decode import draft_window_eager
 from vllm_ascend.worker.v2.spec_decode.draft_window_eager import AscendDraftAttentionReadInputs
@@ -107,11 +108,11 @@ def test_eager_forward_is_delegated_once_and_reader_retires_after_it(monkeypatch
             raise ValueError("native forward failed")
         return "result"
 
-    monkeypatch.setattr(AscendTargetDependentARSpeculator, "_generate_draft", forward)
+    monkeypatch.setattr(TargetDependentARSpeculator, "_generate_draft", forward)
 
     class Owner(Eagle3GraphIntegrationMixin):
-        def _eagle3_window_is_active(self):
-            return active
+        def _update_decode_attn_metadata(self, *args):
+            calls.append(("update", args))
 
         def _finish_eagle3_window_step(self, current, *, succeeded):
             assert current is inputs
@@ -119,14 +120,17 @@ def test_eager_forward_is_delegated_once_and_reader_retires_after_it(monkeypatch
 
     owner: Any = object.__new__(Owner)
     owner._eagle3_window_live_inputs = inputs
+    owner._eagle3_window_proposal_context = object() if active else None
     args = (2, 4, metadata, object(), object())
     if fail:
         with pytest.raises(ValueError, match="native forward failed"):
             owner._generate_draft(*args)
     else:
-        assert owner._generate_draft(*args) == "result"
+        assert owner._generate_draft(*args) is None
     assert calls[0][0] == "forward" and calls[0][1][:5] == args
-    assert calls[1:] == ([("retire", not fail)] if active else [])
+    assert [event[0] for event in calls] == ["forward"] + ([] if fail else ["update"]) + (["retire"] if active else [])
+    if active:
+        assert calls[-1] == ("retire", not fail)
 
 
 @pytest.mark.parametrize("scheduled", [-1, 1, 2, 4, True])

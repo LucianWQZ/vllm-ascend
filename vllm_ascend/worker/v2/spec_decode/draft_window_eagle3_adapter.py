@@ -30,7 +30,6 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_eager import (
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_eagle3 import (
     Eagle3DraftWindowMixin,
-    _eagle3_graph_scheduled_consumers,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
     DraftWindowGraphBindingProvider,
@@ -80,70 +79,6 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentA
             self._eagle3_graph_session = Eagle3GraphSession(self)
         return result
 
-    def propose(
-        self,
-        input_batch,
-        attn_metadata,
-        slot_mappings,
-        last_hidden_states,
-        aux_hidden_states,
-        num_sampled,
-        num_rejected,
-        last_sampled,
-        next_prefill_tokens,
-        temperature,
-        seeds,
-        dp_sync_state=None,
-        dummy_run=False,
-        skip_attn_for_dummy_run=False,
-        mm_inputs=None,
-        is_profile=None,
-        num_speculative_tokens=None,
-    ):
-        from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import validate_draft_graph_review_requests
-
-        validate_draft_graph_review_requests(self, input_batch, dummy_run=dummy_run, is_profile=bool(is_profile))
-        if (
-            hasattr(self, "_eagle3_window_epoch_source")
-            and not dummy_run
-            and not is_profile
-            and not getattr(input_batch, "is_dummy", False)
-        ):
-            _eagle3_graph_scheduled_consumers(self.num_speculative_steps, num_speculative_tokens)
-        self.input_batch = input_batch
-        args = (
-            input_batch,
-            attn_metadata,
-            slot_mappings,
-            last_hidden_states,
-            aux_hidden_states,
-            num_sampled,
-            num_rejected,
-            last_sampled,
-            next_prefill_tokens,
-            temperature,
-            seeds,
-        )
-        kwargs = dict(
-            dp_sync_state=dp_sync_state,
-            dummy_run=dummy_run,
-            skip_attn_for_dummy_run=skip_attn_for_dummy_run,
-            mm_inputs=mm_inputs,
-            is_profile=is_profile,
-            num_speculative_tokens=num_speculative_tokens,
-        )
-        if not hasattr(self, "_eagle3_window_epoch_source"):
-            return super().propose(*args, **kwargs)
-        with self._eagle3_draft_window_proposal_scope(
-            input_batch,
-            dummy_run=dummy_run,
-            is_profile=bool(is_profile),
-            num_speculative_tokens=None
-            if dummy_run or is_profile or getattr(input_batch, "is_dummy", False)
-            else num_speculative_tokens,
-        ):
-            return super().propose(*args, **kwargs)
-
     def _run_model(
         self,
         num_tokens,
@@ -164,44 +99,6 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentA
             cudagraph_runtime_mode,
             mm_inputs,
         )
-
-    def _generate_draft(
-        self,
-        num_reqs,
-        num_tokens_padded,
-        attn_metadata,
-        slot_mappings,
-        num_tokens_across_dp,
-        cudagraph_runtime_mode=CUDAGraphMode.NONE,
-        num_speculative_steps=None,
-    ):
-        inputs = None
-        if self._eagle3_window_is_active():
-            if cudagraph_runtime_mode != CUDAGraphMode.NONE:
-                raise RuntimeError("Eagle3 Window per-step eager reader received a Graph descriptor")
-            inputs = self._eagle3_window_live_inputs
-            if inputs is None:
-                raise RuntimeError("Eagle3 Draft forward has no current Window inputs")
-            inputs.validate_for(inputs.identity)
-            if attn_metadata is not inputs.metadata:
-                raise RuntimeError("Eagle3 Draft forward lost its current private Window metadata")
-        try:
-            result = super()._generate_draft(
-                num_reqs,
-                num_tokens_padded,
-                attn_metadata,
-                slot_mappings,
-                num_tokens_across_dp,
-                cudagraph_runtime_mode,
-                num_speculative_steps,
-            )
-        except BaseException:
-            if inputs is not None:
-                self._finish_eagle3_window_step(inputs, succeeded=False)
-            raise
-        if inputs is not None:
-            self._finish_eagle3_window_step(inputs, succeeded=True)
-        return result
 
     def _update_decode_attn_metadata(self, attn_metadata, step, num_reqs=None):
         # The Graph-owner eager control already published exact private lengths;

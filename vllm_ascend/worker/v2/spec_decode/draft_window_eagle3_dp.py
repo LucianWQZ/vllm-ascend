@@ -12,7 +12,7 @@ from contextlib import contextmanager
 def _validate_eagle_dp_dummy(owner, session):
     session.require_reusable()
     provider = getattr(owner, "_draft_window_graph_binding_provider", None)
-    runtime = getattr(owner, "_draft_window_runtime_state", None)
+    runtime = getattr(owner, "_draft_window_graph_binding_provider", None)
     support = getattr(owner, "_draft_graph_review_limit", None)
     if (
         getattr(owner, "method", None) != "eagle3"

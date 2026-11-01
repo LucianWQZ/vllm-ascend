@@ -330,6 +330,10 @@ class AscendTargetDependentARSpeculator(LmheadTPDraftSamplingMixin, TargetDepend
         we need to cache input_batch, so we can use it later in
         generate_draft.
         """
+        if getattr(self, "method", None) == "eagle3":
+            from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import validate_draft_graph_review_requests
+
+            validate_draft_graph_review_requests(self, input_batch, dummy_run=dummy_run, is_profile=bool(is_profile))
         self.input_batch = input_batch
         # Replicated drafts use global tokens, unlike the PCP-local target.
         # Every DP rank must take the draft sync, including decode and idle ranks.
@@ -337,8 +341,22 @@ class AscendTargetDependentARSpeculator(LmheadTPDraftSamplingMixin, TargetDepend
         # wrap build_attn_metadata to use Ascend attention metadata building.
         # so we can call super().propose() directly.
         runtime = getattr(self, "_draft_window_runtime", None)
+        graph_scope = None
+        if hasattr(self, "_eagle3_window_epoch_source"):
+            graph_scope = getattr(self, "_eagle3_draft_window_proposal_scope", None)
+            if not callable(graph_scope):
+                raise RuntimeError("Eagle3 Graph has no proposal owner")
         with (
-            runtime.proposal_context(
+            graph_scope(
+                input_batch,
+                dummy_run=dummy_run,
+                is_profile=bool(is_profile),
+                num_speculative_tokens=None
+                if dummy_run or is_profile or getattr(input_batch, "is_dummy", False)
+                else num_speculative_tokens,
+            )
+            if graph_scope is not None
+            else runtime.proposal_context(
                 self,
                 input_batch,
                 dummy_run,
@@ -509,18 +527,39 @@ class AscendTargetDependentARSpeculator(LmheadTPDraftSamplingMixin, TargetDepend
         """Thin override: delegate to upstream single-step ``_generate_draft``,
         then apply Ascend-specific attention-metadata updates required by the
         FIA operator."""
-        # vLLM #60335 added `num_speculative_steps` on main.
-        super()._generate_draft(
-            num_reqs,
-            num_tokens_padded,
-            attn_metadata,
-            slot_mappings,
-            num_tokens_across_dp,
-            cudagraph_runtime_mode,
-            num_speculative_steps,
-        )
-        if attn_metadata is not None:
-            self._update_decode_attn_metadata(attn_metadata, 1, num_reqs)
+        inputs = None
+        finish_step = None
+        if getattr(self, "_eagle3_window_proposal_context", None) is not None:
+            if cudagraph_runtime_mode != CUDAGraphMode.NONE:
+                raise RuntimeError("Eagle3 Window per-step eager reader received a Graph descriptor")
+            inputs = getattr(self, "_eagle3_window_live_inputs", None)
+            if inputs is None:
+                raise RuntimeError("Eagle3 Draft forward has no current Window inputs")
+            inputs.validate_for(inputs.identity)
+            if attn_metadata is not inputs.metadata:
+                raise RuntimeError("Eagle3 Draft forward lost its current private Window metadata")
+            finish_step = getattr(self, "_finish_eagle3_window_step", None)
+            if not callable(finish_step):
+                raise RuntimeError("Eagle3 Draft forward has no reader completion owner")
+        try:
+            # vLLM #60335 added `num_speculative_steps` on main.
+            super()._generate_draft(
+                num_reqs,
+                num_tokens_padded,
+                attn_metadata,
+                slot_mappings,
+                num_tokens_across_dp,
+                cudagraph_runtime_mode,
+                num_speculative_steps,
+            )
+            if attn_metadata is not None:
+                self._update_decode_attn_metadata(attn_metadata, 1, num_reqs)
+        except BaseException:
+            if finish_step is not None:
+                finish_step(inputs, succeeded=False)
+            raise
+        if finish_step is not None:
+            finish_step(inputs, succeeded=True)
 
     def _multi_step_decode(
         self,
