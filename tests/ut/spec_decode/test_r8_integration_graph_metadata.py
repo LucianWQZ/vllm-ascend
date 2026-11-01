@@ -150,7 +150,7 @@ def test_graph_capture_requires_explicit_matching_source_topology(case):
 class TensorProtocol:
     def __init__(self, values, device="cpu", pointer=None, dtype="int32"):
         self.values = tuple(values)
-        self.shape = (len(values),)
+        self.shape: tuple[int, ...] = (len(values),)
         self.ndim = 1
         self.dtype = dtype
         self.device = SimpleNamespace(type=device)
@@ -176,7 +176,7 @@ def bridge():
         body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), *nodes, call],
         type_ignores=[],
     )
-    namespace = {
+    namespace: dict[str, Any] = {
         "dataclass": dataclass,
         "torch": SimpleNamespace(int32="int32"),
         "upstream_speculator_module": SimpleNamespace(build_attn_metadata=lambda **kw: kw),
@@ -533,12 +533,15 @@ def test_typed_update_uses_manager_config_and_restores_context(relative, method_
     statement = statements[0]
     assert len(statement.body) == 2
     validation, update_call = statement.body
+    assert isinstance(validation, ast.Expr) and isinstance(validation.value, ast.Call)
+    assert isinstance(update_call, ast.Expr) and isinstance(update_call.value, ast.Call)
     assert ast.unparse(validation.value.func) == "validate_draft_window_update_tasks"
     assert ast.unparse(update_call.value.func) == "graph.update"
     assert len(update_call.value.args) == 2 and not update_call.value.keywords
-    current = ContextVar("current_vllm_config", default=None)
+    current: ContextVar[object | None] = ContextVar("current_vllm_config", default=None)
     manager_config, ambient_config = object(), object()
-    context_entries, observations = [], []
+    context_entries: list[object] = []
+    observations: list[str] = []
     backend, binding = object(), object()
     metadata, resolved = [object()], object()
 
@@ -828,7 +831,7 @@ def test_full_graph_final_metadata_reuses_groups_without_mixing_native_reads():
         def __getitem__(self, key):
             return key[0], "canonical-full-slots"
 
-    namespace = dict(
+    namespace: dict[str, Any] = dict(
         copy=copy,
         private_isolation_view={"full.a": shared, "full.b": shared, "swa.a": shared, "swa.b": shared},
         final_metadata={},
