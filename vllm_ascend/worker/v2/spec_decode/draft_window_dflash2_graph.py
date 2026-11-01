@@ -12,7 +12,10 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphTensorIdentity
 
 
 def _require(condition: bool, message: str) -> None:
@@ -20,46 +23,21 @@ def _require(condition: bool, message: str) -> None:
         raise ValueError("DFlash2 Graph: " + message)
 
 
-def _field(owner: Any, name: str) -> Any:
-    value = owner
-    for component in name.split("."):
-        value = getattr(value, component)
-    return value
+def _capture_tensor(
+    parent: Any,
+    name: str,
+    shape: tuple[int, ...],
+    dtype: str,
+) -> tuple[Any, str, Any, DraftWindowGraphTensorIdentity]:
+    from vllm_ascend.worker.v2.spec_decode.draft_window_graph import _tensor_identity
 
-
-@dataclass(frozen=True, slots=True)
-class _TensorOwner:
-    name: str
-    tensor: Any = field(repr=False, compare=False)
-    address: int
-    shape: tuple[int, ...]
-    stride: tuple[int, ...]
-    dtype: str
-    device: str
-
-    @classmethod
-    def bind(cls, owner: Any, name: str, shape: tuple[int, ...], dtype: str) -> _TensorOwner:
-        tensor = _field(owner, name)
-        _require(
-            tuple(tensor.shape) == shape and str(tensor.dtype) == dtype,
-            f"{name} shape/dtype does not match static K/selector capacity",
-        )
-        _require(
-            tensor.is_contiguous() and tensor.data_ptr() != 0, f"{name} must have live contiguous persistent storage"
-        )
-        return cls(name, tensor, tensor.data_ptr(), shape, tuple(tensor.stride()), dtype, str(tensor.device))
-
-    def validate(self, owner: Any) -> None:
-        actual = _field(owner, self.name)
-        if (
-            actual is not self.tensor
-            or actual.data_ptr() != self.address
-            or tuple(actual.shape) != self.shape
-            or tuple(actual.stride()) != self.stride
-            or str(actual.dtype) != self.dtype
-            or str(actual.device) != self.device
-        ):
-            raise RuntimeError(f"DFlash2 Graph captured input owner changed: {self.name}")
+    tensor = getattr(parent, name)
+    _require(
+        tuple(tensor.shape) == shape and str(tensor.dtype) == dtype,
+        f"{name} shape/dtype does not match static K/selector capacity",
+    )
+    _require(tensor.is_contiguous() and tensor.data_ptr() != 0, f"{name} must have live contiguous persistent storage")
+    return parent, name, tensor, _tensor_identity(tensor)
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,12 +111,12 @@ class DFlash2GraphContract:
     top_k: int
     max_num_reqs: int
     sampling_mode: str
-    model_id: int
-    selector_id: int
-    sampler_id: int
-    static_context_id: int
-    block_tables_id: int
-    buffers: tuple[_TensorOwner, ...]
+    model: Any = field(repr=False, compare=False)
+    selector: Any = field(repr=False, compare=False)
+    sampler: Any = field(repr=False, compare=False)
+    static_context: Any = field(repr=False, compare=False)
+    block_tables: Any = field(repr=False, compare=False)
+    buffers: tuple[tuple[Any, str, Any, DraftWindowGraphTensorIdentity], ...]
     layers: tuple[_NativeLayer, ...]
     convolution_owners: tuple[tuple[Any, int], ...] = field(repr=False, compare=False)
 
@@ -157,14 +135,18 @@ class DFlash2GraphContract:
             or (self.sampling_mode == "greedy" and owner.draft_logits is not None)
             or owner.use_fp64_gumbel is not False
             or owner.enable_adaptive_verification
-            or id(owner.model) != self.model_id
-            or id(owner.model.model.candidate_selector) != self.selector_id
-            or id(owner.candidate_sampler) != self.sampler_id
-            or id(owner.vllm_config.compilation_config.static_forward_context) != self.static_context_id
+            or owner.model is not self.model
+            or owner.model.model.candidate_selector is not self.selector
+            or owner.candidate_sampler is not self.sampler
+            or owner.vllm_config.compilation_config.static_forward_context is not self.static_context
         ):
             raise RuntimeError("DFlash2 Graph model/selector/static shape owner changed")
-        for buffer in self.buffers:
-            buffer.validate(owner)
+        from vllm_ascend.worker.v2.spec_decode.draft_window_graph import _tensor_identity
+
+        for parent, name, tensor, captured in self.buffers:
+            actual = getattr(parent, name)
+            if actual is not tensor or _tensor_identity(actual) != captured:
+                raise RuntimeError(f"DFlash2 Graph captured input owner changed: {name}")
         context = owner.vllm_config.compilation_config.static_forward_context
         for layer in self.layers:
             if (
@@ -195,7 +177,7 @@ class DFlash2GraphContract:
         First integration admits one homogeneous global Draft group only.
         """
         full_spec, backend, impl_type, builder = _source_types()
-        _require(id(block_tables) == self.block_tables_id, "canonical BlockTables owner changed")
+        _require(block_tables is self.block_tables, "canonical BlockTables owner changed")
         _require(type(window_size) is int and window_size > 0, "positive integer Window required")
         _require(type(query_width) is int and query_width == self.query_width, "captured query width changed")
         groups = [(gid, group) for gid, consumers in enumerate(attn_groups) for group in consumers]
@@ -325,8 +307,6 @@ def validate_dflash2_graph_source(owner: Any) -> DFlash2GraphContract:
         "actual selector/sampler contract differs",
     )
     fields = (
-        ("candidate_sampler.scores", (capacity, k, top_k), "torch.float32"),
-        ("candidate_sampler.cached_candidate_ids", (capacity, k, top_k), "torch.int64"),
         ("sample_indices", (capacity * k,), "torch.int64"),
         ("sample_pos", (capacity * k,), "torch.int64"),
         ("sample_idx_mapping", (capacity * k,), "torch.int64"),
@@ -334,7 +314,11 @@ def validate_dflash2_graph_source(owner: Any) -> DFlash2GraphContract:
         ("seeds", (capacity,), "torch.int64"),
         ("draft_tokens", (capacity, k), "torch.int64"),
     )
-    buffers = tuple(_TensorOwner.bind(owner, *args) for args in fields)
+    buffers = (
+        _capture_tensor(sampler, "scores", (capacity, k, top_k), "torch.float32"),
+        _capture_tensor(sampler, "cached_candidate_ids", (capacity, k, top_k), "torch.int64"),
+        *(_capture_tensor(owner, *args) for args in fields),
+    )
     _require(config.draft_sample_method in ("greedy", "probabilistic"), "unknown candidate sampling mode")
     probabilistic = config.draft_sample_method == "probabilistic"
     _require(
@@ -342,7 +326,7 @@ def validate_dflash2_graph_source(owner: Any) -> DFlash2GraphContract:
         "probabilistic selector requires its existing full-vocab cache; greedy must not add one",
     )
     if probabilistic:
-        buffers += (_TensorOwner.bind(owner, "draft_logits", (capacity, k, owner.vocab_size), "torch.float32"),)
+        buffers += (_capture_tensor(owner, "draft_logits", (capacity, k, owner.vocab_size), "torch.float32"),)
     _, _, impl_type, _ = _source_types()
     layers, convolutions = [], []
     context = owner.vllm_config.compilation_config.static_forward_context
@@ -371,11 +355,11 @@ def validate_dflash2_graph_source(owner: Any) -> DFlash2GraphContract:
         top_k,
         capacity,
         config.draft_sample_method,
-        id(model),
-        id(selector),
-        id(sampler),
-        id(context),
-        id(owner.block_tables),
+        model,
+        selector,
+        sampler,
+        context,
+        owner.block_tables,
         buffers,
         tuple(layers),
         tuple(convolutions),

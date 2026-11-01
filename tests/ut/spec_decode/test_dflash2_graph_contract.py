@@ -20,10 +20,17 @@ class TensorHeader:
     def __init__(self, shape, dtype="torch.int64"):
         self.shape, self.dtype, self.device = tuple(shape), dtype, "npu:0"
         self.address = id(self)
+        self.offset = 0
         self.contiguous = True
 
     def data_ptr(self):
         return self.address
+
+    def untyped_storage(self):
+        return self
+
+    def storage_offset(self):
+        return self.offset
 
     def stride(self):
         result, size = [], 1
@@ -247,6 +254,7 @@ def test_malformed_capture_contract_is_rejected(module, owner, mutation, message
     [
         lambda x: setattr(x, "sample_pos", TensorHeader((28,))),
         lambda x: setattr(x.sample_pos, "address", x.sample_pos.address + 8),
+        lambda x: setattr(x.sample_pos, "offset", 1),
         lambda x: setattr(x.speculative_config, "draft_sample_method", "probabilistic"),
         lambda x: setattr(x, "draft_logits", TensorHeader((4, 7, 8), "torch.float32")),
         lambda x: setattr(x.model.model, "candidate_selector", Selector()),
