@@ -172,13 +172,12 @@ class Eagle3GraphStagingOwner:
                 raise RuntimeError("eager first-pass dispatch cannot manufacture a Graph bank")
             route = DraftWindowGraphRoute.EAGLE3_FIRST_PASS if first else DraftWindowGraphRoute.EAGLE3_AR_STEP
             ordinal = 0 if first else identity.step - 1
-            fingerprint = capture_identity.fingerprint
             if (
-                fingerprint.route is not route
+                capture_identity.route is not route
                 or capture_identity.consumer_ordinal != ordinal
-                or fingerprint.static_k != self.static_k
-                or fingerprint.query_width != (self.static_k + 1 if first else 1)
-                or fingerprint.graph_mode != "FULL"
+                or (capture_identity.descriptor.num_tokens // capture_identity.num_reqs)
+                != (self.static_k + 1 if first else 1)
+                or capture_identity.descriptor.cg_mode.name != "FULL"
             ):
                 raise RuntimeError("Eagle3 destination does not identify this exact consumer ordinal")
             carrier = self.provider.bind_read_carrier(

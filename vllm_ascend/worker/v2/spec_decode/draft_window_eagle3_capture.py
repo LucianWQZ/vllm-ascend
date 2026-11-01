@@ -15,8 +15,9 @@ from contextlib import contextmanager
 from typing import Any
 
 import torch
+from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 
-from vllm_ascend.attention.attention_v1 import AscendAttentionBackendImpl, AscendAttentionState
+from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.worker.v2.spec_decode.draft_window import (
     _build_draft_window_source_capability_for_context,
     build_draft_window_runtime_context,
@@ -27,7 +28,6 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
     DraftWindowGraphMetadataBuild,
     DraftWindowGraphReadInputs,
     DraftWindowGraphRoute,
-    DraftWindowGraphRouteFingerprint,
     DraftWindowGraphWriteSideReference,
     install_draft_window_graph_binding_provider,
 )
@@ -78,10 +78,6 @@ def build_eagle3_graph_source(owner: Any) -> tuple[Any, Any]:
     return capability, context
 
 
-def _class_path(cls: type) -> str:
-    return cls.__module__ + "." + cls.__qualname__
-
-
 class Eagle3GraphSession:
     """Separate persistent bank per descriptor x real AR consumer ordinal."""
 
@@ -95,7 +91,9 @@ class Eagle3GraphSession:
         self.controller = Eagle3GraphStagingOwner(
             owner._draft_window_runtime_state, self.provider, static_k=owner.num_speculative_steps
         )
-        self._captures: dict[tuple[DraftWindowGraphRoute, int, int, int], DraftWindowGraphCaptureIdentity] = {}
+        self._captures: dict[
+            tuple[DraftWindowGraphRoute, BatchExecutionDescriptor, int], DraftWindowGraphCaptureIdentity
+        ] = {}
         self._capture_call: tuple[DraftWindowGraphRoute, int, int] | None = None
         self._capture_ordinal = 0
         for first, manager in ((True, owner.prefill_cudagraph_manager), (False, owner.decode_cudagraph_manager)):
@@ -109,48 +107,23 @@ class Eagle3GraphSession:
                     n = desc.num_reqs or min(desc.num_tokens, manager.max_num_reqs)
                     if desc.num_tokens != n * q:
                         raise RuntimeError("Eagle3 startup descriptor does not match its method-specific query width")
-                    fingerprint = DraftWindowGraphRouteFingerprint(
-                        method="eagle3",
-                        route=route,
-                        graph_mode="FULL",
-                        backend_impl=_class_path(AscendAttentionBackendImpl),
-                        builder_impl=group.builder,
-                        global_group_id=group.gid,
-                        layout=group.status.value,
-                        capture_descriptor=f"eagle3:{route.value}:{n}:{desc.num_tokens}",
-                        capture_bucket=(n, desc.num_tokens),
-                        query_width=q,
-                        padded_request_count=n,
-                        padded_token_count=desc.num_tokens,
-                        static_k=owner.num_speculative_steps,
-                        window_size=owner._draft_window_runtime_state.capability.inventory.window_size,
-                        logical_block_size=group.scheduler_block_size,
-                        kernel_block_size=group.table_column_span,
-                        block_span_tokens=group.table_column_span,
-                        tensor_parallel_size=context.tensor_parallel_size,
-                        tensor_parallel_rank=context.tensor_parallel_rank,
-                        parallel_read_semantics="replicated",
-                        data_parallel_size=context.data_parallel_size,
-                        pipeline_parallel_size=context.pipeline_parallel_size,
-                        prefill_context_parallel_size=context.prefill_context_parallel_size,
-                        decode_context_parallel_size=context.decode_context_parallel_size,
-                        sequence_parallel=context.sequence_parallel,
-                        dsa_context_parallel=context.dsa_context_parallel,
-                        flashcomm=context.flashcomm,
-                        async_scheduling=context.async_scheduling,
-                        prefix_caching=context.prefix_caching,
-                    )
                     for ordinal in range(1 if first else owner.num_speculative_steps - 1):
-                        key = route, n, desc.num_tokens, ordinal
-                        if key in self._captures:
+                        key = route, desc, ordinal
+                        if any(
+                            identity.route is route
+                            and identity.num_reqs == n
+                            and identity.descriptor.num_tokens == desc.num_tokens
+                            and identity.consumer_ordinal == ordinal
+                            for identity in self._captures.values()
+                        ):
                             raise RuntimeError("ambiguous Eagle3 capture bank (including unsupported LoRA variants)")
                         self._captures[key] = self.provider.register_capture_identity(
-                            fingerprint=fingerprint, execution_lane=0, consumer_ordinal=ordinal
+                            route=route, descriptor=desc, num_reqs=n, consumer_ordinal=ordinal
                         )
                         # Seed dummy contents before any GLOBAL capture.
                         # Synchronous H2D is forbidden inside the callback.
                         read = self.provider.startup_capture_read_inputs(self._captures[key])
-                        capacity = min(owner.max_model_len, fingerprint.window_size + group.table_column_span - 1)
+                        capacity = min(owner.max_model_len, self.provider.window_size + group.table_column_span - 1)
                         read.window_block_table.zero_()
                         read.valid_num_blocks.fill_(read.window_block_table.shape[1])
                         read.cpu_window_exact.fill_(capacity)
@@ -163,10 +136,17 @@ class Eagle3GraphSession:
 
     def resolve(self, *, first: bool, n: int, tokens: int, ordinal: int) -> DraftWindowGraphCaptureIdentity:
         route = DraftWindowGraphRoute.EAGLE3_FIRST_PASS if first else DraftWindowGraphRoute.EAGLE3_AR_STEP
-        try:
-            return self._captures[route, n, tokens, ordinal]
-        except KeyError as error:
-            raise RuntimeError("Eagle3 Window has no exact capture bank; no eager fallback") from error
+        matches = tuple(
+            identity
+            for identity in self._captures.values()
+            if identity.route is route
+            and identity.num_reqs == n
+            and identity.descriptor.num_tokens == tokens
+            and identity.consumer_ordinal == ordinal
+        )
+        if len(matches) != 1:
+            raise RuntimeError("Eagle3 Window has no exact capture bank; no eager fallback")
+        return matches[0]
 
     @contextmanager
     def capture_call(self, *, first: bool, n: int, tokens: int):
@@ -193,9 +173,7 @@ class Eagle3GraphSession:
         read = self.provider.startup_capture_read_inputs(identity)
         # Persistent dummy banks were initialized before GLOBAL capture.
         # No CPU->device copy, fill or reset is allowed in this callback.
-        capacity = min(
-            self.owner.max_model_len, identity.fingerprint.window_size + identity.fingerprint.block_span_tokens - 1
-        )
+        capacity = min(self.owner.max_model_len, self.provider.window_size + self.provider.group.table_column_span - 1)
         private = copy_draft_attention_metadata(metadata)
         result: dict[str, Any] = {}
         for name, layer in private.items():
@@ -224,17 +202,19 @@ class Eagle3GraphSession:
         return result, identity
 
     def write_reference(self, identity: DraftWindowGraphCaptureIdentity, target: Mapping[str, Any]):
-        fp = identity.fingerprint
+        desc = identity.descriptor
+        n, tokens = identity.num_reqs, desc.num_tokens
+        query_width = tokens // n
         state = next(v for v in target.values() if v is not None).attn_state
-        if fp.route is DraftWindowGraphRoute.EAGLE3_AR_STEP:
+        if identity.route is DraftWindowGraphRoute.EAGLE3_AR_STEP:
             state = AscendAttentionState.DecodeOnly
         return DraftWindowGraphWriteSideReference(
-            slot_mapping=self.owner.block_tables.slot_mappings[fp.global_group_id, : fp.padded_token_count],
-            positions=self.owner.input_buffers.positions[: fp.padded_token_count],
-            query_start_loc=self.owner.input_buffers.query_start_loc[: fp.padded_request_count + 1],
-            actual_seq_lengths_q=tuple((i + 1) * fp.query_width for i in range(fp.padded_request_count)),
+            slot_mapping=self.owner.block_tables.slot_mappings[self.provider.group.gid, :tokens],
+            positions=self.owner.input_buffers.positions[:tokens],
+            query_start_loc=self.owner.input_buffers.query_start_loc[: n + 1],
+            actual_seq_lengths_q=tuple((i + 1) * query_width for i in range(n)),
             attn_state=state,
-            num_actual_tokens=fp.padded_token_count,
+            num_actual_tokens=tokens,
             causal=True,
         )
 

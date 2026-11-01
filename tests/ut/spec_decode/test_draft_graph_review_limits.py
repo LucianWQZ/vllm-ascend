@@ -722,12 +722,9 @@ class Main544EagleControls(unittest.TestCase):
             runtime.retire_generation = lambda actual: setattr(runtime, "_last_retired_identity", actual)
             capture = N(
                 consumer_ordinal=0 if step == 0 else step - 1,
-                fingerprint=N(
-                    route=route.EAGLE3_FIRST_PASS if step == 0 else route.EAGLE3_AR_STEP,
-                    static_k=3,
-                    query_width=4 if step == 0 else 1,
-                    graph_mode="FULL",
-                ),
+                route=route.EAGLE3_FIRST_PASS if step == 0 else route.EAGLE3_AR_STEP,
+                num_reqs=1,
+                descriptor=N(num_tokens=4 if step == 0 else 1, cg_mode=N(name="FULL")),
             )
             owner.publish_step(
                 capture_identity=capture,

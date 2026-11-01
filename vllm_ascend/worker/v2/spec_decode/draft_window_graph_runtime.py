@@ -20,10 +20,8 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 
 import vllm_ascend.envs as envs
-from vllm_ascend.attention.attention_v1 import AscendAttentionBackendImpl
 from vllm_ascend.device.hardware_profile import AttentionBackendFamily
 from vllm_ascend.worker.v2.attn_utils import build_attn_metadata_factory, build_attn_metadata_wrapper
-from vllm_ascend.worker.v2.spec_decode.dflash.capture import format_dflash_capture_descriptor
 from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftMetadataInputs,
     DraftWindowPolicyDecision,
@@ -33,7 +31,10 @@ from vllm_ascend.worker.v2.spec_decode.draft_window import (
     _build_draft_window_source_capability_for_context,
     build_draft_window_runtime_context,
 )
-from vllm_ascend.worker.v2.spec_decode.draft_window_eager import AscendDraftAttentionReadInputs
+from vllm_ascend.worker.v2.spec_decode.draft_window_eager import (
+    AscendDraftAttentionReadInputs,
+    build_draft_window_attn_metadata,
+)
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
     DraftWindowGraphBindingProvider,
     DraftWindowGraphCaptureIdentity,
@@ -41,7 +42,6 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
     DraftWindowGraphReadCarrier,
     DraftWindowGraphReadInputs,
     DraftWindowGraphRoute,
-    DraftWindowGraphRouteFingerprint,
     DraftWindowGraphWriteSideReference,
     _tensor_identity,
     install_draft_window_graph_binding_provider,
@@ -60,29 +60,13 @@ class DraftWindowGraphSession:
         self,
         descriptor: BatchExecutionDescriptor,
     ) -> DraftWindowGraphCaptureIdentity:
-        manager = self.owner.query_cudagraph_manager
-        descriptor_text = format_dflash_capture_descriptor(
-            descriptor,
-            max_num_reqs=int(manager.max_num_reqs),
-        )
-        num_reqs = _descriptor_request_count(
-            descriptor,
-            max_num_reqs=int(manager.max_num_reqs),
-        )
-        query_width = descriptor.uniform_token_count or descriptor.num_tokens // num_reqs
         matches = tuple(
             identity
             for identity in self.provider.registered_capture_identities(route=self.route)
-            if identity.fingerprint.capture_descriptor == descriptor_text
-            and identity.fingerprint.capture_bucket == (num_reqs, descriptor.num_tokens)
-            and identity.fingerprint.query_width == query_width
-            and identity.fingerprint.graph_mode == descriptor.cg_mode.name
+            if identity.descriptor == descriptor
         )
         if len(matches) != 1:
-            raise RuntimeError(
-                "runtime graph descriptor does not resolve one persistent carrier: "
-                f"descriptor={descriptor_text!r} matches={len(matches)}"
-            )
+            raise RuntimeError(f"runtime descriptor does not resolve one captured consumer: {descriptor!r}")
         return matches[0]
 
 
@@ -249,56 +233,13 @@ def install_parallel_graph(
     if len(set(descriptor_keys)) != len(descriptor_keys):
         raise NotImplementedError("Draft Window Graph does not support ambiguous LoRA capture buckets")
 
-    group = runtime_state.capability.inventory.require_single_group_direct_prefix()
-    block_span_tokens = group.table_column_span
-    if not isinstance(block_span_tokens, int) or isinstance(block_span_tokens, bool) or block_span_tokens <= 0:
-        raise RuntimeError("Draft Window Graph group has no positive block-span contract")
-    static_k = int(owner.speculative_config.num_speculative_tokens)
-    if static_k <= 0:
+    if int(owner.speculative_config.num_speculative_tokens) <= 0:
         raise ValueError("Draft Window Graph static K must be positive")
     for descriptor in descriptors:
-        num_reqs = _descriptor_request_count(descriptor, max_num_reqs=max_num_reqs)
-        if descriptor.num_tokens % num_reqs:
-            raise RuntimeError("Graph capture token bucket is not divisible by request count")
-        query_width = descriptor.uniform_token_count or descriptor.num_tokens // num_reqs
-        fingerprint = DraftWindowGraphRouteFingerprint(
-            method=runtime_state.capability.inventory.method,
-            route=route,
-            graph_mode=descriptor.cg_mode.name,
-            backend_impl=_class_path(AscendAttentionBackendImpl),
-            builder_impl=group.builder,
-            global_group_id=group.gid,
-            layout=group.status.value,
-            capture_descriptor=format_dflash_capture_descriptor(
-                descriptor,
-                max_num_reqs=max_num_reqs,
-            ),
-            capture_bucket=(num_reqs, descriptor.num_tokens),
-            query_width=query_width,
-            padded_request_count=num_reqs,
-            padded_token_count=descriptor.num_tokens,
-            static_k=static_k,
-            window_size=runtime_state.capability.inventory.window_size,
-            logical_block_size=group.scheduler_block_size,
-            kernel_block_size=group.table_column_span,
-            block_span_tokens=block_span_tokens,
-            tensor_parallel_size=runtime_context.tensor_parallel_size,
-            tensor_parallel_rank=runtime_context.tensor_parallel_rank,
-            parallel_read_semantics="replicated",
-            data_parallel_size=runtime_context.data_parallel_size,
-            pipeline_parallel_size=runtime_context.pipeline_parallel_size,
-            prefill_context_parallel_size=runtime_context.prefill_context_parallel_size,
-            decode_context_parallel_size=runtime_context.decode_context_parallel_size,
-            sequence_parallel=runtime_context.sequence_parallel,
-            dsa_context_parallel=runtime_context.dsa_context_parallel,
-            flashcomm=runtime_context.flashcomm,
-            async_scheduling=runtime_context.async_scheduling,
-            prefix_caching=runtime_context.prefix_caching,
-        )
         provider.register_capture_identity(
-            fingerprint=fingerprint,
-            execution_lane=0,
-            consumer_ordinal=0,
+            route=route,
+            descriptor=descriptor,
+            num_reqs=_descriptor_request_count(descriptor, max_num_reqs=max_num_reqs),
         )
     owner._draft_window_graph_session = session
     return session
@@ -324,8 +265,7 @@ def prepare_parallel_graph(
     if proposal_context is None or proposal_context.mapping_epoch != inputs.identity.mapping_epoch:
         raise RuntimeError("Draft Window Graph proposal identity is stale")
     capture_identity = session.resolve_capture_identity(descriptor)
-    fingerprint = capture_identity.fingerprint
-    if inputs.padded_request_count != fingerprint.padded_request_count:
+    if inputs.padded_request_count != capture_identity.num_reqs:
         raise RuntimeError("Draft Window Graph generation does not match the capture request bucket")
     target_metadata = owner.model_state.attn_metadata
     if not isinstance(target_metadata, Mapping) or not target_metadata:
@@ -348,7 +288,7 @@ def prepare_parallel_graph(
             read_inputs=read_inputs,
             write_side=write_side,
             target_metadata=target_metadata,
-            fingerprint=fingerprint,
+            capture_identity=capture_identity,
         ),
         target_metadata=target_metadata,
         write_side_reference=write_side,
@@ -398,11 +338,11 @@ def _build_private_graph_metadata(
     read_inputs: DraftWindowGraphReadInputs,
     write_side: DraftWindowGraphWriteSideReference,
     target_metadata: Mapping[Any, Any],
-    fingerprint: DraftWindowGraphRouteFingerprint,
+    capture_identity: DraftWindowGraphCaptureIdentity,
 ) -> DraftWindowGraphMetadataBuild:
     active_upper = read_inputs.cpu_window_upper[: read_inputs.actual_request_count]
     max_seq_len = int(active_upper.max().item()) if active_upper.numel() else 0
-    group_id = fingerprint.global_group_id
+    group_id = owner._draft_window_graph_binding_provider.group.gid
     block_tables = tuple(
         read_inputs.window_block_table if gid == group_id else full_table[: read_inputs.padded_request_count]
         for gid, full_table in enumerate(owner.block_tables.input_block_tables)
@@ -416,21 +356,22 @@ def _build_private_graph_metadata(
     )
     with ExitStack() as stack:
         stack.enter_context(build_attn_metadata_wrapper())
-        if fingerprint.route is DraftWindowGraphRoute.DSPARK:
+        if capture_identity.route is DraftWindowGraphRoute.DSPARK:
             stack.enter_context(
                 build_attn_metadata_factory(
                     owner.input_buffers.positions,
-                    fingerprint.padded_token_count,
+                    capture_identity.descriptor.num_tokens,
                     torch.from_numpy(owner.input_batch.is_prefilling_np),
                 )
             )
-        metadata = owner._build_ascend_draft_attn_metadata(
+        metadata = build_draft_window_attn_metadata(
+            owner,
             # FULL attention consumes the captured padded Q, including PAD
             # slots. Keep that uniform layout in the builder itself, avoiding
             # a second synthetic request. Generation identity stays active-only.
             num_reqs=read_inputs.padded_request_count,
             num_reqs_padded=read_inputs.padded_request_count,
-            num_tokens_padded=fingerprint.padded_token_count,
+            num_tokens_padded=capture_identity.descriptor.num_tokens,
             read_inputs=typed_read_inputs,
             causal=write_side.causal,
             query_start_loc_np=None,
@@ -445,7 +386,9 @@ def _build_private_graph_metadata(
     for layer_name in window_layers:
         layer_metadata = metadata.get(layer_name)
         if layer_metadata is not None and id(layer_metadata) not in bound_metadata_ids:
-            _bind_parallel_graph_device_lengths(layer_metadata, read_inputs, fingerprint.query_width)
+            _bind_parallel_graph_device_lengths(
+                layer_metadata, read_inputs, (capture_identity.descriptor.num_tokens // capture_identity.num_reqs)
+            )
             bound_metadata_ids.add(id(layer_metadata))
     finalized_groups: dict[int, int | None] = {}
     native_swa = getattr(owner._draft_window_runtime_state.capability, "native_swa_graph", None)
@@ -482,7 +425,9 @@ def _build_private_graph_metadata(
             final_layer_metadata.seq_lens = native_snapshot.device_exact
             final_layer_metadata.seq_lens_cpu = native_snapshot.cpu_exact
             final_layer_metadata.seq_lens_list = native_snapshot.cpu_exact.tolist()
-            final_layer_metadata.slot_mapping = owner.block_tables.slot_mappings[gid, : fingerprint.padded_token_count]
+            final_layer_metadata.slot_mapping = owner.block_tables.slot_mappings[
+                gid, : capture_identity.descriptor.num_tokens
+            ]
             final_layer_metadata.causal = True
             final_layer_metadata.attn_state = layer_metadata.attn_state
     return DraftWindowGraphMetadataBuild(metadata=metadata, native_full_snapshot=native_snapshot)
@@ -493,11 +438,10 @@ def _build_write_side_reference(
     capture_identity: DraftWindowGraphCaptureIdentity,
     target_metadata: Mapping[Any, Any],
 ) -> DraftWindowGraphWriteSideReference:
-    fingerprint = capture_identity.fingerprint
-    gid = fingerprint.global_group_id
-    token_count = fingerprint.padded_token_count
-    request_count = fingerprint.padded_request_count
-    query_width = fingerprint.query_width
+    gid = owner._draft_window_graph_binding_provider.group.gid
+    token_count = capture_identity.descriptor.num_tokens
+    request_count = capture_identity.num_reqs
+    query_width = capture_identity.descriptor.num_tokens // capture_identity.num_reqs
     target_layer = next((value for value in target_metadata.values() if value is not None), None)
     if target_layer is None:
         raise RuntimeError("Draft Window Graph Target metadata contains no layer state")
@@ -521,7 +465,3 @@ def _descriptor_request_count(
     max_num_reqs: int,
 ) -> int:
     return descriptor.num_reqs or min(descriptor.num_tokens, max_num_reqs)
-
-
-def _class_path(value: type[Any]) -> str:
-    return f"{value.__module__}.{value.__qualname__}"

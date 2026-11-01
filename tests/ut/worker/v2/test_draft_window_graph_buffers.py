@@ -4,9 +4,12 @@
 
 from dataclasses import replace
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
+from vllm.config.compilation import CUDAGraphMode
+from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 
 from vllm_ascend.device.hardware_profile import AttentionBackendFamily
 from vllm_ascend.worker.v2.spec_decode.draft_window import (
@@ -29,7 +32,6 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_eager_capability import _bui
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
     DraftWindowGraphBindingProvider,
     DraftWindowGraphRoute,
-    DraftWindowGraphRouteFingerprint,
     DraftWindowGraphWriteSideReference,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_plan import compute_draft_window_plan
@@ -77,36 +79,8 @@ def graph_buffers():
     )
     runtime = build_draft_window_runtime_state(DraftWindowSourceCapability(inventory, source, projection, topology))
     provider = DraftWindowGraphBindingProvider(runtime_state=runtime)
-    fingerprint = DraftWindowGraphRouteFingerprint(
-        method="dflash",
-        route=DraftWindowGraphRoute.DFLASH,
-        graph_mode="FULL",
-        backend_impl=group.backend,
-        builder_impl=group.builder,
-        global_group_id=0,
-        layout=group.status.value,
-        capture_descriptor="two-request",
-        capture_bucket=(2, 2),
-        query_width=1,
-        padded_request_count=2,
-        padded_token_count=2,
-        static_k=1,
-        window_size=4,
-        logical_block_size=4,
-        kernel_block_size=4,
-        block_span_tokens=4,
-        tensor_parallel_size=1,
-        data_parallel_size=1,
-        pipeline_parallel_size=1,
-        prefill_context_parallel_size=1,
-        decode_context_parallel_size=1,
-        sequence_parallel=False,
-        dsa_context_parallel=False,
-        flashcomm=False,
-        async_scheduling=True,
-        prefix_caching=False,
-    )
-    capture = provider.register_capture_identity(fingerprint=fingerprint, execution_lane=0, consumer_ordinal=0)
+    descriptor = BatchExecutionDescriptor(CUDAGraphMode.FULL, num_tokens=2, num_reqs=2, uniform_token_count=1)
+    capture = provider.register_capture_identity(route=DraftWindowGraphRoute.DFLASH, descriptor=descriptor, num_reqs=2)
     return SimpleNamespace(
         runtime=runtime,
         provider=provider,
@@ -155,7 +129,7 @@ def _bank_tensors(bank):
 def _bind(case, inputs):
     actual = inputs.actual_request_count
     padded = inputs.padded_request_count
-    query_width = case.capture.fingerprint.query_width
+    query_width = case.capture.descriptor.num_tokens // case.capture.num_reqs
     tokens = actual * query_width
     query_lengths = tuple(row * query_width for row in range(1, actual + 1)) + (tokens,) * (padded - actual)
     reference = DraftWindowGraphWriteSideReference(
@@ -341,19 +315,13 @@ def test_eagle_serialized_steps_own_distinct_banks_and_preserve_previous_consume
     retained: list[tuple[DraftWindowWorkspace, list[torch.Tensor]]] = []
     for step, (padded, query_width) in enumerate(((2, 4), (1, 1), (2, 1))):
         route = DraftWindowGraphRoute.EAGLE3_FIRST_PASS if step == 0 else DraftWindowGraphRoute.EAGLE3_AR_STEP
+        descriptor = BatchExecutionDescriptor(
+            CUDAGraphMode.FULL, num_tokens=padded * query_width, num_reqs=padded, uniform_token_count=query_width
+        )
         capture = provider.register_capture_identity(
-            fingerprint=replace(
-                case.capture.fingerprint,
-                method="eagle3",
-                route=route,
-                capture_descriptor=f"eagle-step-{step}",
-                capture_bucket=(padded, padded * query_width),
-                query_width=query_width,
-                padded_request_count=padded,
-                padded_token_count=padded * query_width,
-                static_k=3,
-            ),
-            execution_lane=0,
+            route=route,
+            descriptor=descriptor,
+            num_reqs=padded,
             consumer_ordinal=max(step - 1, 0),
         )
         bank = provider.prepare_workspace(capture)
@@ -399,3 +367,126 @@ def test_eagle_serialized_steps_own_distinct_banks_and_preserve_previous_consume
         retained.append((bank, snapshots))
         previous = inputs.identity
     assert len(retained) == 3
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("cg_mode", CUDAGraphMode.PIECEWISE),
+        ("num_tokens", 4),
+        ("num_reqs", 1),
+        ("uniform_token_count", 2),
+        ("max_query_len", 2),
+        ("num_active_loras", 1),
+        ("num_ubatches", 2),
+    ],
+)
+def test_runtime_capture_resolves_all_actual_descriptor_fields(graph_buffers, field, value):
+    import ast
+    from pathlib import Path
+
+    source = Path(__file__).resolve().parents[4] / "vllm_ascend/worker/v2/spec_decode/draft_window_graph_runtime.py"
+    cls = next(
+        n
+        for n in ast.parse(source.read_text()).body
+        if isinstance(n, ast.ClassDef) and n.name == "DraftWindowGraphSession"
+    )
+    method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "resolve_capture_identity")
+    ns: dict[str, Any] = {}
+    exec(
+        compile(
+            ast.fix_missing_locations(
+                ast.Module(
+                    body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), method],
+                    type_ignores=[],
+                )
+            ),
+            str(source),
+            "exec",
+        ),
+        ns,
+    )
+    session = SimpleNamespace(provider=graph_buffers.provider, route=DraftWindowGraphRoute.DFLASH)
+    descriptor = graph_buffers.capture.descriptor
+    assert hash(descriptor) == hash(replace(descriptor))
+    assert ns[method.name](session, replace(descriptor)) is graph_buffers.capture
+    with pytest.raises(RuntimeError, match="descriptor does not resolve"):
+        ns[method.name](session, replace(descriptor, **{field: value}))
+
+
+@pytest.mark.parametrize("field,value", [("num_active_loras", 1), ("num_ubatches", 2)])
+def test_unqualified_descriptor_variants_are_not_opened(graph_buffers, field, value):
+    with pytest.raises(NotImplementedError, match="LoRA or microbatch"):
+        graph_buffers.provider.register_capture_identity(
+            route=DraftWindowGraphRoute.DFLASH,
+            descriptor=replace(graph_buffers.capture.descriptor, **{field: value}),
+            num_reqs=2,
+        )
+
+
+def test_capture_token_cannot_be_forged_or_cross_provider(graph_buffers):
+    case = graph_buffers
+    with pytest.raises(RuntimeError, match="not registered"):
+        case.provider.prepare_workspace(replace(case.capture))
+    other = DraftWindowGraphBindingProvider(runtime_state=case.runtime)
+    foreign = other.register_capture_identity(route=case.capture.route, descriptor=case.capture.descriptor, num_reqs=2)
+    with pytest.raises(RuntimeError, match="not registered"):
+        case.provider.prepare_workspace(foreign)
+
+
+@pytest.mark.parametrize(
+    "field", ["window_block_table", "valid_num_blocks", "device_window_exact", "cpu_window_exact", "cpu_window_upper"]
+)
+def test_capture_bank_rejects_replaced_operand_before_materialization(graph_buffers, field):
+    case = graph_buffers
+    carrier = case.provider._carriers[case.capture]
+    original = getattr(carrier.workspace, field)
+    setattr(carrier.workspace, field, original.clone())
+    with pytest.raises(RuntimeError, match="address or tensor geometry changed"):
+        case.provider.prepare_workspace(case.capture)
+
+
+def test_capture_bank_rejects_same_storage_with_changed_stride(graph_buffers):
+    carrier = graph_buffers.provider._carriers[graph_buffers.capture]
+    original = carrier.workspace.window_block_table
+    changed = original.t()
+    assert changed.data_ptr() == original.data_ptr() and changed.shape == original.shape
+    assert changed.stride() != original.stride()
+    carrier.workspace.window_block_table = changed
+    with pytest.raises(RuntimeError, match="address or tensor geometry changed"):
+        graph_buffers.provider.prepare_workspace(graph_buffers.capture)
+
+
+def test_capture_bank_rejects_replaced_read_view(graph_buffers):
+    carrier = graph_buffers.provider._carriers[graph_buffers.capture]
+    carrier.read_inputs = replace(carrier.read_inputs, cpu_window_exact=carrier.read_inputs.cpu_window_exact.clone())
+    with pytest.raises(RuntimeError, match="address or tensor geometry changed"):
+        graph_buffers.provider.prepare_workspace(graph_buffers.capture)
+
+
+def test_parallel_capture_uses_exact_manager_descriptor_and_preserves_full_tables(graph_buffers):
+    from vllm.v1.worker.gpu.input_batch import InputBuffers
+
+    from vllm_ascend.worker.v2.spec_decode.dflash.capture import _build_capture_context, _seed_capture_read_inputs
+
+    case = graph_buffers
+    buffers = object.__new__(InputBuffers)
+    owner = SimpleNamespace(
+        input_buffers=buffers,
+        _draft_window_graph_binding_provider=case.provider,
+        model_state=SimpleNamespace(attn_metadata=case.target_metadata),
+    )
+    desc = case.capture.descriptor
+    ctx = _build_capture_context(owner, buffers, {CUDAGraphMode.FULL: [desc]}, max_num_reqs=2)
+    assert ctx is not None
+    identity, read = ctx.resolve(2, 2, False)
+    assert identity is case.capture
+    full = case.source._input_block_tables[0]
+    before = full.clone()
+    maximum = _seed_capture_read_inputs(identity, read, (full,), max_model_len=16, provider=case.provider)
+    assert maximum == 7 and read.cpu_window_exact.tolist() == read.cpu_window_upper.tolist() == [7, 7]
+    assert read.device_window_exact.tolist() == [7, 7] and read.valid_num_blocks.tolist() == [2, 2]
+    assert torch.equal(full, before)
+    assert torch.equal(read.window_block_table, full[:, :2])
+    with pytest.raises(RuntimeError, match="does not resolve exactly one"):
+        _build_capture_context(owner, buffers, {CUDAGraphMode.FULL: [replace(desc, max_query_len=1)]}, max_num_reqs=2)

@@ -114,24 +114,6 @@ def _normalized_request_count(
     return descriptor.num_reqs or min(descriptor.num_tokens, max_num_reqs)
 
 
-def format_dflash_capture_descriptor(
-    descriptor: BatchExecutionDescriptor,
-    *,
-    max_num_reqs: int,
-) -> str:
-    """Return the source-checked descriptor identity used by the P6 fingerprint."""
-    num_reqs = _normalized_request_count(
-        descriptor,
-        max_num_reqs=max_num_reqs,
-    )
-    return (
-        f"mode={descriptor.cg_mode.name};reqs={num_reqs};"
-        f"tokens={descriptor.num_tokens};uniform={descriptor.uniform_token_count};"
-        f"max_query={descriptor.max_query_len};loras={descriptor.num_active_loras};"
-        f"ubatches={descriptor.num_ubatches}"
-    )
-
-
 def _descriptor_key(
     descriptor: BatchExecutionDescriptor,
     *,
@@ -185,27 +167,15 @@ def _build_capture_context(
     entries: list[_CaptureEntry] = []
     for descriptor in descriptors:
         key = _descriptor_key(descriptor, max_num_reqs=max_num_reqs)
-        descriptor_text = format_dflash_capture_descriptor(
-            descriptor,
-            max_num_reqs=max_num_reqs,
-        )
-        num_reqs = key[0]
-        query_width = descriptor.uniform_token_count or (descriptor.num_tokens // num_reqs)
         matches = tuple(
-            identity
-            for identity in identities
-            if identity.fingerprint.capture_bucket == key[:2]
-            and identity.fingerprint.graph_mode == key[2]
-            and identity.fingerprint.query_width == query_width
+            identity for identity in identities if identity.descriptor == descriptor and identity.num_reqs == key[0]
         )
         if len(matches) != 1:
             raise RuntimeError(
                 "Draft Window capture descriptor does not resolve exactly one "
-                f"registered carrier: descriptor={descriptor_text!r} matches={len(matches)}"
+                f"registered carrier: descriptor={descriptor!r} matches={len(matches)}"
             )
         identity = matches[0]
-        if identity.fingerprint.capture_descriptor != descriptor_text:
-            raise RuntimeError("Draft Window capture descriptor identity is stale")
         entries.append(
             _CaptureEntry(
                 key=key,
@@ -262,9 +232,9 @@ def _seed_capture_read_inputs(
     input_block_tables: Sequence[torch.Tensor],
     *,
     max_model_len: int,
+    provider: DraftWindowGraphBindingProvider,
 ) -> int:
-    fingerprint = identity.fingerprint
-    gid = fingerprint.global_group_id
+    gid = provider.group.gid
     if not 0 <= gid < len(input_block_tables):
         raise RuntimeError("Draft Window capture gid is absent from dummy full tables")
     source = input_block_tables[gid]
@@ -278,9 +248,9 @@ def _seed_capture_read_inputs(
 
     capture_upper = min(
         max_model_len,
-        fingerprint.window_size + fingerprint.block_span_tokens - 1,
+        provider.window_size + provider.group.table_column_span - 1,
     )
-    valid_num_blocks = (capture_upper + fingerprint.block_span_tokens - 1) // fingerprint.block_span_tokens
+    valid_num_blocks = (capture_upper + provider.group.table_column_span - 1) // provider.group.table_column_span
     if valid_num_blocks > source.shape[1] or valid_num_blocks > destination.shape[1]:
         raise RuntimeError("Draft Window capture table cannot cover the Window capacity")
 
@@ -335,10 +305,7 @@ def ascend_prepare_dflash_inputs_to_capture(
         return AttentionState(None, slot_mappings_by_layer)
 
     max_seq_len = _seed_capture_read_inputs(
-        identity,
-        read_inputs,
-        input_block_tables,
-        max_model_len=max_model_len,
+        identity, read_inputs, input_block_tables, max_model_len=max_model_len, provider=context.provider
     )
     query_start_loc_cpu = torch.from_numpy(input_batch.query_start_loc_np)
     dcp_local_seq_lens = None
@@ -353,7 +320,7 @@ def ascend_prepare_dflash_inputs_to_capture(
             num_reqs_padded=input_batch.num_reqs_after_padding,
         )
     read_block_tables = list(input_block_tables)
-    read_block_tables[identity.fingerprint.global_group_id] = read_inputs.window_block_table
+    read_block_tables[context.provider.group.gid] = read_inputs.window_block_table
     native_swa = context.native_swa_plan
     from vllm_ascend.worker.v2.spec_decode.draft_window_eager import AscendDraftAttentionReadInputs
 

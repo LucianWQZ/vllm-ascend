@@ -401,9 +401,7 @@ def test_private_full_padded_build_is_separate_from_unchanged_true_eager_clamp()
     calls = [
         n
         for n in ast.walk(private)
-        if isinstance(n, ast.Call)
-        and isinstance(n.func, ast.Attribute)
-        and n.func.attr == "_build_ascend_draft_attn_metadata"
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "build_draft_window_attn_metadata"
     ]
     assert len(calls) == 1
     passed = {kw.arg: ast.unparse(kw.value) for kw in calls[0].keywords}
@@ -450,7 +448,9 @@ def _run_actual_private_binding_loop(graph_device_binding, read, metadata_by_lay
         window_layers=tuple(metadata_by_layer),
         metadata=metadata_by_layer,
         read_inputs=read,
-        fingerprint=SimpleNamespace(query_width=8),
+        capture_identity=SimpleNamespace(
+            descriptor=SimpleNamespace(num_tokens=read.padded_request_count * 8), num_reqs=read.padded_request_count
+        ),
         _bind_parallel_graph_device_lengths=strict_bind,
     )
     exec(
@@ -825,7 +825,7 @@ def full_metadata_finalization():
             native_swa=object(),
             write_side=writes,
             read_inputs=SimpleNamespace(padded_request_count=1),
-            fingerprint=SimpleNamespace(padded_token_count=8),
+            capture_identity=SimpleNamespace(descriptor=SimpleNamespace(num_tokens=8)),
             owner=SimpleNamespace(
                 _draft_window_live_inputs=SimpleNamespace(identity=object()),
                 block_tables=SimpleNamespace(input_block_tables=[[10], [20]], slot_mappings=Slots()),
