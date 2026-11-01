@@ -19,6 +19,7 @@ from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.worker.v2.spec_decode.draft_window import (
+    DraftWindowWorkspace,
     _build_draft_window_source_capability_for_context,
     build_draft_window_runtime_context,
 )
@@ -26,7 +27,6 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_eagle3_graph import Eagle3Gr
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
     DraftWindowGraphCaptureIdentity,
     DraftWindowGraphMetadataBuild,
-    DraftWindowGraphReadInputs,
     DraftWindowGraphRoute,
     DraftWindowGraphWriteSideReference,
     install_draft_window_graph_binding_provider,
@@ -122,7 +122,7 @@ class Eagle3GraphSession:
                         )
                         # Seed dummy contents before any GLOBAL capture.
                         # Synchronous H2D is forbidden inside the callback.
-                        read = self.provider.startup_capture_read_inputs(self._captures[key])
+                        read = self.provider.startup_capture_workspace(self._captures[key])
                         capacity = min(owner.max_model_len, self.provider.window_size + group.table_column_span - 1)
                         read.window_block_table.zero_()
                         read.valid_num_blocks.fill_(read.window_block_table.shape[1])
@@ -170,7 +170,7 @@ class Eagle3GraphSession:
         first = route is DraftWindowGraphRoute.EAGLE3_FIRST_PASS
         identity = self.resolve(first=first, n=n, tokens=tokens, ordinal=self._capture_ordinal)
         self._capture_ordinal += 1
-        read = self.provider.startup_capture_read_inputs(identity)
+        read = self.provider.startup_capture_workspace(identity)
         # Persistent dummy banks were initialized before GLOBAL capture.
         # No CPU->device copy, fill or reset is allowed in this callback.
         capacity = min(self.owner.max_model_len, self.provider.window_size + self.provider.group.table_column_span - 1)
@@ -236,11 +236,11 @@ class Eagle3GraphSession:
         target = owner._require_eagle3_target_metadata()
         write = self.write_reference(identity, target)
 
-        def build(read: DraftWindowGraphReadInputs):
+        def build(workspace: DraftWindowWorkspace):
             private = owner._build_eagle3_graph_metadata(
                 inputs=inputs,
-                read=read,
-                num_reqs=inputs.actual_request_count,
+                workspace=workspace,
+                num_reqs=inputs.identity.actual_request_count,
                 num_reqs_padded=n,
                 num_tokens_padded=tokens,
                 query_start_loc_np=owner.input_batch.query_start_loc_np if first else None,

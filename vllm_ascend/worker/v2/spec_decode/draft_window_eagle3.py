@@ -461,18 +461,20 @@ class Eagle3DraftWindowMixin:
     ) -> AscendDraftAttentionReadInputs:
         """The one formal P4b validation/narrowing boundary before building."""
         inputs.validate_for(expected_identity)
+        workspace = inputs.workspace
+        padded = expected_identity.padded_request_count
         gid = expected_identity.global_group_id
         block_tables = tuple(
-            inputs.window_block_table if group_id == gid else full_table[: inputs.padded_request_count]
+            workspace.window_block_table[:padded] if group_id == gid else full_table[:padded]
             for group_id, full_table in enumerate(self.block_tables.input_block_tables)
         )
-        active_upper = inputs.cpu_window_upper[: inputs.actual_request_count]
+        active_upper = workspace.cpu_window_upper[: expected_identity.actual_request_count]
         max_seq_len = int(active_upper.max().item()) if active_upper.numel() else 0
         return AscendDraftAttentionReadInputs(
             block_tables=block_tables,
-            seq_lens=inputs.device_window_exact,
-            seq_lens_cpu_exact=inputs.cpu_window_exact,
-            seq_lens_cpu_upper_bound=inputs.cpu_window_upper,
+            seq_lens=workspace.device_window_exact[:padded],
+            seq_lens_cpu_exact=workspace.cpu_window_exact[:padded],
+            seq_lens_cpu_upper_bound=workspace.cpu_window_upper[:padded],
             max_seq_len=max_seq_len,
         )
 

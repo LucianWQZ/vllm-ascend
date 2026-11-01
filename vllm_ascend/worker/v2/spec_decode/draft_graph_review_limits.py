@@ -437,8 +437,8 @@ def validate_eagle_single_request_graph_stage(owner, inputs, *, first, n, tokens
         return
     validate_eagle_single_request_graph_descriptor(owner, first=first, n=n, tokens=tokens)
     if (
-        inputs.actual_request_count != n
-        or inputs.padded_request_count != n
+        inputs.identity.actual_request_count != n
+        or inputs.identity.padded_request_count != n
         or type(ordinal) is not int
         or ordinal not in ((0,) if first else (0, 1))
         or inputs.identity.step != (0 if first else ordinal + 1)

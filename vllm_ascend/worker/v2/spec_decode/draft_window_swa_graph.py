@@ -276,7 +276,7 @@ def build_group_metadata(owner: Any, *, read_inputs: Any, builder_kwargs: dict[s
         "native SWA current full snapshot missing",
     )
     snapshot.validate(inputs.identity, plan)
-    n = inputs.padded_request_count
+    n = inputs.identity.padded_request_count
     absolute = AscendDraftAttentionReadInputs(
         block_tables=tuple(t[:n] for t in owner.block_tables.input_block_tables),
         seq_lens=snapshot.device_exact,

@@ -125,8 +125,8 @@ def _bank_tensors(bank):
 
 
 def _bind(case, inputs):
-    actual = inputs.actual_request_count
-    padded = inputs.padded_request_count
+    actual = inputs.identity.actual_request_count
+    padded = inputs.identity.padded_request_count
     query_width = case.capture.descriptor.num_tokens // case.capture.num_reqs
     tokens = actual * query_width
     query_lengths = tuple(row * query_width for row in range(1, actual + 1)) + (tokens,) * (padded - actual)
@@ -171,9 +171,9 @@ def test_direct_capture_bank_never_allocates_scratch_or_mutates_full_source(grap
     inputs = _materialize(case)
     carrier = _bind(case, inputs)
     assert case.runtime._workspace is None
-    assert inputs.window_block_table.data_ptr() == carrier.read_inputs.window_block_table.data_ptr()
+    assert inputs.workspace.window_block_table.data_ptr() == carrier.workspace.window_block_table.data_ptr()
     assert inputs.workspace is carrier.workspace
-    assert torch.equal(inputs.window_block_table, torch.tensor([[12, 13], [23, 24]], dtype=torch.int32))
+    assert torch.equal(inputs.workspace.window_block_table, torch.tensor([[12, 13], [23, 24]], dtype=torch.int32))
     assert torch.equal(case.owner.input_block_tables[0], full_before)
     assert case.target_metadata["target.layer"].seq_lens_list == [91, 92]
 
@@ -184,10 +184,10 @@ def test_first_real_generation_clears_startup_capture_seed_and_padding(graph_buf
     for tensor in _bank_tensors(bank):
         tensor.fill_(99)
     inputs = _materialize(case, ends=(4,))
-    assert inputs.window_block_table.tolist() == [[11, 0], [0, 0]]
+    assert inputs.workspace.window_block_table.tolist() == [[11, 0], [0, 0]]
     for tensor in _bank_tensors(bank)[1:]:
         assert tensor[1].item() == 0
-    assert inputs.device_window_exact.tolist() == [4, 0]
+    assert inputs.workspace.device_window_exact.tolist() == [4, 0]
     assert case.runtime._workspace is None
 
 
@@ -202,8 +202,8 @@ def test_retirement_preserves_bank_until_next_generation_then_clears_tail(graph_
     assert all(torch.equal(tensor, old) for tensor, old in zip(_bank_tensors(bank), snapshots))
     second = _materialize(case, epoch=1, ends=(4,))
     assert [tensor.data_ptr() for tensor in _bank_tensors(bank)] == pointers
-    assert second.window_block_table.tolist() == [[11, 0], [0, 0]]
-    assert second.valid_num_blocks.tolist() == [4, 0]
+    assert second.workspace.window_block_table.tolist() == [[11, 0], [0, 0]]
+    assert second.workspace.valid_num_blocks.tolist() == [4, 0]
     for tensor in _bank_tensors(bank)[2:]:
         assert tensor.tolist() == [4, 0]
     with pytest.raises(RuntimeError, match="retired Draft inputs"):
@@ -455,17 +455,21 @@ def test_capture_bank_rejects_same_storage_with_changed_stride(graph_buffers):
         graph_buffers.provider.prepare_workspace(graph_buffers.capture)
 
 
-def test_capture_bank_rejects_replaced_read_view(graph_buffers):
-    carrier = graph_buffers.provider._carriers[graph_buffers.capture]
-    carrier.read_inputs = replace(carrier.read_inputs, cpu_window_exact=carrier.read_inputs.cpu_window_exact.clone())
-    with pytest.raises(RuntimeError, match="address or tensor geometry changed"):
-        graph_buffers.provider.prepare_workspace(graph_buffers.capture)
+def test_startup_capture_exposes_the_real_bank_without_fake_generation(graph_buffers):
+    case = graph_buffers
+    carrier = case.provider._carriers[case.capture]
+    bank = case.provider.startup_capture_workspace(case.capture)
+    assert bank is carrier.workspace and bank.bound_identity is None
+    assert bank.max_num_reqs == case.capture.num_reqs
+    bank.max_num_reqs += 1
+    with pytest.raises(RuntimeError, match="request geometry changed"):
+        case.provider.startup_capture_workspace(case.capture)
 
 
 def test_parallel_capture_uses_exact_manager_descriptor_and_preserves_full_tables(graph_buffers):
     from vllm.v1.worker.gpu.input_batch import InputBuffers
 
-    from vllm_ascend.worker.v2.spec_decode.dflash.capture import _build_capture_context, _seed_capture_read_inputs
+    from vllm_ascend.worker.v2.spec_decode.dflash.capture import _build_capture_context, _seed_capture_workspace
 
     case = graph_buffers
     buffers = object.__new__(InputBuffers)
@@ -481,7 +485,7 @@ def test_parallel_capture_uses_exact_manager_descriptor_and_preserves_full_table
     assert identity is case.capture
     full = case.source._input_block_tables[0]
     before = full.clone()
-    maximum = _seed_capture_read_inputs(identity, read, (full,), max_model_len=16, provider=case.provider)
+    maximum = _seed_capture_workspace(identity, read, (full,), max_model_len=16, provider=case.provider)
     assert maximum == 7 and read.cpu_window_exact.tolist() == read.cpu_window_upper.tolist() == [7, 7]
     assert read.device_window_exact.tolist() == [7, 7] and read.valid_num_blocks.tolist() == [2, 2]
     assert torch.equal(full, before)
@@ -495,3 +499,44 @@ def test_materialization_rejects_actual_canonical_source_owner_replacement(graph
     case.owner.input_block_tables[0] = case.owner.input_block_tables[0].clone()
     with pytest.raises(RuntimeError, match="replaced after FullSource binding"):
         _materialize(case)
+
+
+@pytest.mark.parametrize("field", ["table", "counts"])
+def test_workspace_rejects_invalid_native_dtype_at_its_creation_boundary(field):
+    table = torch.zeros((2, 4), dtype=torch.int64 if field == "table" else torch.int32)
+    counts = torch.zeros(2, dtype=torch.int64 if field == "counts" else torch.int32)
+    with pytest.raises(TypeError, match="must use int32"):
+        DraftWindowWorkspace(
+            max_num_reqs=2, table_capacity_columns=2, table_template=table, valid_count_template=counts
+        )
+
+
+def test_nonfull_scratch_narrows_the_actual_bank_only_at_the_ascend_read_seam(graph_buffers):
+    from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowGraphInputMixin
+
+    case = graph_buffers
+    plan = compute_draft_window_plan(full_exact_end=11, future_offset=0, window_size=4, block_span_tokens=4)
+    inputs = case.runtime.materialize(
+        mapping_epoch=0,
+        ordered_request_ids=("request-a",),
+        idx_mapping=case.mapping,
+        read_descriptors=[case.projection.describe(plan, valid_num_blocks=4)],
+        cpu_window_exact=torch.tensor([plan.window_visible_length], dtype=torch.int32),
+        cpu_window_upper=torch.tensor([plan.window_visible_length + 1], dtype=torch.int32),
+        cpu_valid_num_blocks=torch.tensor([4], dtype=torch.int32),
+        num_reqs_padded=1,
+        phase=DraftWindowExecutionPhase.PROPOSAL,
+        step=0,
+        execution_lane=0,
+    )
+    assert inputs.workspace.window_block_table.shape[0] == 2
+    owner: Any = SimpleNamespace(block_tables=SimpleNamespace(input_block_tables=[case.source._input_block_tables[0]]))
+    read = DraftWindowGraphInputMixin._validated_draft_attention_read_inputs(owner, inputs, inputs.identity)
+    assert read.block_tables[0].shape == (1, 2)
+    assert read.seq_lens.shape == read.seq_lens_cpu_exact.shape == read.seq_lens_cpu_upper_bound.shape == (1,)
+    assert read.block_tables[0].data_ptr() == inputs.workspace.window_block_table.data_ptr()
+    assert read.seq_lens.data_ptr() == inputs.workspace.device_window_exact.data_ptr()
+    assert read.seq_lens_cpu_upper_bound.item() == read.seq_lens_cpu_exact.item() + 1
+    case.runtime.retire_generation(inputs.identity)
+    with pytest.raises(RuntimeError, match="retired Draft inputs"):
+        DraftWindowGraphInputMixin._validated_draft_attention_read_inputs(owner, inputs, inputs.identity)

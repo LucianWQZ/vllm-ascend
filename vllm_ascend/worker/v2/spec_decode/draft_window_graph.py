@@ -75,19 +75,6 @@ class DraftWindowGraphCaptureIdentity:
 
 
 @dataclass(frozen=True, slots=True)
-class DraftWindowGraphReadInputs:
-    """Only the persistent Draft read carrier presented to a metadata builder."""
-
-    window_block_table: torch.Tensor
-    valid_num_blocks: torch.Tensor
-    device_window_exact: torch.Tensor
-    cpu_window_exact: torch.Tensor
-    cpu_window_upper: torch.Tensor
-    actual_request_count: int
-    padded_request_count: int
-
-
-@dataclass(frozen=True, slots=True)
 class DraftWindowGraphWriteSideReference:
     """Full-context write/query state that Window metadata must preserve.
 
@@ -146,7 +133,6 @@ class DraftWindowGraphReadCarrier:
     """One persistent capture operand rebound to explicit runtime metadata."""
 
     capture_identity: DraftWindowGraphCaptureIdentity
-    read_inputs: DraftWindowGraphReadInputs
     workspace: DraftWindowWorkspace
     backing_snapshot: tuple[DraftWindowGraphTensorIdentity, ...]
     runtime_identity: DraftWindowGenerationIdentity | None = None
@@ -324,36 +310,15 @@ class DraftWindowGraphBindingProvider:
             )
         )
 
-    def startup_capture_read_inputs(
+    def startup_capture_workspace(
         self,
         capture_identity: DraftWindowGraphCaptureIdentity,
-    ) -> DraftWindowGraphReadInputs:
-        """Resolve stable startup backing without manufacturing a generation."""
-        if not isinstance(capture_identity, DraftWindowGraphCaptureIdentity):
-            raise TypeError("startup capture requires a capture identity")
+    ) -> DraftWindowWorkspace:
+        """Return the real persistent bank before any business generation."""
         carrier = self._require_registered_capture(capture_identity)
-        if (
-            carrier.state is not DraftWindowGraphCarrierState.EMPTY
-            or carrier.runtime_identity is not None
-            or carrier.metadata is not None
-        ):
+        if carrier.state in (DraftWindowGraphCarrierState.BOUND, DraftWindowGraphCarrierState.SUBMITTED):
             raise RuntimeError("startup capture carrier is already bound to a runtime generation")
-        read_inputs = carrier.read_inputs
-        if read_inputs.padded_request_count != capture_identity.num_reqs:
-            raise RuntimeError("startup capture carrier request geometry changed")
-        if read_inputs.actual_request_count == read_inputs.padded_request_count:
-            return read_inputs
-        capture_view = DraftWindowGraphReadInputs(
-            window_block_table=read_inputs.window_block_table,
-            valid_num_blocks=read_inputs.valid_num_blocks,
-            device_window_exact=read_inputs.device_window_exact,
-            cpu_window_exact=read_inputs.cpu_window_exact,
-            cpu_window_upper=read_inputs.cpu_window_upper,
-            actual_request_count=read_inputs.padded_request_count,
-            padded_request_count=read_inputs.padded_request_count,
-        )
-        carrier.read_inputs = capture_view
-        return capture_view
+        return carrier.workspace
 
     @property
     def inventory_method(self) -> str:
@@ -428,18 +393,8 @@ class DraftWindowGraphBindingProvider:
             raise RuntimeError("capture request bucket exceeds source capacity")
         backing = self._runtime_state.new_workspace(num_reqs)
         backing._needs_clear = True
-        read_inputs = DraftWindowGraphReadInputs(
-            window_block_table=backing.window_block_table,
-            valid_num_blocks=backing.valid_num_blocks,
-            device_window_exact=backing.device_window_exact,
-            cpu_window_exact=backing.cpu_window_exact,
-            cpu_window_upper=backing.cpu_window_upper,
-            actual_request_count=0,
-            padded_request_count=num_reqs,
-        )
         self._carriers[identity] = DraftWindowGraphReadCarrier(
             capture_identity=identity,
-            read_inputs=read_inputs,
             workspace=backing,
             backing_snapshot=_bank_snapshot(backing),
         )
@@ -470,7 +425,7 @@ class DraftWindowGraphBindingProvider:
         capture_identity: DraftWindowGraphCaptureIdentity,
         inputs: DraftMetadataInputs,
         metadata_builder: Callable[
-            [DraftWindowGraphReadInputs],
+            [DraftWindowWorkspace],
             Mapping[str, Any] | DraftWindowGraphMetadataBuild,
         ],
         target_metadata: Any,
@@ -501,19 +456,9 @@ class DraftWindowGraphBindingProvider:
             write_side_reference,
         )
 
-        read_inputs = carrier.read_inputs
         if inputs.workspace is not carrier.workspace:
             raise RuntimeError("Graph generation was not materialized into its exact capture bank")
-        carrier.read_inputs = DraftWindowGraphReadInputs(
-            window_block_table=read_inputs.window_block_table,
-            valid_num_blocks=read_inputs.valid_num_blocks,
-            device_window_exact=read_inputs.device_window_exact,
-            cpu_window_exact=read_inputs.cpu_window_exact,
-            cpu_window_upper=read_inputs.cpu_window_upper,
-            actual_request_count=generation.actual_request_count,
-            padded_request_count=generation.padded_request_count,
-        )
-        build_result = metadata_builder(carrier.read_inputs)
+        build_result = metadata_builder(carrier.workspace)
         if isinstance(build_result, DraftWindowGraphMetadataBuild):
             metadata, native_snapshot = build_result.metadata, build_result.native_full_snapshot
         else:
@@ -521,7 +466,7 @@ class DraftWindowGraphBindingProvider:
         if not isinstance(metadata, Mapping) or not metadata:
             raise RuntimeError("explicit Draft Window graph carrier produced no Draft metadata")
         self._validate_metadata_uses_carrier(
-            self._window_metadata(metadata), carrier.read_inputs, write_side_reference, write_side_snapshot
+            self._window_metadata(metadata), carrier.workspace, write_side_reference, write_side_snapshot
         )
         self._validate_native_metadata(metadata, native_snapshot, generation, write_side_reference)
         self._runtime_state.publish_metadata(inputs, metadata, target_metadata=target_metadata)
@@ -672,7 +617,7 @@ class DraftWindowGraphBindingProvider:
                 raise RuntimeError("Draft graph carrier lost its full write-side reference")
             self._validate_metadata_uses_carrier(
                 self._window_metadata(carrier.metadata),
-                carrier.read_inputs,
+                carrier.workspace,
                 carrier.write_side_reference,
                 carrier.write_side_snapshot,
             )
@@ -703,10 +648,9 @@ class DraftWindowGraphBindingProvider:
         carrier = self._carriers.get(capture_identity)
         if carrier is None or carrier.capture_identity is not capture_identity:
             raise RuntimeError("capture identity/bucket is not registered by this Draft provider")
-        if (
-            _bank_snapshot(carrier.workspace) != carrier.backing_snapshot
-            or _bank_snapshot(carrier.read_inputs) != carrier.backing_snapshot
-        ):
+        if carrier.workspace.max_num_reqs != capture_identity.num_reqs:
+            raise RuntimeError("Graph capture bank request geometry changed")
+        if _bank_snapshot(carrier.workspace) != carrier.backing_snapshot:
             raise RuntimeError("Graph capture bank address or tensor geometry changed")
         return carrier
 
@@ -799,12 +743,12 @@ class DraftWindowGraphBindingProvider:
     def _validate_metadata_uses_carrier(
         cls,
         metadata: Mapping[str, Any],
-        read_inputs: DraftWindowGraphReadInputs,
+        workspace: DraftWindowWorkspace,
         write_side_reference: DraftWindowGraphWriteSideReference,
         write_side_snapshot: _DraftWindowGraphWriteSideSnapshot,
     ) -> None:
         identity = _tensor_identity
-        cls._validate_metadata_uses_read_carrier(metadata, read_inputs, _identity=identity)
+        cls._validate_metadata_uses_read_carrier(metadata, workspace, _identity=identity)
         cls._validate_write_side_unchanged(
             write_side_reference,
             write_side_snapshot,
@@ -839,16 +783,16 @@ class DraftWindowGraphBindingProvider:
     @staticmethod
     def _validate_metadata_uses_read_carrier(
         metadata: Mapping[str, Any],
-        read_inputs: DraftWindowGraphReadInputs,
+        workspace: DraftWindowWorkspace,
         *,
         _identity=None,
     ) -> None:
         """Validate only Draft-private read carriers, never full write state."""
         identity = _tensor_identity if _identity is None else _identity
-        expected_table_storage = identity(read_inputs.window_block_table).storage_data_ptr
-        expected_device_storage = identity(read_inputs.device_window_exact).storage_data_ptr
-        expected_cpu_storage = identity(read_inputs.cpu_window_exact).storage_data_ptr
-        expected_lengths = read_inputs.cpu_window_exact.tolist()
+        expected_table_storage = identity(workspace.window_block_table).storage_data_ptr
+        expected_device_storage = identity(workspace.device_window_exact).storage_data_ptr
+        expected_cpu_storage = identity(workspace.cpu_window_exact).storage_data_ptr
+        expected_lengths = workspace.cpu_window_exact.tolist()
         for layer_name, layer_metadata in metadata.items():
             if layer_metadata is None:
                 continue

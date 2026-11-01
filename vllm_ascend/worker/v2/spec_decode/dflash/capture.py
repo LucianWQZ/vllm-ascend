@@ -33,10 +33,10 @@ from vllm.v1.worker.gpu.spec_decode.dflash.cudagraph import (
 from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_ascend.worker.v2.attn_utils import build_attn_metadata
+from vllm_ascend.worker.v2.spec_decode.draft_window import DraftWindowWorkspace
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
     DraftWindowGraphBindingProvider,
     DraftWindowGraphCaptureIdentity,
-    DraftWindowGraphReadInputs,
     DraftWindowGraphRoute,
     resolve_parallel_draft_window_graph_route,
 )
@@ -53,7 +53,7 @@ class _CaptureScopeState:
 class _CaptureEntry:
     key: tuple[int, int, str]
     identity: DraftWindowGraphCaptureIdentity
-    read_inputs: DraftWindowGraphReadInputs
+    workspace: DraftWindowWorkspace
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,7 +85,7 @@ class DraftWindowDFlashCaptureContext:
         num_reqs: int,
         num_tokens: int,
         skip_attn: bool,
-    ) -> tuple[DraftWindowGraphCaptureIdentity, DraftWindowGraphReadInputs]:
+    ) -> tuple[DraftWindowGraphCaptureIdentity, DraftWindowWorkspace]:
         self._require_active()
         mode = CUDAGraphMode.PIECEWISE.name if skip_attn else CUDAGraphMode.FULL.name
         key = (num_reqs, num_tokens, mode)
@@ -96,10 +96,10 @@ class DraftWindowDFlashCaptureContext:
                 f"carrier: key={key!r} matches={len(matches)}"
             )
         entry = matches[0]
-        current = self.provider.startup_capture_read_inputs(entry.identity)
-        if current is not entry.read_inputs:
+        current = self.provider.startup_capture_workspace(entry.identity)
+        if current is not entry.workspace:
             raise RuntimeError("Draft Window capture backing changed after context binding")
-        return entry.identity, entry.read_inputs
+        return entry.identity, entry.workspace
 
     def _require_active(self) -> None:
         if not self._state.active:
@@ -180,7 +180,7 @@ def _build_capture_context(
             _CaptureEntry(
                 key=key,
                 identity=identity,
-                read_inputs=provider.startup_capture_read_inputs(identity),
+                workspace=provider.startup_capture_workspace(identity),
             )
         )
     if len({entry.key for entry in entries}) != len(entries):
@@ -226,9 +226,9 @@ def draft_window_dflash_capture_scope(
             delattr(input_buffers, _CAPTURE_CONTEXT_ATTRIBUTE)
 
 
-def _seed_capture_read_inputs(
+def _seed_capture_workspace(
     identity: DraftWindowGraphCaptureIdentity,
-    read_inputs: DraftWindowGraphReadInputs,
+    workspace: DraftWindowWorkspace,
     input_block_tables: Sequence[torch.Tensor],
     *,
     max_model_len: int,
@@ -238,12 +238,12 @@ def _seed_capture_read_inputs(
     if not 0 <= gid < len(input_block_tables):
         raise RuntimeError("Draft Window capture gid is absent from dummy full tables")
     source = input_block_tables[gid]
-    destination = read_inputs.window_block_table
+    destination = workspace.window_block_table
     if source.ndim != 2 or destination.ndim != 2:
         raise RuntimeError("Draft Window capture tables must be two-dimensional")
-    if source.shape[0] != read_inputs.padded_request_count:
+    if source.shape[0] != identity.num_reqs:
         raise RuntimeError("Draft Window capture full table row count is inconsistent")
-    if destination.shape[0] != read_inputs.padded_request_count:
+    if destination.shape[0] != identity.num_reqs:
         raise RuntimeError("Draft Window capture backing row count is inconsistent")
 
     capture_upper = min(
@@ -256,10 +256,10 @@ def _seed_capture_read_inputs(
 
     destination.zero_()
     destination[:, :valid_num_blocks].copy_(source[:, :valid_num_blocks])
-    read_inputs.valid_num_blocks.fill_(valid_num_blocks)
-    read_inputs.device_window_exact.fill_(capture_upper)
-    read_inputs.cpu_window_exact.fill_(capture_upper)
-    read_inputs.cpu_window_upper.fill_(capture_upper)
+    workspace.valid_num_blocks.fill_(valid_num_blocks)
+    workspace.device_window_exact.fill_(capture_upper)
+    workspace.cpu_window_exact.fill_(capture_upper)
+    workspace.cpu_window_upper.fill_(capture_upper)
     return capture_upper
 
 
@@ -292,7 +292,7 @@ def ascend_prepare_dflash_inputs_to_capture(
         raise TypeError("invalid Draft Window capture context on Draft input buffers")
     if context.input_buffers_owner_id != id(input_buffers):
         raise RuntimeError("Draft Window capture context owner mismatch")
-    identity, read_inputs = context.resolve(num_reqs, num_tokens, skip_attn)
+    identity, workspace = context.resolve(num_reqs, num_tokens, skip_attn)
 
     input_batch = InputBatch.make_dummy(num_reqs, num_tokens, input_buffers)
     input_block_tables = block_tables.get_dummy_block_tables(num_reqs)
@@ -304,15 +304,15 @@ def ascend_prepare_dflash_inputs_to_capture(
     if skip_attn:
         return AttentionState(None, slot_mappings_by_layer)
 
-    max_seq_len = _seed_capture_read_inputs(
-        identity, read_inputs, input_block_tables, max_model_len=max_model_len, provider=context.provider
+    max_seq_len = _seed_capture_workspace(
+        identity, workspace, input_block_tables, max_model_len=max_model_len, provider=context.provider
     )
     query_start_loc_cpu = torch.from_numpy(input_batch.query_start_loc_np)
     dcp_local_seq_lens = None
     if block_tables.cp_size > 1:
         dcp_local_seq_lens = prepare_dcp_local_seq_lens(
             input_buffers.dcp_local_seq_lens,
-            read_inputs.device_window_exact,
+            workspace.device_window_exact,
             input_batch.num_reqs,
             block_tables.cp_size,
             block_tables.cp_rank,
@@ -320,15 +320,15 @@ def ascend_prepare_dflash_inputs_to_capture(
             num_reqs_padded=input_batch.num_reqs_after_padding,
         )
     read_block_tables = list(input_block_tables)
-    read_block_tables[context.provider.group.gid] = read_inputs.window_block_table
+    read_block_tables[context.provider.group.gid] = workspace.window_block_table
     native_swa = context.native_swa_plan
     from vllm_ascend.worker.v2.spec_decode.draft_window_eager import AscendDraftAttentionReadInputs
 
     graph_read_inputs = AscendDraftAttentionReadInputs(
         block_tables=tuple(read_block_tables),
-        seq_lens=read_inputs.device_window_exact,
-        seq_lens_cpu_exact=read_inputs.cpu_window_exact,
-        seq_lens_cpu_upper_bound=read_inputs.cpu_window_upper,
+        seq_lens=workspace.device_window_exact,
+        seq_lens_cpu_exact=workspace.cpu_window_exact,
+        seq_lens_cpu_upper_bound=workspace.cpu_window_upper,
         max_seq_len=max_seq_len,
         dcp_local_seq_lens=dcp_local_seq_lens,
     )
@@ -339,9 +339,9 @@ def ascend_prepare_dflash_inputs_to_capture(
         query_start_loc_gpu=input_batch.query_start_loc,
         query_start_loc_cpu=query_start_loc_cpu,
         max_query_len=num_tokens // num_reqs,
-        seq_lens=read_inputs.device_window_exact,
-        seq_lens_cpu=read_inputs.cpu_window_exact,
-        seq_lens_cpu_upper_bound=read_inputs.cpu_window_upper,
+        seq_lens=workspace.device_window_exact,
+        seq_lens_cpu=workspace.cpu_window_exact,
+        seq_lens_cpu_upper_bound=workspace.cpu_window_upper,
         draft_window_read_inputs=graph_read_inputs,
         dcp_local_seq_lens=dcp_local_seq_lens,
         max_seq_len=max_seq_len,

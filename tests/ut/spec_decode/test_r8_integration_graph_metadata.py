@@ -277,8 +277,7 @@ def graph_device_binding():
         exact = torch.tensor(values, dtype=torch.int32)
         device = exact.clone()
         read = SimpleNamespace(
-            actual_request_count=actual,
-            padded_request_count=padded,
+            max_num_reqs=padded,
             window_block_table=table,
             cpu_window_exact=exact,
             device_window_exact=device,
@@ -321,7 +320,7 @@ def test_private_full_binds_device_after_old_cpu_operand_is_rejected(
     assert metadata.seq_lens_cpu is read.cpu_window_exact
     assert metadata.seq_lens_list == read.cpu_window_exact.tolist()
     assert metadata.slot_mapping is slots and metadata.positions is positions
-    assert read.actual_request_count == actual and read.padded_request_count == padded
+    assert read.max_num_reqs == padded
 
 
 @pytest.mark.parametrize("field", ["seq_lens", "seq_lens_cpu", "seq_lens_gpu", "block_tables"])
@@ -361,7 +360,7 @@ def test_private_full_uses_padded_builder_then_isolates_before_binding():
     ]
     assert len(calls) == 1
     passed = {kw.arg: ast.unparse(kw.value) for kw in calls[0].keywords}
-    assert passed["num_reqs"] == passed["num_reqs_padded"] == "read_inputs.padded_request_count"
+    assert passed["num_reqs"] == passed["num_reqs_padded"] == "workspace.max_num_reqs"
     private_statements = [ast.unparse(n) for n in private.body]
     isolation = next(
         i for i, text in enumerate(private_statements) if "copy_draft_attention_metadata(metadata)" in text
@@ -396,9 +395,9 @@ def _run_actual_private_binding_loop(graph_device_binding, read, metadata_by_lay
     namespace = dict(
         window_layers=tuple(metadata_by_layer),
         metadata=metadata_by_layer,
-        read_inputs=read,
+        workspace=read,
         capture_identity=SimpleNamespace(
-            descriptor=SimpleNamespace(num_tokens=read.padded_request_count * 8), num_reqs=read.padded_request_count
+            descriptor=SimpleNamespace(num_tokens=read.max_num_reqs * 8), num_reqs=read.max_num_reqs
         ),
         _bind_parallel_graph_device_lengths=strict_bind,
     )
@@ -764,7 +763,7 @@ def full_metadata_finalization():
             native_snapshot=snapshot,
             native_swa=object(),
             write_side=writes,
-            read_inputs=SimpleNamespace(padded_request_count=1),
+            workspace=SimpleNamespace(max_num_reqs=1),
             capture_identity=SimpleNamespace(descriptor=SimpleNamespace(num_tokens=8)),
             owner=SimpleNamespace(
                 _draft_window_live_inputs=SimpleNamespace(identity=object()),

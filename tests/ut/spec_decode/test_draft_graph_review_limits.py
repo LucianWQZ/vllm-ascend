@@ -568,7 +568,7 @@ class ActualGraphDescriptorControls(unittest.TestCase):
             self.run_actual(manager, N(num_reqs=4, num_tokens=4))
         self.assertEqual(seen, [])
         for first, step, ordinal, tokens in ((True, 0, 0, 4), (False, 1, 0, 1), (False, 2, 1, 1)):
-            inputs = N(actual_request_count=1, padded_request_count=1, identity=N(step=step))
+            inputs = N(identity=N(actual_request_count=1, padded_request_count=1, step=step))
             M.validate_eagle_single_request_graph_stage(owner, inputs, first=first, n=1, tokens=tokens, ordinal=ordinal)
             inputs.identity.step = 7
             with self.assertRaises(NotImplementedError):

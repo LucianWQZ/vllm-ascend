@@ -28,6 +28,7 @@ from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftWindowRuntimeContext,
     DraftWindowRuntimeState,
     DraftWindowSourceCapability,
+    DraftWindowWorkspace,
     _build_draft_window_source_capability_for_context,
     build_draft_window_runtime_context,
 )
@@ -40,7 +41,6 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
     DraftWindowGraphCaptureIdentity,
     DraftWindowGraphMetadataBuild,
     DraftWindowGraphReadCarrier,
-    DraftWindowGraphReadInputs,
     DraftWindowGraphRoute,
     DraftWindowGraphWriteSideReference,
     _tensor_identity,
@@ -265,7 +265,7 @@ def prepare_parallel_graph(
     if proposal_context is None or proposal_context.mapping_epoch != inputs.identity.mapping_epoch:
         raise RuntimeError("Draft Window Graph proposal identity is stale")
     capture_identity = session.resolve_capture_identity(descriptor)
-    if inputs.padded_request_count != capture_identity.num_reqs:
+    if inputs.identity.padded_request_count != capture_identity.num_reqs:
         raise RuntimeError("Draft Window Graph generation does not match the capture request bucket")
     target_metadata = owner.model_state.attn_metadata
     if not isinstance(target_metadata, Mapping) or not target_metadata:
@@ -283,9 +283,10 @@ def prepare_parallel_graph(
     carrier = session.provider.bind_read_carrier(
         capture_identity=capture_identity,
         inputs=inputs,
-        metadata_builder=lambda read_inputs: _build_private_graph_metadata(
+        metadata_builder=lambda workspace: _build_private_graph_metadata(
             owner,
-            read_inputs=read_inputs,
+            workspace=workspace,
+            actual_request_count=inputs.identity.actual_request_count,
             write_side=write_side,
             target_metadata=target_metadata,
             capture_identity=capture_identity,
@@ -298,7 +299,7 @@ def prepare_parallel_graph(
 
 def _bind_parallel_graph_device_lengths(
     metadata: Any,
-    read_inputs: DraftWindowGraphReadInputs,
+    workspace: DraftWindowWorkspace,
     query_width: int,
 ) -> None:
     """Bind the private FULL consumer after checking the fresh builder owners.
@@ -310,10 +311,10 @@ def _bind_parallel_graph_device_lengths(
     added and the eager/baseline builder selection is left unchanged.
     """
     expected = (
-        ("block_tables", read_inputs.window_block_table),
-        ("seq_lens", read_inputs.cpu_window_exact),
-        ("seq_lens_cpu", read_inputs.cpu_window_exact),
-        ("seq_lens_gpu", read_inputs.device_window_exact),
+        ("block_tables", workspace.window_block_table),
+        ("seq_lens", workspace.cpu_window_exact),
+        ("seq_lens_cpu", workspace.cpu_window_exact),
+        ("seq_lens_gpu", workspace.device_window_exact),
     )
     for name, source in expected:
         actual = getattr(metadata, name, None)
@@ -324,34 +325,35 @@ def _bind_parallel_graph_device_lengths(
                 f"private Graph builder lost its current {name} owner: "
                 f"actual={actual_identity}, expected={expected_identity}"
             )
-    query_lengths = [(i + 1) * query_width for i in range(read_inputs.padded_request_count)]
+    query_lengths = [(i + 1) * query_width for i in range(workspace.max_num_reqs)]
     if metadata.actual_seq_lengths_q != query_lengths:
         raise RuntimeError("private Graph builder changed its captured padded query layout")
-    if metadata.seq_lens_list != read_inputs.cpu_window_exact.tolist():
+    if metadata.seq_lens_list != workspace.cpu_window_exact.tolist():
         raise RuntimeError("private Graph builder changed its current exact length values")
-    metadata.seq_lens = read_inputs.device_window_exact
+    metadata.seq_lens = workspace.device_window_exact
 
 
 def _build_private_graph_metadata(
     owner: Any,
     *,
-    read_inputs: DraftWindowGraphReadInputs,
+    workspace: DraftWindowWorkspace,
+    actual_request_count: int,
     write_side: DraftWindowGraphWriteSideReference,
     target_metadata: Mapping[Any, Any],
     capture_identity: DraftWindowGraphCaptureIdentity,
 ) -> DraftWindowGraphMetadataBuild:
-    active_upper = read_inputs.cpu_window_upper[: read_inputs.actual_request_count]
+    active_upper = workspace.cpu_window_upper[:actual_request_count]
     max_seq_len = int(active_upper.max().item()) if active_upper.numel() else 0
     group_id = owner._draft_window_graph_binding_provider.group.gid
     block_tables = tuple(
-        read_inputs.window_block_table if gid == group_id else full_table[: read_inputs.padded_request_count]
+        workspace.window_block_table if gid == group_id else full_table[: workspace.max_num_reqs]
         for gid, full_table in enumerate(owner.block_tables.input_block_tables)
     )
     typed_read_inputs = AscendDraftAttentionReadInputs(
         block_tables=block_tables,
-        seq_lens=read_inputs.device_window_exact,
-        seq_lens_cpu_exact=read_inputs.cpu_window_exact,
-        seq_lens_cpu_upper_bound=read_inputs.cpu_window_upper,
+        seq_lens=workspace.device_window_exact,
+        seq_lens_cpu_exact=workspace.cpu_window_exact,
+        seq_lens_cpu_upper_bound=workspace.cpu_window_upper,
         max_seq_len=max_seq_len,
     )
     with ExitStack() as stack:
@@ -369,8 +371,8 @@ def _build_private_graph_metadata(
             # FULL attention consumes the captured padded Q, including PAD
             # slots. Keep that uniform layout in the builder itself, avoiding
             # a second synthetic request. Generation identity stays active-only.
-            num_reqs=read_inputs.padded_request_count,
-            num_reqs_padded=read_inputs.padded_request_count,
+            num_reqs=workspace.max_num_reqs,
+            num_reqs_padded=workspace.max_num_reqs,
             num_tokens_padded=capture_identity.descriptor.num_tokens,
             read_inputs=typed_read_inputs,
             causal=write_side.causal,
@@ -387,7 +389,7 @@ def _build_private_graph_metadata(
         layer_metadata = metadata.get(layer_name)
         if layer_metadata is not None and id(layer_metadata) not in bound_metadata_ids:
             _bind_parallel_graph_device_lengths(
-                layer_metadata, read_inputs, (capture_identity.descriptor.num_tokens // capture_identity.num_reqs)
+                layer_metadata, workspace, (capture_identity.descriptor.num_tokens // capture_identity.num_reqs)
             )
             bound_metadata_ids.add(id(layer_metadata))
     finalized_groups: dict[int, int | None] = {}
@@ -419,9 +421,7 @@ def _build_private_graph_metadata(
             if native_snapshot is None:
                 raise RuntimeError("native SWA private Graph metadata has no current full-length snapshot")
             native_snapshot.validate(owner._draft_window_live_inputs.identity, native_swa)
-            final_layer_metadata.block_tables = owner.block_tables.input_block_tables[gid][
-                : read_inputs.padded_request_count
-            ]
+            final_layer_metadata.block_tables = owner.block_tables.input_block_tables[gid][: workspace.max_num_reqs]
             final_layer_metadata.seq_lens = native_snapshot.device_exact
             final_layer_metadata.seq_lens_cpu = native_snapshot.cpu_exact
             final_layer_metadata.seq_lens_list = native_snapshot.cpu_exact.tolist()

@@ -22,6 +22,7 @@ from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftMetadataInputs,
     DraftWindowPolicyDecision,
     DraftWindowPolicyState,
+    DraftWindowWorkspace,
     build_draft_window_runtime_state,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_eager import (
@@ -499,17 +500,17 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin):
         )
         return self._draft_window_runtime_state.read_metadata(inputs.identity)
 
-    def _build_eagle3_graph_metadata(self, *, read: Any, **kwargs: Any) -> dict[str, Any]:
+    def _build_eagle3_graph_metadata(self, *, workspace: DraftWindowWorkspace, **kwargs: Any) -> dict[str, Any]:
         gid = kwargs["inputs"].identity.global_group_id
-        upper = read.cpu_window_upper[: read.actual_request_count]
+        upper = workspace.cpu_window_upper[: kwargs["num_reqs"]]
         view = AscendDraftAttentionReadInputs(
             block_tables=tuple(
-                read.window_block_table if i == gid else table[: read.padded_request_count]
+                workspace.window_block_table if i == gid else table[: kwargs["num_reqs_padded"]]
                 for i, table in enumerate(self.block_tables.input_block_tables)
             ),
-            seq_lens=read.device_window_exact,
-            seq_lens_cpu_exact=read.cpu_window_exact,
-            seq_lens_cpu_upper_bound=read.cpu_window_upper,
+            seq_lens=workspace.device_window_exact,
+            seq_lens_cpu_exact=workspace.cpu_window_exact,
+            seq_lens_cpu_upper_bound=workspace.cpu_window_upper,
             max_seq_len=int(upper.max().item()) if upper.numel() else 0,
         )
         metadata = self._build_eagle3_private_attn_metadata(**kwargs, read_inputs_override=view, publish=False)
@@ -518,9 +519,9 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin):
         # both exact owners explicitly here, leaving eager assembly unchanged.
         for layer in metadata.values():
             if layer is not None:
-                layer.seq_lens = read.device_window_exact
-                layer.seq_lens_cpu = read.cpu_window_exact
-                layer.seq_lens_list = read.cpu_window_exact.tolist()
+                layer.seq_lens = workspace.device_window_exact
+                layer.seq_lens_cpu = workspace.cpu_window_exact
+                layer.seq_lens_list = workspace.cpu_window_exact.tolist()
         return metadata
 
     def _require_eagle3_target_metadata(

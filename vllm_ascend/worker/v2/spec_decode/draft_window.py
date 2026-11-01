@@ -205,7 +205,7 @@ class DraftWindowReadDescriptor:
 
 @dataclass(frozen=True, slots=True)
 class SingleGroupDirectPrefixProvider:
-    """P2-only projection provider; it never materializes a window table."""
+    """Canonical read projection; it never materializes a window table."""
 
     inventory: DraftWindowInventory
     full_source: FullDraftKVSource
@@ -462,9 +462,8 @@ class DraftWindowSourceCapability:
     full_source: FullDraftKVSource
     provider: SingleGroupDirectPrefixProvider
     runtime_context: DraftWindowRuntimeContext | None = None
-    # P7-X mixed/prefix rows can require a full-resident row in the same
-    # stable backing that carries narrow decode rows.  Existing P3 fixtures
-    # omit this field and retain the original narrow capacity.
+    # Mixed/prefix rows can require a full-resident row in the same stable
+    # backing that carries narrow decode rows.
     workspace_capacity_columns: int | None = None
     # Only a reviewed native-SWA/Full Graph route may retain its independent
     # native groups beside the single P3 extra-Window source.
@@ -1066,6 +1065,12 @@ class DraftWindowWorkspace:
             raise ValueError("workspace request capacity must be greater than 0")
         if table_capacity_columns <= 0:
             raise ValueError("workspace table capacity must be greater than 0")
+        if table_template.ndim != 2 or valid_count_template.ndim != 1:
+            raise ValueError("Draft workspace templates require a table and one-dimensional valid counts")
+        if table_template.dtype != torch.int32 or valid_count_template.dtype != torch.int32:
+            raise TypeError("Draft workspace tables and valid counts must use int32")
+        if table_template.device != valid_count_template.device:
+            raise ValueError("Draft workspace table and valid-count templates must share a device")
         self.max_num_reqs = max_num_reqs
         self.table_capacity_columns = table_capacity_columns
         self.window_block_table = table_template.new_zeros((max_num_reqs, table_capacity_columns))
@@ -1225,22 +1230,7 @@ class DraftWindowWorkspace:
     def build_inputs(
         self, owner: "DraftWindowRuntimeState", identity: DraftWindowGenerationIdentity
     ) -> "DraftMetadataInputs":
-        self.assert_bound(identity)
-        padded = identity.padded_request_count
-        return DraftMetadataInputs(
-            identity=identity,
-            window_block_table=self.window_block_table[:padded],
-            valid_num_blocks=self.valid_num_blocks[:padded],
-            device_window_exact=self.device_window_exact[:padded],
-            cpu_window_exact=self.cpu_window_exact[:padded],
-            cpu_window_upper=self.cpu_window_upper[:padded],
-            active_table_columns=self._active_table_columns,
-            actual_request_count=identity.actual_request_count,
-            padded_request_count=padded,
-            table_capacity_columns=self.table_capacity_columns,
-            _owner=owner,
-            workspace=self,
-        )
+        return DraftMetadataInputs(identity=identity, workspace=self, _owner=owner)
 
     def assert_bound(self, expected_identity: DraftWindowGenerationIdentity) -> None:
         if self._bound_identity != expected_identity:
@@ -1269,92 +1259,19 @@ class DraftWindowWorkspace:
 
 @dataclass(frozen=True, slots=True, eq=False)
 class DraftMetadataInputs:
-    """Immutable typed transport for one workspace binding.
+    """One generation handle retaining its actual read bank and runtime owner.
 
-    The runtime owns one current generation and retains its workspace. These
-    are read inputs only: positions, query layout, slot mappings, Target state,
-    and the canonical FullSource owner are intentionally absent.
+    The bank owns all read tensors. A new handle on every materialization
+    rejects stale references even when the next generation reuses that bank.
+    Positions, query layout, write slots and Target metadata remain separate.
     """
 
     identity: DraftWindowGenerationIdentity
-    window_block_table: torch.Tensor
-    valid_num_blocks: torch.Tensor
-    device_window_exact: torch.Tensor
-    cpu_window_exact: torch.Tensor
-    cpu_window_upper: torch.Tensor
-    active_table_columns: tuple[int, ...]
-    actual_request_count: int
-    padded_request_count: int
-    table_capacity_columns: int
-    _owner: "DraftWindowRuntimeState" = field(repr=False, compare=False)
     workspace: DraftWindowWorkspace = field(repr=False, compare=False)
+    _owner: "DraftWindowRuntimeState" = field(repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        if self.actual_request_count != self.identity.actual_request_count:
-            raise ValueError("typed inputs actual request count disagrees with identity")
-        if self.padded_request_count != self.identity.padded_request_count:
-            raise ValueError("typed inputs padded request count disagrees with identity")
-        if len(self.active_table_columns) != self.actual_request_count:
-            raise ValueError("active table-column counts must match actual requests")
-        if self.table_capacity_columns <= 0:
-            raise ValueError("typed inputs table capacity must be greater than 0")
-        if any(columns < 0 or columns > self.table_capacity_columns for columns in self.active_table_columns):
-            raise ValueError("active table-column counts exceed typed input capacity")
-        if self.window_block_table.shape != (
-            self.padded_request_count,
-            self.table_capacity_columns,
-        ):
-            raise ValueError("Window table shape does not match padded rows and capacity")
-        for name, tensor in (
-            ("valid counts", self.valid_num_blocks),
-            ("device Window exact", self.device_window_exact),
-            ("CPU Window exact", self.cpu_window_exact),
-            ("CPU Window upper", self.cpu_window_upper),
-        ):
-            if tensor.ndim != 1 or tensor.shape[0] != self.padded_request_count:
-                raise ValueError(f"{name} shape does not match padded request count")
-        if self.valid_num_blocks.dtype != torch.int32:
-            raise TypeError("valid counts must use int32")
-        if self.window_block_table.dtype != torch.int32:
-            raise TypeError("Window block table must use int32")
-        if self.valid_num_blocks.device != self.window_block_table.device:
-            raise ValueError("valid counts and Window block table must share a device")
-        if self.device_window_exact.device != self.window_block_table.device:
-            raise ValueError("device Window exact and Window block table must share a device")
-        for name, tensor in (
-            ("device Window exact", self.device_window_exact),
-            ("CPU Window exact", self.cpu_window_exact),
-            ("CPU Window upper", self.cpu_window_upper),
-        ):
-            if tensor.dtype != torch.int32:
-                raise TypeError(f"{name} must use int32")
-        if self.cpu_window_exact.device.type != "cpu" or self.cpu_window_upper.device.type != "cpu":
-            raise ValueError("CPU Window lengths must live on CPU")
-        if self.actual_request_count and bool(
-            torch.any(
-                self.cpu_window_upper[: self.actual_request_count] < self.cpu_window_exact[: self.actual_request_count]
-            )
-        ):
-            raise ValueError("CPU Window upper must be greater than or equal to exact")
-        if self.padded_request_count > self.actual_request_count:
-            tail = slice(self.actual_request_count, self.padded_request_count)
-            inert_tensors = [
-                self.cpu_window_exact[tail],
-                self.cpu_window_upper[tail],
-            ]
-            # CPU tests retain strict device-value coverage. Production NPU
-            # inputs rely on workspace zero-before-write and must not insert a
-            # device reduction/synchronization into every proposal.
-            if self.window_block_table.device.type == "cpu":
-                inert_tensors.extend(
-                    (
-                        self.window_block_table[tail],
-                        self.valid_num_blocks[tail],
-                        self.device_window_exact[tail],
-                    )
-                )
-            if any(bool(tensor.count_nonzero()) for tensor in inert_tensors):
-                raise ValueError("padded Draft metadata rows must be deterministically zero")
+        self.workspace.assert_bound(self.identity)
 
     @property
     def retired(self) -> bool:
@@ -1420,7 +1337,7 @@ class DraftWindowRuntimeState:
         """Keep possibly submitted Draft backing intact until process isolation.
 
         Unknown native partial submission cannot justify another device write
-        or a completion claim. The live lease intentionally blocks reuse.
+        or a completion claim. The live input handle intentionally blocks reuse.
         """
         inputs = self._active_inputs
         if inputs is None:
