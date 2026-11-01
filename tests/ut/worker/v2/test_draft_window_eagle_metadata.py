@@ -98,7 +98,8 @@ def test_shared_assembler_preserves_uniform_full_capture_and_nonuniform_queries(
 def test_eager_forward_is_delegated_once_and_reader_retires_after_it(monkeypatch, active, fail):
     calls = []
     metadata = object()
-    inputs = SimpleNamespace(identity=object())
+    inputs = SimpleNamespace(identity=object(), metadata=metadata)
+    inputs.validate_for = lambda current: current is inputs.identity or pytest.fail("replaced reader identity")
 
     def forward(self, *args):
         calls.append(("forward", args))
@@ -118,7 +119,6 @@ def test_eager_forward_is_delegated_once_and_reader_retires_after_it(monkeypatch
 
     owner: Any = object.__new__(Owner)
     owner._eagle3_window_live_inputs = inputs
-    owner._draft_window_runtime_state = SimpleNamespace(read_metadata=lambda identity: metadata)
     args = (2, 4, metadata, object(), object())
     if fail:
         with pytest.raises(ValueError, match="native forward failed"):
@@ -140,10 +140,13 @@ def proposal():
     owner: Any = Eagle3DraftWindowMixin()
     owner.method, owner.num_speculative_steps = "eagle3", 3
     owner.speculative_config = SimpleNamespace(uses_dynamic_speculative_decoding=lambda: False)
-    owner._draft_window_source_capability = SimpleNamespace(
-        policy=SimpleNamespace(normalized_method="eagle3"), expected_future_offset=3
+    runtime: Any = SimpleNamespace(
+        source=SimpleNamespace(policy=SimpleNamespace(normalized_method="eagle3"), expected_future_offset=3),
+        _active_inputs=None,
+        quarantined_identity=None,
+        _last_retired_identity=None,
+        require_reusable=lambda: None,
     )
-    runtime: Any = SimpleNamespace(_active_inputs=None, quarantined_identity=None, _last_retired_identity=None)
 
     def retire(identity):
         assert runtime._active_inputs.identity is identity
@@ -151,7 +154,7 @@ def proposal():
 
     runtime.retire_generation = retire
     runtime.quarantine_generation = lambda identity: setattr(runtime, "quarantined_identity", identity)
-    owner._draft_window_runtime_state = runtime
+    owner._draft_window_graph_binding_provider = runtime
     owner._initialize_eagle3_draft_window_state()
     batch = SimpleNamespace(
         num_reqs=1,
@@ -166,7 +169,7 @@ def proposal():
     )
     session: Any = object.__new__(Eagle3GraphSession)
     session.owner, session._carriers = owner, []
-    session.provider = SimpleNamespace(require_reusable=lambda: None)
+    session.provider = runtime
     owner._eagle3_graph_session = session
     owner._require_eagle3_target_metadata = lambda: {}
     session.write_reference = lambda identity, target: None

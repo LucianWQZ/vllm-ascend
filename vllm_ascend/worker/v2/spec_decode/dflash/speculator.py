@@ -144,7 +144,7 @@ def _draft_window_context_kv_scope(owner, input_batch):
     query metadata or Graph dispatch. Reuse the ordinary Source completion
     contract for these writes; captured Window banks and generations stay idle.
     """
-    runtime = owner._draft_window_runtime_state
+    runtime = owner._draft_window_graph_binding_provider
     if runtime.quarantined_identity is not None or getattr(owner, "_draft_window_graph_submission_uncertain", False):
         raise RuntimeError("Draft Window backing is quarantined before a context-only KV write")
     from vllm_ascend.worker.v2.spec_decode.draft_window_lifetime import DraftWindowOwnerPool
@@ -184,7 +184,7 @@ def _draft_window_owner_scope(owner, input_batch, dummy_run=False, is_profile=Fa
         # no tensor value read or device synchronization is introduced here.
         dflash2_contract.validate_owner(owner)
     runtime = getattr(owner, "_draft_window_runtime", None)
-    graph_runtime = getattr(owner, "_draft_window_runtime_state", None)
+    graph_runtime = getattr(owner, "_draft_window_graph_binding_provider", None)
     limit = getattr(owner, "_draft_graph_review_limit", None)
     context_only_full8 = (
         limit is not None
@@ -301,7 +301,7 @@ class AscendDFlashSpeculator(DraftWindowGraphInputMixin, LmheadTPDraftSamplingMi
     def build_draft_attn_metadatas(self, num_reqs_padded, seq_lens_cpu_upper_bound):
         from vllm_ascend.worker.v2.spec_decode.draft_window_graph_metadata import is_parallel_graph_dp_dummy
 
-        if hasattr(self, "_draft_window_runtime_state") and not is_parallel_graph_dp_dummy(self):
+        if hasattr(self, "_draft_window_graph_binding_provider") and not is_parallel_graph_dp_dummy(self):
             graph_metadata = consume_draft_window_graph_metadata(
                 self, route=DraftWindowGraphRoute.DFLASH, expected_consumer_count=1
             )
@@ -358,7 +358,7 @@ class AscendDFlashSpeculator(DraftWindowGraphInputMixin, LmheadTPDraftSamplingMi
         # It needs this speculator to update full-graph params, so set it here.
         self.query_cudagraph_manager.speculator = self
         self.query_cudagraph_manager.update_stream = self.update_stream
-        if hasattr(self, "_draft_window_runtime_state"):
+        if hasattr(self, "_draft_window_graph_binding_provider"):
             if not draft_window_graph_enabled():
                 raise RuntimeError("Draft Graph configuration changed during initialization")
             install_parallel_graph(self)
@@ -430,7 +430,9 @@ class AscendDFlashSpeculator(DraftWindowGraphInputMixin, LmheadTPDraftSamplingMi
         dcp_local_seq_lens: torch.Tensor | None = None,
         slot_mappings: torch.Tensor | None = None,
     ) -> dict[str, Any] | None:
-        if hasattr(self, "_draft_window_runtime_state") and not getattr(self, "_draft_window_bypass_active", False):
+        if hasattr(self, "_draft_window_graph_binding_provider") and not getattr(
+            self, "_draft_window_bypass_active", False
+        ):
             with build_attn_metadata_wrapper():
                 return _build_graph_uniform_metadata(
                     self,

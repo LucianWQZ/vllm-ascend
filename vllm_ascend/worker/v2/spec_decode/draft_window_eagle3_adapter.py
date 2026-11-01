@@ -22,7 +22,6 @@ from vllm_ascend.worker.v2.attn_utils import build_attn_metadata_factory
 from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftMetadataInputs,
     DraftWindowWorkspace,
-    build_draft_window_runtime_state,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_eager import (
     AscendDraftAttentionReadInputs,
@@ -34,6 +33,7 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_eagle3 import (
     _eagle3_graph_scheduled_consumers,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
+    DraftWindowGraphBindingProvider,
     DraftWindowGraphRoute,
     consume_draft_window_graph_metadata,
 )
@@ -49,22 +49,16 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentA
         policy = getattr(self, "_draft_window_policy", None)
         if policy is None:
             return
-        if hasattr(self, "_draft_window_source_capability") or hasattr(
-            self,
-            "_draft_window_runtime_state",
-        ):
+        if hasattr(self, "_draft_window_graph_binding_provider"):
             raise RuntimeError("draft-window runtime ownership is already initialized")
         from vllm_ascend.worker.v2.spec_decode.draft_window_eagle3_capture import build_eagle3_graph_source
 
         capability = build_eagle3_graph_source(self)
-        runtime_state = build_draft_window_runtime_state(capability)
-        self._draft_window_source_capability = capability
-        self._draft_window_runtime_state = runtime_state
+        self._draft_window_graph_binding_provider = DraftWindowGraphBindingProvider(source=capability)
         try:
             self._initialize_eagle3_draft_window_state()
         except BaseException:
-            del self._draft_window_source_capability
-            del self._draft_window_runtime_state
+            del self._draft_window_graph_binding_provider
             raise
 
     def _configure_decode_metadata_update(self) -> None:
@@ -80,7 +74,7 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentA
 
     def init_cudagraph_manager(self, cudagraph_mode):
         result = super().init_cudagraph_manager(cudagraph_mode)
-        if hasattr(self, "_draft_window_runtime_state"):
+        if hasattr(self, "_draft_window_graph_binding_provider"):
             from vllm_ascend.worker.v2.spec_decode.draft_window_eagle3_capture import Eagle3GraphSession
 
             self._eagle3_graph_session = Eagle3GraphSession(self)
@@ -186,7 +180,10 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentA
             if cudagraph_runtime_mode != CUDAGraphMode.NONE:
                 raise RuntimeError("Eagle3 Window per-step eager reader received a Graph descriptor")
             inputs = self._eagle3_window_live_inputs
-            if inputs is None or attn_metadata is not self._draft_window_runtime_state.read_metadata(inputs.identity):
+            if inputs is None:
+                raise RuntimeError("Eagle3 Draft forward has no current Window inputs")
+            inputs.validate_for(inputs.identity)
+            if attn_metadata is not inputs.metadata:
                 raise RuntimeError("Eagle3 Draft forward lost its current private Window metadata")
         try:
             result = super()._generate_draft(
@@ -470,12 +467,8 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentA
 
         if not publish:
             return metadata
-        self._draft_window_runtime_state.publish_metadata(
-            inputs,
-            metadata,
-            target_metadata=target_metadata,
-        )
-        return self._draft_window_runtime_state.read_metadata(inputs.identity)
+        inputs.publish(metadata, target_metadata=target_metadata)
+        return metadata
 
     def _build_eagle3_graph_metadata(self, *, workspace: DraftWindowWorkspace, **kwargs: Any) -> dict[str, Any]:
         view = draft_window_read_inputs(
@@ -483,7 +476,7 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentA
             actual_request_count=kwargs["num_reqs"],
             padded_request_count=kwargs["num_reqs_padded"],
             block_tables=self.block_tables.input_block_tables,
-            global_group_id=kwargs["inputs"]._owner.capability.group.gid,
+            global_group_id=kwargs["inputs"]._owner.source.group.gid,
         )
         metadata = self._build_eagle3_private_attn_metadata(**kwargs, read_inputs_override=view, publish=False)
         # The normal nonparallel FIA builder deliberately prefers its CPU

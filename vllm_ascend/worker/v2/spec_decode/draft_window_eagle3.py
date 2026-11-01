@@ -19,7 +19,6 @@ from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftMetadataInputs,
     DraftWindowExecutionPhase,
     DraftWindowGenerationIdentity,
-    DraftWindowRuntimeState,
     DraftWindowSourceCapability,
     gather_valid_num_blocks_cpu,
 )
@@ -30,6 +29,7 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_eager import (
     _requires_prefill_baseline_bypass,
     draft_window_read_inputs,
 )
+from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphBindingProvider
 from vllm_ascend.worker.v2.spec_decode.draft_window_nongraph import (
     DraftWindowBatchPhasePlan,
     DraftWindowPhaseAwareMaterializationPlan,
@@ -82,8 +82,7 @@ class Eagle3DraftWindowMixin:
     materialization, and serialized retirement.
     """
 
-    _draft_window_runtime_state: DraftWindowRuntimeState
-    _draft_window_source_capability: DraftWindowSourceCapability
+    _draft_window_graph_binding_provider: DraftWindowGraphBindingProvider
     _eagle3_window_epoch_source: DraftWindowProposalEpochSource
     _eagle3_window_proposal_context: DraftWindowProposalContext | None
     _eagle3_window_proposal_plan: Eagle3FrozenProposalPlan | None
@@ -108,7 +107,7 @@ class Eagle3DraftWindowMixin:
             raise NotImplementedError("MRV2 Eagle3 Draft Window does not support dynamic speculative decoding")
         if hasattr(self, "_eagle3_window_epoch_source"):
             raise RuntimeError("P4b Eagle3 Draft Window state is already initialized")
-        capability = self._draft_window_source_capability
+        capability = self._draft_window_graph_binding_provider.source
         if self.method != "eagle3" or capability.policy.normalized_method != "eagle3":
             raise RuntimeError("P4b Draft Window state is restricted to normalized Eagle3")
         static_k = self.num_speculative_steps
@@ -207,7 +206,7 @@ class Eagle3DraftWindowMixin:
                     and not live_inputs.retired
                     and not getattr(self, "_draft_window_graph_submission_uncertain", False)
                 ):
-                    self._draft_window_runtime_state.abort_generation(live_inputs.identity)
+                    self._draft_window_graph_binding_provider.abort_generation(live_inputs.identity)
             finally:
                 self._eagle3_window_proposal_context = None
                 self._eagle3_window_proposal_plan = None
@@ -221,7 +220,7 @@ class Eagle3DraftWindowMixin:
 
     def _eagle3_window_is_active(self) -> bool:
         return (
-            hasattr(self, "_draft_window_runtime_state")
+            hasattr(self, "_draft_window_graph_binding_provider")
             and not getattr(self, "_eagle3_window_bypass_active", False)
             and getattr(self, "_eagle3_window_proposal_context", None) is not None
         )
@@ -266,7 +265,7 @@ class Eagle3DraftWindowMixin:
             increment=0,
             max_model_len=self.max_model_len,
         )
-        capability = self._draft_window_source_capability
+        capability = self._draft_window_graph_binding_provider.source
         cpu_valid_num_blocks = self._gather_eagle3_valid_counts(
             num_reqs=num_reqs,
             num_reqs_padded=num_reqs_padded,
@@ -287,7 +286,7 @@ class Eagle3DraftWindowMixin:
             phase_plan=context.phase_plan,
         )
         self._eagle3_window_epoch_source.validate(context, input_batch)
-        inputs = self._draft_window_runtime_state.materialize(
+        inputs = self._draft_window_graph_binding_provider.materialize(
             proposal=context,
             idx_mapping=input_batch.idx_mapping,
             read_descriptors=step_plan.read_descriptors,
@@ -308,7 +307,7 @@ class Eagle3DraftWindowMixin:
             if getattr(self, "_eagle3_graph_session", None) is not None:
                 self._quarantine_eagle3_window()
             else:
-                self._draft_window_runtime_state.abort_generation(inputs.identity)
+                self._draft_window_graph_binding_provider.abort_generation(inputs.identity)
                 self._eagle3_window_live_inputs = None
                 self._eagle3_window_proposal_plan = None
             raise
@@ -401,7 +400,7 @@ class Eagle3DraftWindowMixin:
             num_reqs_padded=num_reqs_padded,
         )
         step_plan = build_eagle3_step_materialization_plan(
-            source=self._draft_window_source_capability,
+            source=self._draft_window_graph_binding_provider.source,
             proposal=proposal,
             cpu_full_exact=cpu_exact,
             cpu_apply_time_full_upper=cpu_upper,
@@ -411,7 +410,7 @@ class Eagle3DraftWindowMixin:
             padded_request_count=num_reqs_padded,
         )
         self._eagle3_window_epoch_source.validate(context, input_batch)
-        inputs = self._draft_window_runtime_state.materialize_serialized_step(
+        inputs = self._draft_window_graph_binding_provider.materialize_serialized_step(
             previous_identity=previous_identity,
             proposal=context,
             idx_mapping=input_batch.idx_mapping,
@@ -431,7 +430,7 @@ class Eagle3DraftWindowMixin:
             if getattr(self, "_eagle3_graph_session", None) is not None:
                 self._quarantine_eagle3_window()
             else:
-                self._draft_window_runtime_state.abort_generation(inputs.identity)
+                self._draft_window_graph_binding_provider.abort_generation(inputs.identity)
                 self._eagle3_window_live_inputs = None
             raise
         return inputs
@@ -448,7 +447,7 @@ class Eagle3DraftWindowMixin:
             actual_request_count=len(expected_identity.proposal.ordered_request_ids),
             padded_request_count=expected_identity.padded_request_count,
             block_tables=self.block_tables.input_block_tables,
-            global_group_id=inputs._owner.capability.group.gid,
+            global_group_id=inputs._owner.source.group.gid,
         )
 
     def _finish_eagle3_window_step(
@@ -466,19 +465,19 @@ class Eagle3DraftWindowMixin:
             return
         try:
             if succeeded:
-                self._draft_window_runtime_state.retire_generation(inputs.identity)
+                self._draft_window_graph_binding_provider.retire_generation(inputs.identity)
                 self._eagle3_window_last_identity = inputs.identity
                 self._eagle3_window_next_step = inputs.identity.step + 1
             else:
                 if not inputs.retired:
-                    self._draft_window_runtime_state.abort_generation(inputs.identity)
+                    self._draft_window_graph_binding_provider.abort_generation(inputs.identity)
                 self._eagle3_window_last_identity = None
         except BaseException:
             if graph_session is not None:
                 self._quarantine_eagle3_window()
             else:
                 if not inputs.retired:
-                    self._draft_window_runtime_state.abort_generation(inputs.identity)
+                    self._draft_window_graph_binding_provider.abort_generation(inputs.identity)
                 self._eagle3_window_last_identity = None
                 self._eagle3_window_live_inputs = None
             raise
@@ -487,7 +486,7 @@ class Eagle3DraftWindowMixin:
     def _quarantine_eagle3_window(self) -> None:
         """Keep actual banks alive after an uncertain partial submission."""
         self._draft_window_graph_submission_uncertain = True
-        runtime = self._draft_window_runtime_state
+        runtime = self._draft_window_graph_binding_provider
         if runtime._active_inputs is not None and runtime.quarantined_identity is None:
             runtime.quarantine_generation(runtime._active_inputs.identity)
 
@@ -509,7 +508,7 @@ class Eagle3DraftWindowMixin:
         num_reqs: int,
         num_reqs_padded: int,
     ) -> torch.Tensor:
-        capability = self._draft_window_source_capability
+        capability = self._draft_window_graph_binding_provider.source
         return gather_valid_num_blocks_cpu(
             capability.full_source,
             global_group_id=capability.group.gid,

@@ -23,11 +23,9 @@ from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftMetadataInputs,
     DraftWindowExecutionPhase,
     DraftWindowGenerationIdentity,
-    DraftWindowRuntimeState,
-    DraftWindowSourceCapability,
-    build_draft_window_runtime_state,
     gather_valid_num_blocks_cpu,
 )
+from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphBindingProvider
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph_metadata import copy_draft_attention_metadata
 from vllm_ascend.worker.v2.spec_decode.draft_window_nongraph import (
     DraftWindowBatchPhasePlan,
@@ -272,8 +270,7 @@ class DraftWindowGraphInputMixin:
 
     _speculator_name: str
     _group_causal: bool | Mapping[int, bool]
-    _draft_window_runtime_state: DraftWindowRuntimeState
-    _draft_window_source_capability: DraftWindowSourceCapability
+    _draft_window_graph_binding_provider: DraftWindowGraphBindingProvider
     _draft_window_epoch_source: DraftWindowProposalEpochSource
     _draft_window_proposal_context: DraftWindowProposalContext | None
     _draft_window_live_inputs: DraftMetadataInputs | None
@@ -299,10 +296,7 @@ class DraftWindowGraphInputMixin:
         policy = getattr(self, "_draft_window_policy", None)
         if policy is None:
             return
-        if hasattr(self, "_draft_window_source_capability") or hasattr(
-            self,
-            "_draft_window_runtime_state",
-        ):
+        if hasattr(self, "_draft_window_graph_binding_provider"):
             raise RuntimeError("draft-window runtime ownership is already initialized")
         if hasattr(self, "_draft_window_runtime"):
             raise RuntimeError("Graph Window cannot replace the typed eager runtime")
@@ -318,13 +312,11 @@ class DraftWindowGraphInputMixin:
             vllm_config=self.vllm_config,
             dflash2_graph_contract=getattr(self, "_dflash2_graph_contract", None),
         )
-        runtime_state = build_draft_window_runtime_state(capability)
-        self._draft_window_source_capability = capability
-        self._draft_window_runtime_state = runtime_state
+        self._draft_window_graph_binding_provider = DraftWindowGraphBindingProvider(source=capability)
         self._initialize_draft_window_graph_inputs()
 
     def _initialize_draft_window_graph_inputs(self) -> None:
-        if not hasattr(self, "_draft_window_runtime_state"):
+        if not hasattr(self, "_draft_window_graph_binding_provider"):
             raise RuntimeError("P4a eager state requires initialized P3 runtime state")
         if hasattr(self, "_draft_window_epoch_source"):
             raise RuntimeError("P4a eager state is already initialized")
@@ -353,7 +345,7 @@ class DraftWindowGraphInputMixin:
         if epoch_source is None:
             yield
             return
-        if self._draft_window_runtime_state.quarantined_identity is not None or getattr(
+        if self._draft_window_graph_binding_provider.quarantined_identity is not None or getattr(
             self, "_draft_window_graph_submission_uncertain", False
         ):
             raise RuntimeError("draft-window backing is quarantined after uncertain Graph submission")
@@ -413,14 +405,14 @@ class DraftWindowGraphInputMixin:
                 if live_inputs is not None and not live_inputs.retired:
                     if succeeded:
                         try:
-                            self._draft_window_runtime_state.retire_generation(live_inputs.identity)
+                            self._draft_window_graph_binding_provider.retire_generation(live_inputs.identity)
                         except BaseException:
                             self._draft_window_graph_submission_uncertain = True
                             succeeded = False
                             raise
                     else:
                         # Retain uncertain backing without device RPC on unwind.
-                        self._draft_window_runtime_state.quarantine_generation(live_inputs.identity)
+                        self._draft_window_graph_binding_provider.quarantine_generation(live_inputs.identity)
                 elif succeeded:
                     raise RuntimeError("Draft Graph proposal completed without consuming its current inputs")
             finally:
@@ -474,7 +466,7 @@ class DraftWindowGraphInputMixin:
                 out=cpu_apply_time_full_upper[:num_reqs],
             )
             cpu_apply_time_full_upper[:num_reqs].clamp_(max=self.max_model_len)
-        capability = self._draft_window_source_capability
+        capability = self._draft_window_graph_binding_provider.source
         valid_num_blocks = gather_valid_num_blocks_cpu(
             capability.full_source,
             global_group_id=capability.group.gid,
@@ -493,7 +485,7 @@ class DraftWindowGraphInputMixin:
         )
         # Recheck freshness after the controlled length snapshot and host plan.
         self._draft_window_epoch_source.validate(context, input_batch)
-        inputs = self._draft_window_runtime_state.materialize(
+        inputs = self._draft_window_graph_binding_provider.materialize(
             proposal=context,
             idx_mapping=input_batch.idx_mapping,
             read_descriptors=plan.read_descriptors,
@@ -520,7 +512,7 @@ class DraftWindowGraphInputMixin:
             actual_request_count=len(expected_identity.proposal.ordered_request_ids),
             padded_request_count=expected_identity.padded_request_count,
             block_tables=self.block_tables.input_block_tables,
-            global_group_id=inputs._owner.capability.group.gid,
+            global_group_id=inputs._owner.source.group.gid,
         )
 
     def _build_draft_attn_metadata(
@@ -535,8 +527,8 @@ class DraftWindowGraphInputMixin:
         query_start_loc_np: np.ndarray | None = None,
         dcp_local_seq_lens: torch.Tensor | None = None,
     ) -> dict[str, Any] | None:
-        runtime_state = getattr(self, "_draft_window_runtime_state", None)
-        if runtime_state is None or getattr(self, "_draft_window_bypass_active", False):
+        provider = getattr(self, "_draft_window_graph_binding_provider", None)
+        if provider is None or getattr(self, "_draft_window_bypass_active", False):
             return super()._build_draft_attn_metadata(  # type: ignore[misc]
                 num_reqs,
                 num_reqs_padded,
@@ -594,12 +586,8 @@ class DraftWindowGraphInputMixin:
         if self.model_state.attn_metadata is not target_metadata:
             raise RuntimeError("Target metadata owner changed during Draft metadata build")
         metadata = copy_draft_attention_metadata(metadata)
-        runtime_state.publish_metadata(
-            inputs,
-            metadata,
-            target_metadata=target_metadata,
-        )
-        return runtime_state.read_metadata(inputs.identity)
+        inputs.publish(metadata, target_metadata=target_metadata)
+        return metadata
 
     def _require_nonempty_target_metadata(self) -> Mapping[Any, Any]:
         target_metadata = self.model_state.attn_metadata

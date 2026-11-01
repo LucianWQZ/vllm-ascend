@@ -158,7 +158,7 @@ class AscendDSparkSpeculator(DraftWindowGraphInputMixin, LmheadTPDraftSamplingMi
         # It needs this speculator to update full-graph params, so set it here.
         self.query_cudagraph_manager.speculator = self
         self.query_cudagraph_manager.update_stream = self.update_stream
-        if hasattr(self, "_draft_window_runtime_state"):
+        if hasattr(self, "_draft_window_graph_binding_provider"):
             if not draft_window_graph_enabled():
                 raise RuntimeError("Draft Graph configuration changed during initialization")
             install_parallel_graph(self)
@@ -316,7 +316,7 @@ class AscendDSparkSpeculator(DraftWindowGraphInputMixin, LmheadTPDraftSamplingMi
     def build_draft_attn_metadatas(self, num_reqs_padded, seq_lens_cpu_upper_bound):
         from vllm_ascend.worker.v2.spec_decode.draft_window_graph_metadata import is_parallel_graph_dp_dummy
 
-        if hasattr(self, "_draft_window_runtime_state") and not is_parallel_graph_dp_dummy(self):
+        if hasattr(self, "_draft_window_graph_binding_provider") and not is_parallel_graph_dp_dummy(self):
             graph_metadata = consume_draft_window_graph_metadata(
                 self, route=DraftWindowGraphRoute.DSPARK, expected_consumer_count=1
             )
@@ -368,7 +368,9 @@ class AscendDSparkSpeculator(DraftWindowGraphInputMixin, LmheadTPDraftSamplingMi
         slot_mappings: torch.Tensor | None = None,
     ) -> dict[str, Any] | None:
         """Build Ascend draft metadata through the upstream attention hook."""
-        if hasattr(self, "_draft_window_runtime_state") and not getattr(self, "_draft_window_bypass_active", False):
+        if hasattr(self, "_draft_window_graph_binding_provider") and not getattr(
+            self, "_draft_window_bypass_active", False
+        ):
             # The Graph read transport owns the current exact CPU/device pair.
             # Do not run PR eager projection or its CPU-upper preparer again.
             input_batch = self.input_batch
