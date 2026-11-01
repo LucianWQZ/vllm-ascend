@@ -650,9 +650,9 @@ def full_metadata_finalization():
 
 def test_full_graph_final_metadata_preserves_group_aliases_and_canonical_write_state(full_metadata_finalization):
     case = full_metadata_finalization
-    from vllm_ascend.attention.attention_v1 import AscendMetadata
+    from vllm_ascend.attention.attention_v1 import AscendAttentionState, AscendMetadata
 
-    layer = AscendMetadata(attn_state=object())
+    layer = AscendMetadata(attn_state=AscendAttentionState.ChunkedPrefill)
     metadata = {"draft.a": layer, "draft.b": layer, "unused": None}
     result = case.finalize(metadata)
     assert result is metadata and result["draft.a"] is result["draft.b"] is layer
