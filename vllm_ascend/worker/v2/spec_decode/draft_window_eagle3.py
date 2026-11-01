@@ -19,7 +19,6 @@ from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftMetadataInputs,
     DraftWindowExecutionPhase,
     DraftWindowGenerationIdentity,
-    DraftWindowReadDescriptor,
     DraftWindowRuntimeState,
     DraftWindowSourceCapability,
     SingleGroupDirectPrefixProvider,
@@ -30,10 +29,12 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_eager import (
     DraftWindowProposalContext,
     DraftWindowProposalEpochSource,
     _requires_prefill_baseline_bypass,
+    draft_window_read_inputs,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_nongraph import (
     DraftWindowBatchPhasePlan,
-    DraftWindowRowPhase,
+    DraftWindowPhaseAwareMaterializationPlan,
+    build_phase_aware_materialization_plan,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_plan import DraftWindowPlan, compute_draft_window_plan
 
@@ -71,19 +72,6 @@ class Eagle3FrozenProposalPlan:
         for row_plan in self.row_plans:
             if row_plan.full_horizon_end - row_plan.full_exact_end != self.static_k:
                 raise ValueError("Eagle3 proposal rows must use the configured static K")
-
-
-@dataclass(frozen=True, slots=True)
-class Eagle3StepMaterializationPlan:
-    """Host descriptor/length snapshot for one proposal step."""
-
-    step: int
-    read_descriptors: tuple[DraftWindowReadDescriptor, ...]
-    cpu_window_exact: torch.Tensor
-    cpu_window_upper: torch.Tensor
-    cpu_valid_num_blocks: torch.Tensor
-    window_starts: tuple[int, ...]
-    row_phase_fingerprint: tuple[str, ...]
 
 
 class Eagle3DraftWindowMixin:
@@ -459,21 +447,12 @@ class Eagle3DraftWindowMixin:
     ) -> AscendDraftAttentionReadInputs:
         """The one formal P4b validation/narrowing boundary before building."""
         inputs.validate_for(expected_identity)
-        workspace = inputs.workspace
-        padded = expected_identity.padded_request_count
-        gid = inputs._owner.capability.provider.global_group_id
-        block_tables = tuple(
-            workspace.window_block_table[:padded] if group_id == gid else full_table[:padded]
-            for group_id, full_table in enumerate(self.block_tables.input_block_tables)
-        )
-        active_upper = workspace.cpu_window_upper[: expected_identity.actual_request_count]
-        max_seq_len = int(active_upper.max().item()) if active_upper.numel() else 0
-        return AscendDraftAttentionReadInputs(
-            block_tables=block_tables,
-            seq_lens=workspace.device_window_exact[:padded],
-            seq_lens_cpu_exact=workspace.cpu_window_exact[:padded],
-            seq_lens_cpu_upper_bound=workspace.cpu_window_upper[:padded],
-            max_seq_len=max_seq_len,
+        return draft_window_read_inputs(
+            inputs.workspace,
+            actual_request_count=expected_identity.actual_request_count,
+            padded_request_count=expected_identity.padded_request_count,
+            block_tables=self.block_tables.input_block_tables,
+            global_group_id=inputs._owner.capability.provider.global_group_id,
         )
 
     def _finish_eagle3_window_step(
@@ -586,9 +565,9 @@ def build_eagle3_step_materialization_plan(
     cpu_apply_time_full_upper: torch.Tensor,
     cpu_valid_num_blocks: torch.Tensor,
     step: int,
-    phase_plan: DraftWindowBatchPhasePlan | None = None,
+    phase_plan: DraftWindowBatchPhasePlan,
     padded_request_count: int | None = None,
-) -> Eagle3StepMaterializationPlan:
+) -> DraftWindowPhaseAwareMaterializationPlan:
     """Project one real ``E_s`` without recomputing the proposal anchor."""
     if not isinstance(step, int) or isinstance(step, bool):
         raise TypeError("Eagle3 proposal step must be a Python int")
@@ -605,80 +584,21 @@ def build_eagle3_step_materialization_plan(
     _validate_counts(proposal.actual_request_count, padded)
     if step == 0 and padded != proposal.padded_request_count:
         raise ValueError("first-pass consumer padding must match its frozen proposal layout")
-    for name, tensor in (
-        ("full exact", cpu_full_exact),
-        ("apply-time full upper", cpu_apply_time_full_upper),
-        ("valid block counts", cpu_valid_num_blocks),
-    ):
-        _validate_cpu_int32_vector(
-            tensor,
-            name=name,
-            padded_request_count=padded,
-        )
-
-    cpu_window_exact = torch.zeros(padded, dtype=torch.int32)
-    cpu_window_upper = torch.zeros(padded, dtype=torch.int32)
-    descriptors: list[DraftWindowReadDescriptor] = []
-    window_starts: list[int] = []
-    if phase_plan is None:
-        row_phases = (DraftWindowRowPhase.PURE_DECODE,) * proposal.actual_request_count
-    else:
-        if len(phase_plan.row_phases) != proposal.actual_request_count:
-            raise ValueError("Eagle3 row phase plan does not match active requests")
-        row_phases = phase_plan.row_phases
-    for row, proposal_row in enumerate(proposal.row_plans):
-        full_exact = int(cpu_full_exact[row].item())
-        full_upper = int(cpu_apply_time_full_upper[row].item())
-        valid_num_blocks = int(cpu_valid_num_blocks[row].item())
-        if step == 0 and full_exact != proposal_row.full_exact_end:
-            raise ValueError("Eagle3 first-pass exact end must equal proposal-entry L0")
-        if full_upper < full_exact:
-            raise ValueError("apply-time full upper must be greater than or equal to exact")
-        if row_phases[row] is DraftWindowRowPhase.PREFILL_CONTINUING:
-            source_width = provider.full_source.input_block_table_row_width(provider.global_group_id)
-            if valid_num_blocks < 0 or valid_num_blocks > source_width:
-                raise RuntimeError("Eagle3 resident extent is outside the canonical source row")
-            safe_extent = valid_num_blocks * provider.block_span_tokens
-            if safe_extent < full_exact:
-                raise RuntimeError("Eagle3 continuing-prefill full read exceeds resident source")
-            descriptor = DraftWindowReadDescriptor(
-                global_group_id=provider.global_group_id,
-                source_start_column=0,
-                first_token_offset=0,
-                required_columns=valid_num_blocks,
-                safe_extent_tokens=safe_extent,
-                valid_num_blocks=valid_num_blocks,
-                source_row_width=source_width,
-            )
-            visible = full_exact
-            window_start = 0
-            window_upper = min(max(full_upper, visible), safe_extent)
-        else:
-            descriptor = provider.describe_frozen_step(
-                proposal_row,
-                full_exact_end=full_exact,
-                valid_num_blocks=valid_num_blocks,
-            )
-            visible = full_exact - proposal_row.window_start
-            raw_upper = max(full_upper - proposal_row.window_start, visible)
-            window_upper = min(raw_upper, descriptor.safe_extent_tokens)
-            window_start = proposal_row.window_start
-        if window_upper < visible:
-            raise RuntimeError("Eagle3 Window upper is shorter than Window exact")
-        descriptors.append(descriptor)
-        window_starts.append(window_start)
-        cpu_window_exact[row] = visible
-        cpu_window_upper[row] = window_upper
-
-    return Eagle3StepMaterializationPlan(
-        step=step,
-        read_descriptors=tuple(descriptors),
-        cpu_window_exact=cpu_window_exact,
-        cpu_window_upper=cpu_window_upper,
+    result = build_phase_aware_materialization_plan(
+        provider=provider,
+        phase_plan=phase_plan,
+        cpu_full_exact=cpu_full_exact,
+        cpu_apply_time_full_upper=cpu_apply_time_full_upper,
         cpu_valid_num_blocks=cpu_valid_num_blocks,
-        window_starts=tuple(window_starts),
-        row_phase_fingerprint=tuple(phase.value for phase in row_phases),
+        actual_request_count=proposal.actual_request_count,
+        padded_request_count=padded,
+        frozen_row_plans=proposal.row_plans,
     )
+    if step == 0 and any(
+        int(cpu_full_exact[row]) != plan.full_exact_end for row, plan in enumerate(proposal.row_plans)
+    ):
+        raise ValueError("Eagle3 first-pass exact end must equal proposal-entry L0")
+    return result
 
 
 def _validate_counts(actual_request_count: int, padded_request_count: int) -> None:

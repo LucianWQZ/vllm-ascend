@@ -26,7 +26,6 @@ from vllm_ascend.worker.v2.spec_decode.draft_window import (
 from vllm_ascend.worker.v2.spec_decode.draft_window_eagle3_graph import Eagle3GraphStagingOwner
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
     DraftWindowGraphCaptureIdentity,
-    DraftWindowGraphMetadataBuild,
     DraftWindowGraphRoute,
     DraftWindowGraphWriteSideReference,
     install_draft_window_graph_binding_provider,
@@ -259,7 +258,7 @@ class Eagle3GraphSession:
                 )
                 if hasattr(layer, "positions"):
                     layer.positions = write.positions
-            return DraftWindowGraphMetadataBuild(metadata=private)
+            return private
 
         self.controller.publish_step(
             capture_identity=identity,

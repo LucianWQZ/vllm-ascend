@@ -192,8 +192,7 @@ def test_native_source_keeps_actual_mask_and_exact_boundary(module, owner):
     with pytest.raises(ValueError, match="original noncausal native band"):
         validate_source(contract, owner, window_size=1914)
     assert contract.layers[0].mask is mask
-    assert contract.host_header()["native_layers"][0]["native_window"] == 2048
-    assert contract.host_header()["scope"] == "HOST_OWNERS_NOT_COMPLETION_OR_HARDWARE_READ_SET"
+    assert contract.layers[0].native_window == 2048
 
 
 def test_full_only_source_host_contract_does_not_fake_native_model(module, owner):

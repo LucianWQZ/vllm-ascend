@@ -279,44 +279,6 @@ class DFlash2GraphContract:
             )
         return {gid: native}
 
-    def host_header(self) -> dict[str, Any]:
-        """Small startup contract inventory, not a device execution observation."""
-        return dict(
-            schema="dflash2-graph-owned-selector-native-source-v1",
-            k=self.num_steps,
-            query_width=self.query_width,
-            top_k=self.top_k,
-            max_num_reqs=self.max_num_reqs,
-            sampling_mode=self.sampling_mode,
-            model_owner=self.model_id,
-            selector_owner=self.selector_id,
-            sampler_owner=self.sampler_id,
-            static_forward_context_owner=self.static_context_id,
-            block_tables_owner=self.block_tables_id,
-            buffers=[
-                dict(
-                    name=b.name,
-                    owner=id(b.tensor),
-                    address=b.address,
-                    shape=b.shape,
-                    stride=b.stride,
-                    dtype=b.dtype,
-                    device=b.device,
-                )
-                for b in self.buffers
-            ],
-            native_layers=[
-                dict(
-                    name=layer.name,
-                    impl_owner=id(layer.impl),
-                    native_window=layer.native_window,
-                    mask_address=layer.mask_address,
-                )
-                for layer in self.layers
-            ],
-            scope="HOST_OWNERS_NOT_COMPLETION_OR_HARDWARE_READ_SET",
-        )
-
 
 def validate_dflash2_graph_source(owner: Any) -> DFlash2GraphContract:
     """Bind one loaded DFlash2 model's existing addresses, never allocate KV.

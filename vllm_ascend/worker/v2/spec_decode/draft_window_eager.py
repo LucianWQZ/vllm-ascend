@@ -11,7 +11,7 @@ untouched. The upstream vLLM checkout remains unmodified.
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import numpy as np
 import torch
@@ -25,6 +25,7 @@ from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftWindowGenerationIdentity,
     DraftWindowRuntimeState,
     DraftWindowSourceCapability,
+    build_draft_window_runtime_state,
     gather_valid_num_blocks_cpu,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph_metadata import copy_draft_attention_metadata
@@ -33,9 +34,6 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_nongraph import (
     build_phase_aware_materialization_plan,
     classify_draft_window_batch_phase,
 )
-
-if TYPE_CHECKING:
-    from vllm_ascend.worker.v2.spec_decode.draft_window_swa_graph import NativeSWAFullSnapshot
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,6 +198,28 @@ class DraftWindowProposalEpochSource:
         self._active = None
 
 
+def draft_window_read_inputs(
+    workspace: Any,
+    *,
+    actual_request_count: int,
+    padded_request_count: int,
+    block_tables: Any,
+    global_group_id: int,
+) -> AscendDraftAttentionReadInputs:
+    """Narrow one real scratch/capture bank to its builder's request rows."""
+    active_upper = workspace.cpu_window_upper[:actual_request_count]
+    return AscendDraftAttentionReadInputs(
+        block_tables=tuple(
+            (workspace.window_block_table if gid == global_group_id else table)[:padded_request_count]
+            for gid, table in enumerate(block_tables)
+        ),
+        seq_lens=workspace.device_window_exact[:padded_request_count],
+        seq_lens_cpu_exact=workspace.cpu_window_exact[:padded_request_count],
+        seq_lens_cpu_upper_bound=workspace.cpu_window_upper[:padded_request_count],
+        max_seq_len=int(active_upper.max().item()) if active_upper.numel() else 0,
+    )
+
+
 def build_draft_window_attn_metadata(
     owner: Any,
     *,
@@ -219,22 +239,6 @@ def build_draft_window_attn_metadata(
     small Ascend seam shared by parallel drafting and Eagle's first/AR reads;
     proposal, position, write-slot preparation and sampling remain upstream.
     """
-    native_swa = getattr(getattr(owner, "_draft_window_source_capability", None), "native_swa_graph", None)
-    if native_swa is not None and attn_groups is None:
-        from vllm_ascend.worker.v2.spec_decode.draft_window_swa_graph import build_group_metadata
-
-        return build_group_metadata(
-            owner,
-            read_inputs=read_inputs,
-            builder_kwargs=dict(
-                num_reqs=num_reqs,
-                num_reqs_padded=num_reqs_padded,
-                num_tokens_padded=num_tokens_padded,
-                causal=causal,
-                query_start_loc_np=query_start_loc_np,
-                dcp_local_seq_lens=dcp_local_seq_lens,
-            ),
-        )
     if query_width is None:
         query_width = owner.num_query_per_req
     if query_start_loc_np is None:
@@ -286,6 +290,8 @@ def build_draft_window_attn_metadata(
 class DraftWindowGraphInputMixin:
     """Proposal input ownership for DFlash, DFlash2 and eligible DSpark Graph."""
 
+    _speculator_name: str
+    _group_causal: bool | Mapping[int, bool]
     _draft_window_runtime_state: DraftWindowRuntimeState
     _draft_window_source_capability: DraftWindowSourceCapability
     _draft_window_epoch_source: DraftWindowProposalEpochSource
@@ -308,6 +314,37 @@ class DraftWindowGraphInputMixin:
     num_query_per_req: int
     max_model_len: int
 
+    def _initialize_draft_window_source_capability(self) -> None:
+        """Atomically bind eligible P2 source and P3 ownership state."""
+        policy = getattr(self, "_draft_window_policy", None)
+        if policy is None:
+            return
+        if hasattr(self, "_draft_window_source_capability") or hasattr(
+            self,
+            "_draft_window_runtime_state",
+        ):
+            raise RuntimeError("draft-window runtime ownership is already initialized")
+        if hasattr(self, "_draft_window_runtime"):
+            raise RuntimeError("Graph Window cannot replace the typed eager runtime")
+        from vllm_ascend.worker.v2.spec_decode.draft_window_graph_runtime import build_parallel_graph_source
+
+        capability, graph_context = build_parallel_graph_source(
+            policy=policy,
+            runtime_route=self._speculator_name.lower(),
+            attn_groups=self.attn_groups,
+            block_tables=self.block_tables,
+            kv_cache_config=self.kv_cache_config,
+            causal=self._group_causal,
+            vllm_config=self.vllm_config,
+            input_buffers=self.input_buffers,
+            dflash2_graph_contract=getattr(self, "_dflash2_graph_contract", None),
+        )
+        runtime_state = build_draft_window_runtime_state(capability)
+        self._draft_window_source_capability = capability
+        self._draft_window_runtime_state = runtime_state
+        self._initialize_draft_window_graph_inputs()
+        self._draft_window_graph_context = graph_context
+
     def _initialize_draft_window_graph_inputs(self) -> None:
         if not hasattr(self, "_draft_window_runtime_state"):
             raise RuntimeError("P4a eager state requires initialized P3 runtime state")
@@ -321,7 +358,6 @@ class DraftWindowGraphInputMixin:
         self._draft_window_dp_dummy_active = False
         self._draft_window_selected_metadata = None
         self._draft_window_deferred_metadata = None
-        self._draft_window_native_full_snapshot: NativeSWAFullSnapshot | None = None
 
     @contextmanager
     def _draft_window_proposal_scope(
@@ -414,8 +450,6 @@ class DraftWindowGraphInputMixin:
                 self._draft_window_proposal_context = None
                 self._draft_window_selected_metadata = None
                 self._draft_window_deferred_metadata = None
-                if succeeded:
-                    self._draft_window_native_full_snapshot = None
                 epoch_source.finish(context)
 
     def _snapshot_prepared_draft_seq_lens(
@@ -496,19 +530,6 @@ class DraftWindowGraphInputMixin:
             quarantine_on_failure=hasattr(self, "_draft_window_graph_session"),
             output_workspace=output_workspace,
         )
-        if capability.native_swa_graph is not None:
-            from vllm_ascend.worker.v2.spec_decode.draft_window_swa_graph import NativeSWAFullSnapshot
-
-            if self._draft_window_native_full_snapshot is not None:
-                raise RuntimeError("native SWA full-length snapshot was not retired")
-            snapshot = NativeSWAFullSnapshot(
-                inputs.identity,
-                cpu_full_exact,
-                cpu_apply_time_full_upper,
-                self.input_buffers.seq_lens[:num_reqs_padded],
-            )
-            self._draft_window_native_full_snapshot = snapshot
-            snapshot.validate(inputs.identity, capability.native_swa_graph)
         return inputs
 
     def _validated_draft_attention_read_inputs(
@@ -518,21 +539,12 @@ class DraftWindowGraphInputMixin:
     ) -> AscendDraftAttentionReadInputs:
         """The single formal P4a validation and transport-narrowing boundary."""
         inputs.validate_for(expected_identity)
-        workspace = inputs.workspace
-        padded = expected_identity.padded_request_count
-        global_group_id = inputs._owner.capability.provider.global_group_id
-        block_tables = tuple(
-            (workspace.window_block_table[:padded] if gid == global_group_id else full_table[:padded])
-            for gid, full_table in enumerate(self.block_tables.input_block_tables)
-        )
-        active_upper = workspace.cpu_window_upper[: expected_identity.actual_request_count]
-        max_seq_len = int(active_upper.max().item()) if active_upper.numel() else 0
-        return AscendDraftAttentionReadInputs(
-            block_tables=block_tables,
-            seq_lens=workspace.device_window_exact[:padded],
-            seq_lens_cpu_exact=workspace.cpu_window_exact[:padded],
-            seq_lens_cpu_upper_bound=workspace.cpu_window_upper[:padded],
-            max_seq_len=max_seq_len,
+        return draft_window_read_inputs(
+            inputs.workspace,
+            actual_request_count=expected_identity.actual_request_count,
+            padded_request_count=expected_identity.padded_request_count,
+            block_tables=self.block_tables.input_block_tables,
+            global_group_id=inputs._owner.capability.provider.global_group_id,
         )
 
     def _build_draft_attn_metadata(

@@ -27,9 +27,9 @@ def graph_source_initialization(request, monkeypatch):
     """Exercise actual owner initialization without loading a device model."""
     method = request.param
     paths = {
-        "dspark": ("dspark/speculator.py", "AscendDSparkSpeculator"),
-        "dflash": ("dflash/speculator.py", "AscendDFlashSpeculator"),
-        "dflash2": ("dflash/speculator.py", "AscendDFlashSpeculator"),
+        "dspark": ("draft_window_eager.py", "DraftWindowGraphInputMixin"),
+        "dflash": ("draft_window_eager.py", "DraftWindowGraphInputMixin"),
+        "dflash2": ("draft_window_eager.py", "DraftWindowGraphInputMixin"),
         "eagle3": ("draft_window_eagle3_adapter.py", "Eagle3GraphIntegrationMixin"),
     }
     relative, class_name = paths[method]
@@ -45,6 +45,10 @@ def graph_source_initialization(request, monkeypatch):
     capture = ModuleType(capture_name)
     capture.__dict__["build_eagle3_graph_source"] = build_source
     monkeypatch.setitem(sys.modules, capture_name, capture)
+    graph_runtime_name = "vllm_ascend.worker.v2.spec_decode.draft_window_graph_runtime"
+    graph_runtime = ModuleType(graph_runtime_name)
+    graph_runtime.__dict__["build_parallel_graph_source"] = build_source
+    monkeypatch.setitem(sys.modules, graph_runtime_name, graph_runtime)
     namespace = {"build_parallel_graph_source": build_source, "build_draft_window_runtime_state": build_state}
     exec(compile(ast.Module(body=[initialize], type_ignores=[]), str(path), "exec"), namespace)
     owner = SimpleNamespace(

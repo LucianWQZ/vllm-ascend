@@ -13,7 +13,7 @@ from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftWindowReadDescriptor,
     SingleGroupDirectPrefixProvider,
 )
-from vllm_ascend.worker.v2.spec_decode.draft_window_plan import compute_draft_window_plan
+from vllm_ascend.worker.v2.spec_decode.draft_window_plan import DraftWindowPlan, compute_draft_window_plan
 from vllm_ascend.worker.v2.spec_decode.draft_window_runtime import continuing_prefill_rows
 
 
@@ -115,9 +115,12 @@ def build_phase_aware_materialization_plan(
     cpu_valid_num_blocks: torch.Tensor,
     actual_request_count: int,
     padded_request_count: int,
+    frozen_row_plans: tuple[DraftWindowPlan, ...] | None = None,
 ) -> DraftWindowPhaseAwareMaterializationPlan:
     if len(phase_plan.row_phases) != actual_request_count:
         raise ValueError("row phase plan does not match active request count")
+    if frozen_row_plans is not None and len(frozen_row_plans) != actual_request_count:
+        raise ValueError("frozen window plans must match active request count")
     for name, tensor in (
         ("full exact", cpu_full_exact),
         ("apply-time full upper", cpu_apply_time_full_upper),
@@ -157,14 +160,17 @@ def build_phase_aware_materialization_plan(
             visible = full_exact
             visible_upper = min(max(full_upper, visible), safe_extent)
         else:
-            scalar = compute_draft_window_plan(
-                full_exact_end=full_exact,
-                future_offset=0,
-                window_size=provider.inventory.window_size,
-                block_span_tokens=provider.legacy_block_size,
-            )
-            descriptor = provider.describe(scalar, valid_num_blocks=valid)
-            visible = scalar.window_visible_length
+            if frozen_row_plans is None:
+                scalar = compute_draft_window_plan(
+                    full_exact_end=full_exact,
+                    window_size=provider.inventory.window_size,
+                    block_span_tokens=provider.legacy_block_size,
+                )
+                descriptor = provider.describe(scalar, valid_num_blocks=valid)
+            else:
+                scalar = frozen_row_plans[row]
+                descriptor = provider.describe_frozen_step(scalar, full_exact_end=full_exact, valid_num_blocks=valid)
+            visible = full_exact - scalar.window_start
             visible_upper = min(
                 max(full_upper - scalar.window_start, visible),
                 descriptor.safe_extent_tokens,

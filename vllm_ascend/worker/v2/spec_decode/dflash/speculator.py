@@ -20,18 +20,12 @@ from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 
 from vllm_ascend.ops.triton.v2.spec_decode.prepare_dflash_inputs import prepare_dflash_inputs_triton
 from vllm_ascend.worker.v2.attn_utils import build_attn_metadata_factory, build_attn_metadata_wrapper
-from vllm_ascend.worker.v2.spec_decode.draft_window import (
-    DraftWindowPolicyDecision,
-    DraftWindowPolicyState,
-    build_draft_window_runtime_state,
-)
 from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowGraphInputMixin
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
     DraftWindowGraphRoute,
     consume_draft_window_graph_metadata,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph_runtime import (
-    build_parallel_graph_source,
     draft_window_graph_enabled,
     install_parallel_graph,
 )
@@ -289,46 +283,6 @@ def _build_graph_uniform_metadata(
 
 
 class AscendDFlashSpeculator(DraftWindowGraphInputMixin, LmheadTPDraftSamplingMixin, DFlashSpeculator):
-    def _configure_draft_window(self, decision: DraftWindowPolicyDecision) -> None:
-        """Attach the eligible P1 policy contract without enabling a window."""
-        if decision.state is not DraftWindowPolicyState.ELIGIBLE_ON:
-            raise ValueError("draft-window owner requires an ELIGIBLE_ON policy decision")
-        if hasattr(self, "_draft_window_policy"):
-            raise RuntimeError("draft-window policy is already configured")
-        if hasattr(self, "draft_window_policy") or hasattr(self, "_draft_window_runtime"):
-            raise RuntimeError("Graph Window cannot attach to an existing typed eager policy or owner")
-        self._draft_window_policy = decision
-
-    def _initialize_draft_window_source_capability(self) -> None:
-        """Atomically bind eligible P2 source and P3 ownership state."""
-        policy = getattr(self, "_draft_window_policy", None)
-        if policy is None:
-            return
-        if hasattr(self, "_draft_window_source_capability") or hasattr(
-            self,
-            "_draft_window_runtime_state",
-        ):
-            raise RuntimeError("draft-window runtime ownership is already initialized")
-        if hasattr(self, "_draft_window_runtime"):
-            raise RuntimeError("Graph Window cannot replace the typed eager runtime")
-        runtime_route = self._speculator_name.lower()
-        capability, graph_context = build_parallel_graph_source(
-            policy=policy,
-            runtime_route=runtime_route,
-            attn_groups=self.attn_groups,
-            block_tables=self.block_tables,
-            kv_cache_config=self.kv_cache_config,
-            causal=self._group_causal,
-            vllm_config=self.vllm_config,
-            input_buffers=self.input_buffers,
-            dflash2_graph_contract=getattr(self, "_dflash2_graph_contract", None),
-        )
-        runtime_state = build_draft_window_runtime_state(capability)
-        self._draft_window_source_capability = capability
-        self._draft_window_runtime_state = runtime_state
-        self._initialize_draft_window_graph_inputs()
-        self._draft_window_graph_context = graph_context
-
     def load_draft_model(
         self,
         target_model: torch.nn.Module,

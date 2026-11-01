@@ -21,14 +21,13 @@ from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.worker.v2.attn_utils import build_attn_metadata_factory
 from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftMetadataInputs,
-    DraftWindowPolicyDecision,
-    DraftWindowPolicyState,
     DraftWindowWorkspace,
     build_draft_window_runtime_state,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_eager import (
     AscendDraftAttentionReadInputs,
     build_draft_window_attn_metadata,
+    draft_window_read_inputs,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_eagle3 import (
     Eagle3DraftWindowMixin,
@@ -44,18 +43,6 @@ from vllm_ascend.worker.v2.spec_decode.target_dependent_ar.speculator import Asc
 
 class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentARSpeculator, EagleSpeculator):
     decode_cudagraph_manager: Any
-
-    def _configure_draft_window(self, decision: DraftWindowPolicyDecision) -> None:
-        """Attach the eligible P1 policy contract without enabling a window."""
-        if decision.state is not DraftWindowPolicyState.ELIGIBLE_ON:
-            raise ValueError("draft-window owner requires an ELIGIBLE_ON policy decision")
-        if (
-            hasattr(self, "_draft_window_policy")
-            or hasattr(self, "draft_window_policy")
-            or hasattr(self, "_draft_window_runtime")
-        ):
-            raise RuntimeError("draft-window policy is already configured")
-        self._draft_window_policy = decision
 
     def _initialize_draft_window_source_capability(self) -> None:
         """Atomically bind eligible P2 source and P3 ownership state."""
@@ -503,17 +490,12 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentA
         return self._draft_window_runtime_state.read_metadata(inputs.identity)
 
     def _build_eagle3_graph_metadata(self, *, workspace: DraftWindowWorkspace, **kwargs: Any) -> dict[str, Any]:
-        gid = kwargs["inputs"]._owner.capability.provider.global_group_id
-        upper = workspace.cpu_window_upper[: kwargs["num_reqs"]]
-        view = AscendDraftAttentionReadInputs(
-            block_tables=tuple(
-                workspace.window_block_table if i == gid else table[: kwargs["num_reqs_padded"]]
-                for i, table in enumerate(self.block_tables.input_block_tables)
-            ),
-            seq_lens=workspace.device_window_exact,
-            seq_lens_cpu_exact=workspace.cpu_window_exact,
-            seq_lens_cpu_upper_bound=workspace.cpu_window_upper,
-            max_seq_len=int(upper.max().item()) if upper.numel() else 0,
+        view = draft_window_read_inputs(
+            workspace,
+            actual_request_count=kwargs["num_reqs"],
+            padded_request_count=kwargs["num_reqs_padded"],
+            block_tables=self.block_tables.input_block_tables,
+            global_group_id=kwargs["inputs"]._owner.capability.provider.global_group_id,
         )
         metadata = self._build_eagle3_private_attn_metadata(**kwargs, read_inputs_override=view, publish=False)
         # The normal nonparallel FIA builder deliberately prefers its CPU
