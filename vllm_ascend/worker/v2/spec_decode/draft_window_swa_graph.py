@@ -261,7 +261,10 @@ def partition_source(
 
 def build_group_metadata(owner: Any, *, read_inputs: Any, builder_kwargs: dict[str, Any]) -> dict[str, Any]:
     """Use the existing assembler twice with distinct, explicit read operands."""
-    from vllm_ascend.worker.v2.spec_decode.draft_window_eager import AscendDraftAttentionReadInputs
+    from vllm_ascend.worker.v2.spec_decode.draft_window_eager import (
+        AscendDraftAttentionReadInputs,
+        build_draft_window_attn_metadata,
+    )
 
     plan = owner._draft_window_source_capability.native_swa_graph
     snapshot = getattr(owner, "_draft_window_native_full_snapshot", None)
@@ -281,10 +284,14 @@ def build_group_metadata(owner: Any, *, read_inputs: Any, builder_kwargs: dict[s
         seq_lens_cpu_upper_bound=snapshot.cpu_upper,
         max_seq_len=int(snapshot.cpu_upper.max().item()),
     )
-    full = owner._build_ascend_draft_attn_metadata(
-        read_inputs=read_inputs, attn_groups=plan.filter_groups(owner.attn_groups, native=False), **builder_kwargs
+    full = build_draft_window_attn_metadata(
+        owner,
+        read_inputs=read_inputs,
+        attn_groups=plan.filter_groups(owner.attn_groups, native=False),
+        **builder_kwargs,
     )
-    native = owner._build_ascend_draft_attn_metadata(
+    native = build_draft_window_attn_metadata(
+        owner,
         read_inputs=absolute,
         attn_groups=plan.filter_groups(owner.attn_groups, native=True),
         **dict(builder_kwargs, causal=owner._group_causal),

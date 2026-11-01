@@ -168,18 +168,13 @@ def bridge():
     tree = ast.parse(SOURCE.read_text())
     names = {"AscendDraftAttentionReadInputs", "_AscendDraftAttentionReadCertificate"}
     nodes = [n for n in tree.body if isinstance(n, ast.ClassDef) and n.name in names]
-    mixin = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "DraftWindowGraphInputMixin")
-    call = next(
-        n for n in mixin.body if isinstance(n, ast.FunctionDef) and n.name == "_call_ascend_draft_attn_metadata_builder"
-    )
     module = ast.Module(
-        body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), *nodes, call],
+        body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), *nodes],
         type_ignores=[],
     )
     namespace: dict[str, Any] = {
         "dataclass": dataclass,
         "torch": SimpleNamespace(int32="int32"),
-        "upstream_speculator_module": SimpleNamespace(build_attn_metadata=lambda **kw: kw),
     }
     exec(compile(ast.fix_missing_locations(module), str(SOURCE), "exec"), namespace)
     cls = namespace["AscendDraftAttentionReadInputs"]
@@ -204,9 +199,7 @@ def bridge():
         seq_lens_cpu_upper_bound=upper,
         max_seq_len=1040,
     )
-    return SimpleNamespace(
-        read=read, common=common, kwargs=kwargs, call=namespace["_call_ascend_draft_attn_metadata_builder"]
-    )
+    return SimpleNamespace(read=read, common=common, kwargs=kwargs)
 
 
 def test_current_exact_pair_is_certified_without_reprojection_or_write_mutation(bridge):
@@ -259,15 +252,6 @@ def test_existing_projection_owner_is_not_overwritten(bridge):
     bridge.common._draft_window_device_read = object()
     with pytest.raises(ValueError, match="already has a read projection owner"):
         bridge.read.certify_common_metadata(0, bridge.common)
-
-
-def test_shared_mixin_forwards_same_exact_read_owner_without_mutating_kwargs(bridge):
-    result = bridge.call(None, read_inputs=bridge.read, builder_kwargs=bridge.kwargs)
-    assert result["draft_window_read_inputs"] is bridge.read
-    assert result["seq_lens_cpu"] is bridge.read.seq_lens_cpu_exact
-    assert "draft_window_read_inputs" not in bridge.kwargs
-    with pytest.raises(ValueError, match="already have a metadata build owner"):
-        bridge.call(None, read_inputs=bridge.read, builder_kwargs=result)
 
 
 class GraphTensorProtocol(TensorProtocol):
@@ -432,12 +416,11 @@ def test_private_full_padded_build_is_separate_from_unchanged_true_eager_clamp()
     assert isolation < binding
 
     eager_tree = ast.parse(SOURCE.read_text())
-    mixin = next(n for n in eager_tree.body if isinstance(n, ast.ClassDef) and n.name == "DraftWindowGraphInputMixin")
     eager = next(
-        n for n in mixin.body if isinstance(n, ast.FunctionDef) and n.name == "_build_ascend_draft_attn_metadata"
+        n for n in eager_tree.body if isinstance(n, ast.FunctionDef) and n.name == "build_draft_window_attn_metadata"
     )
     # True eager retains active-clamped query boundaries; FULL uses its own padded call.
-    assert "np.minimum(self.arange_np[:num_reqs_padded + 1], num_reqs)" in ast.unparse(eager)
+    assert "np.minimum(owner.arange_np[:num_reqs_padded + 1], num_reqs)" in ast.unparse(eager)
 
 
 def _run_actual_private_binding_loop(graph_device_binding, read, metadata_by_layer):

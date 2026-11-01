@@ -14,7 +14,6 @@ from typing import Any
 
 import numpy as np
 import torch
-import vllm.v1.worker.gpu.spec_decode.speculator as upstream_speculator_module
 from vllm.config.compilation import CUDAGraphMode
 
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
@@ -27,6 +26,7 @@ from vllm_ascend.worker.v2.spec_decode.draft_window import (
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_eager import (
     AscendDraftAttentionReadInputs,
+    build_draft_window_attn_metadata,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_eagle3 import (
     Eagle3DraftWindowMixin,
@@ -174,7 +174,7 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin):
         session = getattr(self, "_eagle3_graph_session", None)
         if session is not None and session._capture_call is not None:
             attn_metadata, _ = session.capture_metadata(attn_metadata)
-        output = super()._run_model(
+        return super()._run_model(
             num_tokens,
             attn_metadata,
             slot_mappings,
@@ -182,7 +182,6 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin):
             cudagraph_runtime_mode,
             mm_inputs,
         )
-        return output
 
     def _generate_draft(
         self,
@@ -194,23 +193,15 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin):
         cudagraph_runtime_mode=CUDAGraphMode.NONE,
         num_speculative_steps=None,
     ):
-        if not self._eagle3_window_is_active():
-            return super()._generate_draft(
-                num_reqs,
-                num_tokens_padded,
-                attn_metadata,
-                slot_mappings,
-                num_tokens_across_dp,
-                cudagraph_runtime_mode,
-                num_speculative_steps,
-            )
-        if cudagraph_runtime_mode != CUDAGraphMode.NONE:
-            raise RuntimeError("Eagle3 Window per-step eager reader received a Graph descriptor")
-        inputs = self._eagle3_window_live_inputs
-        if inputs is None or attn_metadata is not self._draft_window_runtime_state.read_metadata(inputs.identity):
-            raise RuntimeError("Eagle3 Draft forward lost its current private Window metadata")
+        inputs = None
+        if self._eagle3_window_is_active():
+            if cudagraph_runtime_mode != CUDAGraphMode.NONE:
+                raise RuntimeError("Eagle3 Window per-step eager reader received a Graph descriptor")
+            inputs = self._eagle3_window_live_inputs
+            if inputs is None or attn_metadata is not self._draft_window_runtime_state.read_metadata(inputs.identity):
+                raise RuntimeError("Eagle3 Draft forward lost its current private Window metadata")
         try:
-            super()._generate_draft(
+            result = super()._generate_draft(
                 num_reqs,
                 num_tokens_padded,
                 attn_metadata,
@@ -220,9 +211,12 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin):
                 num_speculative_steps,
             )
         except BaseException:
-            self._finish_eagle3_window_step(inputs, succeeded=False)
+            if inputs is not None:
+                self._finish_eagle3_window_step(inputs, succeeded=False)
             raise
-        self._finish_eagle3_window_step(inputs, succeeded=True)
+        if inputs is not None:
+            self._finish_eagle3_window_step(inputs, succeeded=True)
+        return result
 
     def _update_decode_attn_metadata(self, attn_metadata, step, num_reqs=None):
         # The Graph-owner eager control already published exact private lengths;
@@ -452,43 +446,11 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin):
         else:
             inputs.validate_for(inputs.identity)
             read_inputs = read_inputs_override
-        if query_start_loc_np is not None:
-            query_start_loc_cpu = torch.empty(num_reqs_padded + 1, dtype=torch.int32)
-            query_start_loc_cpu[: num_reqs + 1] = torch.from_numpy(query_start_loc_np[: num_reqs + 1])
-            query_start_loc_cpu[num_reqs:] = query_start_loc_cpu[num_reqs]
-            query_lengths = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
-            max_query_len = int(query_lengths.max().item()) if query_lengths.numel() else 0
-        else:
-            query_start_loc_cpu = torch.clamp(torch.from_numpy(self.arange_np[: num_reqs_padded + 1]), max=num_reqs)
-            max_query_len = 1
-
-        if len(read_inputs.block_tables) != len(self.block_tables.input_block_tables):
-            raise ValueError("Eagle3 Window read tables do not match configured cache groups")
-        if read_inputs.seq_lens.shape[0] != num_reqs_padded:
-            raise ValueError("Eagle3 Window read lengths do not match padded requests")
         if self.block_tables.cp_size != 1:
             raise NotImplementedError("MRV2 Eagle3 Draft Window does not support DCP")
         if self.model_state.attn_metadata is not target_metadata:
             raise RuntimeError("Target metadata owner changed before Eagle3 Draft metadata build")
 
-        builder_kwargs = dict(
-            attn_groups=self.attn_groups,
-            num_reqs=num_reqs_padded,
-            num_tokens=num_tokens_padded,
-            query_start_loc_gpu=self.input_buffers.query_start_loc[: num_reqs_padded + 1],
-            query_start_loc_cpu=query_start_loc_cpu,
-            max_query_len=max_query_len,
-            seq_lens=read_inputs.seq_lens,
-            seq_lens_cpu=read_inputs.seq_lens_cpu_exact,
-            dcp_local_seq_lens=None,
-            max_seq_len=read_inputs.max_seq_len,
-            block_tables=list(read_inputs.block_tables),
-            # The write carrier is always the canonical full slot owner.
-            slot_mappings=self.block_tables.slot_mappings[:, :num_tokens_padded],
-            kv_cache_config=self.kv_cache_config,
-            causal=True,
-            seq_lens_cpu_upper_bound=read_inputs.seq_lens_cpu_upper_bound,
-        )
         input_batch = self.input_batch
         assert input_batch is not None
         is_prefilling = torch.from_numpy(input_batch.is_prefilling_np)
@@ -498,7 +460,17 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin):
             is_prefilling,
             parallel_config=self.draft_vllm_config.parallel_config,
         ):
-            metadata = self._call_eagle3_draft_attn_metadata_builder(read_inputs=read_inputs, **builder_kwargs)
+            metadata = build_draft_window_attn_metadata(
+                self,
+                num_reqs=num_reqs,
+                num_reqs_padded=num_reqs_padded,
+                num_tokens_padded=num_tokens_padded,
+                read_inputs=read_inputs,
+                query_width=1,
+                causal=True,
+                query_start_loc_np=query_start_loc_np,
+                dcp_local_seq_lens=None,
+            )
         if not isinstance(metadata, dict) or not metadata:
             raise RuntimeError("eligible Eagle3 Window route produced no Draft metadata")
         if self.model_state.attn_metadata is not target_metadata:
@@ -550,12 +522,6 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin):
                 layer.seq_lens_cpu = read.cpu_window_exact
                 layer.seq_lens_list = read.cpu_window_exact.tolist()
         return metadata
-
-    def _call_eagle3_draft_attn_metadata_builder(self, *, read_inputs, **builder_kwargs):
-        if builder_kwargs.get("draft_window_read_inputs") is not None:
-            raise ValueError("Eagle3 Graph read view already has a metadata owner")
-        builder_kwargs["draft_window_read_inputs"] = read_inputs
-        return upstream_speculator_module.build_attn_metadata(**builder_kwargs)
 
     def _require_eagle3_target_metadata(
         self,

@@ -198,6 +198,89 @@ class DraftWindowProposalEpochSource:
         self._active = None
 
 
+def build_draft_window_attn_metadata(
+    owner: Any,
+    *,
+    num_reqs: int,
+    num_reqs_padded: int,
+    num_tokens_padded: int,
+    read_inputs: AscendDraftAttentionReadInputs,
+    query_width: int | None = None,
+    causal: bool | Mapping[int, bool],
+    query_start_loc_np: np.ndarray | None,
+    dcp_local_seq_lens: torch.Tensor | None,
+    attn_groups: Any = None,
+) -> dict[str, Any]:
+    """Assemble canonical query/write fields with one explicit Window read view.
+
+    The fixed upstream assembler reads Full buffers from its owner. Keep this
+    small Ascend seam shared by parallel drafting and Eagle's first/AR reads;
+    proposal, position, write-slot preparation and sampling remain upstream.
+    """
+    native_swa = getattr(getattr(owner, "_draft_window_source_capability", None), "native_swa_graph", None)
+    if native_swa is not None and attn_groups is None:
+        from vllm_ascend.worker.v2.spec_decode.draft_window_swa_graph import build_group_metadata
+
+        return build_group_metadata(
+            owner,
+            read_inputs=read_inputs,
+            builder_kwargs=dict(
+                num_reqs=num_reqs,
+                num_reqs_padded=num_reqs_padded,
+                num_tokens_padded=num_tokens_padded,
+                causal=causal,
+                query_start_loc_np=query_start_loc_np,
+                dcp_local_seq_lens=dcp_local_seq_lens,
+            ),
+        )
+    if query_width is None:
+        query_width = owner.num_query_per_req
+    if query_start_loc_np is None:
+        query_start_loc_cpu = torch.from_numpy(
+            np.minimum(owner.arange_np[: num_reqs_padded + 1], num_reqs) * query_width
+        )
+        max_query_len = query_width
+    else:
+        query_start_loc_cpu = torch.empty(num_reqs_padded + 1, dtype=torch.int32)
+        query_start_loc_cpu[: num_reqs + 1] = torch.from_numpy(query_start_loc_np[: num_reqs + 1])
+        query_start_loc_cpu[num_reqs:] = query_start_loc_cpu[num_reqs]
+        lengths = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+        max_query_len = int(lengths.max().item()) if lengths.numel() else 0
+    if len(read_inputs.block_tables) != len(owner.block_tables.input_block_tables):
+        raise ValueError("Draft attention read block-table group count does not match the configured cache groups")
+    if read_inputs.seq_lens.shape[0] != num_reqs_padded:
+        raise ValueError("Draft attention read lengths do not match the padded request count")
+    if dcp_local_seq_lens is None:
+        dcp_local_seq_lens = read_inputs.dcp_local_seq_lens
+    if dcp_local_seq_lens is None and owner.block_tables.cp_size > 1:
+        dcp_local_seq_lens = prepare_dcp_local_seq_lens(
+            owner.input_buffers.dcp_local_seq_lens,
+            read_inputs.seq_lens,
+            num_reqs,
+            owner.block_tables.cp_size,
+            owner.block_tables.cp_rank,
+            owner.block_tables.cp_interleave,
+        )
+    return upstream_speculator_module.build_attn_metadata(
+        draft_window_read_inputs=read_inputs,
+        attn_groups=owner.attn_groups if attn_groups is None else attn_groups,
+        num_reqs=num_reqs_padded,
+        num_tokens=num_tokens_padded,
+        query_start_loc_gpu=owner.input_buffers.query_start_loc[: num_reqs_padded + 1],
+        query_start_loc_cpu=query_start_loc_cpu,
+        max_query_len=max_query_len,
+        seq_lens=read_inputs.seq_lens,
+        seq_lens_cpu=read_inputs.seq_lens_cpu_exact,
+        dcp_local_seq_lens=(None if dcp_local_seq_lens is None else dcp_local_seq_lens[:num_reqs_padded]),
+        max_seq_len=read_inputs.max_seq_len,
+        block_tables=list(read_inputs.block_tables),
+        slot_mappings=owner.block_tables.slot_mappings[:, :num_tokens_padded],
+        kv_cache_config=owner.kv_cache_config,
+        causal=causal,
+        seq_lens_cpu_upper_bound=read_inputs.seq_lens_cpu_upper_bound,
+    )
+
+
 class DraftWindowGraphInputMixin:
     """Proposal input ownership for DFlash, DFlash2 and eligible DSpark Graph."""
 
@@ -481,6 +564,8 @@ class DraftWindowGraphInputMixin:
             raise AssertionError("DFlash/DSpark query width must come from the speculator instance")
         if step != self.num_query_per_req:
             raise RuntimeError("P4a apply-time step does not match the actual query width")
+        if query_start_loc_np is not None:
+            raise NotImplementedError("MRV2 draft-window P4a requires the uniform DFlash/DSpark query layout")
         target_metadata = self._require_nonempty_target_metadata()
         inputs = self._materialize_draft_window_read_inputs(
             num_reqs=num_reqs,
@@ -504,7 +589,8 @@ class DraftWindowGraphInputMixin:
             # The pinned FULL branch does not consume this temporary value.
             # P6 builds/publishes the real bank metadata once before replay.
             return None
-        metadata = self._build_ascend_draft_attn_metadata(
+        metadata = build_draft_window_attn_metadata(
+            self,
             num_reqs=num_reqs,
             num_reqs_padded=num_reqs_padded,
             num_tokens_padded=num_tokens_padded,
@@ -524,102 +610,6 @@ class DraftWindowGraphInputMixin:
             target_metadata=target_metadata,
         )
         return runtime_state.read_metadata(inputs.identity)
-
-    def _build_ascend_draft_attn_metadata(
-        self,
-        *,
-        num_reqs: int,
-        num_reqs_padded: int,
-        num_tokens_padded: int,
-        read_inputs: AscendDraftAttentionReadInputs,
-        causal: bool | Mapping[int, bool],
-        query_start_loc_np: np.ndarray | None,
-        dcp_local_seq_lens: torch.Tensor | None,
-        attn_groups: Any = None,
-    ) -> dict[str, Any]:
-        """Vendor-local copy of the upstream metadata-assembly seam.
-
-        Only query layout and builder kwargs are reproduced. Proposal logic,
-        input preparation, slot calculation, forward, and sampling remain in
-        upstream. ``UPSTREAM_DRIFT_GUARD`` tests pin the source contract.
-        """
-        native_swa = getattr(getattr(self, "_draft_window_source_capability", None), "native_swa_graph", None)
-        if native_swa is not None and attn_groups is None:
-            from vllm_ascend.worker.v2.spec_decode.draft_window_swa_graph import build_group_metadata
-
-            return build_group_metadata(
-                self,
-                read_inputs=read_inputs,
-                builder_kwargs=dict(
-                    num_reqs=num_reqs,
-                    num_reqs_padded=num_reqs_padded,
-                    num_tokens_padded=num_tokens_padded,
-                    causal=causal,
-                    query_start_loc_np=query_start_loc_np,
-                    dcp_local_seq_lens=dcp_local_seq_lens,
-                ),
-            )
-        if query_start_loc_np is not None:
-            raise NotImplementedError("MRV2 draft-window P4a requires the uniform DFlash/DSpark query layout")
-        # a982 keeps its range on CPU as NumPy; retain the existing uniform
-        # query/padded-tail contract without allocating or reading device data.
-        query_start_loc_cpu = torch.from_numpy(
-            np.minimum(self.arange_np[: num_reqs_padded + 1], num_reqs) * self.num_query_per_req
-        )
-        max_query_len = self.num_query_per_req
-
-        if len(read_inputs.block_tables) != len(self.block_tables.input_block_tables):
-            raise ValueError("Draft attention read block-table group count does not match the configured cache groups")
-        if read_inputs.seq_lens.shape[0] != num_reqs_padded:
-            raise ValueError("Draft attention read lengths do not match the padded request count")
-        if dcp_local_seq_lens is None:
-            dcp_local_seq_lens = read_inputs.dcp_local_seq_lens
-        if dcp_local_seq_lens is None and self.block_tables.cp_size > 1:
-            dcp_local_seq_lens = prepare_dcp_local_seq_lens(
-                self.input_buffers.dcp_local_seq_lens,
-                read_inputs.seq_lens,
-                num_reqs,
-                self.block_tables.cp_size,
-                self.block_tables.cp_rank,
-                self.block_tables.cp_interleave,
-            )
-
-        builder_kwargs = dict(
-            attn_groups=self.attn_groups if attn_groups is None else attn_groups,
-            num_reqs=num_reqs_padded,
-            num_tokens=num_tokens_padded,
-            query_start_loc_gpu=self.input_buffers.query_start_loc[: num_reqs_padded + 1],
-            query_start_loc_cpu=query_start_loc_cpu,
-            max_query_len=max_query_len,
-            seq_lens=read_inputs.seq_lens,
-            seq_lens_cpu=read_inputs.seq_lens_cpu_exact,
-            dcp_local_seq_lens=(None if dcp_local_seq_lens is None else dcp_local_seq_lens[:num_reqs_padded]),
-            max_seq_len=read_inputs.max_seq_len,
-            block_tables=list(read_inputs.block_tables),
-            slot_mappings=self.block_tables.slot_mappings[:, :num_tokens_padded],
-            kv_cache_config=self.kv_cache_config,
-            causal=causal,
-            seq_lens_cpu_upper_bound=read_inputs.seq_lens_cpu_upper_bound,
-        )
-        return self._call_ascend_draft_attn_metadata_builder(
-            read_inputs=read_inputs,
-            builder_kwargs=builder_kwargs,
-        )
-
-    def _call_ascend_draft_attn_metadata_builder(
-        self,
-        *,
-        read_inputs: AscendDraftAttentionReadInputs,
-        builder_kwargs: dict[str, Any],
-    ) -> dict[str, Any]:
-        # Existing Ascend scopes still own positions, prefill/parallel context
-        # and normal eager callbacks. Graph supplies its already-materialized
-        # exact pair explicitly; the builder rejects a second projection owner.
-        kwargs = dict(builder_kwargs)
-        if kwargs.get("draft_window_read_inputs") is not None:
-            raise ValueError("Graph read inputs already have a metadata build owner")
-        kwargs["draft_window_read_inputs"] = read_inputs
-        return upstream_speculator_module.build_attn_metadata(**kwargs)
 
     def _require_nonempty_target_metadata(self) -> Mapping[Any, Any]:
         target_metadata = self.model_state.attn_metadata
