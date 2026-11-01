@@ -369,8 +369,9 @@ def report_owner_draft_native_attention(owner: Any, logger: Any) -> DraftNativeA
     # A real initialized manager is authoritative. Before manager creation this
     # is only the explicit Draft request, never the Target's graph selection.
     graph_requested = not eager and (any(mode != "NONE" for mode in modes) if modes else True)
-    capability = _get(owner, "_draft_window_source_capability")
-    routes = _get(_get(capability, "inventory"), "groups", ()) or ()
+    provider = _get(owner, "_draft_window_graph_binding_provider")
+    group = _get(_get(provider, "source"), "group")
+    routes = () if group is None else (group,)
     runtime = _get(owner, "_draft_window_runtime")
     inventory = report_draft_native_attention(
         owner,

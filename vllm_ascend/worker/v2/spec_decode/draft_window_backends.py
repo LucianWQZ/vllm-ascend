@@ -2,9 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inspect actual draft consumers before selecting a read-view provider.
 
-This inventory is created after ``set_attn`` and owns no tensors. A candidate
-means the dense provider's addressing contract matches, not device validation.
-Unknown consumers remain missing providers instead of being silently skipped.
+Resolve every real consumer after ``set_attn`` without owning tensors.
+Unknown or incompatible consumers fail before proposal work; successful
+selection describes an addressing contract, not device qualification.
 """
 
 from collections.abc import Callable, Sequence
@@ -21,7 +21,6 @@ class DraftWindowProviderStatus(str, Enum):
     DIRECT_DSA = "DIRECT_DSA"
     DIRECT_SFA = "DIRECT_SFA"
     DIRECT_SFA_INDEXER = "DIRECT_SFA_INDEXER"
-    PROVIDER_MISSING = "PROVIDER_MISSING"
 
 
 @dataclass(frozen=True)
@@ -104,7 +103,6 @@ class DraftWindowGroupRoute:
     table_column_span: int
     read_semantics: str
     status: DraftWindowProviderStatus
-    reason: str
     native_window: int | None = None
 
 
@@ -119,12 +117,12 @@ def _select_read_provider(
     native_window: int | None,
     uniform_windows: bool,
     full_retention_dflash2: bool,
-) -> tuple[DraftWindowProviderStatus, str]:
+) -> DraftWindowProviderStatus:
     """Match one actual consumer, then apply its layout-specific restrictions."""
     status = DraftWindowProviderStatus
-    missing = status.PROVIDER_MISSING
+    selected: DraftWindowProviderStatus | None = None
     if not uncompressed:
-        return missing, "Compressed or packed cache geometry needs a separate read provider"
+        raise NotImplementedError("Compressed or packed cache geometry needs a separate read provider")
 
     def matches(backend_type: type | None, builder_types: tuple[type | None, ...], spec_type: type | None) -> bool:
         return (
@@ -145,43 +143,44 @@ def _select_read_provider(
         elif full_retention_dflash2:
             native = True
         else:
-            return missing, "Dense chunked or nonuniform native attention needs a separate provider"
+            raise NotImplementedError("Dense chunked or nonuniform native attention needs a separate provider")
     elif not native:
-        selected = missing
         if matches(types.mla_backend, (types.mla_builder,), types.mla_spec):
             if builder.flashmla_state is not None:
-                return missing, "FlashMLA persistent derived state needs a separate provider"
+                raise NotImplementedError("FlashMLA persistent derived state needs a separate provider")
             selected = status.DIRECT_MLA
         elif matches(types.sfa_backend, (types.sfa_builder,), types.mla_spec):
             if builder.nope:
-                return missing, "NoPE SFA has persistent sparse-kernel state requiring its own owner"
+                raise NotImplementedError("NoPE SFA has persistent sparse-kernel state requiring its own owner")
             if any(item.non_causal_multi_token_decode for item in specs):
-                return missing, "Ordinary SFA kernels use causal sparse_mode=3 for multi-token queries"
+                raise NotImplementedError("Ordinary SFA kernels use causal sparse_mode=3 for multi-token queries")
             selected = status.DIRECT_SFA
         elif matches(types.dsa_backend, (types.dsa_builder, types.dsa_cp_builder), types.dsa_spec):
             hf = builder.model_config.hf_config
             if type(builder) is types.dsa_cp_builder:
-                return missing, "Legacy DSA-CP is rejected by the MRV2 startup contract; no Window provider is enabled"
+                raise NotImplementedError(
+                    "Legacy DSA-CP is rejected by the MRV2 startup contract; no Window provider is enabled"
+                )
             if builder.compressor_ratio != 1:
-                return missing, "Compressed DSA needs a separate provider"
+                raise NotImplementedError("Compressed DSA needs a separate provider")
             if builder._device_metadata_enabled:
-                return missing, "Deferred DSA metadata needs an executor completion contract"
+                raise NotImplementedError("Deferred DSA metadata needs an executor completion contract")
             if getattr(hf, "vision_n_layers", 0) > 0:
-                return missing, "DSA vision ranges require absolute-to-window coordinate projection"
+                raise NotImplementedError("DSA vision ranges require absolute-to-window coordinate projection")
             if any(
                 item.model_version is not None or item.indexes_kv_by_block_stride or item.bounded_replay
                 for item in specs
             ):
-                return missing, "Packed, strided, or replay DSA needs a separate read provider"
+                raise NotImplementedError("Packed, strided, or replay DSA needs a separate read provider")
             if hf.sliding_window <= 0 or any(item.sliding_window != hf.sliding_window for item in specs):
-                return missing, "DSA native-window kernel and resident cache geometry disagree"
+                raise NotImplementedError("DSA native-window kernel and resident cache geometry disagree")
             selected = status.DIRECT_DSA
         elif matches(types.indexer_backend, (types.indexer_builder,), types.indexer_spec):
             if builder.use_pcp or builder.use_dcp or builder.use_dsa_cp:
-                return missing, "SFA indexer rank-local read coordinates need a separate provider"
+                raise NotImplementedError("SFA indexer rank-local read coordinates need a separate provider")
             if any(item.cache_sparse_li_c4 or item.sfa_dcp_replicated_indexer_size != 1 for item in specs):
-                return missing, "Packed C4 or replicated indexer pages need a separate provider"
-            return status.DIRECT_SFA_INDEXER, ""
+                raise NotImplementedError("Packed C4 or replicated indexer pages need a separate provider")
+            return status.DIRECT_SFA_INDEXER
         if selected in (status.DIRECT_MLA, status.DIRECT_SFA) and any(
             item.model_version is not None
             or item.cache_sparse_sfa_c8
@@ -190,16 +189,16 @@ def _select_read_provider(
             or item.indexes_kv_by_block_stride
             for item in specs
         ):
-            return missing, "Packed, offloaded, or strided MLA/SFA caches need a separate provider"
-        if selected is missing:
-            return missing, f"No read-view provider for {backend.__name__}/{type(builder).__name__}"
+            raise NotImplementedError("Packed, offloaded, or strided MLA/SFA caches need a separate provider")
     if native:
         if not uniform_windows or native_window is None or native_window <= 0:
-            return missing, "Native SWA group has inconsistent windows"
+            raise NotImplementedError("Native SWA group has inconsistent windows")
         selected = status.NATIVE_SWA_CANDIDATE
+    if selected is None:
+        raise NotImplementedError(f"No read-view provider for {backend.__name__}/{type(builder).__name__}")
     if parallel_config.prefill_context_parallel_size != 1 or parallel_config.decode_context_parallel_size != 1:
-        return missing, "Context-parallel read coordinates need a separate provider"
-    return selected, ""
+        raise NotImplementedError("Context-parallel read coordinates need a separate provider")
+    return selected
 
 
 def inventory_draft_window_groups(
@@ -277,17 +276,20 @@ def inventory_draft_window_groups(
             )
             windows = {getattr(item, "sliding_window", None) for item in consumer_specs}
             native_window = next(iter(windows)) if len(windows) == 1 else None
-            status, reason = _select_read_provider(
-                backend,
-                builder,
-                consumer_specs,
-                types,
-                parallel_config,
-                uncompressed=ratio == 1 and storage_size == scheduler_span,
-                native_window=native_window,
-                uniform_windows=len(windows) == 1,
-                full_retention_dflash2=full_retention_dflash2,
-            )
+            try:
+                status = _select_read_provider(
+                    backend,
+                    builder,
+                    consumer_specs,
+                    types,
+                    parallel_config,
+                    uncompressed=ratio == 1 and storage_size == scheduler_span,
+                    native_window=native_window,
+                    uniform_windows=len(windows) == 1,
+                    full_retention_dflash2=full_retention_dflash2,
+                )
+            except NotImplementedError as error:
+                raise NotImplementedError(f"Draft Window gid={gid}: {error}") from error
             routes.append(
                 DraftWindowGroupRoute(
                     gid=gid,
@@ -296,41 +298,12 @@ def inventory_draft_window_groups(
                     table_column_span=column_span,
                     read_semantics=read_semantics,
                     status=status,
-                    reason=reason,
                     native_window=native_window,
                 )
             )
-    return tuple(routes)
-
-
-def require_draft_window_providers(routes: Sequence[DraftWindowGroupRoute]) -> None:
-    """Fail before materializing any group if any required provider is missing."""
     if not routes:
         raise ValueError("Draft Window requires at least one attention consumer")
-    missing = [
-        route
-        for route in routes
-        if route.status in (DraftWindowProviderStatus.PROVIDER_MISSING, DraftWindowProviderStatus.NATIVE_SWA_CANDIDATE)
-    ]
-    if missing:
-        details = "; ".join(f"gid={route.gid}: {route.reason}" for route in missing)
-        raise NotImplementedError(f"Draft Window provider missing: {details}")
-
-
-def describe_draft_window_routes(speculator: Any) -> tuple[DraftWindowGroupRoute, ...]:
-    """Inspect initialized draft attention; never invoke from the OFF path."""
-    config = speculator.attn_vllm_config
-    routes = inventory_draft_window_groups(
-        attn_groups=speculator.attn_groups,
-        kv_cache_config=speculator.kv_cache_config,
-        block_tables=speculator.block_tables,
-        parallel_config=config.parallel_config,
-        full_retention_dflash2=getattr(speculator, "_dflash2_full_kv_reference", False),
-    )
-    actual_layers = {name for route in routes for name in route.layers}
-    if actual_layers != set(speculator.draft_attn_layer_names):
-        raise ValueError("Draft Window inventory does not cover the actual draft attention layers")
-    return routes
+    return tuple(routes)
 
 
 def require_compatible_direct_prefix_routes(routes: Sequence[DraftWindowGroupRoute]) -> None:
@@ -340,16 +313,17 @@ def require_compatible_direct_prefix_routes(routes: Sequence[DraftWindowGroupRou
     aligned start is expressible, without changing the window to an LCM or
     failing after an ordinary request crosses a block boundary.
     """
-    require_draft_window_providers(routes)
+    if not routes:
+        raise ValueError("Draft Window requires at least one attention consumer")
+    if any(route.status is DraftWindowProviderStatus.NATIVE_SWA_CANDIDATE for route in routes):
+        raise NotImplementedError("Native SWA requires its checked subset/intersection provider")
     prefix_routes = tuple(
         route for route in routes if route.status is not DraftWindowProviderStatus.NATIVE_SWA_INTERSECTION
     )
     if not prefix_routes:
         # Native-band builders validate and rebase their own coordinates;
         # unlike a direct-prefix reader, they need no companion Full group.
-        if routes:
-            return
-        raise NotImplementedError("Draft Window requires at least one certified read group")
+        return
     anchor_span = prefix_routes[0].table_column_span
     for route in prefix_routes:
         if anchor_span % route.table_column_span:
@@ -425,11 +399,6 @@ def select_native_swa_subset_routes(
                 replace(
                     route,
                     status=DraftWindowProviderStatus.NATIVE_SWA_INTERSECTION,
-                    reason=(
-                        "Typed causal native band intersected using its builder's current exact pair"
-                        if causal
-                        else "Typed DFlash2 unmasked resident interval using its builder's current exact pair"
-                    ),
                 )
             )
     if not projected:
@@ -441,7 +410,16 @@ def require_direct_prefix_routes(
     speculator: Any, *, window_size: int | None = None
 ) -> tuple[DraftWindowGroupRoute, ...]:
     """Select all direct-prefix consumers before any proposal work is submitted."""
-    routes = describe_draft_window_routes(speculator)
+    config = speculator.attn_vllm_config
+    routes = inventory_draft_window_groups(
+        attn_groups=speculator.attn_groups,
+        kv_cache_config=speculator.kv_cache_config,
+        block_tables=speculator.block_tables,
+        parallel_config=config.parallel_config,
+        full_retention_dflash2=getattr(speculator, "_dflash2_full_kv_reference", False),
+    )
+    if {name for route in routes for name in route.layers} != set(speculator.draft_attn_layer_names):
+        raise ValueError("Draft Window providers do not cover the actual draft attention layers")
     if any(route.status is DraftWindowProviderStatus.NATIVE_SWA_CANDIDATE for route in routes):
         if window_size is None or speculator.speculative_config.method != "dflash":
             raise NotImplementedError("Native SWA coverage is only certified for the DFlash extra-Window route")

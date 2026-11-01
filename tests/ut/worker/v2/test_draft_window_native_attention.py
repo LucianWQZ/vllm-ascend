@@ -272,6 +272,17 @@ class NativeAttentionTests(unittest.TestCase):
         self.assertEqual(native.inspect_draft_native_attention(owner, provider_routes=[good]).kind, "SWA")
         self.assertEqual(native.inspect_draft_native_attention(owner, provider_routes=[bad]).kind, "UNKNOWN")
 
+    def test_startup_uses_the_actual_graph_source_group(self):
+        owner = loaded(config(kinds=["sliding_attention"] * 2), [2048, 2048])
+        name = owner.attn_groups[0][0].layer_names[0]
+        owner._draft_window_graph_binding_provider = SimpleNamespace(
+            source=SimpleNamespace(group=SimpleNamespace(layers=(name,), native_window=2048))
+        )
+        self.assertEqual(native.report_owner_draft_native_attention(owner, Log()).kind, "SWA")
+        owner._draft_window_graph_binding_provider.source.group.native_window = 4096
+        with self.assertRaises(NotImplementedError):
+            native.report_owner_draft_native_attention(owner, Log())
+
     def test_off_no_runtime_and_unknown_window_graph_fail_closed(self):
         owner = loaded(config(architecture="UnknownDraft"), [None, None])
         inventory = native.inspect_draft_native_attention(owner)

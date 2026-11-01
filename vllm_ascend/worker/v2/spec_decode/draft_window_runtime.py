@@ -319,10 +319,11 @@ class DraftWindowRuntime:
             prepared_exact_device=prepared_exact_device,
         )
         if self.method == "eagle3":
+            continuing = continuing_prefill_rows(self._input_batch, num_reqs)
             if (
                 legacy is not None
                 and self._dense_device_reads
-                and continuing_prefill_rows(self._input_batch, num_reqs).all()
+                and continuing.all()
                 and (
                     self._input_batch.num_draft_tokens_per_req is None
                     or not self._input_batch.num_draft_tokens_per_req[:num_reqs].any()
@@ -341,7 +342,7 @@ class DraftWindowRuntime:
             # existing certified producer and native Full/window handling.
             # Mixed decode/prompt rows require the device-exact Full-capacity
             # path because rejection can make a CPU mirror optimistic.
-            if continuing_prefill_rows(self._input_batch, num_reqs).any() and (
+            if continuing.any() and (
                 self._input_batch.is_prefilling_np[:num_reqs].all()
                 or not getattr(self.speculator, "advance_draft_positions", False)
                 or getattr(self.speculator, "replicated_pcp", False)
