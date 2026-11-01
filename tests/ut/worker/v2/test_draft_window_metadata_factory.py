@@ -9,7 +9,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-import numpy as np
 import pytest
 import torch
 
@@ -23,102 +22,127 @@ CALLBACK_NAMES = ("common_metadata_callback", "metadata_builder_callback")
 
 @pytest.fixture
 def metadata_isolation():
-    from vllm_ascend.worker.v2.spec_decode.draft_window import (
-        DraftMetadataStore,
+    from vllm_ascend.worker.v2.spec_decode.draft_window_graph_metadata import (
+        copy_draft_attention_metadata,
         validate_draft_metadata_isolation,
     )
-    from vllm_ascend.worker.v2.spec_decode.draft_window_eager import _isolate_draft_metadata_from_target
 
-    return _isolate_draft_metadata_from_target, validate_draft_metadata_isolation, DraftMetadataStore
+    return copy_draft_attention_metadata, validate_draft_metadata_isolation
 
 
-def test_metadata_copy_is_selective_and_isolates_shared_tensor_and_numpy_views(metadata_isolation):
-    isolate, validate, _ = metadata_isolation
-    tensor = torch.arange(12)
-    array = np.arange(12)
-    private_table = torch.arange(20).view(4, 5)
-    target = {"tensor": tensor, "array": array}
-    draft = {"read_table": private_table, "tensor": tensor[2:6], "array": array[3:8]}
-    with pytest.raises(ValueError, match="aliases Target"):
-        validate(draft, target_metadata=target)
-    private = isolate(draft, target)
-    assert private["read_table"] is private_table  # No unrelated Full table copy.
+def _attention_metadata():
+    return SimpleNamespace(
+        block_tables=torch.arange(12, dtype=torch.int32).view(3, 4),
+        seq_lens=torch.tensor([3, 4], dtype=torch.int32),
+        seq_lens_cpu=torch.tensor([3, 4], dtype=torch.int32),
+        seq_lens_list=[3, 4],
+        actual_seq_lengths_q=[1, 2],
+        slot_mapping=torch.tensor([9, 13], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
+        attn_mask=torch.zeros(2, 2, dtype=torch.int8),
+        attn_state="target",
+        qfa_metadata_cache={"lengths": (torch.tensor([0, 1, 2]), torch.tensor([3, 4]))},
+    )
+
+
+def test_metadata_copy_owns_mutable_fields_and_borrows_read_only_operands(metadata_isolation):
+    copy_metadata, validate = metadata_isolation
+    layer = _attention_metadata()
+    target = {"target": layer}
+    private = copy_metadata({"draft": layer})
+    copied = private["draft"]
+    assert copied is not layer
+    for field in ("block_tables", "seq_lens", "seq_lens_cpu", "slot_mapping", "query_start_loc", "attn_mask"):
+        assert getattr(copied, field) is getattr(layer, field)
+    # Cache payloads are read-only operator outputs; only the mutable cache
+    # dictionary belongs to the per-build metadata object.
+    assert copied.qfa_metadata_cache is not layer.qfa_metadata_cache
+    assert copied.qfa_metadata_cache["lengths"] is layer.qfa_metadata_cache["lengths"]
     validate(private, target_metadata=target)
-    private["tensor"].fill_(-1)
-    private["array"][:] = -1
-    assert tensor.tolist() == list(range(12))
-    assert array.tolist() == list(range(12))
+    copied.attn_state = "draft"
+    copied.seq_lens_list[0] = 99
+    copied.actual_seq_lengths_q.append(3)
+    copied.qfa_metadata_cache.clear()
+    assert layer.attn_state == "target"
+    assert layer.seq_lens_list == [3, 4]
+    assert layer.actual_seq_lengths_q == [1, 2]
+    assert "lengths" in layer.qfa_metadata_cache
 
 
-def test_empty_tensors_do_not_alias_only_because_both_have_zero_address(metadata_isolation):
-    isolate, validate, _ = metadata_isolation
-    target, independent = torch.empty(0), torch.empty(0)
-    assert target.data_ptr() == independent.data_ptr() == 0
-    validate({"read": independent}, target_metadata={"read": target})
-    assert isolate({"read": independent}, {"read": target})["read"] is independent
-    with pytest.raises(ValueError, match="aliases Target"):
-        validate({"read": target}, target_metadata={"read": target})
+def test_real_ascend_metadata_preserves_canonical_full_operands(metadata_isolation):
+    from vllm_ascend.attention.attention_v1 import AscendAttentionState, AscendMetadata
+
+    copy_metadata, validate = metadata_isolation
+    layer = AscendMetadata(**vars(_attention_metadata()))
+    private = copy_metadata({"draft": layer})
+    copied = private["draft"]
+    copied.attn_state = AscendAttentionState.DecodeOnly
+    copied.seq_lens_list[0] = 9
+    assert layer.attn_state == "target" and layer.seq_lens_list == [3, 4]
+    assert copied.slot_mapping is layer.slot_mapping
+    assert copied.query_start_loc is layer.query_start_loc
+    validate(private, target_metadata={"target": layer})
 
 
-def test_frozen_slotted_metadata_keeps_layer_aliases_without_mutating_target(metadata_isolation):
-    isolate, validate, _ = metadata_isolation
+def test_metadata_copy_preserves_group_aliases_and_missing_layers(metadata_isolation):
+    copy_metadata, validate = metadata_isolation
+    layer = _attention_metadata()
+    private = copy_metadata({"a": layer, "b": layer, "unused": None})
+    assert private["a"] is private["b"] and private["a"] is not layer
+    assert private["unused"] is None
+    validate(private, target_metadata={"target": layer})
+
+
+@pytest.mark.parametrize("field", [None, "seq_lens_list", "actual_seq_lengths_q", "qfa_metadata_cache"])
+def test_publication_guard_rejects_actual_target_mutation_aliases(metadata_isolation, field):
+    copy_metadata, validate = metadata_isolation
+    target_layer = _attention_metadata()
+    target = {"target": target_layer}
+    draft = copy_metadata({"draft": target_layer})
+    if field is None:
+        draft["draft"] = target_layer
+    else:
+        setattr(draft["draft"], field, getattr(target_layer, field))
+    with pytest.raises(ValueError, match="alias Target"):
+        validate(draft, target_metadata=target)
+    with pytest.raises(ValueError, match="alias Target"):
+        validate(target, target_metadata=target)
+
+
+def test_frozen_slotted_metadata_is_copied_before_field_replacement(metadata_isolation):
+    copy_metadata, validate = metadata_isolation
 
     @dataclass(frozen=True, slots=True)
     class Metadata:
-        lengths: torch.Tensor
-        nested: tuple
+        seq_lens_list: list[int]
+        actual_seq_lengths_q: list[int]
+        qfa_metadata_cache: dict
+        block_tables: torch.Tensor
 
-    target_layer = Metadata(torch.tensor([3]), ([np.arange(3)],))
-    target = {"layer": target_layer}
-    private = isolate({"a": target_layer, "b": target_layer}, target)
-    assert private["a"] is private["b"] and private["a"] is not target_layer
-    validate(private, target_metadata=target)
-    private["a"].lengths.fill_(9)
-    private["a"].nested[0][0][:] = 9
-    assert target_layer.lengths.item() == 3
-    assert target_layer.nested[0][0].tolist() == [0, 1, 2]
-
-
-def test_mutable_metadata_cycles_bytearrays_and_inherited_slots_remain_isolated(metadata_isolation):
-    isolate, validate, _ = metadata_isolation
-
-    class Base:
-        __slots__ = ("lengths",)
-
-    class Layer(Base):
-        __slots__ = ("unused",)
-
-    layer = Layer()
-    layer.lengths = torch.tensor([4])
-    cycle = []
-    cycle.append(cycle)
-    target = {"cycle": cycle, "state": bytearray(b"ab"), "tags": {1}, "layer": layer}
-    private = isolate(target, target)
-    assert private["cycle"][0] is private["cycle"]
-    assert not hasattr(private["layer"], "unused")
-    validate(private, target_metadata=target)
-    private["layer"].lengths.fill_(7)
-    private["state"][0] = ord("z")
-    private["tags"].add(2)
-    assert layer.lengths.item() == 4 and target["state"] == b"ab" and target["tags"] == {1}
+    table = torch.arange(4, dtype=torch.int32).view(1, 4)
+    layer = Metadata([3], [1], {}, table)
+    private = copy_metadata({"draft": layer})
+    private["draft"].seq_lens_list[0] = 9
+    assert layer.seq_lens_list == [3]
+    assert private["draft"].block_tables is table
+    validate(private, target_metadata={"target": layer})
 
 
-def test_numpy_memoryview_backing_and_publication_reject_remaining_aliases(metadata_isolation):
-    isolate, validate, store_type = metadata_isolation
-    backing = bytearray(range(12))
-    target = {"array": np.frombuffer(backing, dtype=np.uint8)}
-    draft = {"array": np.frombuffer(memoryview(backing)[2:], dtype=np.uint8)}
-    with pytest.raises(ValueError, match="aliases Target"):
-        validate(draft, target_metadata=target)
-    private = isolate(draft, target)
-    validate(private, target_metadata=target)
-    identity = object()
-    inputs = SimpleNamespace(identity=identity, validate_for=Mock())
-    store = store_type()
-    with pytest.raises(ValueError, match="aliases Target"):
-        store.publish(inputs, {"array": target["array"][2:]}, target_metadata=target)
-    store.publish(inputs, private, target_metadata=target)
-    assert store.read(identity) is private
+def test_metadata_copy_rejects_invalid_known_host_fields(metadata_isolation):
+    copy_metadata, validate = metadata_isolation
+    for field, value in (
+        ("seq_lens_list", (3, 4)),
+        ("actual_seq_lengths_q", torch.tensor([1, 2])),
+        ("qfa_metadata_cache", []),
+    ):
+        layer = _attention_metadata()
+        setattr(layer, field, value)
+        with pytest.raises(TypeError, match=field):
+            copy_metadata({"draft": layer})
+    with pytest.raises(ValueError, match="non-empty layer mapping"):
+        copy_metadata({})
+    with pytest.raises(ValueError, match="layer mappings"):
+        validate({}, target_metadata=None)
 
 
 @pytest.fixture

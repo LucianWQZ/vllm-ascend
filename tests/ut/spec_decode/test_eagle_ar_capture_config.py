@@ -42,7 +42,7 @@ def function(path, name, namespace):
 
 
 def config(directory, maximum=1):
-    model = copy.deepcopy(GUARD._QUALIFIED_MODEL_CONFIGS["eagle3"])
+    model = copy.deepcopy(GUARD._CONSUMER_CONFIGS["eagle3"])
     path = Path(directory) / "config.json"
     path.write_text(json.dumps(model))
     hf = NS(**model)

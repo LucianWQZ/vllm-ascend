@@ -8,11 +8,9 @@ while leaving positions, query layout, slot mappings, and Target metadata
 untouched. The upstream vLLM checkout remains unmodified.
 """
 
-import copy
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass, fields, is_dataclass
-from enum import Enum
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -28,8 +26,8 @@ from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftWindowLeaseState,
     DraftWindowRuntimeState,
     DraftWindowSourceCapability,
-    collect_mutable_references,
 )
+from vllm_ascend.worker.v2.spec_decode.draft_window_graph_metadata import copy_draft_attention_metadata
 from vllm_ascend.worker.v2.spec_decode.draft_window_nongraph import (
     DraftWindowBatchPhasePlan,
     build_phase_aware_materialization_plan,
@@ -218,6 +216,8 @@ class DraftWindowGraphInputMixin:
     vllm_config: Any
     draft_attn_layer_names: set[str] | None
     arange: torch.Tensor
+    arange_np: np.ndarray
+    _draft_window_graph_session: Any
     attn_groups: Any
     kv_cache_config: Any
     num_query_per_req: int
@@ -358,6 +358,13 @@ class DraftWindowGraphInputMixin:
         if num_reqs_padded < num_reqs:
             raise ValueError("padded request count must be at least actual requests")
 
+        selected = getattr(self, "_draft_window_selected_metadata", None)
+        output_workspace = None
+        if selected is not None:
+            session = self._draft_window_graph_session
+            capture_identity = session.resolve_capture_identity(selected.descriptor)
+            output_workspace = session.provider.prepare_workspace(capture_identity)
+
         cpu_full_exact = self._snapshot_prepared_draft_seq_lens(num_reqs_padded)
         cpu_apply_time_full_upper = torch.zeros(
             num_reqs_padded,
@@ -405,6 +412,7 @@ class DraftWindowGraphInputMixin:
             execution_lane=0,
             row_phase_fingerprint=plan.row_phase_fingerprint,
             quarantine_on_failure=hasattr(self, "_draft_window_graph_session"),
+            output_workspace=output_workspace,
         )
         if capability.native_swa_graph is not None:
             from vllm_ascend.worker.v2.spec_decode.draft_window_swa_graph import NativeSWAFullSnapshot
@@ -510,10 +518,7 @@ class DraftWindowGraphInputMixin:
             raise RuntimeError("eligible P4a route produced no Draft metadata")
         if self.model_state.attn_metadata is not target_metadata:
             raise RuntimeError("Target metadata owner changed during Draft metadata build")
-        metadata = _isolate_draft_metadata_from_target(
-            metadata,
-            target_metadata,
-        )
+        metadata = copy_draft_attention_metadata(metadata)
         runtime_state.publish_metadata(
             inputs,
             metadata,
@@ -658,110 +663,3 @@ def _requires_prefill_baseline_bypass(
     the proposal epoch before any materialization.
     """
     return classify_draft_window_batch_phase(input_batch).bypass_entire_batch
-
-
-def _isolate_draft_metadata_from_target(
-    draft_metadata: Any,
-    target_metadata: Any,
-) -> Any:
-    """Clone only Draft-side mutable references that alias real Target state."""
-    target_keys, target_numpy_arrays = collect_mutable_references(target_metadata)
-    memo: dict[int, Any] = {}
-
-    def isolate(value: Any) -> Any:
-        if value is None or isinstance(
-            value,
-            (
-                bool,
-                int,
-                float,
-                complex,
-                str,
-                bytes,
-                type,
-                Enum,
-                torch.dtype,
-                torch.device,
-            ),
-        ):
-            return value
-        value_id = id(value)
-        if value_id in memo:
-            return memo[value_id]
-        if isinstance(value, torch.Tensor):
-            storage = (str(value.device), value.untyped_storage().data_ptr())
-            if ("object", value_id) in target_keys or ("tensor_storage", storage) in target_keys:
-                cloned = value.clone()
-                memo[value_id] = cloned
-                return cloned
-            return value
-        if isinstance(value, np.ndarray):
-            if ("object", value_id) in target_keys or any(
-                np.shares_memory(value, target_array) for target_array in target_numpy_arrays
-            ):
-                cloned_array = value.copy()
-                memo[value_id] = cloned_array
-                return cloned_array
-            return value
-        if isinstance(value, dict):
-            result = {} if ("object", value_id) in target_keys else value
-            memo[value_id] = result
-            items = list(value.items())
-            if result is value:
-                for key, item in items:
-                    value[key] = isolate(item)
-            else:
-                result.update((key, isolate(item)) for key, item in items)
-            return result
-        if isinstance(value, list):
-            result_list: list[Any] = [] if ("object", value_id) in target_keys else value
-            memo[value_id] = result_list
-            isolated_items = [isolate(item) for item in value]
-            result_list[:] = isolated_items
-            return result_list
-        if isinstance(value, tuple):
-            result_tuple = tuple(isolate(item) for item in value)
-            memo[value_id] = result_tuple
-            return result_tuple
-        if isinstance(value, set):
-            result_set = {isolate(item) for item in value}
-            if ("object", value_id) not in target_keys:
-                value.clear()
-                value.update(result_set)
-                result_set = value
-            memo[value_id] = result_set
-            return result_set
-        if is_dataclass(value) and not isinstance(value, type):
-            # Always operate on a shallow Draft-side copy. A mutable dataclass
-            # may itself be shared with Target; mutating it before discovering
-            # that alias would corrupt Target metadata. object.__setattr__ also
-            # handles frozen/slotted dataclass copies without touching Target.
-            result_dataclass = copy.copy(value)
-            memo[value_id] = result_dataclass
-            for data_field in fields(value):
-                object.__setattr__(
-                    result_dataclass,
-                    data_field.name,
-                    isolate(getattr(value, data_field.name)),
-                )
-            return result_dataclass
-        values = getattr(value, "__dict__", None)
-        result_object = copy.copy(value) if ("object", value_id) in target_keys else value
-        memo[value_id] = result_object
-        if isinstance(values, dict):
-            for name, item in list(values.items()):
-                setattr(result_object, name, isolate(item))
-        for owner_type in type(value).__mro__:
-            slots = owner_type.__dict__.get("__slots__", ())
-            if isinstance(slots, str):
-                slots = (slots,)
-            for name in slots:
-                if name in ("__dict__", "__weakref__"):
-                    continue
-                try:
-                    setattr(result_object, name, isolate(getattr(value, name)))
-                except (AttributeError, TypeError):
-                    continue
-        return result_object
-
-    return isolate(draft_metadata)

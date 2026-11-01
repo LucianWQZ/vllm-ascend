@@ -1,14 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
-"""Ownership transfer for the frozen Eagle3 Graph per-consumer bank design.
+"""Per-consumer Eagle3 Graph banks with same-stream reuse and quarantine.
 
-P3 is staging scratch. P6 owns separate persistent first-pass/AR banks. The
-scratch's final reader is the ordered copy into a bank, not the later FIA.
-Releasing scratch after that copy has been enqueued relies on same-stream FIFO;
-it neither releases the destination bank nor reports device completion. The
-normal Graph replay/UPDATE/event contract separately orders bank reuse.
-
-This owner is not installed by default and does not open any Graph gate.
+Each first/AR consumer materializes directly into its own capture bank. A Host
+step retirement releases only its binding, not the buffers or device reader.
+The normal Graph tail-notify/current-stream dependency orders the next write.
 """
 
 from __future__ import annotations
@@ -147,7 +143,7 @@ class Eagle3GraphStagingOwner:
         if self._stream_identity() != self._stream:
             raise RuntimeError("Eagle3 staging stream changed within one proposal")
 
-    def bind_and_release_scratch(
+    def publish_step(
         self,
         *,
         capture_identity: DraftWindowGraphCaptureIdentity,
@@ -156,13 +152,7 @@ class Eagle3GraphStagingOwner:
         target_metadata: Mapping[str, Any],
         write_side_reference: DraftWindowGraphWriteSideReference,
     ) -> None:
-        """Copy all read state into its registered bank, retaining that bank.
-
-        Every later scratch materialization must stay on the same current
-        stream. CPU lengths have owning copies in P6; device copies precede
-        subsequent scratch writes in that stream. No device completion is
-        inferred from Python returning or P3's Host lease retirement.
-        """
+        """Publish and retain one prepared consumer, without another copy."""
         self.require_reusable()
         try:
             self._require_stream()
@@ -194,26 +184,12 @@ class Eagle3GraphStagingOwner:
             carrier = self.provider.bind_read_carrier(
                 capture_identity=capture_identity,
                 inputs=inputs,
-                proposal_id=self._proposal_epoch,
                 metadata_builder=metadata_builder,
                 target_metadata=target_metadata,
                 write_side_reference=write_side_reference,
             )
             if carrier.state is not DraftWindowGraphCarrierState.BOUND:
-                raise RuntimeError("Eagle3 scratch handoff has no bound persistent destination")
-            # The provider made owning CPU and current-stream device copies.
-            # Check all five buffers again at the transfer boundary. A single
-            # alias would let later staging overwrite a prior Graph consumer.
-            for name in (
-                "window_block_table",
-                "valid_num_blocks",
-                "device_window_exact",
-                "cpu_window_exact",
-                "cpu_window_upper",
-            ):
-                source, destination = getattr(inputs, name), getattr(carrier.read_inputs, name)
-                if source.untyped_storage().data_ptr() == destination.untyped_storage().data_ptr():
-                    raise RuntimeError("Eagle3 persistent read bank aliases reusable staging scratch")
+                raise RuntimeError("Eagle3 consumer has no bound persistent destination")
             self._require_stream()
             self.runtime.retire_generation(identity)
             self._carriers.append(carrier)

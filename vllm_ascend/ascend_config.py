@@ -88,17 +88,6 @@ def _native_swa_graph_window_review(speculative: Any, window_size: Any) -> bool:
     )
 
 
-def _dense_dp_graph_window_review(vllm_config: Any, window_size: Any) -> bool:
-    """Use the same startup contract as the DFlash Graph owner."""
-    from vllm_ascend import envs
-    from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import resolve_draft_graph_review_limit
-
-    scope = resolve_draft_graph_review_limit(
-        vllm_config, experimental_graph_review=envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH
-    )
-    return scope is not None and scope.method == "dflash" and window_size in (None, 32768)
-
-
 def _eagle3_tp4_graph_review(vllm_config: Any) -> bool:
     """Use the qualified actual Eagle consumer geometry, not an architecture name."""
     from vllm_ascend import envs
@@ -107,42 +96,26 @@ def _eagle3_tp4_graph_review(vllm_config: Any) -> bool:
     scope = resolve_draft_graph_review_limit(
         vllm_config, experimental_graph_review=envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH
     )
-    return (
-        scope is not None
-        and scope.method == "eagle3"
-        and vllm_config.parallel_config.tensor_parallel_size == 4
-        and vllm_config.parallel_config.data_parallel_size == scope.data_parallel_size
-        and vllm_config.scheduler_config.max_num_seqs == scope.max_requests
-    )
+    return scope is not None and scope.method == "eagle3"
 
 
-def _single_request_graph_off_review(vllm_config: Any) -> bool:
-    """A qualified Graph owner may also execute without the additional Window."""
-    if (vllm_config.additional_config or {}).get("draft_window_size") is not None:
-        return False
-    from vllm_ascend import envs
-    from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import resolve_draft_graph_review_limit
-
-    return (
-        resolve_draft_graph_review_limit(
-            vllm_config, experimental_graph_review=envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH
-        )
-        is not None
-    )
-
-
-def validate_draft_window_graph_config(vllm_config: Any) -> bool:
+def validate_draft_window_graph_config(vllm_config: Any, *, support: Any = ...) -> bool:
     """Validate the actual selected Draft Graph topology and provider geometry."""
     from vllm_ascend import envs
 
     speculative = vllm_config.speculative_config
     if not envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH or speculative is None or speculative.enforce_eager:
         return False
+    from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import resolve_draft_graph_review_limit
+
+    if support is ...:
+        support = resolve_draft_graph_review_limit(vllm_config, experimental_graph_review=True)
     additional = vllm_config.additional_config or {}
-    speculative = vllm_config.speculative_config
     native_swa_window = _native_swa_graph_window_review(speculative, additional.get("draft_window_size"))
-    dense_dp_window = _dense_dp_graph_window_review(vllm_config, additional.get("draft_window_size"))
-    single_request_off = _single_request_graph_off_review(vllm_config)
+    dense_dp_window = (
+        support is not None and support.method == "dflash" and additional.get("draft_window_size") in (None, 32768)
+    )
+    single_request_off = additional.get("draft_window_size") is None and support is not None
     if (
         speculative is None
         or speculative.method not in ("dspark", "dflash", "eagle3")
@@ -169,7 +142,7 @@ def validate_draft_window_graph_config(vllm_config: Any) -> bool:
         raise ValueError("replicated TP Graph review requires matching actual Target/Draft TP in (2, 4, 16)")
     if native_swa_window and tp != 4:
         raise ValueError("native SWA Graph review first requires actual TP4")
-    eagle_tp4 = speculative.method == "eagle3" and tp == 4 and _eagle3_tp4_graph_review(vllm_config)
+    eagle_tp4 = tp == 4 and support is not None and support.method == "eagle3"
     if speculative.method == "eagle3" and (
         not (tp == 2 or eagle_tp4)
         or type(getattr(speculative, "num_speculative_tokens", None)) is not int

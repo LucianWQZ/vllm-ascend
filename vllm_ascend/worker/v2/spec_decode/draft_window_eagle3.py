@@ -246,6 +246,7 @@ class Eagle3DraftWindowMixin:
         *,
         num_reqs: int,
         num_reqs_padded: int,
+        output_workspace: Any = None,
     ) -> DraftMetadataInputs:
         """Freeze proposal L0/H/S and materialize first-pass read state."""
         if self._eagle3_window_next_step != 0 or self._eagle3_window_proposal_plan is not None:
@@ -316,6 +317,7 @@ class Eagle3DraftWindowMixin:
             execution_lane=0,
             row_phase_fingerprint=step_plan.row_phase_fingerprint,
             quarantine_on_failure=hasattr(self, "_eagle3_graph_session"),
+            output_workspace=output_workspace,
         )
         self._eagle3_window_proposal_plan = proposal
         self._eagle3_window_live_inputs = inputs
@@ -365,6 +367,7 @@ class Eagle3DraftWindowMixin:
         num_reqs: int,
         num_reqs_padded: int,
         seq_lens_cpu_upper_bound: torch.Tensor,
+        output_workspace: Any = None,
     ) -> DraftMetadataInputs:
         """Refresh one AR step from FullSource under the proposal epoch."""
         if step != self._eagle3_window_next_step:
@@ -440,6 +443,7 @@ class Eagle3DraftWindowMixin:
             step=step,
             execution_lane=0,
             quarantine_on_failure=hasattr(self, "_eagle3_graph_session"),
+            output_workspace=output_workspace,
         )
         self._eagle3_window_live_inputs = inputs
         try:

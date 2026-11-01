@@ -10,7 +10,6 @@ output snapshot, artifact writer, or oracle participates in this path.
 
 from __future__ import annotations
 
-import copy
 from collections.abc import Mapping, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass, replace
@@ -344,7 +343,6 @@ def prepare_parallel_graph(
     carrier = session.provider.bind_read_carrier(
         capture_identity=capture_identity,
         inputs=inputs,
-        proposal_id=inputs.identity.mapping_epoch,
         metadata_builder=lambda read_inputs: _build_private_graph_metadata(
             owner,
             read_inputs=read_inputs,
@@ -439,43 +437,33 @@ def _build_private_graph_metadata(
             dcp_local_seq_lens=None,
         )
 
-    # Use the same deep isolation routine as eager P4, then explicitly restore
-    # only the immutable full write/query carriers frozen by P6.
-    from vllm_ascend.worker.v2.spec_decode.draft_window_eager import (
-        _isolate_draft_metadata_from_target,
-    )
+    from vllm_ascend.worker.v2.spec_decode.draft_window_graph_metadata import copy_draft_attention_metadata
 
-    private_isolation_view = _isolate_draft_metadata_from_target(metadata, target_metadata)
+    metadata = copy_draft_attention_metadata(metadata)
     window_layers = owner._draft_window_runtime_state.capability.inventory.require_single_group_direct_prefix().layers
-    # One backend object is shared by all layers in its attention group.
-    # Validate and bind each private object once, retaining every layer alias.
     bound_metadata_ids: set[int] = set()
     for layer_name in window_layers:
-        layer_metadata = private_isolation_view.get(layer_name)
+        layer_metadata = metadata.get(layer_name)
         if layer_metadata is not None and id(layer_metadata) not in bound_metadata_ids:
             _bind_parallel_graph_device_lengths(layer_metadata, read_inputs, fingerprint.query_width)
             bound_metadata_ids.add(id(layer_metadata))
-    # Preserve the isolated view unchanged for the private-state oracle.  The
-    # final metadata uses shallow copies of its layer objects so restoring the
-    # canonical full write/query owners cannot retroactively weaken that view.
-    final_metadata: dict[str, Any] = {}
-    finalized_groups: dict[tuple[int, int | None], Any] = {}
+    finalized_groups: dict[int, int | None] = {}
     native_swa = getattr(owner._draft_window_runtime_state.capability, "native_swa_graph", None)
     native_snapshot = getattr(owner, "_draft_window_native_full_snapshot", None) if native_swa is not None else None
     native_gids = (
         {} if native_swa is None else {name: group.gid for group in native_swa.native_groups for name in group.layers}
     )
-    for layer_name, layer_metadata in private_isolation_view.items():
+    for layer_name, layer_metadata in metadata.items():
         if layer_metadata is None:
-            final_metadata[layer_name] = None
             continue
-        # The actual builder shares one object across an attention group.
-        # Finalize that object once, never across different native read groups.
-        group_key = (id(layer_metadata), native_gids.get(layer_name))
-        if group_key in finalized_groups:
-            final_metadata[layer_name] = finalized_groups[group_key]
+        gid = native_gids.get(layer_name)
+        key = id(layer_metadata)
+        if key in finalized_groups:
+            if finalized_groups[key] != gid:
+                raise RuntimeError("one Draft metadata object spans incompatible native groups")
             continue
-        final_layer_metadata = copy.copy(layer_metadata)
+        finalized_groups[key] = gid
+        final_layer_metadata = layer_metadata
         final_layer_metadata.slot_mapping = write_side.slot_mapping
         final_layer_metadata.positions = write_side.positions
         final_layer_metadata.query_start_loc = write_side.query_start_loc
@@ -497,13 +485,7 @@ def _build_private_graph_metadata(
             final_layer_metadata.slot_mapping = owner.block_tables.slot_mappings[gid, : fingerprint.padded_token_count]
             final_layer_metadata.causal = True
             final_layer_metadata.attn_state = layer_metadata.attn_state
-        finalized_groups[group_key] = final_layer_metadata
-        final_metadata[layer_name] = final_layer_metadata
-    return DraftWindowGraphMetadataBuild(
-        metadata=final_metadata,
-        private_isolation_view=private_isolation_view,
-        native_full_snapshot=native_snapshot,
-    )
+    return DraftWindowGraphMetadataBuild(metadata=metadata, native_full_snapshot=native_snapshot)
 
 
 def _build_write_side_reference(

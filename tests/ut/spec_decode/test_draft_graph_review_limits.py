@@ -4,7 +4,6 @@
 import ast
 import copy
 import importlib.util
-import json
 import sys
 import tempfile
 import types
@@ -46,10 +45,9 @@ class DraftGraphSupportTest(unittest.TestCase):
 
     def config(self, *, method="eagle3", rows=1, dp=1, window=True):
         profile = "eagle3" if method == "eagle3" else "dflash_full8"
-        model = copy.deepcopy(GUARD._QUALIFIED_MODEL_CONFIGS[profile])
+        model = copy.deepcopy(GUARD._CONSUMER_CONFIGS[profile])
         directory = Path(self.directory.name) / f"{method}-{rows}-{dp}-{window}"
         directory.mkdir(exist_ok=True)
-        (directory / "config.json").write_text(json.dumps(model))
         parallel = dict(
             tensor_parallel_size=4,
             data_parallel_size=dp,
@@ -139,14 +137,12 @@ class DraftGraphSupportTest(unittest.TestCase):
 
     def test_unscoped_dflash_loading_and_dflash2_super_config_stay_unmodified(self):
         config = self.config(method="dflash")
-        path = Path(config.speculative_config.draft_model_config.model) / "config.json"
         # Unscoped DFlash startup must not pollute copies used by the shared
         # DFlash/DFlash2 load_dflash_model path, even when support is None.
         for model in (
             {"architectures": ["GlmDFlashDraftModel"], "model_type": "glm_moe_dsa"},
             {"architectures": ["DFlash2DraftModel"], "model_type": "qwen3"},
         ):
-            path.write_text(json.dumps(model))
             config.speculative_config.draft_model_config.hf_config = NS(**model)
             fields = vars(config).copy()
             # The real DFlash2 service selects method=dflash too.
@@ -159,38 +155,113 @@ class DraftGraphSupportTest(unittest.TestCase):
 
     def test_config_packaging_changes_do_not_change_support(self):
         config = self.config()
-        path = Path(config.speculative_config.draft_model_config.model) / "config.json"
-        model = json.loads(path.read_text())
-        model.update(transformers_version="a packaging version", initializer_range=0.3, _name_or_path="elsewhere")
-        path.write_text(json.dumps(model, indent=1))
-        self.assertEqual(self.resolve(config).method, "eagle3")
+        hf = config.speculative_config.draft_model_config.hf_config
+        hf.transformers_version = "a packaging version"
+        hf.initializer_range = 0.3
+        hf.unused_export_note = "not read by the fixed model"
+        with patch.object(Path, "read_text", side_effect=AssertionError("unexpected config IO")):
+            self.assertEqual(self.resolve(config).method, "eagle3")
 
-    def test_unknown_semantics_and_changed_aux_or_heads_do_not_open(self):
+    def test_startup_reuses_the_frozen_support_without_reparsing(self):
+        config = self.config(rows=2)
+        support = self.resolve(config)
+        validator = actual_source_function(
+            MODULE_PATH.parents[3] / "ascend_config.py",
+            "validate_draft_window_graph_config",
+            {"Any": Any, "_native_swa_graph_window_review": lambda *_: False},
+        )
+        package = types.ModuleType("vllm_ascend")
+        package.__dict__["envs"] = NS(VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH=True)
+        with patch.dict(
+            sys.modules, {"vllm_ascend": package, "vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits": GUARD}
+        ):
+            with patch.object(
+                GUARD, "resolve_draft_graph_review_limit", wraps=GUARD.resolve_draft_graph_review_limit
+            ) as resolve:
+                self.assertTrue(validator(config))
+                self.assertEqual(resolve.call_count, 1)
+            with patch.object(Path, "read_text", side_effect=AssertionError("already resolved")):
+                self.assertTrue(validator(config, support=support))
+                config.speculative_config.enforce_eager = True
+                self.assertFalse(validator(config))
+
+    def test_real_factory_passes_its_single_frozen_support_to_validation(self):
+        config = self.config(rows=2)
+        before = vars(config).copy()
+        policy = NS(enabled=True, state="on")
+        namespace = {
+            "_resolve_window_policy": lambda _: policy,
+            "_init_speculator": lambda *_: NS(),
+            "_configure_graph_window_owner": lambda *_: None,
+            "DraftWindowPolicyState": NS(FORCED_OFF="forced"),
+        }
+        factory_path = MODULE_PATH.with_name("__init__.py")
+        namespace["_use_graph_window_owner"] = actual_source_function(
+            factory_path, "_use_graph_window_owner", namespace
+        )
+        factory = actual_source_function(factory_path, "init_speculator", namespace)
+        package = types.ModuleType("vllm_ascend")
+        package.__dict__["envs"] = NS(VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH=True)
+        module = types.ModuleType("vllm_ascend.ascend_config")
+        observed: list[Any] = []
+        module.__dict__["validate_draft_window_graph_config"] = lambda _, **kwargs: observed.append(kwargs["support"])
+        with (
+            patch.dict(
+                sys.modules,
+                {
+                    "vllm_ascend": package,
+                    "vllm_ascend.ascend_config": module,
+                    "vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits": GUARD,
+                },
+            ),
+            patch.object(
+                GUARD, "resolve_draft_graph_review_limit", wraps=GUARD.resolve_draft_graph_review_limit
+            ) as resolve,
+        ):
+            owner = factory(config, None)
+            self.assertEqual(resolve.call_count, 1)
+        self.assertEqual(observed, [owner._draft_graph_review_limit])
+        self.assertEqual(vars(config), before)
+
+    def test_real_consumer_overrides_and_normalized_positions_stay_protected(self):
+        for field, value in (("is_causal", False), ("target_hidden_size", 4096), ("use_aux_hidden_state", False)):
+            config = self.config()
+            setattr(config.speculative_config.draft_model_config.hf_config, field, value)
+            with self.subTest(field=field), self.assertRaises(NotImplementedError):
+                self.resolve(config)
+        config = self.config()
+        config.speculative_config.draft_model_config.hf_config.rope_parameters = {
+            "rope_type": "default",
+            "rope_theta": 1,
+        }
+        with self.assertRaisesRegex(NotImplementedError, "rope_parameters"):
+            self.resolve(config)
+
+    def test_changed_attention_aux_or_position_semantics_are_rejected(self):
         for field, value in (
-            ("unrecognized_attention_mode", "new"),
+            ("is_causal", True),
             ("num_key_value_heads", 4),
             ("eagle_config", {"eagle_aux_hidden_state_layer_ids": [2, 18, 34]}),
             ("rope_parameters", {"rope_type": "default", "rope_theta": 10000}),
         ):
             config = self.config()
-            path = Path(config.speculative_config.draft_model_config.model) / "config.json"
-            model = json.loads(path.read_text())
-            model[field] = value
-            path.write_text(json.dumps(model))
+            setattr(config.speculative_config.draft_model_config.hf_config, field, value)
             with self.subTest(field=field), self.assertRaises(NotImplementedError):
                 self.resolve(config)
 
     def test_swa_counterexample_remains_blocked_with_window_off(self):
         config = self.config(method="dflash", window=False)
-        path = Path(config.speculative_config.draft_model_config.model) / "config.json"
-        path.write_text(json.dumps(GUARD._QUALIFIED_MODEL_CONFIGS["dflash_swa6"]))
+        hf = config.speculative_config.draft_model_config.hf_config
+        hf.layer_types = ["sliding_attention"] * 5 + ["full_attention"]
+        hf.sliding_window = 4096
         with self.assertRaisesRegex(NotImplementedError, "valid-output"):
             self.resolve(config)
 
     def test_diagnostic_flag_does_not_bypass_failed_model(self):
         config = self.config(method="dflash")
-        path = Path(config.speculative_config.draft_model_config.model) / "config.json"
-        path.write_text(json.dumps(GUARD._QUALIFIED_MODEL_CONFIGS["dflash_swa6"]))
+        hf = config.speculative_config.draft_model_config.hf_config
+        hf.layer_types = ["sliding_attention"] * 5 + ["full_attention"]
+        hf.sliding_window = 4096
         config.additional_config["draft_window_graph_numeric_diagnostic"] = True
         with self.assertRaises(NotImplementedError):
             self.resolve(config)
@@ -247,10 +318,10 @@ class DraftGraphSupportTest(unittest.TestCase):
         )
         GUARD.validate_draft_graph_review_requests(owner, batch)
 
-    def test_normalized_model_conflict_is_not_hidden_by_original_config(self):
+    def test_changed_normalized_head_dimension_stays_blocked(self):
         config = self.config()
         config.speculative_config.draft_model_config.hf_config.head_dim = 128
-        with self.assertRaisesRegex(NotImplementedError, "Normalized Draft head_dim"):
+        with self.assertRaisesRegex(NotImplementedError, "consumer head_dim"):
             self.resolve(config)
 
     def test_exact_lengths_follow_canonical_continuing_prefill_progress(self):
@@ -641,7 +712,7 @@ class Main544EagleControls(unittest.TestCase):
                     graph_mode="FULL",
                 ),
             )
-            owner.bind_and_release_scratch(
+            owner.publish_step(
                 capture_identity=capture,
                 inputs=inputs,
                 metadata_builder=lambda read: None,

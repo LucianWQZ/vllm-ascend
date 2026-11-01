@@ -426,9 +426,7 @@ def test_private_full_padded_build_is_separate_from_unchanged_true_eager_clamp()
     assert passed["num_reqs"] == passed["num_reqs_padded"] == "read_inputs.padded_request_count"
     private_statements = [ast.unparse(n) for n in private.body]
     isolation = next(
-        i
-        for i, text in enumerate(private_statements)
-        if "private_isolation_view = _isolate_draft_metadata_from_target" in text
+        i for i, text in enumerate(private_statements) if "copy_draft_attention_metadata(metadata)" in text
     )
     binding = next(i for i, text in enumerate(private_statements) if "_bind_parallel_graph_device_lengths(" in text)
     assert isolation < binding
@@ -467,7 +465,7 @@ def _run_actual_private_binding_loop(graph_device_binding, read, metadata_by_lay
 
     namespace = dict(
         window_layers=tuple(metadata_by_layer),
-        private_isolation_view=metadata_by_layer,
+        metadata=metadata_by_layer,
         read_inputs=read,
         fingerprint=SimpleNamespace(query_width=8),
         _bind_parallel_graph_device_lengths=strict_bind,
@@ -715,7 +713,7 @@ def test_typed_update_rejects_stale_task_or_replaced_read_operands(typed_update_
 
 
 @pytest.fixture
-def full_metadata_dispatch():
+def full_metadata_dispatch(monkeypatch):
     """Execute the normal FULL-selection boundary with actual epoch/row keys."""
     source = SOURCE.with_name("draft_window_graph_metadata.py")
     tree = ast.parse(source.read_text())
@@ -730,7 +728,11 @@ def full_metadata_dispatch():
     class Provider:
         inventory_method = "dflash"
 
-    namespace = {"dataclass": dataclass, "DraftWindowGraphBindingProvider": Provider}
+    graph_module_name = "vllm_ascend.worker.v2.spec_decode.draft_window_graph"
+    graph_module = ModuleType(graph_module_name)
+    graph_module.__dict__["DraftWindowGraphBindingProvider"] = Provider
+    monkeypatch.setitem(sys.modules, graph_module_name, graph_module)
+    namespace = {"dataclass": dataclass}
     module = ast.Module(
         body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), *nodes],
         type_ignores=[],
@@ -743,7 +745,7 @@ def full_metadata_dispatch():
         _draft_window_proposal_context=SimpleNamespace(mapping_epoch=7, ordered_request_ids=("req-a", "req-b")),
         _draft_window_graph_binding_provider=Provider(),
         num_query_per_req=8,
-        _draft_window_runtime_state=SimpleNamespace(_active_inputs=inputs, metadata_store=SimpleNamespace(_entry=None)),
+        _draft_window_runtime_state=SimpleNamespace(_active_inputs=inputs, _metadata=None),
         _draft_window_live_inputs=inputs,
         _draft_window_deferred_metadata=None,
     )
@@ -754,6 +756,10 @@ def full_metadata_dispatch():
 def test_full_metadata_dispatch_defers_once_for_current_generation(full_metadata_dispatch):
     c = full_metadata_dispatch
     c.select_parallel_graph_metadata(c.owner, c.descriptor)
+    selected = c.owner._draft_window_selected_metadata
+    assert selected.descriptor is c.descriptor
+    assert selected.request_ids == ("req-a", "req-b") and selected.mapping_epoch == 7
+    assert selected.padded_requests == 2 and selected.padded_tokens == 16
     assert c.defer_parallel_graph_metadata(c.owner, c.inputs, padded_requests=2, padded_tokens=16)
     c.validate_deferred_parallel_graph_metadata(c.owner, c.inputs, c.descriptor)
     assert c.owner._draft_window_deferred_metadata is c.inputs.identity
@@ -793,24 +799,20 @@ def test_eager_dispatch_keeps_ordinary_metadata_build(full_metadata_dispatch):
 def test_full_metadata_dispatch_does_not_replace_published_metadata(full_metadata_dispatch):
     c = full_metadata_dispatch
     c.select_parallel_graph_metadata(c.owner, c.descriptor)
-    c.owner._draft_window_runtime_state.metadata_store._entry = object()
+    c.owner._draft_window_runtime_state._metadata = object()
     with pytest.raises(RuntimeError, match="existing publication"):
         c.defer_parallel_graph_metadata(c.owner, c.inputs, padded_requests=2, padded_tokens=16)
 
 
-def test_full_graph_final_metadata_reuses_groups_without_mixing_native_reads():
-    """The actual finalization loop shares per-group objects, not reader semantics."""
-    import copy
-
+@pytest.fixture
+def full_metadata_finalization():
+    """Execute the real in-place finalization of one private metadata mapping."""
     source = SOURCE.with_name("draft_window_graph_runtime.py")
     tree = ast.parse(source.read_text())
     function = next(
         n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_build_private_graph_metadata"
     )
-    loop = next(
-        n for n in function.body if isinstance(n, ast.For) and ast.unparse(n.iter) == "private_isolation_view.items()"
-    )
-    shared = SimpleNamespace(attn_state=object())
+    loop = next(n for n in function.body if isinstance(n, ast.For) and ast.unparse(n.iter) == "metadata.items()")
     writes = SimpleNamespace(
         slot_mapping=object(),
         positions=object(),
@@ -831,28 +833,52 @@ def test_full_graph_final_metadata_reuses_groups_without_mixing_native_reads():
         def __getitem__(self, key):
             return key[0], "canonical-full-slots"
 
-    namespace: dict[str, Any] = dict(
-        copy=copy,
-        private_isolation_view={"full.a": shared, "full.b": shared, "swa.a": shared, "swa.b": shared},
-        final_metadata={},
-        finalized_groups={},
-        native_gids={"swa.a": 0, "swa.b": 1},
-        native_snapshot=snapshot,
-        native_swa=object(),
-        write_side=writes,
-        read_inputs=SimpleNamespace(padded_request_count=1),
-        fingerprint=SimpleNamespace(padded_token_count=8),
-        owner=SimpleNamespace(
-            _draft_window_live_inputs=SimpleNamespace(identity=object()),
-            block_tables=SimpleNamespace(input_block_tables=[[10], [20]], slot_mappings=Slots()),
-        ),
-    )
-    exec(compile(ast.fix_missing_locations(ast.Module(body=[loop], type_ignores=[])), str(source), "exec"), namespace)
-    result = namespace["final_metadata"]
-    assert result["full.a"] is result["full.b"]
-    assert result["full.a"] is not shared and result["full.a"].causal is False
-    assert result["swa.a"] is not result["swa.b"] and result["swa.a"] is not result["full.a"]
-    assert result["swa.a"].block_tables == [10] and result["swa.b"].block_tables == [20]
-    assert result["swa.a"].causal is result["swa.b"].causal is True
-    assert len(validates) == 2
-    assert not hasattr(shared, "slot_mapping")
+    def finalize(metadata):
+        namespace: dict[str, Any] = dict(
+            metadata=metadata,
+            finalized_groups={},
+            native_gids={"swa.a": 0, "swa.b": 1},
+            native_snapshot=snapshot,
+            native_swa=object(),
+            write_side=writes,
+            read_inputs=SimpleNamespace(padded_request_count=1),
+            fingerprint=SimpleNamespace(padded_token_count=8),
+            owner=SimpleNamespace(
+                _draft_window_live_inputs=SimpleNamespace(identity=object()),
+                block_tables=SimpleNamespace(input_block_tables=[[10], [20]], slot_mappings=Slots()),
+            ),
+        )
+        exec(
+            compile(ast.fix_missing_locations(ast.Module(body=[loop], type_ignores=[])), str(source), "exec"),
+            namespace,
+        )
+        return namespace["metadata"]
+
+    return SimpleNamespace(finalize=finalize, writes=writes, snapshot=snapshot, validates=validates)
+
+
+def test_full_graph_final_metadata_reuses_actual_builder_groups_without_mixing_native_reads(full_metadata_finalization):
+    case = full_metadata_finalization
+    full, swa0, swa1 = (SimpleNamespace(attn_state=object()) for _ in range(3))
+    metadata = {"full.a": full, "full.b": full, "swa.a": swa0, "swa.b": swa1, "unused": None}
+    result = case.finalize(metadata)
+    assert result is metadata  # Final operands use the one private build.
+    assert result["full.a"] is result["full.b"] is full
+    assert full.causal is False and full.slot_mapping is case.writes.slot_mapping
+    assert full.positions is case.writes.positions and full.query_start_loc is case.writes.query_start_loc
+    assert full.actual_seq_lengths_q == [8] and full.num_actual_tokens == 8
+    assert full.attn_state is case.writes.attn_state
+    assert swa0.block_tables == [10] and swa1.block_tables == [20]
+    assert swa0.seq_lens is swa1.seq_lens is case.snapshot.device_exact
+    assert swa0.seq_lens_cpu is swa1.seq_lens_cpu is case.snapshot.cpu_exact
+    assert swa0.seq_lens_list == swa1.seq_lens_list == [17]
+    assert swa0.slot_mapping == (0, "canonical-full-slots")
+    assert swa1.slot_mapping == (1, "canonical-full-slots")
+    assert swa0.causal is swa1.causal is True
+    assert result["unused"] is None and len(case.validates) == 2
+
+
+def test_full_graph_final_metadata_rejects_one_object_for_incompatible_reader_groups(full_metadata_finalization):
+    shared = SimpleNamespace(attn_state=object())
+    with pytest.raises(RuntimeError, match="one Draft metadata object spans incompatible native groups"):
+        full_metadata_finalization.finalize({"full.a": shared, "swa.a": shared})

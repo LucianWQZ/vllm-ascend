@@ -27,7 +27,6 @@ from vllm_ascend.worker.v2.spec_decode.draft_window import (
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_eager import (
     AscendDraftAttentionReadInputs,
-    _isolate_draft_metadata_from_target,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_eagle3 import (
     Eagle3DraftWindowMixin,
@@ -37,6 +36,7 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
     DraftWindowGraphRoute,
     consume_draft_window_graph_metadata,
 )
+from vllm_ascend.worker.v2.spec_decode.draft_window_graph_metadata import copy_draft_attention_metadata
 
 
 class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin):
@@ -250,11 +250,15 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin):
                 padded = batch_desc.num_reqs or num_reqs
                 self._snapshot_eagle3_decode_step_one(num_reqs=num_reqs, num_reqs_padded=padded)
                 for step in range(1, self.num_speculative_steps):
+                    bank = session.provider.prepare_workspace(
+                        session.resolve(first=False, n=padded, tokens=batch_desc.num_tokens, ordinal=step - 1)
+                    )
                     inputs = self._materialize_eagle3_decode_step(
                         step=step,
                         num_reqs=num_reqs,
                         num_reqs_padded=padded,
                         seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+                        output_workspace=bank,
                     )
                     session.stage(inputs, first=False, n=padded, tokens=batch_desc.num_tokens, ordinal=step - 1)
                 return self.decode_cudagraph_manager.run_fullgraph(batch_desc)
@@ -500,7 +504,7 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin):
 
         # Isolate before assigning per-layer state: a buggy/reusing builder
         # must not let the state write below mutate a Target-owned object.
-        metadata = _isolate_draft_metadata_from_target(metadata, target_metadata)
+        metadata = copy_draft_attention_metadata(metadata)
         for layer_name, layer_metadata in metadata.items():
             if layer_metadata is None:
                 continue

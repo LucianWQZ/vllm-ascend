@@ -8,10 +8,8 @@ contract when the new experimental Graph owner is explicitly selected.
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from operator import index
-from pathlib import Path
 from typing import TypeGuard
 
 
@@ -25,28 +23,11 @@ class DraftGraphSupport:
     query_tokens: int
 
 
-# These fields describe the actual attention/auxiliary/position consumers.
-# Packaging, weight-initialization and token-generation defaults below do not
-# alter these fixed model implementations' Graph input or cache geometry.
-# All other original fields must match; a new/unknown semantic field fails closed.
-_NON_CONSUMER_CONFIG_FIELDS = frozenset(
-    (
-        "auto_map",
-        "transformers_version",
-        "_name_or_path",
-        "initializer_range",
-        "attention_dropout",
-        "eos_token_id",
-        "bos_token_id",
-        "pad_token_id",
-        "use_cache",
-        "pretraining_tp",
-        "max_window_layers",
-    )
-)
+# Match only fields consumed by the fixed model's projection, attention, aux
+# selection or absolute-position path. Packaging and unconsumed config keys do
+# not define a new Graph geometry. Runtime dtype/capacity are checked below.
 _COMMON_CONSUMER_CONFIG = {
     "attention_bias": False,
-    "dtype": "bfloat16",
     "hidden_act": "silu",
     "hidden_size": 2048,
     "max_position_embeddings": 262144,
@@ -54,7 +35,7 @@ _COMMON_CONSUMER_CONFIG = {
     "tie_word_embeddings": False,
     "vocab_size": 248320,
 }
-_QUALIFIED_MODEL_CONFIGS = {
+_CONSUMER_CONFIGS = {
     "dflash_full8": {
         **_COMMON_CONSUMER_CONFIG,
         **{
@@ -63,61 +44,22 @@ _QUALIFIED_MODEL_CONFIGS = {
             "dflash_config": {"mask_token_id": 248070, "target_layer_ids": [1, 10, 19, 28, 37]},
             "head_dim": 128,
             "intermediate_size": 6144,
-            "layer_types": [
-                "full_attention",
-                "full_attention",
-                "full_attention",
-                "full_attention",
-                "full_attention",
-                "full_attention",
-                "full_attention",
-                "full_attention",
-            ],
+            "layer_types": ["full_attention"] * 8,
             "model_type": "qwen3",
             "num_attention_heads": 32,
             "num_hidden_layers": 8,
             "num_key_value_heads": 4,
             "num_target_layers": 40,
-            "rope_scaling": {
+            "rope_parameters": {
                 "beta_fast": 32.0,
                 "beta_slow": 1.0,
                 "factor": 64.0,
                 "original_max_position_embeddings": 4096,
                 "rope_type": "yarn",
-                "type": "yarn",
+                "rope_theta": 10000000,
             },
-            "rope_theta": 10000000,
             "sliding_window": None,
             "use_sliding_window": False,
-        },
-    },
-    "dflash_swa6": {
-        **_COMMON_CONSUMER_CONFIG,
-        **{
-            "architectures": ["DFlashDraftModel"],
-            "dflash_config": {
-                "block_size": 16,
-                "mask_token_id": 248077,
-                "target_layer_ids": [1, 6, 11, 16, 22, 27, 32, 37],
-            },
-            "head_dim": 128,
-            "intermediate_size": 6144,
-            "layer_types": [
-                "sliding_attention",
-                "sliding_attention",
-                "sliding_attention",
-                "sliding_attention",
-                "sliding_attention",
-                "full_attention",
-            ],
-            "model_type": "qwen3",
-            "num_attention_heads": 32,
-            "num_hidden_layers": 6,
-            "num_key_value_heads": 8,
-            "num_target_layers": 40,
-            "rope_parameters": {"rope_theta": 10000000, "rope_type": "default"},
-            "sliding_window": 4096,
-            "use_sliding_window": True,
         },
     },
     "eagle3": {
@@ -144,16 +86,45 @@ _QUALIFIED_MODEL_CONFIGS = {
 _FULL8_QUERY_TOKENS = 8
 
 
-def _checkpoint_profile(speculative):
-    model = getattr(speculative.draft_model_config, "model", None)
-    config_file = Path(model) / "config.json" if isinstance(model, (str, Path)) else None
-    if config_file is None or not config_file.is_file() or config_file.stat().st_size > 1 << 20:
+def _consumer_profile(speculative):
+    """Use the same normalized configuration that constructs the actual model."""
+    hf = speculative.draft_model_config.hf_config
+    architectures = getattr(hf, "architectures", ()) or ()
+    if architectures == ["DFlashDraftModel"] and getattr(hf, "model_type", None) == "qwen3":
+        if (
+            getattr(hf, "layer_types", None) == ["sliding_attention"] * 5 + ["full_attention"]
+            and getattr(hf, "sliding_window", None) == 4096
+        ):
+            return "dflash_swa6"
+        profile = "dflash_full8"
+    elif architectures == ["LlamaForCausalLMEagle3"]:
+        profile = "eagle3"
+    else:
         return None
-    config = json.loads(config_file.read_text())
-    if not isinstance(config, dict):
-        raise ValueError("Draft checkpoint config must be an object")
-    config = {key: value for key, value in config.items() if key not in _NON_CONSUMER_CONFIG_FIELDS}
-    return next((name for name, expected in _QUALIFIED_MODEL_CONFIGS.items() if config == expected), None)
+    expected = _CONSUMER_CONFIGS[profile]
+    for field, value in expected.items():
+        actual = getattr(hf, field, None)
+        if field == "rope_parameters" and isinstance(actual, dict):
+            actual = dict(actual)
+            actual.pop("type", None)  # Transformers can retain this legacy alias.
+        if actual != value:
+            raise NotImplementedError(f"Draft Graph consumer {field} differs from its qualified configuration")
+    # These actual model overrides change projection/auxiliary/attention work;
+    # none belongs to the qualified consumer. Packaging keys do not enter here.
+    if any(
+        getattr(hf, field, None) is not None
+        for field in (
+            "is_causal",
+            "target_hidden_size",
+            "num_aux_hidden_states",
+            "norm_before_fc",
+            "use_aux_hidden_state",
+            "add_swa_attention_sink_bias",
+            "quantization_config",
+        )
+    ) or (profile == "dflash_full8" and getattr(hf, "eagle_config", None)):
+        raise NotImplementedError("Draft Graph consumer overrides have not been qualified")
+    return profile
 
 
 def full8_graph_review_max_requests(limit):
@@ -183,7 +154,7 @@ def resolve_draft_graph_review_limit(vllm_config, *, experimental_graph_review=F
     effective = decode() if callable(decode) else mode
     if getattr(effective, "name", effective) == "NONE":
         return None
-    profile = _checkpoint_profile(speculative)
+    profile = _consumer_profile(speculative)
     if profile == "dflash_swa6":
         raise NotImplementedError(
             "This six-layer native-SWA DFlash Graph combination has an unresolved valid-output counterexample; "
@@ -191,30 +162,10 @@ def resolve_draft_graph_review_limit(vllm_config, *, experimental_graph_review=F
         )
     scope = None
     if profile in ("dflash_full8", "eagle3"):
-        expected = _QUALIFIED_MODEL_CONFIGS[profile]
-        hf = speculative.draft_model_config.hf_config
-        for field in (
-            "architectures",
-            "hidden_size",
-            "num_hidden_layers",
-            "num_attention_heads",
-            "num_key_value_heads",
-            "head_dim",
-            "max_position_embeddings",
-            "layer_types",
-            "sliding_window",
-            "use_sliding_window",
-            "fc_norm",
-            "eagle_aux_hidden_state_layer_ids",
-            "dflash_config",
-        ):
-            if field in expected and getattr(hf, field, None) != expected[field]:
-                raise NotImplementedError(f"Normalized Draft {field} differs from its qualified consumer configuration")
         scope = _validate_qualified_graph_config(vllm_config, profile)
     else:
         hf = speculative.draft_model_config.hf_config
-        # These Qwen dense consumers require the exact qualified calculation
-        # config. A familiar architecture name cannot open an unknown variant.
+        # Familiar names do not open an unknown normalized consumer geometry.
         architectures = getattr(hf, "architectures", ()) or ()
         if (speculative.method == "eagle3" and "LlamaForCausalLMEagle3" in architectures) or (
             speculative.method == "dflash"

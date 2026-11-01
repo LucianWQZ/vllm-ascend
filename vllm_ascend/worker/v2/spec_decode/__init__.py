@@ -17,7 +17,7 @@
 # This file is a part of the vllm-ascend project.
 #
 import copy
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.config import CompilationMode, VllmConfig
@@ -105,7 +105,9 @@ def _resolve_window_policy(vllm_config: VllmConfig) -> DraftWindowPolicyDecision
     )
 
 
-def _use_graph_window_owner(vllm_config: VllmConfig, policy: DraftWindowPolicyDecision | None) -> bool:
+def _use_graph_window_owner(
+    vllm_config: VllmConfig, policy: DraftWindowPolicyDecision | None, support: Any = ...
+) -> bool:
     """Keep the ordinary eager runtime and persistent Graph owner exclusive."""
     if policy is None or not policy.enabled or vllm_config.speculative_config.enforce_eager:
         return False
@@ -115,7 +117,7 @@ def _use_graph_window_owner(vllm_config: VllmConfig, policy: DraftWindowPolicyDe
         raise NotImplementedError("Draft Window Graph requires its explicit experimental Graph entry")
     from vllm_ascend.ascend_config import validate_draft_window_graph_config
 
-    validate_draft_window_graph_config(vllm_config)
+    validate_draft_window_graph_config(vllm_config, support=support)
     return True
 
 
@@ -156,7 +158,7 @@ def init_speculator(vllm_config: VllmConfig, device: torch.device, req_states: "
             vllm_config, experimental_graph_review=envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH
         )
     policy = _resolve_window_policy(vllm_config)
-    use_graph_owner = _use_graph_window_owner(vllm_config, policy)
+    use_graph_owner = _use_graph_window_owner(vllm_config, policy, review_limit)
     speculator = _init_speculator(vllm_config, device, req_states)
     if review_limit is not None:
         speculator._draft_graph_review_limit = review_limit

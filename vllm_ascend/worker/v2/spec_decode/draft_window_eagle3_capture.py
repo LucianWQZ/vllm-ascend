@@ -12,7 +12,6 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from contextlib import contextmanager
-from copy import copy
 from typing import Any
 
 import torch
@@ -22,7 +21,6 @@ from vllm_ascend.worker.v2.spec_decode.draft_window import (
     _build_draft_window_source_capability_for_context,
     build_draft_window_runtime_context,
 )
-from vllm_ascend.worker.v2.spec_decode.draft_window_eager import _isolate_draft_metadata_from_target
 from vllm_ascend.worker.v2.spec_decode.draft_window_eagle3_graph import Eagle3GraphStagingOwner
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
     DraftWindowGraphCaptureIdentity,
@@ -33,6 +31,7 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
     DraftWindowGraphWriteSideReference,
     install_draft_window_graph_binding_provider,
 )
+from vllm_ascend.worker.v2.spec_decode.draft_window_graph_metadata import copy_draft_attention_metadata
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph_runtime import (
     draft_window_graph_enabled,
     validate_graph_context,
@@ -197,14 +196,13 @@ class Eagle3GraphSession:
         capacity = min(
             self.owner.max_model_len, identity.fingerprint.window_size + identity.fingerprint.block_span_tokens - 1
         )
-        private = _isolate_draft_metadata_from_target(metadata, metadata)
+        private = copy_draft_attention_metadata(metadata)
         result: dict[str, Any] = {}
         for name, layer in private.items():
             if layer is None:
                 result[name] = None
                 continue
             source = metadata[name]
-            layer = copy(layer)
             layer.block_tables = read.window_block_table
             layer.seq_lens = read.device_window_exact
             layer.seq_lens_cpu = read.cpu_window_exact
@@ -212,7 +210,7 @@ class Eagle3GraphSession:
             layer.max_seq_len = capacity
             layer.causal = True
             # Full write/query fields are preserved, never derived from V/S.
-            for attr in ("slot_mapping", "actual_seq_lengths_q", "positions"):
+            for attr in ("slot_mapping", "positions"):
                 if hasattr(source, attr):
                     setattr(layer, attr, getattr(source, attr))
             # Match runtime write_reference: bind the owned Full input query,
@@ -269,12 +267,9 @@ class Eagle3GraphSession:
                 target_metadata=target,
                 first_pass=first,
             )
-            final: dict[str, Any] = {}
             for name, layer in private.items():
                 if layer is None:
-                    final[name] = None
                     continue
-                layer = copy(layer)
                 layer.slot_mapping, layer.query_start_loc = write.slot_mapping, write.query_start_loc
                 layer.actual_seq_lengths_q = list(write.actual_seq_lengths_q)
                 layer.attn_state, layer.num_actual_tokens, layer.causal = (
@@ -284,10 +279,9 @@ class Eagle3GraphSession:
                 )
                 if hasattr(layer, "positions"):
                     layer.positions = write.positions
-                final[name] = layer
-            return DraftWindowGraphMetadataBuild(metadata=final, private_isolation_view=private)
+            return DraftWindowGraphMetadataBuild(metadata=private)
 
-        self.controller.bind_and_release_scratch(
+        self.controller.publish_step(
             capture_identity=identity,
             inputs=inputs,
             metadata_builder=build,

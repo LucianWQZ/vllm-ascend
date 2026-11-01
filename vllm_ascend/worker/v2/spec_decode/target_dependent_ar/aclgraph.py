@@ -377,9 +377,13 @@ class AutoRegressiveAclGraphManager(SpeculatorCudaGraphManager):
                     context.ordered_request_ids,
                     num_speculative_tokens=owner._eagle3_window_scheduled_tokens,
                 )
+                bank = session.provider.prepare_workspace(
+                    session.resolve(first=True, n=desc.num_reqs, tokens=desc.num_tokens, ordinal=0)
+                )
                 inputs = owner._materialize_eagle3_first_pass(
                     num_reqs=owner.input_batch.num_reqs,
                     num_reqs_padded=desc.num_reqs,
+                    output_workspace=bank,
                 )
                 session.stage(inputs, first=True, n=desc.num_reqs, tokens=desc.num_tokens, ordinal=0)
             metadata_batch = owner.build_draft_attn_metadatas(
