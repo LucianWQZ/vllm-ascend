@@ -479,14 +479,6 @@ def build_attn_metadata(
             raise TypeError("Graph metadata requires typed current Draft read inputs")
         if common_metadata_callback is not None:
             raise ValueError("Graph read inputs and a common metadata callback cannot share one build")
-        draft_window_read_inputs.validate_builder_sources(
-            num_reqs=num_reqs,
-            block_tables=block_tables,
-            seq_lens=seq_lens,
-            seq_lens_cpu=seq_lens_cpu,
-            seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
-            max_seq_len=max_seq_len,
-        )
     if seq_lens_cpu is None:
         if seq_lens_np is None:
             if seq_lens_cpu_upper_bound is not None:
