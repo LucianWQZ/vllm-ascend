@@ -4,7 +4,6 @@
 
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -13,7 +12,6 @@ import torch
 from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftMetadataInputs,
     DraftWindowGenerationIdentity,
-    DraftWindowSourceCapability,
     gather_valid_num_blocks_cpu,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_eager import (
@@ -23,8 +21,6 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_eager import (
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphBindingProvider
 from vllm_ascend.worker.v2.spec_decode.draft_window_nongraph import (
-    DraftWindowBatchPhasePlan,
-    DraftWindowPhaseAwareMaterializationPlan,
     build_phase_aware_materialization_plan,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_plan import DraftWindowPlan, compute_draft_window_plan
@@ -44,34 +40,13 @@ def _eagle3_graph_scheduled_consumers(static_k: int, scheduled: int | None) -> i
     return 1 if scheduled == 0 else static_k
 
 
-@dataclass(frozen=True, slots=True)
-class Eagle3FrozenProposalPlan:
-    """Per-row ``L0/H/S`` values frozen for one static-K proposal."""
-
-    static_k: int
-    row_plans: tuple[DraftWindowPlan, ...]
-    actual_request_count: int
-    padded_request_count: int
-
-    def __post_init__(self) -> None:
-        if self.static_k <= 0:
-            raise ValueError("Eagle3 static K must be greater than 0")
-        if self.actual_request_count != len(self.row_plans):
-            raise ValueError("Eagle3 proposal row plans must match active requests")
-        if self.padded_request_count < self.actual_request_count:
-            raise ValueError("Eagle3 padded request count must cover active requests")
-        for row_plan in self.row_plans:
-            if row_plan.full_horizon_end - row_plan.full_exact_end != self.static_k:
-                raise ValueError("Eagle3 proposal rows must use the configured static K")
-
-
 class Eagle3DraftWindowMixin:
     """Proposal identity and frozen window geometry for static-K Eagle Graph."""
 
     _draft_window_graph_binding_provider: DraftWindowGraphBindingProvider
     _eagle3_window_epoch_source: DraftWindowProposalEpochSource
     _eagle3_window_proposal_context: DraftWindowProposalContext | None
-    _eagle3_window_proposal_plan: Eagle3FrozenProposalPlan | None
+    _eagle3_window_proposal_plan: tuple[DraftWindowPlan, ...] | None
     _eagle3_window_live_inputs: DraftMetadataInputs | None
     _eagle3_window_last_identity: DraftWindowGenerationIdentity | None
     _eagle3_window_decode_step_one_exact: torch.Tensor | None
@@ -243,7 +218,12 @@ class Eagle3DraftWindowMixin:
         output_workspace: Any = None,
     ) -> DraftMetadataInputs:
         """Freeze the first anchor, then project each AR end into its own bank."""
-        if step != self._eagle3_window_next_step or self._eagle3_window_live_inputs is not None:
+        if (
+            type(step) is not int
+            or not 0 <= step < self._eagle3_window_expected_steps
+            or step != self._eagle3_window_next_step
+            or self._eagle3_window_live_inputs is not None
+        ):
             raise RuntimeError("Eagle3 Window step is stale or its previous reader remains active")
         context = self._require_eagle3_window_context()
         batch = self.input_batch
@@ -261,18 +241,21 @@ class Eagle3DraftWindowMixin:
                 padded_request_count=num_reqs_padded,
                 name="proposal L0",
             )
-            proposal = build_eagle3_frozen_proposal_plan(
-                source=provider.source,
-                cpu_proposal_l0=exact,
-                actual_request_count=num_reqs,
-                padded_request_count=num_reqs_padded,
+            proposal = tuple(
+                compute_draft_window_plan(
+                    full_exact_end=int(value),
+                    future_offset=self.num_speculative_steps,
+                    window_size=provider.source.window_size,
+                    block_span_tokens=provider.source.group.table_column_span,
+                )
+                for value in exact[:num_reqs]
             )
             seq_lens_cpu_upper_bound = batch.seq_lens_cpu_upper_bound
         else:
             step_one_exact = self._eagle3_window_decode_step_one_exact
             if proposal is None or previous is None or step_one_exact is None or seq_lens_cpu_upper_bound is None:
                 raise RuntimeError("Eagle3 decode step is missing proposal-owned state")
-            if proposal.actual_request_count != num_reqs:
+            if len(proposal) != num_reqs:
                 raise RuntimeError("Eagle3 request geometry changed within one proposal")
             exact = torch.zeros(num_reqs_padded, dtype=torch.int32, device="cpu")
             torch.add(step_one_exact[:num_reqs], step - 1, out=exact[:num_reqs])
@@ -298,14 +281,14 @@ class Eagle3DraftWindowMixin:
             num_reqs=num_reqs,
             num_reqs_padded=num_reqs_padded,
         )
-        plan = build_eagle3_step_materialization_plan(
+        plan = build_phase_aware_materialization_plan(
             source=provider.source,
-            proposal=proposal,
+            frozen_row_plans=proposal,
             cpu_full_exact=exact,
             cpu_apply_time_full_upper=upper,
             cpu_valid_num_blocks=valid,
-            step=step,
             phase_plan=context.phase_plan,
+            actual_request_count=num_reqs,
             padded_request_count=num_reqs_padded,
         )
         self._eagle3_window_epoch_source.validate(context, batch)
@@ -349,110 +332,6 @@ class Eagle3DraftWindowMixin:
             raise RuntimeError("Eagle3 metadata request count does not match the proposal")
         if num_reqs_padded < num_reqs:
             raise ValueError("padded request count must cover active Eagle3 requests")
-
-
-def build_eagle3_frozen_proposal_plan(
-    *,
-    source: DraftWindowSourceCapability,
-    cpu_proposal_l0: torch.Tensor,
-    actual_request_count: int,
-    padded_request_count: int,
-) -> Eagle3FrozenProposalPlan:
-    """Freeze ``H=L0+K`` and canonical ``S`` once for one proposal."""
-    _validate_counts(actual_request_count, padded_request_count)
-    _validate_cpu_int32_vector(
-        cpu_proposal_l0,
-        name="proposal L0",
-        padded_request_count=padded_request_count,
-    )
-    if source.policy.normalized_method != "eagle3":
-        raise ValueError("Eagle3 proposal planning requires an Eagle3 provider")
-    static_k = source.expected_future_offset
-    if static_k <= 0:
-        raise ValueError("Eagle3 proposal planning requires a positive configured static K")
-
-    row_plans: list[DraftWindowPlan] = []
-    for row in range(actual_request_count):
-        l0 = int(cpu_proposal_l0[row].item())
-        row_plans.append(
-            compute_draft_window_plan(
-                full_exact_end=l0,
-                future_offset=static_k,
-                window_size=source.window_size,
-                block_span_tokens=source.group.table_column_span,
-            )
-        )
-    return Eagle3FrozenProposalPlan(
-        static_k=static_k,
-        row_plans=tuple(row_plans),
-        actual_request_count=actual_request_count,
-        padded_request_count=padded_request_count,
-    )
-
-
-def build_eagle3_step_materialization_plan(
-    *,
-    source: DraftWindowSourceCapability,
-    proposal: Eagle3FrozenProposalPlan,
-    cpu_full_exact: torch.Tensor,
-    cpu_apply_time_full_upper: torch.Tensor,
-    cpu_valid_num_blocks: torch.Tensor,
-    step: int,
-    phase_plan: DraftWindowBatchPhasePlan,
-    padded_request_count: int | None = None,
-) -> DraftWindowPhaseAwareMaterializationPlan:
-    """Project one real ``E_s`` without recomputing the proposal anchor."""
-    if not isinstance(step, int) or isinstance(step, bool):
-        raise TypeError("Eagle3 proposal step must be a Python int")
-    if not 0 <= step < proposal.static_k:
-        raise ValueError(f"Eagle3 proposal step is outside configured static K: step={step} K={proposal.static_k}")
-    if source.expected_future_offset != proposal.static_k:
-        raise RuntimeError("Eagle3 proposal K no longer matches the provider")
-    # L0/H/S and logical request ownership are proposal state. Padding belongs
-    # to this consumer: a Q4 first pass may use pad2 while merged Q1 AR uses
-    # pad1. The frozen first-pass plan itself remains immutable.
-    padded = proposal.padded_request_count if padded_request_count is None else padded_request_count
-    if type(padded) is not int:
-        raise TypeError("Eagle3 consumer padding must be a Python int")
-    _validate_counts(proposal.actual_request_count, padded)
-    if step == 0 and padded != proposal.padded_request_count:
-        raise ValueError("first-pass consumer padding must match its frozen proposal layout")
-    result = build_phase_aware_materialization_plan(
-        source=source,
-        phase_plan=phase_plan,
-        cpu_full_exact=cpu_full_exact,
-        cpu_apply_time_full_upper=cpu_apply_time_full_upper,
-        cpu_valid_num_blocks=cpu_valid_num_blocks,
-        actual_request_count=proposal.actual_request_count,
-        padded_request_count=padded,
-        frozen_row_plans=proposal.row_plans,
-    )
-    if step == 0 and any(
-        int(cpu_full_exact[row]) != plan.full_exact_end for row, plan in enumerate(proposal.row_plans)
-    ):
-        raise ValueError("Eagle3 first-pass exact end must equal proposal-entry L0")
-    return result
-
-
-def _validate_counts(actual_request_count: int, padded_request_count: int) -> None:
-    if actual_request_count < 0:
-        raise ValueError("actual request count must be greater than or equal to 0")
-    if padded_request_count < actual_request_count:
-        raise ValueError("padded request count must cover active requests")
-
-
-def _validate_cpu_int32_vector(
-    tensor: torch.Tensor,
-    *,
-    name: str,
-    padded_request_count: int,
-) -> None:
-    if tensor.device.type != "cpu":
-        raise ValueError(f"CPU {name} must live on CPU")
-    if tensor.dtype != torch.int32:
-        raise TypeError(f"CPU {name} must use int32")
-    if tensor.ndim != 1 or tensor.shape[0] != padded_request_count:
-        raise ValueError(f"CPU {name} must match the padded request count")
 
 
 def _copy_padded_cpu_exact(

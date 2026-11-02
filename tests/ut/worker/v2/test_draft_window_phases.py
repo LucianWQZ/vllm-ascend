@@ -124,10 +124,7 @@ def test_phase_materialization_rejects_counts_outside_canonical_row(full_source,
 
 @pytest.mark.parametrize("step,end", [(0, 14), (1, 13), (2, 14)])
 def test_shared_row_projection_keeps_eagle_anchor_and_full_prefill(full_source, step, end):
-    from vllm_ascend.worker.v2.spec_decode.draft_window_eagle3 import (
-        build_eagle3_frozen_proposal_plan,
-        build_eagle3_step_materialization_plan,
-    )
+    from vllm_ascend.worker.v2.spec_decode.draft_window_plan import compute_draft_window_plan
 
     group = DraftWindowGroupRoute(0, ("draft.layer",), 4, 4, "replicated", DraftWindowProviderStatus.DIRECT_DENSE)
     from vllm_ascend.worker.v2.spec_decode.draft_window_policy import resolve_draft_window_policy
@@ -142,23 +139,22 @@ def test_shared_row_projection_keeps_eagle_anchor_and_full_prefill(full_source, 
         parallel_config=SimpleNamespace(tensor_parallel_size=1),
         tensor_parallel_rank=0,
     )
-    frozen = build_eagle3_frozen_proposal_plan(
-        source=source,
-        cpu_proposal_l0=torch.tensor([14, 2, 0], dtype=torch.int32),
-        actual_request_count=2,
-        padded_request_count=3,
+    frozen = tuple(
+        compute_draft_window_plan(full_exact_end=end, future_offset=3, window_size=8, block_span_tokens=4)
+        for end in (14, 2)
     )
     phases = classify_draft_window_batch_phase(_batch([(8, 8, 1), (0, 8, 2)]))
-    result = build_eagle3_step_materialization_plan(
+    result = build_phase_aware_materialization_plan(
         source=source,
-        proposal=frozen,
-        step=step,
+        frozen_row_plans=frozen,
+        actual_request_count=2,
+        padded_request_count=3,
         phase_plan=phases,
         cpu_full_exact=torch.tensor([end, 2 + step, 0], dtype=torch.int32),
         cpu_apply_time_full_upper=torch.tensor([16, 6, 0], dtype=torch.int32),
         cpu_valid_num_blocks=torch.tensor([4, 3, 0], dtype=torch.int32),
     )
-    assert frozen.row_plans[0].window_start == 8
+    assert frozen[0].window_start == 8
     assert result.read_descriptors[0].source_start_column == 2
     assert result.cpu_window_exact.tolist() == [end - 8, 2 + step, 0]
     assert result.cpu_window_upper.tolist() == [8, 6, 0]

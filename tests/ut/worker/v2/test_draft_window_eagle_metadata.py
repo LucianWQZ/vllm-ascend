@@ -277,7 +277,8 @@ def test_real_proposal_rejects_unconsumed_or_misattributed_reader(proposal, dama
         assert runtime.quarantined_identity is current.identity
 
 
-def test_first_and_ar_share_one_materialization_path_without_moving_the_anchor(proposal, monkeypatch):
+@pytest.mark.parametrize("first_padding", [1, 2])
+def test_first_and_ar_share_one_materialization_path_without_moving_the_anchor(proposal, monkeypatch, first_padding):
     from vllm_ascend.worker.v2.spec_decode import draft_window_eagle3
 
     owner, batch, session, runtime, _ = proposal
@@ -303,7 +304,7 @@ def test_first_and_ar_share_one_materialization_path_without_moving_the_anchor(p
             cpu_valid_num_blocks=kwargs["cpu_valid_num_blocks"],
         )
 
-    monkeypatch.setattr(draft_window_eagle3, "build_eagle3_step_materialization_plan", plan)
+    monkeypatch.setattr(draft_window_eagle3, "build_phase_aware_materialization_plan", plan)
 
     def materialize(**kwargs):
         identity = SimpleNamespace(proposal=kwargs["proposal"], step=kwargs["step"])
@@ -321,17 +322,21 @@ def test_first_and_ar_share_one_materialization_path_without_moving_the_anchor(p
             current = owner._materialize_eagle3_step(
                 step=step,
                 num_reqs=1,
-                num_reqs_padded=1,
+                num_reqs_padded=first_padding if step == 0 else 1,
                 seq_lens_cpu_upper_bound=batch.seq_lens_cpu_upper_bound,
             )
             frozen = frozen or owner._eagle3_window_proposal_plan
             assert owner._eagle3_window_proposal_plan is frozen
-            assert frozen.row_plans[0].window_start == 8
+            assert frozen[0].window_start == 8
             session.stage(current, first=step == 0, n=1, tokens=4 if step == 0 else 1, ordinal=max(0, step - 1))
             session._carriers[-1].state = DraftWindowGraphCarrierState.UPDATED
-    assert [call["cpu_full_exact"].tolist() for call in calls] == [[10], [8], [9]]
-    assert [call["cpu_apply_time_full_upper"].tolist() for call in calls] == [[12], [13], [14]]
-    assert all(call["proposal"] is frozen for call in calls)
+    assert [call["cpu_full_exact"].tolist() for call in calls] == [[10] + [0] * (first_padding - 1), [8], [9]]
+    assert [call["cpu_apply_time_full_upper"].tolist() for call in calls] == [
+        [12] + [0] * (first_padding - 1),
+        [13],
+        [14],
+    ]
+    assert all(call["frozen_row_plans"] is frozen for call in calls)
 
 
 @pytest.mark.parametrize("first,tokens,ordinal", [(True, 4, 0), (False, 1, 0), (False, 1, 1)])
