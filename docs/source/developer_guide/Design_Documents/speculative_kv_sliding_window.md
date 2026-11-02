@@ -233,30 +233,29 @@ MLA or GQA draft. Ordinary TP/EP and sequence-parallel hidden-state collectives
 retain their original query/write coordinates. DSA-CP needs a distinct
 provider for its local query ranges and global KV read coordinates.
 
-Providers distinguish direct GQA, ordinary MLA, standard SFA with its indexer,
-and uncompressed DSA. MRV2 Target DSA-CP is admitted for the uncompressed SFA
-MLA route with sequence-parallel MoE, PP=1 and DCP=1. Its existing builder
-receives padded model-input counts for TP token projection, while actual
-query/write coordinates remain separate. The Draft provider is still chosen
-from its own actual consumer; a Target CP flag does not turn a dense Draft
-into a sharded reader. Compressed DSA and other PP/DCP compositions retain
-their startup guard. A sharded Draft consumer without a corresponding
-provider is rejected. PCP is separate and does not satisfy an unimplemented
-DSA-CP route. MLA and SFA preserve full absolute rotary inputs
-while taking ownership of scratch that would otherwise be overwritten.
-DSA native-window reads must remain a subset of the baseline native read set;
-the provider does not infer residency from stale prefix table entries.
-Compressed, packed, offloaded, or unsupported context-parallel layouts require
-specific providers and are rejected when the selected consumer lacks one.
-An unsupported conditional layout is not evidence that a required model has
-been validated through another backend.
+Draft providers cover the exercised direct GQA, ordinary MLA and dense
+native-SWA routes. No qualified SFA/indexer or DSA Draft pairing has been
+identified in the current model scope; those Draft consumers fail explicitly
+before proposal work. Their historical Host-only provider prototypes are not
+product support, and the conditional model requirement remains unresolved.
+This does not change the Target's SFA/indexer or legacy DSA-CP execution.
+
+MRV2 Target DSA-CP is admitted for the uncompressed SFA MLA route with
+sequence-parallel MoE, PP=1 and DCP=1. Its existing builder receives padded
+model-input counts for TP token projection, while actual query/write
+coordinates remain separate. A Target CP flag does not turn a dense Draft
+into a sharded reader. Ordinary MLA preserves full absolute rotary inputs and
+owns scratch that would otherwise be overwritten. Compressed, packed,
+offloaded and unsupported context-parallel Draft layouts remain rejected.
+PCP does not substitute for legacy DSA-CP, and one model's validation does not
+qualify an unknown Draft consumer.
 
 ### Asynchronous ownership
 
 Every proposal owns independently allocated read views and all derived
 metadata through a completion token. All Eagle3 steps belong to that proposal.
-Mutable DSA builders are owned by lane and step. The owner enters its native
-region before preparation can enqueue a copy or kernel. Successful completion
+The proposal scope starts before preparation can enqueue a copy or kernel.
+Successful completion
 recording retains the owner until the event completes; capacity pressure may
 wait for the oldest submitted proposal. Normal acquisition of a free lane
 performs no global synchronization.
@@ -317,9 +316,9 @@ and keeps the baseline selection. The initial legacy Window exact D2H remains;
 this reuse does not resolve the whole async-first architecture constraint.
 Default CPU-to-device
 copies for projection indices also require an asynchronous staging contract.
-SFA also has existing device-length consumers that can be reused; this does
-not make the GQA and MLA CPU consumers disappear. A device projector for the
-remaining paths therefore needs an explicit consumer contract separating
+An unrelated backend's device-length API does not remove the admitted GQA
+and MLA consumers' requirements. Any future device projector needs a
+consumer contract separating
 device exact lengths from host capacity bounds, together with verified native
 tensor-length inputs and bounded chunk planning. That migration is not yet
 implemented. No previous-step exact value or estimated acceptance is used as

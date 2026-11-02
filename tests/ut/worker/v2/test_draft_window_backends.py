@@ -459,145 +459,6 @@ def test_flashmla_has_separate_persistent_state_contract(types, parallel_config)
         inventory(mla_types, parallel_config, specs=[MLASpec()], builders=[builder])
 
 
-class SFABuilder:
-    nope = False
-
-
-class IndexerBuilder:
-    use_pcp = False
-    use_dcp = False
-    use_dsa_cp = False
-
-
-class IndexerSpec(FullSpec):
-    cache_sparse_li_c4 = False
-    cache_sparse_li_c8 = False
-    sfa_dcp_replicated_indexer_size = 1
-
-
-def sparse_types(types):
-    return replace(
-        types,
-        mla_spec=MLASpec,
-        sfa_backend=DenseBackend,
-        sfa_builder=SFABuilder,
-        indexer_backend=DenseBackend,
-        indexer_builder=IndexerBuilder,
-        indexer_spec=IndexerSpec,
-    )
-
-
-def test_mixed_uniform_group_uses_each_consumers_actual_spec(types, parallel_config):
-    specs = {"draft.attn": MLASpec(), "draft.indexer": IndexerSpec()}
-    groups = [
-        SimpleNamespace(
-            backend=DenseBackend,
-            kv_cache_group_id=0,
-            kv_cache_spec=specs[name],
-            layer_names=[name],
-            get_metadata_builder=lambda index, builder=builder: builder,
-        )
-        for name, builder in [("draft.attn", SFABuilder()), ("draft.indexer", IndexerBuilder())]
-    ]
-    routes = inventory_draft_window_groups(
-        attn_groups=[groups],
-        kv_cache_config=SimpleNamespace(kv_cache_groups=[SimpleNamespace(kv_cache_spec=UniformSpec(specs))]),
-        block_tables=SimpleNamespace(block_sizes=[256], kernel_block_sizes=[128]),
-        parallel_config=parallel_config,
-        types=sparse_types(types),
-    )
-    assert [route.status for route in routes] == [
-        DraftWindowProviderStatus.DIRECT_SFA,
-        DraftWindowProviderStatus.DIRECT_SFA_INDEXER,
-    ]
-    assert all(route.gid == 0 and len(route.layers) == 1 for route in routes)
-    require_compatible_direct_prefix_routes(routes)
-
-
-def test_indexer_c8_quantization_keeps_token_coordinate_span(types, parallel_config):
-    spec = IndexerSpec()
-    spec.cache_sparse_li_c8 = True
-    (route,) = inventory(sparse_types(types), parallel_config, specs=[spec], builders=[IndexerBuilder()])
-    assert route.status is DraftWindowProviderStatus.DIRECT_SFA_INDEXER
-
-
-@pytest.mark.parametrize("field", ["use_pcp", "use_dcp", "use_dsa_cp"])
-def test_indexer_actual_parallel_producer_requires_provider(types, parallel_config, field):
-    builder = IndexerBuilder()
-    setattr(builder, field, True)
-    with pytest.raises(NotImplementedError):
-        inventory(sparse_types(types), parallel_config, specs=[IndexerSpec()], builders=[builder])
-
-
-@pytest.mark.parametrize("field", ["non_causal_multi_token_decode", "cache_sparse_sfa_c8", "store_on_host"])
-def test_sfa_unsupported_native_semantics_are_explicit(types, parallel_config, field):
-    spec = MLASpec()
-    setattr(spec, field, True)
-    with pytest.raises(NotImplementedError):
-        inventory(sparse_types(types), parallel_config, specs=[spec], builders=[SFABuilder()])
-
-
-def test_sfa_nope_state_is_not_plain_rope_provider(types, parallel_config):
-    builder = SFABuilder()
-    builder.nope = True
-    with pytest.raises(NotImplementedError, match="NoPE"):
-        inventory(sparse_types(types), parallel_config, specs=[MLASpec()], builders=[builder])
-
-
-class DSABuilder:
-    compressor_ratio = 1
-    _device_metadata_enabled = False
-    model_config = SimpleNamespace(hf_config=SimpleNamespace(sliding_window=128, vision_n_layers=0))
-
-
-class DSACPBuilder(DSABuilder):
-    pass
-
-
-class DSASpec(FullSpec):
-    model_version = None
-    indexes_kv_by_block_stride = False
-    bounded_replay = False
-    sliding_window = 128
-
-
-def dsa_types(types):
-    return replace(
-        types,
-        dsa_backend=DenseBackend,
-        dsa_builder=DSABuilder,
-        dsa_cp_builder=DSACPBuilder,
-        dsa_spec=DSASpec,
-    )
-
-
-@pytest.mark.parametrize("builder,status", [(DSABuilder(), "DIRECT_DSA"), (DSACPBuilder(), "PROVIDER_MISSING")])
-def test_uncompressed_dsa_requires_native_window_and_actual_owner(types, parallel_config, builder, status):
-    if isinstance(builder, DSACPBuilder):
-        with pytest.raises(NotImplementedError, match="Legacy DSA-CP"):
-            inventory(dsa_types(types), parallel_config, specs=[DSASpec()], builders=[builder])
-        return
-    (route,) = inventory(dsa_types(types), parallel_config, specs=[DSASpec()], builders=[builder])
-    assert route.status.value == status
-
-
-@pytest.mark.parametrize(
-    "field,value", [("sliding_window", 256), ("bounded_replay", True), ("model_version", "packed")]
-)
-def test_dsa_native_window_and_replay_contracts_do_not_silently_inherit_provider(types, parallel_config, field, value):
-    spec = DSASpec()
-    setattr(spec, field, value)
-    with pytest.raises(NotImplementedError):
-        inventory(dsa_types(types), parallel_config, specs=[spec], builders=[DSABuilder()])
-
-
-def test_deferred_dsa_producer_requires_separate_completion_contract(types, parallel_config):
-    builder = DSABuilder()
-    builder._device_metadata_enabled = True
-    with pytest.raises(NotImplementedError, match="executor completion"):
-        inventory(dsa_types(types), parallel_config, specs=[DSASpec()], builders=[builder])
-
-
 def test_small_window_native_intersection_gap(types, parallel_config):
     routes, _, context = native_swa_bundle(types, parallel_config)
     selected = select_native_swa_subset_routes(
@@ -614,8 +475,8 @@ def test_small_window_native_intersection_gap(types, parallel_config):
 
 
 @pytest.mark.parametrize("field", ["prefill_context_parallel_size", "decode_context_parallel_size"])
-@pytest.mark.parametrize("kind", ["dense", "mla", "sfa", "indexer", "dsa", "native"])
-def test_all_admitted_read_providers_use_the_actual_draft_parallel_contract(types, parallel_config, kind, field):
+@pytest.mark.parametrize("kind", ["dense", "mla", "native"])
+def test_admitted_providers_use_the_actual_draft_parallel_contract(types, parallel_config, kind, field):
     candidates = {
         "dense": (types, FullSpec(), DenseBuilder()),
         "mla": (
@@ -623,17 +484,39 @@ def test_all_admitted_read_providers_use_the_actual_draft_parallel_contract(type
             MLASpec(),
             MLABuilder(),
         ),
-        "sfa": (sparse_types(types), MLASpec(), SFABuilder()),
-        "indexer": (sparse_types(types), IndexerSpec(), IndexerBuilder()),
-        "dsa": (dsa_types(types), DSASpec(), DSABuilder()),
         "native": (replace(types, sliding_window_spec=SlidingSpec), SlidingSpec(), DenseBuilder()),
     }
     kinds, spec, builder = candidates[kind]
     if kind == "native":
         spec.sliding_window = 128
-    # This is the same Draft config passed to its actual metadata builders,
-    # not a Target-global CP flag. Indexer may not bypass this guard merely
-    # because a stale builder object reports use_pcp/use_dcp=False.
     setattr(parallel_config, field, 2)
     with pytest.raises(NotImplementedError, match="Context-parallel"):
         inventory(kinds, parallel_config, specs=[spec], builders=[builder])
+
+
+@pytest.mark.parametrize("consumer", ["SFA", "INDEXER", "DSA"])
+def test_unqualified_sparse_draft_consumers_fail_before_proposal_work(types, parallel_config, consumer):
+    from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder, AscendDSASWABackend
+    from vllm_ascend.attention.indexer import AscendSFAIndexerBackend, AscendSFAIndexerMetadataBuilder
+    from vllm_ascend.attention.sfa_v1 import AscendSFABackend, AscendSFAMetadataBuilder
+
+    backend, builder_type = {
+        "SFA": (AscendSFABackend, AscendSFAMetadataBuilder),
+        "INDEXER": (AscendSFAIndexerBackend, AscendSFAIndexerMetadataBuilder),
+        "DSA": (AscendDSASWABackend, AscendDSAMetadataBuilder),
+    }[consumer]
+    group = SimpleNamespace(
+        backend=backend,
+        kv_cache_group_id=0,
+        kv_cache_spec=FullSpec(),
+        layer_names=["draft.layer"],
+        get_metadata_builder=lambda _: object.__new__(builder_type),
+    )
+    with pytest.raises(NotImplementedError, match="No read-view provider"):
+        inventory_draft_window_groups(
+            attn_groups=[[group]],
+            kv_cache_config=SimpleNamespace(kv_cache_groups=[SimpleNamespace(kv_cache_spec=FullSpec())]),
+            block_tables=SimpleNamespace(block_sizes=[256], kernel_block_sizes=[128]),
+            parallel_config=parallel_config,
+            types=types,
+        )

@@ -106,18 +106,10 @@ class DraftWindowRuntime:
         self.speculator = speculator
         self.window_size = policy.effective_window_size
         self.mla_layer_names: tuple[str, ...] = ()
-        self.sfa_layer_names: tuple[str, ...] = ()
-        self.dsa_layer_names: tuple[str, ...] = ()
-        self.dsa_native_windows: dict[int, int] = {}
         self.native_swa_intersections: dict[int, int] = {}
         self.native_swa_causal: dict[int, bool] = {}
-        self._dsa_builders = None
         self._dense_device_reads = False
         self.gids = self._validate_route(speculator)
-        if self.dsa_native_windows:
-            from vllm_ascend.worker.v2.spec_decode.draft_window_dsa import DSABuilderOwners
-
-            self._dsa_builders = DSABuilderOwners()
         read_groups = self.gids or tuple(self.native_swa_intersections)
         if not read_groups:
             raise NotImplementedError("Draft Window requires at least one certified read group")
@@ -208,23 +200,6 @@ class DraftWindowRuntime:
         self.mla_layer_names = tuple(
             name for route in routes if route.status is DraftWindowProviderStatus.DIRECT_MLA for name in route.layers
         )
-        self.sfa_layer_names = tuple(
-            name
-            for route in routes
-            if route.status in (DraftWindowProviderStatus.DIRECT_SFA, DraftWindowProviderStatus.DIRECT_SFA_INDEXER)
-            for name in route.layers
-        )
-        dsa_routes = tuple(route for route in routes if route.status is DraftWindowProviderStatus.DIRECT_DSA)
-        self.dsa_layer_names = tuple(name for route in dsa_routes for name in route.layers)
-        for route in dsa_routes:
-            # The typed inventory checks every consumer's native spec against
-            # the builder authority; no target model name selects this path.
-            builder = next(
-                group.get_metadata_builder(0)
-                for group in speculator.attn_groups[route.gid]
-                if tuple(group.layer_names) == route.layers
-            )
-            self.dsa_native_windows[route.gid] = int(builder.model_config.hf_config.sliding_window)
         return tuple(dict.fromkeys(route.gid for route in routes))
 
     @contextmanager
@@ -777,27 +752,6 @@ class DraftWindowRuntime:
                     ]
                 starts = torch.tensor(starts_list, dtype=torch.int32)
             source = DirectPrefixSource.from_block_tables(speculator.block_tables, gid, rows)
-            if gid in self.dsa_native_windows:
-                from vllm_ascend.attention.utils import split_decodes_and_prefills
-                from vllm_ascend.worker.v2.spec_decode.draft_window_dsa import validate_dsa_read_subset
-
-                _, num_prefills, _, _ = split_decodes_and_prefills(
-                    common_metadata,
-                    decode_threshold=speculator.num_speculative_steps + 1,
-                    treat_short_extends_as_decodes=False,
-                )
-                queries = common_metadata.query_start_loc_cpu[: num_reqs + 1].diff().tolist()
-                # Noncausal sparse indices are the backend's decode path.
-                # Prefill retains its existing causal native mask semantics.
-                certificate = validate_dsa_read_subset(
-                    window_starts=starts.tolist(),
-                    exact_ends=exact.tolist(),
-                    query_lengths=queries,
-                    kernel_block_span=source.block_span,
-                    native_window=self.dsa_native_windows[gid],
-                    causal=bool(common_metadata.causal or num_prefills),
-                )
-                self.pool.retain(owner, certificate)
             view = materialize_direct_prefix(
                 source,
                 exact_cpu=exact,
@@ -818,7 +772,7 @@ class DraftWindowRuntime:
 
     def metadata_builder_callback(self, step: int):
         """Select a proposal-owned builder at the existing metadata extension point."""
-        if self._bypass or (self._dsa_builders is None and not self.native_swa_intersections):
+        if self._bypass or not self.native_swa_intersections:
             return None
         owner = self._owner
         if owner is None:
@@ -840,16 +794,7 @@ class DraftWindowRuntime:
                 )
                 self.pool.retain(owner, owned)
                 return owned
-            if gid not in self.dsa_native_windows or not set(layer_names).issubset(self.dsa_layer_names):
-                return builder
-            if self._owner is not owner:
-                raise RuntimeError("Draft Window builder callback belongs to a stale proposal")
-            assert self._dsa_builders is not None
-            owned = self._dsa_builders.select(builder, layer_names=layer_names, lane=owner.lane, step=step)
-            if self.method != "eagle3" and hasattr(owned, "set_dspark_num_query_per_req"):
-                owned.set_dspark_num_query_per_req(self.speculator.num_query_per_req)
-            self.pool.retain(owner, owned)
-            return owned
+            return builder
 
         return select
 
@@ -867,12 +812,4 @@ class DraftWindowRuntime:
                 metadata, self.mla_layer_names, retain=lambda *objects: self.pool.retain(owner, *objects)
             )
             self.pool.retain(owner, *rotary_reads)
-        if self.sfa_layer_names:
-            from vllm_ascend.worker.v2.spec_decode.draft_window_sfa import freeze_sfa_read_metadata
-
-            self.pool.retain(self._owner, *freeze_sfa_read_metadata(metadata, self.sfa_layer_names))
-        if self.dsa_layer_names:
-            from vllm_ascend.worker.v2.spec_decode.draft_window_dsa import freeze_dsa_rotary_reads
-
-            self.pool.retain(self._owner, *freeze_dsa_rotary_reads(metadata, self.dsa_layer_names))
         self.pool.retain(self._owner, metadata)

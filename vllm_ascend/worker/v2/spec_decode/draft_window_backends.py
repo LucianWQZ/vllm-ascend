@@ -18,9 +18,6 @@ class DraftWindowProviderStatus(str, Enum):
     NATIVE_SWA_CANDIDATE = "NATIVE_SWA_CANDIDATE"
     NATIVE_SWA_INTERSECTION = "NATIVE_SWA_INTERSECTION"
     DIRECT_MLA = "DIRECT_MLA"
-    DIRECT_DSA = "DIRECT_DSA"
-    DIRECT_SFA = "DIRECT_SFA"
-    DIRECT_SFA_INDEXER = "DIRECT_SFA_INDEXER"
 
 
 @dataclass(frozen=True)
@@ -36,15 +33,6 @@ class DraftWindowBackendTypes:
     mla_backend: type | None = None
     mla_builder: type | None = None
     mla_spec: type | None = None
-    sfa_backend: type | None = None
-    sfa_builder: type | None = None
-    indexer_backend: type | None = None
-    indexer_builder: type[Any] | None = None
-    indexer_spec: type | None = None
-    dsa_backend: type | None = None
-    dsa_builder: type | None = None
-    dsa_cp_builder: type | None = None
-    dsa_spec: type | None = None
     sliding_window_spec: type | None = None
 
     @classmethod
@@ -53,15 +41,9 @@ class DraftWindowBackendTypes:
         from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec, UniformTypeKVCacheSpecs
 
         from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionMetadataBuilder
-        from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
-        from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder, AscendDSASWABackend
-        from vllm_ascend.attention.indexer import AscendSFAIndexerBackend, AscendSFAIndexerMetadataBuilder
         from vllm_ascend.attention.mla_v1 import AscendMLABackend, AscendMLAMetadataBuilder
-        from vllm_ascend.attention.sfa_v1 import AscendSFABackend, AscendSFAMetadataBuilder
         from vllm_ascend.core.kv_cache_interface import (
             AscendMLAAttentionSpec,
-            AscendSFAIndexerCacheSpec,
-            AscendSlidingWindowMLASpec,
             get_kv_cache_compression_ratio,
             get_storage_block_size,
         )
@@ -76,15 +58,6 @@ class DraftWindowBackendTypes:
             mla_backend=AscendMLABackend,
             mla_builder=AscendMLAMetadataBuilder,
             mla_spec=AscendMLAAttentionSpec,
-            sfa_backend=AscendSFABackend,
-            sfa_builder=AscendSFAMetadataBuilder,
-            indexer_backend=AscendSFAIndexerBackend,
-            indexer_builder=AscendSFAIndexerMetadataBuilder,
-            indexer_spec=AscendSFAIndexerCacheSpec,
-            dsa_backend=AscendDSASWABackend,
-            dsa_builder=AscendDSAMetadataBuilder,
-            dsa_cp_builder=AscendDSACPMetadataBuilder,
-            dsa_spec=AscendSlidingWindowMLASpec,
             sliding_window_spec=SlidingWindowSpec,
         )
 
@@ -142,39 +115,7 @@ def _select_read_provider(
             if builder.flashmla_state is not None:
                 raise NotImplementedError("FlashMLA persistent derived state needs a separate provider")
             selected = status.DIRECT_MLA
-        elif matches(types.sfa_backend, (types.sfa_builder,), types.mla_spec):
-            if builder.nope:
-                raise NotImplementedError("NoPE SFA has persistent sparse-kernel state requiring its own owner")
-            if any(item.non_causal_multi_token_decode for item in specs):
-                raise NotImplementedError("Ordinary SFA kernels use causal sparse_mode=3 for multi-token queries")
-            selected = status.DIRECT_SFA
-        elif matches(types.dsa_backend, (types.dsa_builder, types.dsa_cp_builder), types.dsa_spec):
-            hf = builder.model_config.hf_config
-            if type(builder) is types.dsa_cp_builder:
-                raise NotImplementedError(
-                    "Legacy DSA-CP is rejected by the MRV2 startup contract; no Window provider is enabled"
-                )
-            if builder.compressor_ratio != 1:
-                raise NotImplementedError("Compressed DSA needs a separate provider")
-            if builder._device_metadata_enabled:
-                raise NotImplementedError("Deferred DSA metadata needs an executor completion contract")
-            if getattr(hf, "vision_n_layers", 0) > 0:
-                raise NotImplementedError("DSA vision ranges require absolute-to-window coordinate projection")
-            if any(
-                item.model_version is not None or item.indexes_kv_by_block_stride or item.bounded_replay
-                for item in specs
-            ):
-                raise NotImplementedError("Packed, strided, or replay DSA needs a separate read provider")
-            if hf.sliding_window <= 0 or any(item.sliding_window != hf.sliding_window for item in specs):
-                raise NotImplementedError("DSA native-window kernel and resident cache geometry disagree")
-            selected = status.DIRECT_DSA
-        elif matches(types.indexer_backend, (types.indexer_builder,), types.indexer_spec):
-            if builder.use_pcp or builder.use_dcp or builder.use_dsa_cp:
-                raise NotImplementedError("SFA indexer rank-local read coordinates need a separate provider")
-            if any(item.cache_sparse_li_c4 or item.sfa_dcp_replicated_indexer_size != 1 for item in specs):
-                raise NotImplementedError("Packed C4 or replicated indexer pages need a separate provider")
-            selected = status.DIRECT_SFA_INDEXER
-        if selected in (status.DIRECT_MLA, status.DIRECT_SFA) and any(
+        if selected is status.DIRECT_MLA and any(
             item.model_version is not None
             or item.cache_sparse_sfa_c8
             or item.cache_sparse_sfa_turboquant
@@ -182,7 +123,7 @@ def _select_read_provider(
             or item.indexes_kv_by_block_stride
             for item in specs
         ):
-            raise NotImplementedError("Packed, offloaded, or strided MLA/SFA caches need a separate provider")
+            raise NotImplementedError("Packed, offloaded, or strided MLA caches need a separate provider")
     if native:
         if not uniform_windows or native_window is None or native_window <= 0:
             raise NotImplementedError("Native SWA group has inconsistent windows")
@@ -422,9 +363,5 @@ def require_direct_prefix_routes(
             noncausal_dflash2=getattr(speculator.draft_model_config, "architectures", ()) == ["DFlash2DraftModel"],
             query_width=speculator.num_query_per_req,
         )
-    if any(route.status is DraftWindowProviderStatus.DIRECT_SFA for route in routes):
-        from vllm_ascend.worker.v2.spec_decode.draft_window_sfa import validate_sfa_read_consumers
-
-        validate_sfa_read_consumers(speculator.attn_vllm_config.compilation_config.static_forward_context, routes)
     require_compatible_direct_prefix_routes(routes)
     return routes
