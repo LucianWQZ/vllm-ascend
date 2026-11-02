@@ -22,11 +22,9 @@ from vllm_ascend.worker.v2.spec_decode.draft_window import (
     gather_valid_num_blocks_cpu,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_eager import (
-    AscendDraftAttentionReadInputs,
     DraftWindowProposalContext,
     DraftWindowProposalEpochSource,
     _requires_prefill_baseline_bypass,
-    draft_window_read_inputs,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphBindingProvider
 from vllm_ascend.worker.v2.spec_decode.draft_window_nongraph import (
@@ -432,54 +430,6 @@ class Eagle3DraftWindowMixin:
                 self._eagle3_window_live_inputs = None
             raise
         return inputs
-
-    def _validated_eagle3_read_inputs(
-        self,
-        inputs: DraftMetadataInputs,
-        expected_identity: DraftWindowGenerationIdentity,
-    ) -> AscendDraftAttentionReadInputs:
-        """The one formal P4b validation/narrowing boundary before building."""
-        inputs.validate_for(expected_identity)
-        return draft_window_read_inputs(
-            inputs.workspace,
-            actual_request_count=len(expected_identity.proposal.ordered_request_ids),
-            padded_request_count=expected_identity.padded_request_count,
-            block_tables=self.block_tables.input_block_tables,
-            global_group_id=inputs._owner.source.group.gid,
-        )
-
-    def _finish_eagle3_window_step(
-        self,
-        inputs: DraftMetadataInputs,
-        *,
-        succeeded: bool,
-    ) -> None:
-        """Retire only after the serialized forward has consumed this step."""
-        if self._eagle3_window_live_inputs is not inputs:
-            raise RuntimeError("Eagle3 step completion does not own the active generation")
-        graph_session = getattr(self, "_eagle3_graph_session", None)
-        if not succeeded and graph_session is not None:
-            self._quarantine_eagle3_window()
-            return
-        try:
-            if succeeded:
-                self._draft_window_graph_binding_provider.retire_generation(inputs.identity)
-                self._eagle3_window_last_identity = inputs.identity
-                self._eagle3_window_next_step = inputs.identity.step + 1
-            else:
-                if not inputs.retired:
-                    self._draft_window_graph_binding_provider.abort_generation(inputs.identity)
-                self._eagle3_window_last_identity = None
-        except BaseException:
-            if graph_session is not None:
-                self._quarantine_eagle3_window()
-            else:
-                if not inputs.retired:
-                    self._draft_window_graph_binding_provider.abort_generation(inputs.identity)
-                self._eagle3_window_last_identity = None
-                self._eagle3_window_live_inputs = None
-            raise
-        self._eagle3_window_live_inputs = None
 
     def _quarantine_eagle3_window(self) -> None:
         """Keep actual banks alive after an uncertain partial submission."""

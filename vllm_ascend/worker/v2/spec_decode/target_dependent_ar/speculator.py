@@ -527,39 +527,18 @@ class AscendTargetDependentARSpeculator(LmheadTPDraftSamplingMixin, TargetDepend
         """Thin override: delegate to upstream single-step ``_generate_draft``,
         then apply Ascend-specific attention-metadata updates required by the
         FIA operator."""
-        inputs = None
-        finish_step = None
-        if getattr(self, "_eagle3_window_proposal_context", None) is not None:
-            if cudagraph_runtime_mode != CUDAGraphMode.NONE:
-                raise RuntimeError("Eagle3 Window per-step eager reader received a Graph descriptor")
-            inputs = getattr(self, "_eagle3_window_live_inputs", None)
-            if inputs is None:
-                raise RuntimeError("Eagle3 Draft forward has no current Window inputs")
-            inputs.validate_for(inputs.identity)
-            if attn_metadata is not inputs.metadata:
-                raise RuntimeError("Eagle3 Draft forward lost its current private Window metadata")
-            finish_step = getattr(self, "_finish_eagle3_window_step", None)
-            if not callable(finish_step):
-                raise RuntimeError("Eagle3 Draft forward has no reader completion owner")
-        try:
-            # vLLM #60335 added `num_speculative_steps` on main.
-            super()._generate_draft(
-                num_reqs,
-                num_tokens_padded,
-                attn_metadata,
-                slot_mappings,
-                num_tokens_across_dp,
-                cudagraph_runtime_mode,
-                num_speculative_steps,
-            )
-            if attn_metadata is not None:
-                self._update_decode_attn_metadata(attn_metadata, 1, num_reqs)
-        except BaseException:
-            if finish_step is not None:
-                finish_step(inputs, succeeded=False)
-            raise
-        if finish_step is not None:
-            finish_step(inputs, succeeded=True)
+        # vLLM #60335 added `num_speculative_steps` on main.
+        super()._generate_draft(
+            num_reqs,
+            num_tokens_padded,
+            attn_metadata,
+            slot_mappings,
+            num_tokens_across_dp,
+            cudagraph_runtime_mode,
+            num_speculative_steps,
+        )
+        if attn_metadata is not None:
+            self._update_decode_attn_metadata(attn_metadata, 1, num_reqs)
 
     def _multi_step_decode(
         self,

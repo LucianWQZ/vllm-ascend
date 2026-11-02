@@ -95,18 +95,15 @@ def test_shared_assembler_preserves_uniform_full_capture_and_nonuniform_queries(
     assert torch.equal(owner.block_tables.input_block_tables[0], torch.full_like(read.block_tables[0], 99))
 
 
-@pytest.mark.parametrize("active,fail", [(False, False), (False, True), (True, False), (True, True)])
-def test_eager_forward_is_delegated_once_and_reader_retires_after_it(monkeypatch, active, fail):
+@pytest.mark.parametrize("fail", [False, True])
+def test_ordinary_eager_forward_uses_the_existing_method_once(monkeypatch, fail):
     calls = []
     metadata = object()
-    inputs = SimpleNamespace(identity=object(), metadata=metadata)
-    inputs.validate_for = lambda current: current is inputs.identity or pytest.fail("replaced reader identity")
 
     def forward(self, *args):
         calls.append(("forward", args))
         if fail:
             raise ValueError("native forward failed")
-        return "result"
 
     monkeypatch.setattr(TargetDependentARSpeculator, "_generate_draft", forward)
 
@@ -114,13 +111,7 @@ def test_eager_forward_is_delegated_once_and_reader_retires_after_it(monkeypatch
         def _update_decode_attn_metadata(self, *args):
             calls.append(("update", args))
 
-        def _finish_eagle3_window_step(self, current, *, succeeded):
-            assert current is inputs
-            calls.append(("retire", succeeded))
-
     owner: Any = object.__new__(Owner)
-    owner._eagle3_window_live_inputs = inputs
-    owner._eagle3_window_proposal_context = object() if active else None
     args = (2, 4, metadata, object(), object())
     if fail:
         with pytest.raises(ValueError, match="native forward failed"):
@@ -128,9 +119,28 @@ def test_eager_forward_is_delegated_once_and_reader_retires_after_it(monkeypatch
     else:
         assert owner._generate_draft(*args) is None
     assert calls[0][0] == "forward" and calls[0][1][:5] == args
-    assert [event[0] for event in calls] == ["forward"] + ([] if fail else ["update"]) + (["retire"] if active else [])
-    if active:
-        assert calls[-1] == ("retire", not fail)
+    assert [event[0] for event in calls] == ["forward"] + ([] if fail else ["update"])
+
+
+def test_graph_owner_keeps_normal_prefill_decode_metadata_and_updates():
+    for name in ("_prefill", "_build_attn_metadata", "_update_decode_attn_metadata"):
+        assert getattr(Eagle3GraphIntegrationMixin, name) is getattr(AscendTargetDependentARSpeculator, name)
+
+
+def test_graph_owner_rejects_unintended_eager_business_forward(monkeypatch):
+    class Owner(Eagle3GraphIntegrationMixin):
+        def _eagle3_window_is_active(self):
+            return True
+
+    monkeypatch.setattr(
+        AscendTargetDependentARSpeculator,
+        "_run_model",
+        lambda *args, **kwargs: pytest.fail("business Graph scope reached an ordinary eager forward"),
+    )
+    owner: Any = object.__new__(Owner)
+    owner._eagle3_graph_session = SimpleNamespace(_capture_call=None)
+    with pytest.raises(RuntimeError, match="FULL Graph managers"):
+        owner._run_model(4, {}, None, None)
 
 
 @pytest.mark.parametrize("scheduled", [-1, 1, 2, 4, True])
@@ -198,7 +208,8 @@ def test_real_proposal_zero_uses_first_reader_and_keeps_static_k(proposal):
     with owner._eagle3_draft_window_proposal_scope(batch, dummy_run=False, is_profile=False, num_speculative_tokens=0):
         assert owner._eagle3_window_expected_steps == 1
         current = inputs(0)
-        owner._finish_eagle3_window_step(current, succeeded=True)
+        session.stage(current, first=True, n=1, tokens=4, ordinal=0)
+        session._carriers[-1].state = DraftWindowGraphCarrierState.UPDATED
     assert runtime._last_retired_identity is current.identity
     assert owner._eagle3_window_static_k == owner._eagle3_window_expected_steps == 3
     assert not session._carriers
