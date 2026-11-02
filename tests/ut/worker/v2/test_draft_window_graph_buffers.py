@@ -713,3 +713,57 @@ def test_publication_rejects_a_builder_that_lost_the_actual_read_bank(graph_buff
     monkeypatch.setattr(case.provider, "_validate_metadata_uses_read_carrier", corrupt)
     with pytest.raises(RuntimeError, match="carrier"):
         _bind(case, inputs)
+
+
+def test_eagle_first_bank_retains_full_table_capacity_for_a_mixed_prefill(graph_buffers, monkeypatch):
+    from vllm_ascend.worker.v2.spec_decode import draft_window_eagle3_capture as capture_module
+
+    case = graph_buffers
+    source = replace(
+        case.projection,
+        policy=resolve_draft_window_policy(requested_window_size=4, method="eagle3", target_model_type="qwen3"),
+        runtime_route="eagle3",
+        expected_future_offset=3,
+    )
+    monkeypatch.setattr(capture_module, "draft_window_graph_enabled", lambda: True)
+    monkeypatch.setattr(capture_module, "validate_graph_context", lambda *args: None)
+    monkeypatch.setattr(capture_module, "_build_draft_window_source_capability_for_context", lambda **kwargs: source)
+    owner = SimpleNamespace(
+        method="eagle3",
+        speculative_config=SimpleNamespace(uses_dynamic_speculative_decoding=lambda: False),
+        vllm_config=object(),
+        block_tables=case.owner,
+        _draft_window_policy=source.policy,
+        attn_groups=object(),
+        kv_cache_config=object(),
+    )
+    bounded = capture_module.build_eagle3_graph_source(owner)
+    assert bounded.capacity_columns == 2 and bounded.workspace_capacity_columns == 4
+    provider = DraftWindowGraphBindingProvider(source=bounded)
+    capture = provider.register_capture_identity(
+        route=DraftWindowGraphRoute.EAGLE3_FIRST_PASS,
+        descriptor=BatchExecutionDescriptor(CUDAGraphMode.FULL, num_tokens=8, num_reqs=2, uniform_token_count=4),
+    )
+    bank = provider.prepare_workspace(capture)
+    inputs = provider.materialize(
+        proposal=replace(_proposal(0, ("request-a", "request-b")), phase_plan=DraftWindowBatchPhasePlan((True, False))),
+        idx_mapping=case.mapping,
+        cpu_full_exact=torch.tensor([11, 14], dtype=torch.int32),
+        cpu_valid_num_blocks=torch.tensor([4, 4], dtype=torch.int32),
+        num_reqs_padded=2,
+        step=0,
+        output_workspace=bank,
+        frozen_row_plans=tuple(
+            compute_draft_window_plan(full_exact_end=end, future_offset=3, window_size=4, block_span_tokens=4)
+            for end in (11, 14)
+        ),
+    )
+    assert inputs.workspace is bank
+    assert bank.cpu_window_exact.tolist() == [11, 2]
+    torch.testing.assert_close(
+        bank.window_block_table, torch.tensor([[11, 12, 13, 14], [24, 0, 0, 0]], dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        case.owner.input_block_tables[0], torch.tensor([[11, 12, 13, 14], [21, 22, 23, 24]], dtype=torch.int32)
+    )
+    assert case.target_metadata["target.layer"].seq_lens_list == [91, 92]

@@ -9,6 +9,7 @@ from typing import Any
 import numpy as np
 import pytest
 import torch
+from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.worker.gpu.spec_decode.eagle.speculator import EagleSpeculator
 from vllm.v1.worker.gpu.spec_decode.target_dependent_ar.speculator import TargetDependentARSpeculator
 
@@ -168,6 +169,8 @@ def test_graph_owner_rejects_unintended_eager_business_forward(monkeypatch):
     )
     owner: Any = object.__new__(Owner)
     owner._eagle3_graph_session = SimpleNamespace(_capture_call=None)
+    owner._eagle3_window_next_step = 1
+    owner.input_batch = SimpleNamespace(has_prefill=False)
     with pytest.raises(RuntimeError, match="FULL Graph managers"):
         owner._run_model(4, {}, None, None)
 
@@ -486,3 +489,142 @@ def test_eagle_graph_builder_uses_the_draft_parallel_config_and_actual_phase(mon
     assert result["layer"].seq_lens_cpu is workspace.cpu_window_exact
     assert result["layer"].seq_lens_list == [5]
     assert vars(target["layer"]) == {"attn_state": target_state}
+
+
+@pytest.mark.parametrize("mode", [CUDAGraphMode.NONE, CUDAGraphMode.PIECEWISE])
+@pytest.mark.parametrize("skip_sample", [False, True])
+@pytest.mark.parametrize("fail", [False, True])
+def test_official_nonuniform_prefill_uses_window_first_bank_without_an_eager_owner(
+    monkeypatch, mode, skip_sample, fail
+):
+    from vllm_ascend.attention.attention_v1 import AscendAttentionState
+    from vllm_ascend.worker.v2.spec_decode.draft_window_graph_metadata import validate_draft_metadata_isolation
+
+    class Owner(Eagle3GraphIntegrationMixin):
+        def _eagle3_window_is_active(self):
+            return True
+
+    owner: Any = object.__new__(Owner)
+    events, sampled = [], []
+    query = torch.tensor([0, 3, 7], dtype=torch.int32)
+    slots = torch.arange(7, dtype=torch.int64) + 80
+    absolute = torch.arange(7, dtype=torch.int64) + 70
+    target_layer = SimpleNamespace(
+        block_tables=torch.full((2, 4), 91, dtype=torch.int32),
+        seq_lens=torch.tensor([77, 88], dtype=torch.int32),
+        seq_lens_gpu=torch.tensor([77, 88], dtype=torch.int32),
+        seq_lens_cpu=torch.tensor([77, 88], dtype=torch.int32),
+        seq_lens_list=[77, 88],
+        actual_seq_lengths_q=[3, 7],
+        query_start_loc=query,
+        positions=absolute,
+        slot_mapping=slots,
+        qfa_metadata_cache={},
+        attn_state=AscendAttentionState.PrefillNoCache,
+    )
+    target = {"draft": target_layer}
+    slot_map = {"draft": slots}
+    original_target_table = target_layer.block_tables.clone()
+    bank = SimpleNamespace(
+        window_block_table=torch.tensor([[1, 2, 0, 0], [5, 6, 7, 8]], dtype=torch.int32),
+        device_window_exact=torch.tensor([5, 11], dtype=torch.int32),
+        cpu_window_exact=torch.tensor([5, 11], dtype=torch.int32),
+    )
+    capture, identity = object(), object()
+    pending = SimpleNamespace(identity=identity, workspace=bank)
+    provider = SimpleNamespace(_active_inputs=None)
+
+    def publish(metadata, *, target_metadata):
+        assert target_metadata is target
+        validate_draft_metadata_isolation(metadata, target_metadata=target)
+        events.append("publish")
+
+    pending.publish = publish
+
+    def resolve(**kwargs):
+        assert kwargs == dict(first=True, n=2, tokens=8, ordinal=0)
+        return capture
+
+    def prepare(actual):
+        assert actual is capture
+        events.append("prepare")
+        return bank
+
+    def materialize(**kwargs):
+        assert kwargs == dict(step=0, num_reqs=2, num_reqs_padded=2, output_workspace=bank)
+        provider._active_inputs = pending
+        events.append("materialize")
+        return pending
+
+    def retire(actual):
+        assert actual is identity and provider._active_inputs is pending
+        events.append("retire")
+        provider._active_inputs = None
+
+    provider.prepare_workspace, provider.retire_generation = prepare, retire
+    owner._draft_window_graph_binding_provider = provider
+    owner._eagle3_graph_session = SimpleNamespace(_capture_call=None, resolve=resolve)
+    owner._eagle3_window_next_step, owner.num_speculative_steps = 0, 3
+    owner.input_batch = SimpleNamespace(num_reqs=2, has_prefill=True, idx_mapping=torch.tensor([1, 0]))
+
+    def gather(mapping, *, num_reqs_padded):
+        assert mapping is owner.input_batch.idx_mapping and num_reqs_padded == 2
+        events.append("gather_full")
+
+    owner.block_tables = SimpleNamespace(gather_block_tables=gather)
+    owner._materialize_eagle3_step = materialize
+    owner._require_eagle3_target_metadata = lambda: target
+    owner._quarantine_eagle3_window = lambda: events.append("quarantine")
+    owner._prepare_replicated_prefill_attn = lambda metadata, mappings, *args, **kwargs: (metadata, mappings)
+    owner.draft_attn_layer_names, owner.pcp_manager = {"draft"}, None
+    owner.input_buffers = SimpleNamespace(positions=absolute.clone())
+    owner.last_token_indices, owner.idx_mapping = torch.tensor([2, 6]), torch.tensor([1, 0])
+    owner.draft_tokens = torch.zeros((2, 3), dtype=torch.int64)
+    owner.hidden_states = torch.zeros((2, 8))
+    owner.sample_src_positions = torch.zeros(2, dtype=torch.int64)
+    owner.temperature = owner.seeds = owner.current_draft_step = owner.draft_logits = object()
+    output = torch.arange(56, dtype=torch.float32).reshape(7, 8)
+
+    def forward(current, num_tokens, metadata, mappings, across, actual_mode, mm_inputs):
+        assert current is owner and num_tokens == 7 and actual_mode is mode and mappings is slot_map
+        assert provider._active_inputs is pending
+        layer = metadata["draft"]
+        assert metadata is not target and layer is not target_layer
+        assert layer.block_tables is bank.window_block_table
+        assert layer.seq_lens is layer.seq_lens_gpu is bank.device_window_exact
+        assert layer.seq_lens_cpu is bank.cpu_window_exact and layer.seq_lens_list == [5, 11]
+        assert layer.attn_state is AscendAttentionState.ChunkedPrefill
+        assert layer.slot_mapping is slots and layer.query_start_loc is query and layer.positions is absolute
+        assert layer.actual_seq_lengths_q == [3, 7]
+        assert target_layer.seq_lens_list == [77, 88]
+        assert target_layer.attn_state is AscendAttentionState.PrefillNoCache
+        torch.testing.assert_close(target_layer.block_tables, original_target_table)
+        events.append("native")
+        if fail:
+            raise ValueError("native prefill failed")
+        return output, output
+
+    def sample(hidden, *args):
+        sampled.append(hidden.clone())
+        return torch.tensor([21, 22], dtype=torch.int64)
+
+    owner.sample_draft = sample
+    monkeypatch.setattr(AscendTargetDependentARSpeculator, "_run_model", forward)
+    if fail:
+        with pytest.raises(ValueError, match="native prefill failed"):
+            owner._prefill(2, 7, target, slot_map, None, mode, skip_sample=skip_sample)
+        assert events == ["prepare", "gather_full", "materialize", "publish", "native", "quarantine"]
+        assert provider._active_inputs is pending and owner._eagle3_window_next_step == 0
+        assert not sampled
+    else:
+        owner._prefill(2, 7, target, slot_map, None, mode, skip_sample=skip_sample)
+        assert events == ["prepare", "gather_full", "materialize", "publish", "native", "retire"]
+        assert provider._active_inputs is None and owner._eagle3_window_next_step == 1
+        if skip_sample:
+            assert not sampled and not bool(owner.draft_tokens.any())
+        else:
+            torch.testing.assert_close(sampled[0], output[[2, 6]])
+            assert owner.draft_tokens[:, 0].tolist() == [21, 22]
+    assert not hasattr(owner, "_draft_window_runtime")
+    assert target_layer.slot_mapping is slots and target_layer.query_start_loc is query
+    torch.testing.assert_close(absolute, torch.arange(7) + 70)

@@ -32,11 +32,13 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
     DraftWindowGraphRoute,
     consume_draft_window_graph_metadata,
 )
+from vllm_ascend.worker.v2.spec_decode.draft_window_graph_metadata import copy_draft_attention_metadata
 from vllm_ascend.worker.v2.spec_decode.target_dependent_ar.speculator import AscendTargetDependentARSpeculator
 
 
 class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentARSpeculator, EagleSpeculator):
     decode_cudagraph_manager: Any
+    _eagle3_window_next_step: int
 
     def _initialize_draft_window_source_capability(self) -> None:
         """Atomically bind eligible P2 source and P3 ownership state."""
@@ -84,18 +86,55 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentA
         mm_inputs=None,
     ):
         session = getattr(self, "_eagle3_graph_session", None)
+        prefill_inputs = None
         if session is not None and session._capture_call is not None:
             attn_metadata, _ = session.capture_metadata(attn_metadata)
         elif self._eagle3_window_is_active():
-            raise RuntimeError("Eagle3 Window uses its FULL Graph managers; ordinary eager uses its own runtime")
-        return super()._run_model(
-            num_tokens,
-            attn_metadata,
-            slot_mappings,
-            num_tokens_across_dp,
-            cudagraph_runtime_mode,
-            mm_inputs,
-        )
+            if (
+                session is None
+                or self._eagle3_window_next_step != 0
+                or not self.input_batch.has_prefill
+                or cudagraph_runtime_mode not in (CUDAGraphMode.NONE, CUDAGraphMode.PIECEWISE)
+            ):
+                raise RuntimeError("Eagle3 Window decode uses its FULL Graph managers; no eager fallback")
+            # The fixed AR proposer deliberately executes nonuniform prefill
+            # outside FULL graphs. Reuse its prepared query/write metadata and
+            # the same persistent first-reader bank, not a second eager owner.
+            n = self.input_batch.num_reqs
+            capture = session.resolve(first=True, n=n, tokens=n * (self.num_speculative_steps + 1), ordinal=0)
+            provider = self._draft_window_graph_binding_provider
+            bank = provider.prepare_workspace(capture)
+            self.block_tables.gather_block_tables(self.input_batch.idx_mapping, num_reqs_padded=n)
+            prefill_inputs = self._materialize_eagle3_step(step=0, num_reqs=n, num_reqs_padded=n, output_workspace=bank)
+            attn_metadata = copy_draft_attention_metadata(attn_metadata)
+            for layer in attn_metadata.values():
+                if layer is not None:
+                    layer.block_tables = bank.window_block_table
+                    layer.seq_lens = layer.seq_lens_gpu = bank.device_window_exact
+                    layer.seq_lens_cpu = bank.cpu_window_exact
+                    layer.seq_lens_list = bank.cpu_window_exact.tolist()
+                    layer.max_seq_len = int(bank.cpu_window_exact.max().item())
+                    layer.attn_state = AscendAttentionState.ChunkedPrefill
+            prefill_inputs.publish(attn_metadata, target_metadata=self._require_eagle3_target_metadata())
+        try:
+            output = super()._run_model(
+                num_tokens,
+                attn_metadata,
+                slot_mappings,
+                num_tokens_across_dp,
+                cudagraph_runtime_mode,
+                mm_inputs,
+            )
+            if prefill_inputs is not None:
+                # Host retirement is not device completion. The capture bank
+                # remains owned, and reuse stays on the checked current stream.
+                self._draft_window_graph_binding_provider.retire_generation(prefill_inputs.identity)
+                self._eagle3_window_next_step = 1
+            return output
+        except BaseException:
+            if prefill_inputs is not None:
+                self._quarantine_eagle3_window()
+            raise
 
     def _multi_step_decode(
         self,

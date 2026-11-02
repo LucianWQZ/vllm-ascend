@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from contextlib import contextmanager
+from dataclasses import replace
 from typing import Any
 
 import torch
@@ -41,7 +42,7 @@ def build_eagle3_graph_source(owner: Any):
     validate_graph_context(owner.vllm_config, owner.block_tables)
     if owner.method != "eagle3" or owner.speculative_config.uses_dynamic_speculative_decoding():
         raise NotImplementedError("Eagle3 Graph requires normalized Eagle3 and static K")
-    return _build_draft_window_source_capability_for_context(
+    source = _build_draft_window_source_capability_for_context(
         policy=owner._draft_window_policy,
         runtime_route="eagle3",
         attn_groups=owner.attn_groups,
@@ -50,6 +51,9 @@ def build_eagle3_graph_source(owner: Any):
         causal=True,
         vllm_config=owner.vllm_config,
     )
+    # A mixed first prefill can contain continuing rows that still read Full.
+    # Retain their table capacity, not additional KV or another owner/buffer.
+    return replace(source, workspace_capacity_columns=source.full_source.input_block_table_row_width(source.group.gid))
 
 
 class Eagle3GraphSession:
