@@ -21,8 +21,7 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_backends import (
     inventory_draft_window_groups,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_plan import (
-    DraftWindowPlan,
-    project_draft_window_interval,
+    DirectPrefixProjection,
     window_capacity_tokens,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_policy import (
@@ -86,23 +85,6 @@ class FullDraftKVSource:
 
 
 @dataclass(frozen=True, slots=True)
-class DraftWindowReadDescriptor:
-    """Read-only description of a row slice in the canonical full source."""
-
-    global_group_id: int
-    source_start_column: int
-    first_token_offset: int
-    required_columns: int
-    safe_extent_tokens: int
-    valid_num_blocks: int
-    source_row_width: int
-
-    @property
-    def source_end_column(self) -> int:
-        return self.source_start_column + self.required_columns
-
-
-@dataclass(frozen=True, slots=True)
 class DraftWindowSourceCapability:
     """Canonical read projection; it never materializes a window table."""
 
@@ -134,86 +116,6 @@ class DraftWindowSourceCapability:
         span = self.group.table_column_span
         capacity_tokens = window_capacity_tokens(window, span)
         object.__setattr__(self, "capacity_columns", (capacity_tokens + span - 1) // span)
-
-    def describe(self, plan: DraftWindowPlan, *, valid_num_blocks: int) -> DraftWindowReadDescriptor:
-        """Project the shared scalar plan onto the canonical batch-sorted table."""
-        return self._describe_interval(
-            window_start=plan.window_start,
-            window_visible_length=plan.window_visible_length,
-            valid_num_blocks=valid_num_blocks,
-        )
-
-    def describe_frozen_step(
-        self,
-        proposal_plan: DraftWindowPlan,
-        *,
-        full_exact_end: int,
-        valid_num_blocks: int,
-    ) -> DraftWindowReadDescriptor:
-        """Advance Eagle's actual end while retaining its proposal-frozen anchor."""
-        if self.policy.normalized_method != "eagle3":
-            raise ValueError("frozen per-step projection is defined only for Eagle3")
-        step_plan = proposal_plan.at_exact_end(full_exact_end)
-        return self._describe_interval(
-            window_start=step_plan.window_start,
-            window_visible_length=step_plan.window_visible_length,
-            valid_num_blocks=valid_num_blocks,
-        )
-
-    def _describe_interval(
-        self,
-        *,
-        window_start: int,
-        window_visible_length: int,
-        valid_num_blocks: int,
-    ) -> DraftWindowReadDescriptor:
-        """Project a previously validated absolute interval onto FullSource."""
-        _require_nonnegative_python_int(valid_num_blocks, "valid_num_blocks")
-        span = self.group.table_column_span
-        projection = project_draft_window_interval(
-            window_start=window_start,
-            full_exact_end=window_start + window_visible_length,
-            block_span_tokens=span,
-        )
-        if projection.first_token_offset != 0:
-            raise NotImplementedError(
-                "MRV2 direct-prefix provider cannot consume a nonzero first-token "
-                f"offset: gid={self.group.gid} "
-                f"start={window_start} span={span} "
-                f"offset={projection.first_token_offset}"
-            )
-        if projection.required_columns > self.capacity_columns:
-            raise RuntimeError(
-                "draft-window projection exceeds provider capacity: "
-                f"required={projection.required_columns} "
-                f"capacity={self.capacity_columns}"
-            )
-        source_row_width = self.full_source.input_block_table_row_width(self.group.gid)
-        if valid_num_blocks > source_row_width:
-            raise RuntimeError(
-                "canonical valid block count exceeds source row width: "
-                f"gid={self.group.gid} valid={valid_num_blocks} "
-                f"row_width={source_row_width}"
-            )
-        if projection.source_end_column > valid_num_blocks:
-            raise RuntimeError(
-                "draft-window source shortage: "
-                f"method={self.policy.normalized_method} "
-                f"model={self.policy.target_model_type} "
-                f"gid={self.group.gid} "
-                f"start={projection.source_start_column} "
-                f"required={projection.required_columns} "
-                f"end={projection.source_end_column} valid={valid_num_blocks}"
-            )
-        return DraftWindowReadDescriptor(
-            global_group_id=self.group.gid,
-            source_start_column=projection.source_start_column,
-            first_token_offset=projection.first_token_offset,
-            required_columns=projection.required_columns,
-            safe_extent_tokens=projection.safe_extent_tokens,
-            valid_num_blocks=valid_num_blocks,
-            source_row_width=source_row_width,
-        )
 
 
 def resolve_static_future_offset(
@@ -479,7 +381,7 @@ class DraftWindowGenerationIdentity:
 
     proposal: "DraftWindowProposalContext"
     padded_request_count: int
-    read_descriptors: tuple[DraftWindowReadDescriptor, ...]
+    read_descriptors: tuple[DirectPrefixProjection, ...]
     idx_mapping_ptr: int
     step: int
 
@@ -524,7 +426,6 @@ class DraftWindowWorkspace:
             device=table_template.device,
         )
         self.cpu_window_exact = torch.zeros(max_num_reqs, dtype=torch.int32)
-        self.cpu_window_upper = torch.zeros(max_num_reqs, dtype=torch.int32)
         self._bound_identity: DraftWindowGenerationIdentity | None = None
         self._needs_clear = False
 
@@ -539,9 +440,7 @@ class DraftWindowWorkspace:
         full_source: FullDraftKVSource,
         global_group_id: int,
         cpu_window_exact: torch.Tensor,
-        cpu_window_upper: torch.Tensor,
         cpu_valid_num_blocks: torch.Tensor,
-        preserve_on_failure: bool = False,
     ) -> None:
         """Rewrite all active and inert state from the canonical full source."""
         if self._bound_identity is not None:
@@ -562,36 +461,19 @@ class DraftWindowWorkspace:
             padded_request_count=padded,
             expected_device=torch.device("cpu"),
         )
-        _validate_window_length_input(
-            cpu_window_upper,
-            name="CPU Window upper",
-            padded_request_count=padded,
-            expected_device=torch.device("cpu"),
-        )
         workspace_tensors = (
             self.window_block_table,
             self.device_window_exact,
             self.cpu_window_exact,
-            self.cpu_window_upper,
         )
         if any(
             _shares_storage(supplied, backing)
-            for supplied in tuple(
-                tensor
-                for tensor in (
-                    cpu_window_exact,
-                    cpu_window_upper,
-                    cpu_valid_num_blocks,
-                )
-                if tensor is not None
-            )
+            for supplied in (cpu_window_exact, cpu_valid_num_blocks)
             for backing in workspace_tensors
         ):
             raise ValueError("Window length inputs must not alias workspace backing")
         if actual and bool(torch.any(cpu_window_exact[:actual] < 0)):
             raise ValueError("Window exact lengths must be greater than or equal to 0")
-        if actual and bool(torch.any(cpu_window_upper[:actual] < cpu_window_exact[:actual])):
-            raise ValueError("CPU Window upper must be greater than or equal to exact")
 
         full_source.validate_owner_bindings()
         full_source._validate_global_group_id(global_group_id)
@@ -601,80 +483,60 @@ class DraftWindowWorkspace:
         if source_table.dtype != self.window_block_table.dtype:
             raise TypeError("canonical source table and Window workspace must share a dtype")
 
-        try:
-            if self._needs_clear:
-                self._zero_all()
-            for row, descriptor in enumerate(identity.read_descriptors):
-                if descriptor.global_group_id != global_group_id:
-                    raise ValueError("read descriptor global gid does not match the runtime source")
-                if (
-                    descriptor.source_start_column < 0
-                    or descriptor.required_columns < 0
-                    or descriptor.safe_extent_tokens < 0
-                    or descriptor.valid_num_blocks < 0
-                ):
-                    raise ValueError("read descriptor extents must be greater than or equal to 0")
-                if descriptor.first_token_offset != 0:
-                    raise NotImplementedError("P3 supports only direct-prefix descriptors with zero token offset")
-                if descriptor.source_row_width != source_table.shape[1]:
-                    raise RuntimeError("read descriptor source row width is stale")
-                if descriptor.required_columns > self.table_capacity_columns:
-                    raise RuntimeError(
-                        "draft-window table capacity exceeded: "
-                        f"required={descriptor.required_columns} "
-                        f"capacity={self.table_capacity_columns}"
-                    )
-                gathered_valid = int(cpu_valid_num_blocks[row].item())
-                if gathered_valid > source_table.shape[1]:
-                    raise RuntimeError("current valid block count exceeds the canonical source row width")
-                if descriptor.valid_num_blocks != gathered_valid:
-                    raise RuntimeError(
-                        "read descriptor valid count is stale: "
-                        f"row={row} descriptor={descriptor.valid_num_blocks} "
-                        f"current={gathered_valid}"
-                    )
-                if descriptor.source_end_column > gathered_valid:
-                    raise RuntimeError(
-                        "draft-window source shortage during materialization: "
-                        f"row={row} end={descriptor.source_end_column} "
-                        f"valid={gathered_valid}"
-                    )
-                required = descriptor.required_columns
-                if required:
-                    self.window_block_table[row, :required].copy_(
-                        source_table[
-                            row,
-                            descriptor.source_start_column : descriptor.source_end_column,
-                        ]
-                    )
-            if actual:
-                self.device_window_exact[:actual].copy_(cpu_window_exact[:actual])
-                self.cpu_window_exact[:actual].copy_(cpu_window_exact[:actual])
-                self.cpu_window_upper[:actual].copy_(cpu_window_upper[:actual])
-            self._bound_identity = identity
-        except BaseException:
-            if not preserve_on_failure:
-                self._zero_all()
-            raise
+        if self._needs_clear:
+            self._zero_all()
+        for row, descriptor in enumerate(identity.read_descriptors):
+            if (
+                descriptor.source_start_column < 0
+                or descriptor.required_columns < 0
+                or descriptor.safe_extent_tokens < 0
+            ):
+                raise ValueError("read descriptor extents must be greater than or equal to 0")
+            if descriptor.first_token_offset != 0:
+                raise NotImplementedError("P3 supports only direct-prefix descriptors with zero token offset")
+            if descriptor.required_columns > self.table_capacity_columns:
+                raise RuntimeError(
+                    "draft-window table capacity exceeded: "
+                    f"required={descriptor.required_columns} "
+                    f"capacity={self.table_capacity_columns}"
+                )
+            gathered_valid = int(cpu_valid_num_blocks[row].item())
+            if not 0 <= gathered_valid <= source_table.shape[1]:
+                raise RuntimeError("current valid block count exceeds the canonical source row width")
+            if descriptor.source_end_column > gathered_valid:
+                raise RuntimeError(
+                    "draft-window source shortage during materialization: "
+                    f"row={row} end={descriptor.source_end_column} "
+                    f"valid={gathered_valid}"
+                )
+            required = descriptor.required_columns
+            if int(cpu_window_exact[row]) > required * full_source.kernel_block_sizes[global_group_id]:
+                raise RuntimeError("Window exact length exceeds its actual readable columns")
+            if required:
+                self.window_block_table[row, :required].copy_(
+                    source_table[
+                        row,
+                        descriptor.source_start_column : descriptor.source_end_column,
+                    ]
+                )
+        if actual:
+            self.device_window_exact[:actual].copy_(cpu_window_exact[:actual])
+            self.cpu_window_exact[:actual].copy_(cpu_window_exact[:actual])
+        self._bound_identity = identity
 
     def assert_bound(self, expected_identity: DraftWindowGenerationIdentity) -> None:
         if self._bound_identity != expected_identity:
             raise RuntimeError("workspace generation identity does not match the expected generation")
 
-    def reset(self, expected_identity: DraftWindowGenerationIdentity, *, clear_buffers: bool = True) -> None:
-        if self._bound_identity is not None:
-            self.assert_bound(expected_identity)
-        if clear_buffers:
-            self._zero_all()
-        else:
-            self._bound_identity = None
-            self._needs_clear = True
+    def reset(self, expected_identity: DraftWindowGenerationIdentity) -> None:
+        self.assert_bound(expected_identity)
+        self._bound_identity = None
+        self._needs_clear = True
 
     def _zero_all(self) -> None:
         self.window_block_table.zero_()
         self.device_window_exact.zero_()
         self.cpu_window_exact.zero_()
-        self.cpu_window_upper.zero_()
         self._bound_identity = None
         self._needs_clear = False
 
@@ -721,7 +583,7 @@ class DraftMetadataInputs:
             object.__setattr__(self, "metadata", metadata)
         except BaseException:
             if self._owner._active_inputs is self and self._owner.quarantined_identity is None:
-                self._owner._handle_active_failure(self)
+                self._owner.quarantine_generation(self.identity)
             raise
 
 

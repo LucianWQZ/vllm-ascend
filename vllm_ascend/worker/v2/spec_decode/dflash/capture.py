@@ -162,7 +162,6 @@ def _seed_capture_workspace(
     destination[:, :valid_num_blocks].copy_(source[:, :valid_num_blocks])
     workspace.device_window_exact.fill_(capture_upper)
     workspace.cpu_window_exact.fill_(capture_upper)
-    workspace.cpu_window_upper.fill_(capture_upper)
     return capture_upper
 
 

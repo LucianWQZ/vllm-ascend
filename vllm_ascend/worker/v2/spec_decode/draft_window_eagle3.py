@@ -126,6 +126,8 @@ class Eagle3DraftWindowMixin:
                 self._eagle3_window_continuing_prefill = False
             return
 
+        if graph_session is None:
+            raise RuntimeError("Eagle3 Draft Window business proposals require their installed Graph manager")
         context = epoch_source.begin(input_batch)
         self._eagle3_window_proposal_context = context
         self._eagle3_window_proposal_plan = None
@@ -142,28 +144,17 @@ class Eagle3DraftWindowMixin:
                     f"consumed={self._eagle3_window_next_step} expected={expected_steps} "
                     f"static_K={self.num_speculative_steps}"
                 )
-            if graph_session is not None:
-                graph_session.finish()
+            graph_session.finish()
         except BaseException:
-            if graph_session is not None:
-                self._quarantine_eagle3_window()
+            self._quarantine_eagle3_window()
             raise
         finally:
-            live_inputs = self._draft_window_graph_binding_provider._active_inputs
-            try:
-                if (
-                    live_inputs is not None
-                    and not live_inputs.retired
-                    and not getattr(self, "_draft_window_graph_submission_uncertain", False)
-                ):
-                    self._draft_window_graph_binding_provider.abort_generation(live_inputs.identity)
-            finally:
-                self._eagle3_window_proposal_context = None
-                self._eagle3_window_proposal_plan = None
-                self._eagle3_window_decode_step_one_exact = None
-                self._eagle3_window_next_step = 0
-                self._eagle3_window_expected_steps = self.num_speculative_steps
-                epoch_source.finish(context)
+            self._eagle3_window_proposal_context = None
+            self._eagle3_window_proposal_plan = None
+            self._eagle3_window_decode_step_one_exact = None
+            self._eagle3_window_next_step = 0
+            self._eagle3_window_expected_steps = self.num_speculative_steps
+            epoch_source.finish(context)
 
     def _eagle3_window_is_active(self) -> bool:
         return (
@@ -281,7 +272,6 @@ class Eagle3DraftWindowMixin:
             cpu_valid_num_blocks=plan.cpu_valid_num_blocks,
             num_reqs_padded=num_reqs_padded,
             step=step,
-            quarantine_on_failure=True,
             output_workspace=output_workspace,
         )
         self._eagle3_window_proposal_plan = proposal

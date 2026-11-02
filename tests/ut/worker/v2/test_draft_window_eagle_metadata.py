@@ -252,6 +252,18 @@ def test_real_proposal_keeps_each_submitted_consumer_until_update(proposal):
     assert not getattr(owner, "_draft_window_graph_submission_uncertain", False)
 
 
+def test_business_window_proposal_requires_the_real_installed_graph_manager(proposal):
+    owner, batch, session, runtime, inputs = proposal
+    del owner._eagle3_graph_session
+    with (
+        pytest.raises(RuntimeError, match="installed Graph manager"),
+        owner._eagle3_draft_window_proposal_scope(batch, dummy_run=False, is_profile=False),
+    ):
+        pytest.fail("a business request reached the old private eager owner")
+    assert owner._eagle3_window_proposal_context is None
+    assert runtime._active_inputs is None
+
+
 @pytest.mark.parametrize(
     "damage", ["missing_reader", "missing_update", "wrong_request", "cloned_proposal", "wrong_step", "wrong_ordinal"]
 )
@@ -450,7 +462,6 @@ def test_eagle_graph_builder_uses_the_draft_parallel_config_and_actual_phase(mon
         window_block_table=torch.tensor([[2, 3]], dtype=torch.int32),
         device_window_exact=torch.tensor([5], dtype=torch.int32),
         cpu_window_exact=torch.tensor([5], dtype=torch.int32),
-        cpu_window_upper=torch.tensor([6], dtype=torch.int32),
     )
     inputs = SimpleNamespace(
         identity=object(), _owner=SimpleNamespace(source=SimpleNamespace(group=SimpleNamespace(gid=0)))

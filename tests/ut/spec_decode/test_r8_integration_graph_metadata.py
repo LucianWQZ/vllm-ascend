@@ -233,7 +233,6 @@ def test_private_full_uses_one_fresh_builder_and_only_binds_its_device_lengths(m
         max_num_reqs=padded,
         window_block_table=torch.arange(padded * 2, dtype=torch.int32).reshape(padded, 2),
         cpu_window_exact=exact,
-        cpu_window_upper=exact.clone(),
         device_window_exact=exact.clone(),
     )
     group = SimpleNamespace(gid=0, layers=("draft.layer.a", "draft.layer.b"))

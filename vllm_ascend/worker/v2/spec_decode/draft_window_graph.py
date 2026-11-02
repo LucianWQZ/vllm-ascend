@@ -21,11 +21,11 @@ from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftMetadataInputs,
     DraftWindowGenerationIdentity,
-    DraftWindowReadDescriptor,
     DraftWindowSourceCapability,
     DraftWindowWorkspace,
     _validate_idx_mapping,
 )
+from vllm_ascend.worker.v2.spec_decode.draft_window_plan import DirectPrefixProjection
 
 if TYPE_CHECKING:
     from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowProposalContext
@@ -114,7 +114,6 @@ def _bank_snapshot(backing: Any) -> tuple[DraftWindowGraphTensorIdentity, ...]:
             "window_block_table",
             "device_window_exact",
             "cpu_window_exact",
-            "cpu_window_upper",
         )
     )
 
@@ -158,13 +157,11 @@ class DraftWindowGraphBindingProvider:
         if table_capacity_columns > source_table.shape[1]:
             raise ValueError("configured workspace capacity exceeds the canonical source row width")
         self._tp_identity = self._capture_topology()
-        if source.group.read_semantics != "replicated" or any(
+        if any(
             getattr(source.parallel_config, name) != 1
             for name in ("pipeline_parallel_size", "prefill_context_parallel_size", "decode_context_parallel_size")
         ):
             raise ValueError("Draft Graph read banks require replicated reads and PP=PCP=DCP=1")
-        self._workspace: DraftWindowWorkspace | None = None
-        self._quarantine_on_failure = False
         self._active_inputs: DraftMetadataInputs | None = None
         self._last_mapping_epoch = -1
         self._last_retired_identity: DraftWindowGenerationIdentity | None = None
@@ -177,24 +174,6 @@ class DraftWindowGraphBindingProvider:
     @property
     def source(self) -> DraftWindowSourceCapability:
         return self._source
-
-    @property
-    def workspace(self) -> DraftWindowWorkspace:
-        # Non-FULL consumers need a temporary read buffer; FULL Graph writes
-        # directly to its capture bank and never allocates this scratch.
-        if self._workspace is None:
-            self._workspace = self.new_workspace()
-        return self._workspace
-
-    def new_workspace(self, num_reqs: int | None = None) -> DraftWindowWorkspace:
-        capability = self.source
-        gid = capability.group.gid
-        table = capability.full_source._input_block_tables[gid]
-        return DraftWindowWorkspace(
-            max_num_reqs=table.shape[0] if num_reqs is None else num_reqs,
-            table_capacity_columns=capability.workspace_capacity_columns or capability.capacity_columns,
-            table_template=table,
-        )
 
     @property
     def quarantined_identity(self) -> DraftWindowGenerationIdentity | None:
@@ -217,15 +196,13 @@ class DraftWindowGraphBindingProvider:
         *,
         proposal: DraftWindowProposalContext,
         idx_mapping: torch.Tensor,
-        read_descriptors: Sequence[DraftWindowReadDescriptor],
+        read_descriptors: Sequence[DirectPrefixProjection],
         cpu_window_exact: torch.Tensor,
-        cpu_window_upper: torch.Tensor,
         cpu_valid_num_blocks: torch.Tensor,
         num_reqs_padded: int,
         step: int,
         previous_identity: DraftWindowGenerationIdentity | None = None,
-        quarantine_on_failure: bool = False,
-        output_workspace: DraftWindowWorkspace | None = None,
+        output_workspace: DraftWindowWorkspace,
     ) -> DraftMetadataInputs:
         """Populate a new proposal or the next retired Eagle consumer's bank."""
         if self._quarantined_identity is not None:
@@ -260,8 +237,7 @@ class DraftWindowGraphBindingProvider:
             idx_mapping_ptr=idx_mapping.data_ptr(),
             step=step,
         )
-        workspace = self.workspace if output_workspace is None else output_workspace
-        self._quarantine_on_failure = quarantine_on_failure
+        workspace = output_workspace
         self._last_mapping_epoch = max(self._last_mapping_epoch, identity.proposal.mapping_epoch)
         try:
             workspace.materialize(
@@ -269,30 +245,17 @@ class DraftWindowGraphBindingProvider:
                 full_source=self.source.full_source,
                 global_group_id=self.source.group.gid,
                 cpu_window_exact=cpu_window_exact,
-                cpu_window_upper=cpu_window_upper,
                 cpu_valid_num_blocks=cpu_valid_num_blocks,
-                preserve_on_failure=quarantine_on_failure,
             )
             self._last_retired_identity = None
             inputs = DraftMetadataInputs(identity=identity, workspace=workspace, _owner=self)
             self._active_inputs = inputs
             return inputs
         except BaseException:
-            if quarantine_on_failure:
-                # A native write may have been submitted before raising, even
-                # though no typed inputs exist yet. Keep the workspace and
-                # backing; only Host state may be changed before child isolation.
-                self._quarantined_identity = identity
-                raise
-            workspace.reset(identity, clear_buffers=workspace is self._workspace)
-            self._active_inputs = None
+            # The bank is capture-owned and may have queued writes even when
+            # native preparation raises. Never clear it or continue the worker.
+            self._quarantined_identity = identity
             raise
-
-    def _handle_active_failure(self, inputs: DraftMetadataInputs) -> None:
-        if self._quarantine_on_failure:
-            self.quarantine_generation(inputs.identity)
-        else:
-            self._abort_active(inputs.identity)
 
     def retire_generation(self, expected_identity: DraftWindowGenerationIdentity) -> None:
         if self._quarantined_identity is not None:
@@ -304,38 +267,15 @@ class DraftWindowGraphBindingProvider:
         self._finish_generation(expected_identity)
         self._last_retired_identity = expected_identity
 
-    def abort_generation(self, expected_identity: DraftWindowGenerationIdentity) -> None:
-        if self._quarantined_identity is not None:
-            raise RuntimeError("cannot abort quarantined draft-window backing")
-        inputs = self._active_inputs
-        if inputs is None:
-            raise RuntimeError("cannot use retired Draft inputs")
-        inputs.validate_for(expected_identity)
-        self._abort_active(expected_identity)
-
-    def _abort_active(self, identity: DraftWindowGenerationIdentity) -> None:
-        if self._quarantined_identity is not None:
-            raise RuntimeError("cannot clean up quarantined draft-window backing")
-        inputs = self._active_inputs
-        if inputs is None:
-            return
-        inputs.validate_for(identity)
-        self._finish_generation(identity)
-        self._last_retired_identity = None
-
     def _finish_generation(self, identity: DraftWindowGenerationIdentity) -> None:
         # Graph bank lifetime belongs to capture, not this Host generation.
         # Clear only at the next same-stream prepare, after the existing tail
-        # dependency. Non-FULL scratch follows its serialized current stream.
+        # dependency.
         inputs = self._active_inputs
         assert inputs is not None
         workspace = inputs.workspace
-        workspace.reset(identity, clear_buffers=workspace is self._workspace)
+        workspace.reset(identity)
         self._active_inputs = None
-
-    @property
-    def submitted_carriers(self) -> tuple[DraftWindowGraphReadCarrier, ...]:
-        return self._submitted_carriers
 
     def capture_identity_for(
         self,
@@ -399,7 +339,11 @@ class DraftWindowGraphBindingProvider:
         source = self.source.full_source
         if num_reqs > source._input_block_tables[self.source.group.gid].shape[0]:
             raise RuntimeError("capture request bucket exceeds source capacity")
-        backing = self.new_workspace(num_reqs)
+        backing = DraftWindowWorkspace(
+            max_num_reqs=num_reqs,
+            table_capacity_columns=self.source.workspace_capacity_columns or self.source.capacity_columns,
+            table_template=source._input_block_tables[self.source.group.gid],
+        )
         backing._needs_clear = True
         self._carriers[identity] = DraftWindowGraphReadCarrier(
             capture_identity=identity,

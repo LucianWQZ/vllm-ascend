@@ -181,7 +181,7 @@ def draft_window_read_inputs(
     global_group_id: int,
 ) -> AscendDraftAttentionReadInputs:
     """Narrow one real scratch/capture bank to its builder's request rows."""
-    active_upper = workspace.cpu_window_upper[:actual_request_count]
+    active_exact = workspace.cpu_window_exact[:actual_request_count]
     return AscendDraftAttentionReadInputs(
         block_tables=tuple(
             (workspace.window_block_table if gid == global_group_id else table)[:padded_request_count]
@@ -189,8 +189,8 @@ def draft_window_read_inputs(
         ),
         seq_lens=workspace.device_window_exact[:padded_request_count],
         seq_lens_cpu_exact=workspace.cpu_window_exact[:padded_request_count],
-        seq_lens_cpu_upper_bound=workspace.cpu_window_upper[:padded_request_count],
-        max_seq_len=int(active_upper.max().item()) if active_upper.numel() else 0,
+        seq_lens_cpu_upper_bound=workspace.cpu_window_exact[:padded_request_count],
+        max_seq_len=int(active_exact.max().item()) if active_exact.numel() else 0,
     )
 
 
@@ -463,29 +463,18 @@ class DraftWindowGraphInputMixin:
         if num_reqs_padded < num_reqs:
             raise ValueError("padded request count must be at least actual requests")
 
-        selected = getattr(self, "_draft_window_selected_metadata", None)
-        output_workspace = None
-        if selected is not None:
-            from vllm_ascend.worker.v2.spec_decode.draft_window_graph import resolve_parallel_draft_window_graph_route
+        selected = self._draft_window_selected_metadata
+        if selected is None:
+            raise RuntimeError("Draft Window input preparation requires the actual FULL dispatch")
+        from vllm_ascend.worker.v2.spec_decode.draft_window_graph import resolve_parallel_draft_window_graph_route
 
-            provider = self._draft_window_graph_binding_provider
-            route = resolve_parallel_draft_window_graph_route(self)
-            assert route is not None
-            capture_identity = provider.capture_identity_for(route=route, descriptor=selected.descriptor)
-            output_workspace = provider.prepare_workspace(capture_identity)
+        provider = self._draft_window_graph_binding_provider
+        route = resolve_parallel_draft_window_graph_route(self)
+        assert route is not None
+        capture_identity = provider.capture_identity_for(route=route, descriptor=selected.descriptor)
+        output_workspace = provider.prepare_workspace(capture_identity)
 
         cpu_full_exact = self._snapshot_prepared_draft_seq_lens(num_reqs_padded)
-        cpu_apply_time_full_upper = torch.zeros(
-            num_reqs_padded,
-            dtype=torch.int32,
-        )
-        if num_reqs:
-            torch.add(
-                input_batch.seq_lens_cpu_upper_bound[:num_reqs],
-                self.num_query_per_req,
-                out=cpu_apply_time_full_upper[:num_reqs],
-            )
-            cpu_apply_time_full_upper[:num_reqs].clamp_(max=self.max_model_len)
         capability = self._draft_window_graph_binding_provider.source
         valid_num_blocks = gather_valid_num_blocks_cpu(
             capability.full_source,
@@ -498,7 +487,6 @@ class DraftWindowGraphInputMixin:
             source=capability,
             phase_plan=context.phase_plan,
             cpu_full_exact=cpu_full_exact,
-            cpu_apply_time_full_upper=cpu_apply_time_full_upper,
             cpu_valid_num_blocks=valid_num_blocks,
             actual_request_count=num_reqs,
             padded_request_count=num_reqs_padded,
@@ -510,11 +498,9 @@ class DraftWindowGraphInputMixin:
             idx_mapping=input_batch.idx_mapping,
             read_descriptors=plan.read_descriptors,
             cpu_window_exact=plan.cpu_window_exact,
-            cpu_window_upper=plan.cpu_window_upper,
             cpu_valid_num_blocks=plan.cpu_valid_num_blocks,
             num_reqs_padded=num_reqs_padded,
             step=0,
-            quarantine_on_failure=hasattr(self, "_draft_window_graph_session"),
             output_workspace=output_workspace,
         )
         return inputs

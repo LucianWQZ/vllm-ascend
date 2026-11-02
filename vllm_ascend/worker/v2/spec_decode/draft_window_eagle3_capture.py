@@ -93,7 +93,6 @@ class Eagle3GraphSession:
                         )
                         read.window_block_table.zero_()
                         read.cpu_window_exact.fill_(capacity)
-                        read.cpu_window_upper.fill_(capacity)
                         read.device_window_exact.copy_(read.cpu_window_exact)
 
     def require_reusable(self) -> None:

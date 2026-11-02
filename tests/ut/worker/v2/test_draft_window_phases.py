@@ -77,7 +77,7 @@ def test_epoch_still_rejects_changed_requests_mapping_or_phases(field):
 
 @pytest.fixture
 def full_source():
-    group = DraftWindowGroupRoute(0, ("draft.layer",), 4, 4, "replicated", DraftWindowProviderStatus.DIRECT_DENSE)
+    group = DraftWindowGroupRoute(0, ("draft.layer",), 4, 4, DraftWindowProviderStatus.DIRECT_DENSE)
     counts = torch.tensor([[4, 3]], dtype=torch.int32)
     owner = SimpleNamespace(
         input_block_tables=[torch.arange(8, dtype=torch.int32).reshape(2, 4)],
@@ -115,7 +115,6 @@ def test_phase_materialization_rejects_counts_outside_canonical_row(full_source,
             source=source,
             phase_plan=phase,
             cpu_full_exact=torch.tensor([2], dtype=torch.int32),
-            cpu_apply_time_full_upper=torch.tensor([2], dtype=torch.int32),
             cpu_valid_num_blocks=torch.tensor([count], dtype=torch.int32),
             actual_request_count=1,
             padded_request_count=1,
@@ -126,7 +125,7 @@ def test_phase_materialization_rejects_counts_outside_canonical_row(full_source,
 def test_shared_row_projection_keeps_eagle_anchor_and_full_prefill(full_source, step, end):
     from vllm_ascend.worker.v2.spec_decode.draft_window_plan import compute_draft_window_plan
 
-    group = DraftWindowGroupRoute(0, ("draft.layer",), 4, 4, "replicated", DraftWindowProviderStatus.DIRECT_DENSE)
+    group = DraftWindowGroupRoute(0, ("draft.layer",), 4, 4, DraftWindowProviderStatus.DIRECT_DENSE)
     from vllm_ascend.worker.v2.spec_decode.draft_window_policy import resolve_draft_window_policy
 
     policy = resolve_draft_window_policy(requested_window_size=8, method="eagle3")
