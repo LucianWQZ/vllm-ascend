@@ -192,6 +192,7 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentA
             query_start_loc_np=query_start_loc_np,
             dcp_local_seq_lens=None,
             attn_state=state if first_pass else AscendAttentionState.DecodeOnly,
+            parallel_config=self.draft_vllm_config.parallel_config,
         )
         if not metadata:
             raise RuntimeError("eligible Eagle3 Window route produced no Draft metadata")

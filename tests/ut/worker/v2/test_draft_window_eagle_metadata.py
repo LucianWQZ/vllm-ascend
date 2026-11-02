@@ -438,3 +438,44 @@ def test_parallel_metadata_hook_rejects_bad_actual_inputs_before_bank_materializ
     with pytest.raises(RuntimeError, match="actual uniform FULL dispatch|canonical Full write slots"):
         owner._build_attn_metadata(1, desc, query, torch.tensor([16]), step, slot_mappings=slots)
     assert not calls
+
+
+@pytest.mark.parametrize("first", [False, True])
+def test_eagle_graph_builder_uses_the_draft_parallel_config_and_actual_phase(monkeypatch, first):
+    from vllm_ascend.attention.attention_v1 import AscendAttentionState
+    from vllm_ascend.worker.v2.spec_decode import draft_window_eagle3_adapter
+
+    owner: Any = object.__new__(Eagle3GraphIntegrationMixin)
+    target_state = AscendAttentionState.ChunkedPrefill
+    target = {"layer": SimpleNamespace(attn_state=target_state)}
+    owner.model_state = SimpleNamespace(attn_metadata=target)
+    owner.block_tables = SimpleNamespace(cp_size=1, input_block_tables=[torch.zeros((1, 2), dtype=torch.int32)])
+    draft_parallel = object()
+    owner.draft_vllm_config = SimpleNamespace(parallel_config=draft_parallel)
+    workspace = SimpleNamespace(
+        window_block_table=torch.tensor([[2, 3]], dtype=torch.int32),
+        device_window_exact=torch.tensor([5], dtype=torch.int32),
+        cpu_window_exact=torch.tensor([5], dtype=torch.int32),
+        cpu_window_upper=torch.tensor([6], dtype=torch.int32),
+    )
+    inputs = SimpleNamespace(identity=object(), _owner=SimpleNamespace(source=SimpleNamespace(group=SimpleNamespace(gid=0))))
+    inputs.validate_for = lambda expected: expected is inputs.identity
+    calls = []
+
+    def build(current, **kwargs):
+        assert current is owner
+        calls.append(kwargs)
+        return {"layer": SimpleNamespace(attn_state=kwargs["attn_state"])}
+
+    monkeypatch.setattr(draft_window_eagle3_adapter, "build_draft_window_attn_metadata", build)
+    result = owner._build_eagle3_graph_metadata(
+        inputs=inputs, workspace=workspace, num_reqs=1, num_reqs_padded=1, num_tokens_padded=4 if first else 1,
+        query_start_loc_np=np.array([0, 4], dtype=np.int32) if first else None,
+        target_metadata=target, first_pass=first,
+    )
+    assert len(calls) == 1 and calls[0]["parallel_config"] is draft_parallel
+    assert result["layer"].attn_state is (target_state if first else AscendAttentionState.DecodeOnly)
+    assert result["layer"].seq_lens is workspace.device_window_exact
+    assert result["layer"].seq_lens_cpu is workspace.cpu_window_exact
+    assert result["layer"].seq_lens_list == [5]
+    assert vars(target["layer"]) == {"attn_state": target_state}
