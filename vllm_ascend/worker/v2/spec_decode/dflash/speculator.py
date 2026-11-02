@@ -225,63 +225,6 @@ def _draft_window_owner_scope(owner, input_batch, dummy_run=False, is_profile=Fa
     return nullcontext()
 
 
-def _build_graph_uniform_metadata(
-    owner,
-    *,
-    num_reqs,
-    batch_desc,
-    query_start_loc_np,
-    seq_lens_cpu_upper_bound,
-    step,
-    causal,
-    dcp_local_seq_lens=None,
-    slot_mappings=None,
-):
-    """Adapt the fixed core uniform hook to the existing owned Graph reader.
-
-    No context-KV operands are projected here. The upstream precompute path
-    keeps its original positions and Full context slots, including dummy PAD.
-    """
-    if getattr(owner, "_draft_window_runtime", None) is not None:
-        raise RuntimeError("Graph metadata cannot also use the typed eager owner")
-    if step != owner.num_query_per_req:
-        raise RuntimeError("Draft Graph metadata step differs from its fixed query width")
-    expected_query = np.arange(num_reqs + 1, dtype=query_start_loc_np.dtype) * owner.num_query_per_req
-    if query_start_loc_np.shape != expected_query.shape or not np.array_equal(query_start_loc_np, expected_query):
-        raise RuntimeError("Draft Graph requires the actual uniform query layout")
-    padded_reqs = batch_desc.num_reqs or num_reqs
-    tokens = batch_desc.num_tokens if batch_desc.cg_mode == CUDAGraphMode.FULL else int(query_start_loc_np[-1])
-    if batch_desc.cg_mode == CUDAGraphMode.FULL and tokens != padded_reqs * owner.num_query_per_req:
-        raise RuntimeError("Draft Graph descriptor differs from its fixed padded query width")
-    from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import (
-        validate_full8_single_request_graph_stage,
-    )
-
-    validate_full8_single_request_graph_stage(owner, actual=num_reqs, padded=padded_reqs, tokens=tokens)
-    full_slots = owner.block_tables.slot_mappings[:, :tokens]
-    if slot_mappings is not None and (
-        slot_mappings.shape != full_slots.shape
-        or slot_mappings.dtype != full_slots.dtype
-        or slot_mappings.device != full_slots.device
-        or slot_mappings.stride() != full_slots.stride()
-        or slot_mappings.data_ptr() != full_slots.data_ptr()
-    ):
-        raise RuntimeError("Draft Graph metadata must retain the canonical Full write slots")
-    # The existing builder reconstructs this same uniform CPU query layout.
-    # Supplying None follows its declared uniform seam only after validation.
-    return DraftWindowGraphInputMixin._build_draft_attn_metadata(
-        owner,
-        num_reqs=num_reqs,
-        num_reqs_padded=padded_reqs,
-        num_tokens_padded=tokens,
-        seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
-        step=step,
-        causal=causal,
-        query_start_loc_np=None,
-        dcp_local_seq_lens=dcp_local_seq_lens,
-    )
-
-
 class AscendDFlashSpeculator(DraftWindowGraphInputMixin, LmheadTPDraftSamplingMixin, DFlashSpeculator):
     def load_draft_model(
         self,
@@ -430,21 +373,6 @@ class AscendDFlashSpeculator(DraftWindowGraphInputMixin, LmheadTPDraftSamplingMi
         dcp_local_seq_lens: torch.Tensor | None = None,
         slot_mappings: torch.Tensor | None = None,
     ) -> dict[str, Any] | None:
-        if hasattr(self, "_draft_window_graph_binding_provider") and not getattr(
-            self, "_draft_window_bypass_active", False
-        ):
-            with build_attn_metadata_wrapper():
-                return _build_graph_uniform_metadata(
-                    self,
-                    num_reqs=num_reqs,
-                    batch_desc=batch_desc,
-                    query_start_loc_np=query_start_loc_np,
-                    seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
-                    step=step,
-                    causal=causal,
-                    dcp_local_seq_lens=dcp_local_seq_lens,
-                    slot_mappings=slot_mappings,
-                )
         runtime = getattr(self, "_draft_window_runtime", None)
         # Older vLLM releases do not accept this optional upstream argument.
         slot_kwargs = {} if slot_mappings is None else {"slot_mappings": slot_mappings}

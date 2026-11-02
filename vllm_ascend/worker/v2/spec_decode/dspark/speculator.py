@@ -49,7 +49,6 @@ from vllm_ascend.worker.v2.attn_utils import (
 )
 from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
 from vllm_ascend.worker.v2.spec_decode.dflash.speculator import (
-    _build_graph_uniform_metadata,
     _draft_window_owner_scope,
     prepare_dflash_inputs_factory,
 )
@@ -368,34 +367,6 @@ class AscendDSparkSpeculator(DraftWindowGraphInputMixin, LmheadTPDraftSamplingMi
         slot_mappings: torch.Tensor | None = None,
     ) -> dict[str, Any] | None:
         """Build Ascend draft metadata through the upstream attention hook."""
-        if hasattr(self, "_draft_window_graph_binding_provider") and not getattr(
-            self, "_draft_window_bypass_active", False
-        ):
-            # The Graph read transport owns the current exact CPU/device pair.
-            # Do not run PR eager projection or its CPU-upper preparer again.
-            input_batch = self.input_batch
-            if input_batch is None:
-                raise RuntimeError("Draft Graph metadata requires the current input batch")
-            with (
-                build_attn_metadata_wrapper(),
-                build_attn_metadata_factory(
-                    self.input_buffers.positions,
-                    batch_desc.num_tokens,
-                    torch.from_numpy(input_batch.is_prefilling_np),
-                    parallel_config=self.attn_vllm_config.parallel_config,
-                ),
-            ):
-                return _build_graph_uniform_metadata(
-                    self,
-                    num_reqs=num_reqs,
-                    batch_desc=batch_desc,
-                    query_start_loc_np=query_start_loc_np,
-                    seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
-                    step=step,
-                    causal=causal,
-                    dcp_local_seq_lens=dcp_local_seq_lens,
-                    slot_mappings=slot_mappings,
-                )
         runtime = getattr(self, "_draft_window_runtime", None)
         # Older vLLM releases do not accept this optional upstream argument.
         slot_kwargs = {} if slot_mappings is None else {"slot_mappings": slot_mappings}

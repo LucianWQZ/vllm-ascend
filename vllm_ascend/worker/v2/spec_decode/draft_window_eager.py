@@ -528,84 +528,65 @@ class DraftWindowGraphInputMixin:
             global_group_id=inputs._owner.source.group.gid,
         )
 
-    def _build_draft_attn_metadata(
+    def _build_attn_metadata(
         self,
         num_reqs: int,
-        num_reqs_padded: int,
-        num_tokens_padded: int,
+        batch_desc: Any,
+        query_start_loc_np: np.ndarray,
         seq_lens_cpu_upper_bound: torch.Tensor,
         step: int,
-        num_query_per_req: int | None = None,
-        causal: bool | Mapping[int, bool] = False,
-        query_start_loc_np: np.ndarray | None = None,
+        causal: bool | Mapping[int, bool] = True,
         dcp_local_seq_lens: torch.Tensor | None = None,
+        slot_mappings: torch.Tensor | None = None,
     ) -> dict[str, Any] | None:
-        provider = getattr(self, "_draft_window_graph_binding_provider", None)
-        if provider is None or getattr(self, "_draft_window_bypass_active", False):
-            return super()._build_draft_attn_metadata(  # type: ignore[misc]
+        if not hasattr(self, "_draft_window_graph_binding_provider") or self._draft_window_bypass_active:
+            slot_kwargs = {} if slot_mappings is None else {"slot_mappings": slot_mappings}
+            return super()._build_attn_metadata(  # type: ignore[misc]
                 num_reqs,
-                num_reqs_padded,
-                num_tokens_padded,
-                seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
-                step=step,
-                num_query_per_req=num_query_per_req,
-                causal=causal,
-                query_start_loc_np=query_start_loc_np,
-                dcp_local_seq_lens=dcp_local_seq_lens,
+                batch_desc,
+                query_start_loc_np,
+                seq_lens_cpu_upper_bound,
+                step,
+                causal,
+                dcp_local_seq_lens,
+                **slot_kwargs,
             )
         if not self.draft_attn_layer_names:
             return None
-        if num_query_per_req is not None:
-            raise AssertionError("DFlash/DSpark query width must come from the speculator instance")
-        if step != self.num_query_per_req:
-            raise RuntimeError("P4a apply-time step does not match the actual query width")
-        if query_start_loc_np is not None:
-            raise NotImplementedError("MRV2 draft-window P4a requires the uniform DFlash/DSpark query layout")
-        target_metadata = self._require_nonempty_target_metadata()
-        inputs = self._materialize_draft_window_read_inputs(
-            num_reqs=num_reqs,
-            num_reqs_padded=num_reqs_padded,
-        )
-        # Register ownership immediately. The outer proposal scope is the one
-        # exception/retirement owner if validation, building, or publishing
-        # fails after the workspace has been materialized.
-        self._draft_window_live_inputs = inputs
-        live_read_inputs = self._validated_draft_attention_read_inputs(
-            inputs,
-            inputs.identity,
-        )
-        from vllm_ascend.worker.v2.spec_decode.draft_window_graph_metadata import (
-            defer_parallel_graph_metadata,
-        )
-
-        if defer_parallel_graph_metadata(
-            self, inputs, padded_requests=num_reqs_padded, padded_tokens=num_tokens_padded
+        padded = batch_desc.num_reqs or num_reqs
+        tokens = batch_desc.num_tokens
+        expected_query: np.ndarray = np.arange(num_reqs + 1, dtype=query_start_loc_np.dtype) * self.num_query_per_req
+        if (
+            step != self.num_query_per_req
+            or batch_desc.cg_mode.name != "FULL"
+            or tokens != padded * self.num_query_per_req
+            or query_start_loc_np.shape != expected_query.shape
+            or not np.array_equal(query_start_loc_np, expected_query)
+            or self._draft_window_selected_metadata is None
         ):
-            # The pinned FULL branch does not consume this temporary value.
-            # P6 builds/publishes the real bank metadata once before replay.
-            return None
-        metadata = build_draft_window_attn_metadata(
-            self,
-            num_reqs=num_reqs,
-            num_reqs_padded=num_reqs_padded,
-            num_tokens_padded=num_tokens_padded,
-            read_inputs=live_read_inputs,
-            causal=causal,
-            query_start_loc_np=query_start_loc_np,
-            dcp_local_seq_lens=dcp_local_seq_lens,
+            raise RuntimeError("Draft Window requires its actual uniform FULL dispatch; no eager fallback")
+        from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import (
+            validate_full8_single_request_graph_stage,
         )
-        if metadata is None:
-            raise RuntimeError("eligible P4a route produced no Draft metadata")
-        if self.model_state.attn_metadata is not target_metadata:
-            raise RuntimeError("Target metadata owner changed during Draft metadata build")
-        inputs.publish(metadata, target_metadata=target_metadata)
-        return metadata
+        from vllm_ascend.worker.v2.spec_decode.draft_window_graph_metadata import defer_parallel_graph_metadata
 
-    def _require_nonempty_target_metadata(self) -> Mapping[Any, Any]:
-        target_metadata = self.model_state.attn_metadata
-        if not isinstance(target_metadata, Mapping) or not target_metadata:
-            raise ValueError("Window ON requires non-empty Target metadata from model_state.attn_metadata")
-        return target_metadata
+
+        validate_full8_single_request_graph_stage(self, actual=num_reqs, padded=padded, tokens=tokens)
+        full_slots = self.block_tables.slot_mappings[:, :tokens]
+        if slot_mappings is not None and (
+            slot_mappings.shape != full_slots.shape
+            or slot_mappings.dtype != full_slots.dtype
+            or slot_mappings.device != full_slots.device
+            or slot_mappings.stride() != full_slots.stride()
+            or slot_mappings.data_ptr() != full_slots.data_ptr()
+        ):
+            raise RuntimeError("Draft Graph metadata must retain the canonical Full write slots")
+        inputs = self._materialize_draft_window_read_inputs(num_reqs=num_reqs, num_reqs_padded=padded)
+        self._draft_window_live_inputs = inputs
+        if not defer_parallel_graph_metadata(self, inputs, padded_requests=padded, padded_tokens=tokens):
+            raise RuntimeError("Draft Window lost its actual FULL metadata dispatch")
+        # The fixed manager builds this bank's metadata once immediately before replay.
+        return None
 
     def _require_current_draft_window_proposal(
         self,

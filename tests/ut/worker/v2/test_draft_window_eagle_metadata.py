@@ -352,3 +352,82 @@ def test_eagle_capture_lookup_keeps_each_real_shape_and_consumer(first, tokens, 
         session.resolve(first=first, n=2, tokens=tokens, ordinal=ordinal)
     with pytest.raises(RuntimeError, match="no exact capture bank"):
         session.resolve(first=first, n=1, tokens=tokens + 1, ordinal=ordinal)
+
+
+@pytest.fixture
+def parallel_hook(monkeypatch):
+    from vllm_ascend.worker.v2.spec_decode import draft_window_graph_metadata
+    from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowGraphInputMixin
+
+    class Baseline:
+        def _build_attn_metadata(self, *args, **kwargs):
+            return (args, kwargs)
+
+    class Owner(DraftWindowGraphInputMixin, Baseline):
+        pass
+
+    owner: Any = Owner()
+    owner._draft_window_graph_binding_provider = object()
+    owner._draft_window_bypass_active = False
+    owner._draft_window_selected_metadata = object()
+    owner.draft_attn_layer_names, owner.num_query_per_req = {"draft.layer"}, 8
+    owner.block_tables = SimpleNamespace(slot_mappings=torch.arange(32, dtype=torch.int64).reshape(1, 32))
+    inputs, calls = object(), []
+
+    def materialize(**kwargs):
+        calls.append(kwargs)
+        return inputs
+
+    owner._materialize_draft_window_read_inputs = materialize
+    monkeypatch.setattr(draft_window_graph_metadata, "defer_parallel_graph_metadata", lambda *args, **kwargs: True)
+    desc = SimpleNamespace(cg_mode=SimpleNamespace(name="FULL"), num_reqs=2, num_tokens=16)
+    return owner, desc, inputs, calls
+
+
+@pytest.mark.parametrize("bypass", [False, True])
+def test_parallel_metadata_hook_retains_the_existing_off_and_prefill_path(parallel_hook, bypass):
+    owner, desc, _, calls = parallel_hook
+    if bypass:
+        owner._draft_window_bypass_active = True
+    else:
+        del owner._draft_window_graph_binding_provider
+    args = (1, desc, np.array([0, 8], dtype=np.int32), torch.tensor([16]), 8)
+    original_args, original_kwargs = owner._build_attn_metadata(*args)
+    assert original_args[:5] == args
+    assert original_args[5:] == (True, None)
+    assert not original_kwargs and not calls
+
+
+def test_parallel_metadata_hook_prepares_one_bank_without_a_temporary_metadata_build(parallel_hook):
+    owner, desc, inputs, calls = parallel_hook
+    result = owner._build_attn_metadata(
+        1,
+        desc,
+        np.array([0, 8], dtype=np.int32),
+        torch.tensor([16]),
+        8,
+        slot_mappings=owner.block_tables.slot_mappings[:, :16],
+    )
+    assert result is None and owner._draft_window_live_inputs is inputs
+    assert calls == [{"num_reqs": 1, "num_reqs_padded": 2}]
+
+
+@pytest.mark.parametrize("damage", ["mode", "query", "step", "tokens", "selection", "full_slots"])
+def test_parallel_metadata_hook_rejects_bad_actual_inputs_before_bank_materialization(parallel_hook, damage):
+    owner, desc, _, calls = parallel_hook
+    query, step, slots = np.array([0, 8], dtype=np.int32), 8, owner.block_tables.slot_mappings[:, :16]
+    if damage == "mode":
+        desc.cg_mode.name = "NONE"
+    elif damage == "query":
+        query[-1] = 7
+    elif damage == "step":
+        step = 7
+    elif damage == "tokens":
+        desc.num_tokens = 15
+    elif damage == "selection":
+        owner._draft_window_selected_metadata = None
+    elif damage == "full_slots":
+        slots = slots.clone()
+    with pytest.raises(RuntimeError, match="actual uniform FULL dispatch|canonical Full write slots"):
+        owner._build_attn_metadata(1, desc, query, torch.tensor([16]), step, slot_mappings=slots)
+    assert not calls
