@@ -458,7 +458,9 @@ def test_eagle_graph_builder_uses_the_draft_parallel_config_and_actual_phase(mon
         cpu_window_exact=torch.tensor([5], dtype=torch.int32),
         cpu_window_upper=torch.tensor([6], dtype=torch.int32),
     )
-    inputs = SimpleNamespace(identity=object(), _owner=SimpleNamespace(source=SimpleNamespace(group=SimpleNamespace(gid=0))))
+    inputs = SimpleNamespace(
+        identity=object(), _owner=SimpleNamespace(source=SimpleNamespace(group=SimpleNamespace(gid=0)))
+    )
     inputs.validate_for = lambda expected: expected is inputs.identity
     calls = []
 
@@ -469,9 +471,14 @@ def test_eagle_graph_builder_uses_the_draft_parallel_config_and_actual_phase(mon
 
     monkeypatch.setattr(draft_window_eagle3_adapter, "build_draft_window_attn_metadata", build)
     result = owner._build_eagle3_graph_metadata(
-        inputs=inputs, workspace=workspace, num_reqs=1, num_reqs_padded=1, num_tokens_padded=4 if first else 1,
+        inputs=inputs,
+        workspace=workspace,
+        num_reqs=1,
+        num_reqs_padded=1,
+        num_tokens_padded=4 if first else 1,
         query_start_loc_np=np.array([0, 4], dtype=np.int32) if first else None,
-        target_metadata=target, first_pass=first,
+        target_metadata=target,
+        first_pass=first,
     )
     assert len(calls) == 1 and calls[0]["parallel_config"] is draft_parallel
     assert result["layer"].attn_state is (target_state if first else AscendAttentionState.DecodeOnly)
