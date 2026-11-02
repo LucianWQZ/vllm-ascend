@@ -368,25 +368,13 @@ not exempt shared backend changes from OFF regression testing. The selector
 change is user-visible even for forced-OFF: it can permit auto-selected MRV2
 while leaving the original speculative method enabled.
 
-### Shared DSA changes and regression obligations
+### Target DSA-CP compatibility
 
-Noncausal DSpark uses K or K+1 query positions. An index buffer must cover the
-native prefix plus the actual query width, including an alignment boundary
-where W+K is exactly a multiple of 128 and the additional position needs
-another column. Default capacity allows K+1; an explicitly known anchor width
-may use K. Insufficient explicit capacity is rejected using host configuration,
-without reading device query values to make that decision.
-
-Noncausal index storage is allocated when its consumer is first enabled and
-then reused by that builder. Causal builders do not need that storage. This
-avoids multiplying unused buffers across proposal lanes and AR steps.
-Device-metadata setup allocates before deferred work/capture. This changes the
-shared OFF/MRV1 allocation time and requires eager reuse, warmup, profiling,
-and existing capture/replay regressions. It is not a measured optimization.
-The SFA Target DSA-CP input-count adaptation is separate from these Draft
-capacity changes. It preserves the existing distributed projection and
-collectives and requires its own all-rank correctness and Graph regression.
-Compressed DSA and unsupported PP/DCP startup guards remain intact.
+The SFA Target DSA-CP input-count adaptation preserves its existing
+projection and collectives and has its own all-rank correctness and Graph
+regression. It does not create a sparse Draft provider or change native DSA
+index construction. Compressed DSA and unsupported PP/DCP startup guards
+remain intact.
 
 ### Validation boundaries
 
