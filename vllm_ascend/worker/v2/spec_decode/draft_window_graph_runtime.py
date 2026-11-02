@@ -17,6 +17,7 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 
 import vllm_ascend.envs as envs
+from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.device.hardware_profile import AttentionBackendFamily, get_current_hardware_profile
 from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftMetadataInputs,
@@ -211,6 +212,11 @@ def _build_private_graph_metadata(
         read_inputs=read_inputs,
         causal=owner._group_causal,
         query_start_loc_np=None,
+        # DSpark's normal Draft builder uses this state even when Target is
+        # decode-only; the Target's heterogeneous metadata is not its contract.
+        attn_state=AscendAttentionState.ChunkedPrefill
+        if capture_identity.route is DraftWindowGraphRoute.DSPARK
+        else None,
     )
     for layer_name in owner._draft_window_graph_binding_provider.source.group.layers:
         # The normal builder uses CPU exact while preparing tiling. FULL FIA

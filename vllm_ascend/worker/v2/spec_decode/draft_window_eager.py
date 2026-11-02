@@ -159,7 +159,9 @@ def build_draft_window_attn_metadata(
     from vllm_ascend.worker.v2.attn_utils import build_attn_metadata
 
     if attn_state is None:
-        attn_state = next(layer.attn_state for layer in owner.model_state.attn_metadata.values() if layer is not None)
+        # Target metadata also contains indexer/cache entries without a state.
+        # Use the same current-batch input as the normal Target builder.
+        attn_state = owner.input_batch.attn_state
     if parallel_config is None:
         parallel_config = owner.attn_vllm_config.parallel_config
     window_gid = owner._draft_window_graph_binding_provider.source.group.gid

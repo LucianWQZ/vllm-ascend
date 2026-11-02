@@ -13,6 +13,7 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.worker.gpu.spec_decode.eagle.speculator import EagleSpeculator
 from vllm.v1.worker.gpu.spec_decode.target_dependent_ar.speculator import TargetDependentARSpeculator
 
+from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.worker.v2.spec_decode import draft_window_eager
 from vllm_ascend.worker.v2.spec_decode.draft_window_eagle3 import (
     Eagle3DraftWindowMixin,
@@ -56,10 +57,12 @@ def assembly(monkeypatch):
             query_start_loc=torch.arange(5, dtype=torch.int32),
             positions=torch.arange(32, dtype=torch.int64),
         ),
-        input_batch=SimpleNamespace(is_prefilling_np=np.array([False] * 4)),
+        input_batch=SimpleNamespace(is_prefilling_np=np.array([False] * 4), attn_state=AscendAttentionState.DecodeOnly),
         vllm_config=SimpleNamespace(parallel_config=object()),
         attn_vllm_config=SimpleNamespace(parallel_config=object()),
-        model_state=SimpleNamespace(attn_metadata={"target": SimpleNamespace(attn_state="decode")}),
+        model_state=SimpleNamespace(
+            attn_metadata={"target": SimpleNamespace(attn_state=AscendAttentionState.DecodeOnly)}
+        ),
         _draft_window_graph_binding_provider=SimpleNamespace(source=SimpleNamespace(group=SimpleNamespace(gid=0))),
         kv_cache_config=object(),
     )
@@ -103,7 +106,7 @@ def test_shared_assembler_preserves_uniform_full_capture_and_nonuniform_queries(
     assert result["draft"].query_start_loc.shape == (5,)
     result = owner.assembly_calls[0]
     assert result["positions"].data_ptr() == owner.input_buffers.positions.data_ptr()
-    assert result["attn_state"] == "decode"
+    assert result["attn_state"] is AscendAttentionState.DecodeOnly
     assert result["parallel_config"] is owner.attn_vllm_config.parallel_config
     assert result["parallel_config"] is not owner.vllm_config.parallel_config
     assert result["query_start_loc_cpu"].tolist() == expected
@@ -123,6 +126,74 @@ def test_shared_assembler_preserves_uniform_full_capture_and_nonuniform_queries(
     assert result["slot_mappings"].data_ptr() == slots.data_ptr()
     assert result["slot_mappings"].shape == (1, tokens)
     assert torch.equal(owner.block_tables.input_block_tables[0], torch.full_like(read.block_table, 99))
+
+
+@pytest.mark.parametrize("indexer_first", [False, True])
+@pytest.mark.parametrize("state", [AscendAttentionState.DecodeOnly, AscendAttentionState.ChunkedPrefill])
+@pytest.mark.parametrize("method", ["dflash", "dspark"])
+def test_parallel_window_uses_actual_method_state_not_target_metadata_order(assembly, indexer_first, state, method):
+    from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
+
+    from vllm_ascend.attention.indexer import AscendSFAIndexerMetadata
+    from vllm_ascend.attention.sfa_v1 import AscendSFAMetadata
+    from vllm_ascend.worker.v2.spec_decode.draft_window import DraftWindowWorkspace
+    from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
+        DraftWindowGraphCaptureIdentity,
+        DraftWindowGraphRoute,
+    )
+    from vllm_ascend.worker.v2.spec_decode.draft_window_graph_runtime import _build_private_graph_metadata
+
+    owner, read = assembly
+    query = torch.tensor([0, 8, 16, 24, 32], dtype=torch.int32)
+    common = dict(
+        num_actual_tokens=32,
+        slot_mapping=owner.block_tables.slot_mappings[0],
+        seq_lens=read.seq_lens,
+        cum_query_lens=query,
+        block_table=read.block_table,
+        sin=torch.empty(0),
+        cos=torch.empty(0),
+    )
+    indexer = AscendSFAIndexerMetadata(**common)
+    attention = AscendSFAMetadata(**common, seq_lens_cpu=read.seq_lens_cpu, attn_state=state)
+    entries = [("indexer", indexer), ("attention", attention)]
+    owner.model_state.attn_metadata = dict(entries if indexer_first else reversed(entries))
+    owner.input_batch.attn_state = state
+    owner._group_causal = False
+    owner._draft_window_graph_binding_provider.source.group.layers = ("draft",)
+    bank = DraftWindowWorkspace(max_num_reqs=4, table_capacity_columns=4, table_template=read.block_table)
+    bank.window_block_table.copy_(read.block_table)
+    bank.cpu_window_exact.copy_(read.seq_lens_cpu)
+    bank.device_window_exact.copy_(read.seq_lens)
+    route = DraftWindowGraphRoute.DSPARK if method == "dspark" else DraftWindowGraphRoute.DFLASH
+    capture = DraftWindowGraphCaptureIdentity(route, BatchExecutionDescriptor(CUDAGraphMode.FULL, 32, 4), 0)
+    result = _build_private_graph_metadata(owner, workspace=bank, actual_request_count=2, capture_identity=capture)
+    expected = AscendAttentionState.ChunkedPrefill if method == "dspark" else state
+    assert result["draft"].attn_state is owner.assembly_calls[-1]["attn_state"] is expected
+    assert not hasattr(indexer, "attn_state") and attention.attn_state is state
+    assert result["draft"].seq_lens is bank.device_window_exact
+    assert result["draft"].slot_mappings.data_ptr() == owner.block_tables.slot_mappings.data_ptr()
+    assert result["draft"].positions.data_ptr() == owner.input_buffers.positions.data_ptr()
+    assert result["draft"].query_start_loc.data_ptr() == owner.input_buffers.query_start_loc.data_ptr()
+    assert list(owner.model_state.attn_metadata.values()) == (
+        [indexer, attention] if indexer_first else [attention, indexer]
+    )
+    assert torch.equal(owner.block_tables.input_block_tables[0], torch.full_like(read.block_table, 99))
+
+
+def test_shared_window_assembler_requires_canonical_batch_state_or_explicit_method_state(assembly):
+    owner, read = assembly
+    del owner.input_batch.attn_state
+    kwargs = dict(
+        num_reqs=2, num_reqs_padded=4, num_tokens_padded=32, read_inputs=read, causal=False, query_start_loc_np=None
+    )
+    with pytest.raises(AttributeError, match="attn_state"):
+        draft_window_eager.build_draft_window_attn_metadata(owner, **kwargs)
+    assert not owner.assembly_calls
+    result = draft_window_eager.build_draft_window_attn_metadata(
+        owner, **kwargs, attn_state=AscendAttentionState.SpecDecoding
+    )
+    assert result["draft"].attn_state is AscendAttentionState.SpecDecoding
 
 
 @pytest.mark.parametrize("fail", [False, True])
