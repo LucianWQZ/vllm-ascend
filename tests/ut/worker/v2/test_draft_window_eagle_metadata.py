@@ -131,17 +131,9 @@ def test_shared_assembler_preserves_uniform_full_capture_and_nonuniform_queries(
 
 @pytest.mark.parametrize("indexer_first", [False, True])
 @pytest.mark.parametrize("state", [AscendAttentionState.DecodeOnly, AscendAttentionState.ChunkedPrefill])
-@pytest.mark.parametrize("method", ["dflash", "dspark"])
-def test_parallel_window_uses_actual_method_state_not_target_metadata_order(assembly, indexer_first, state, method):
-    from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
-
+def test_shared_window_builder_uses_batch_state_not_target_metadata_order(assembly, indexer_first, state):
     from vllm_ascend.attention.indexer import AscendSFAIndexerMetadata
     from vllm_ascend.attention.sfa_v1 import AscendSFAMetadata
-    from vllm_ascend.worker.v2.spec_decode.draft_window import DraftWindowWorkspace
-    from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
-        DraftWindowGraphRoute,
-    )
-    from vllm_ascend.worker.v2.spec_decode.draft_window_graph_runtime import _build_private_graph_metadata
 
     owner, read = assembly
     query = torch.tensor([0, 8, 16, 24, 32], dtype=torch.int32)
@@ -159,19 +151,18 @@ def test_parallel_window_uses_actual_method_state_not_target_metadata_order(asse
     entries = [("indexer", indexer), ("attention", attention)]
     owner.model_state.attn_metadata = dict(entries if indexer_first else reversed(entries))
     owner.input_batch.attn_state = state
-    owner._group_causal = False
-    owner._draft_window_graph_binding_provider.source.group.layers = ("draft",)
-    bank = DraftWindowWorkspace(max_num_reqs=4, table_capacity_columns=4, table_template=read.block_table)
-    bank.window_block_table.copy_(read.block_table)
-    bank.cpu_window_exact.copy_(read.seq_lens_cpu)
-    bank.device_window_exact.copy_(read.seq_lens)
-    route = DraftWindowGraphRoute.DSPARK if method == "dspark" else DraftWindowGraphRoute.DFLASH
-    capture = SimpleNamespace(route=route, descriptor=BatchExecutionDescriptor(CUDAGraphMode.FULL, 32, 4))
-    result = _build_private_graph_metadata(owner, workspace=bank, actual_request_count=2, capture_identity=capture)
-    expected = AscendAttentionState.ChunkedPrefill if method == "dspark" else state
-    assert result["draft"].attn_state is owner.assembly_calls[-1]["attn_state"] is expected
+    result = draft_window_eager.build_draft_window_attn_metadata(
+        owner,
+        num_reqs=4,
+        num_reqs_padded=4,
+        num_tokens_padded=32,
+        read_inputs=read,
+        causal=False,
+        query_start_loc_np=None,
+    )
+    assert result["draft"].attn_state is owner.assembly_calls[-1]["attn_state"] is state
     assert not hasattr(indexer, "attn_state") and attention.attn_state is state
-    assert result["draft"].seq_lens.data_ptr() == bank.device_window_exact.data_ptr()
+    assert result["draft"].seq_lens.data_ptr() == read.seq_lens.data_ptr()
     assert result["draft"].slot_mappings.data_ptr() == owner.block_tables.slot_mappings.data_ptr()
     assert result["draft"].positions.data_ptr() == owner.input_buffers.positions.data_ptr()
     assert result["draft"].query_start_loc.data_ptr() == owner.input_buffers.query_start_loc.data_ptr()
@@ -265,7 +256,7 @@ def test_eagle_partial_schedule_is_not_dynamic_k(scheduled):
 
 
 @pytest.fixture
-def proposal():
+def proposal(monkeypatch):
     owner: Any = Eagle3DraftWindowMixin()
     owner.method, owner.num_speculative_steps = "eagle3", 3
     owner.speculative_config = SimpleNamespace(uses_dynamic_speculative_decoding=lambda: False)
@@ -308,7 +299,23 @@ def proposal():
     session.provider = runtime
     owner._eagle3_graph_session = session
     owner.model_state = SimpleNamespace(attn_metadata={})
-    session.resolve = lambda **kwargs: object()
+    owner.input_batch = batch
+    owner.draft_vllm_config = SimpleNamespace(parallel_config=object())
+    batch.query_start_loc_np = np.array([0, 4], dtype=np.int32)
+    batch.attn_state = AscendAttentionState.DecodeOnly
+    bank = SimpleNamespace(
+        window_block_table=torch.tensor([[1, 2]], dtype=torch.int32),
+        device_window_exact=torch.tensor([5], dtype=torch.int32),
+        cpu_window_exact=torch.tensor([5], dtype=torch.int32),
+    )
+    session.resolve = lambda **kwargs: SimpleNamespace(workspace=bank)
+    from vllm_ascend.worker.v2.spec_decode import draft_window_eagle3_capture
+
+    monkeypatch.setattr(
+        draft_window_eagle3_capture,
+        "build_draft_window_attn_metadata",
+        lambda owner, **kwargs: {"draft": kwargs["read_inputs"]},
+    )
     session.provider.bind_read_carrier = lambda **kwargs: runtime.pending.append(kwargs["inputs"])
 
     def inputs(step, **changes):
@@ -432,6 +439,20 @@ def test_first_and_ar_share_one_materialization_path_without_moving_the_anchor(p
             runtime.pending.clear()
     assert [call["cpu_full_exact"].tolist() for call in calls] == [[10] + [0] * (first_padding - 1), [8], [9]]
     assert all(call["frozen_row_plans"] is frozen for call in calls)
+
+
+def test_eagle_startup_rejects_no_usable_capture_buckets():
+    stream = object()
+    manager = SimpleNamespace(update_stream=stream, _capture_descs={})
+    owner = SimpleNamespace(
+        update_stream=stream,
+        prefill_cudagraph_manager=manager,
+        decode_cudagraph_manager=manager,
+        num_speculative_steps=3,
+        _draft_window_graph_binding_provider=SimpleNamespace(source=SimpleNamespace(group=object())),
+    )
+    with pytest.raises(RuntimeError, match="nonempty capture bucket"):
+        Eagle3GraphSession(owner)
 
 
 @pytest.mark.parametrize("first,tokens,ordinal", [(True, 4, 0), (False, 1, 0), (False, 1, 1)])
@@ -629,11 +650,11 @@ def test_eagle_graph_builder_uses_the_draft_parallel_config_and_actual_phase(
     provider = SimpleNamespace(require_reusable=lambda: None, retire_generation=lambda current: None)
     session: Any = object.__new__(Eagle3GraphSession)
     session.owner, session.provider = owner, provider
-    session.resolve = lambda **kwargs: object()
+    session.resolve = lambda **kwargs: SimpleNamespace(workspace=workspace)
     result = {}
 
     def bind(**kwargs):
-        result.update(kwargs["metadata_builder"](workspace))
+        result.update(kwargs["metadata"])
         return None
 
     provider.bind_read_carrier = bind

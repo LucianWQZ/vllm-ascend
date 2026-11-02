@@ -23,7 +23,6 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_backends import (
 from vllm_ascend.worker.v2.spec_decode.draft_window_plan import (
     DraftWindowPlan,
     compute_draft_window_plan,
-    project_draft_window_interval,
     window_capacity_tokens,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_policy import (
@@ -109,7 +108,7 @@ def _build_draft_window_source_capability_for_context(
     kv_cache_config: Any,
     causal: bool | Mapping[int, bool],
     vllm_config: Any,
-    dflash2_graph_contract: Any = None,
+    dflash2_graph_owner: Any = None,
 ) -> DraftWindowGraphSource:
     """Build source geometry after the caller validates its real Graph executor.
 
@@ -126,14 +125,14 @@ def _build_draft_window_source_capability_for_context(
     expected_method = "dflash" if runtime_route == "dflash2" else runtime_route
     if runtime_route not in {"eagle3", "dflash", "dflash2", "dspark"} or expected_method != policy.normalized_method:
         raise ValueError("Graph source route differs from the actual method policy")
-    if runtime_route != "dflash2" and dflash2_graph_contract is not None:
-        raise ValueError("DFlash2 source contract belongs to a different method")
+    if runtime_route != "dflash2" and dflash2_graph_owner is not None:
+        raise ValueError("DFlash2 source owner belongs to a different method")
     groups = inventory_draft_window_groups(
         attn_groups=attn_groups,
         kv_cache_config=kv_cache_config,
         block_tables=block_tables,
         parallel_config=vllm_config.parallel_config,
-        full_retention_dflash2=dflash2_graph_contract is not None,
+        full_retention_dflash2=dflash2_graph_owner is not None,
     )
     if len(groups) != 1:
         raise NotImplementedError(f"Draft Graph requires one executable consumer group, found {len(groups)}")
@@ -143,11 +142,13 @@ def _build_draft_window_source_capability_for_context(
     ):
         raise NotImplementedError("Draft Graph requires its supported dense or DFlash2 native reader")
     if runtime_route == "dflash2":
-        from vllm_ascend.worker.v2.spec_decode.draft_window_dflash2_graph import DFlash2GraphContract
+        from vllm_ascend.worker.v2.spec_decode.draft_window_dflash2_graph import validate_dflash2_graph_read_source
 
-        if not isinstance(dflash2_graph_contract, DFlash2GraphContract):
-            raise TypeError("DFlash2 Graph requires its actual method contract")
-        dflash2_graph_contract.validate_source(group, causal=causal, window_size=policy.effective_window_size)
+        if dflash2_graph_owner is None:
+            raise TypeError("DFlash2 Graph requires its actual model owner")
+        validate_dflash2_graph_read_source(
+            dflash2_graph_owner, group, causal=causal, window_size=policy.effective_window_size
+        )
     if vllm_config.speculative_config.uses_dynamic_speculative_decoding():
         raise NotImplementedError("Draft Window Graph source requires static speculative decoding")
     return DraftWindowGraphSource(policy=policy, group=group, block_tables=block_tables)
@@ -249,13 +250,11 @@ class DraftWindowWorkspace:
                     if frozen_row_plans is None
                     else frozen_row_plans[row].at_exact_end(exact)
                 )
-                projection = project_draft_window_interval(
-                    window_start=plan.window_start, full_exact_end=exact, block_span_tokens=span
-                )
-                if projection.first_token_offset:
+                if plan.window_start % span:
                     raise NotImplementedError("Draft Graph cannot read an intra-block Window start")
-                start, required = projection.source_start_column, projection.required_columns
-                visible = exact - plan.window_start
+                start = plan.window_start // span
+                visible = plan.window_visible_length
+                required = (visible + span - 1) // span
             if required > self.table_capacity_columns:
                 raise RuntimeError("draft-window table capacity exceeded")
             if start + required > valid or visible > required * span:

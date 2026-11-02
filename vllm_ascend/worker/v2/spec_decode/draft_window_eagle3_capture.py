@@ -18,7 +18,6 @@ import torch
 
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.worker.v2.spec_decode.draft_window import (
-    DraftWindowWorkspace,
     _build_draft_window_source_capability_for_context,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_eager import (
@@ -87,15 +86,13 @@ class Eagle3GraphSession:
                         read.window_block_table.zero_()
                         read.cpu_window_exact.fill_(capacity)
                         read.device_window_exact.copy_(read.cpu_window_exact)
+        if not self._captures:
+            raise RuntimeError("Eagle3 Window requires a nonempty capture bucket inventory")
 
     def require_reusable(self) -> None:
         if getattr(self.owner, "_draft_window_graph_submission_uncertain", False):
             raise RuntimeError("Eagle3 Graph backing is quarantined; process isolation required")
         self.provider.require_reusable()
-
-    def validate_for_provider(self, provider: Any) -> None:
-        if provider is not self.provider or not self._captures:
-            raise RuntimeError("Eagle3 startup carrier belongs to another provider or has no inventory")
 
     def resolve(self, *, first: bool, n: int, tokens: int, ordinal: int) -> DraftWindowGraphBucket:
         route = DraftWindowGraphRoute.EAGLE3_FIRST_PASS if first else DraftWindowGraphRoute.EAGLE3_AR_STEP
@@ -169,9 +166,19 @@ class Eagle3GraphSession:
         identity = self.resolve(first=first, n=n, tokens=tokens, ordinal=ordinal)
         owner = self.owner
 
-        def build(workspace: DraftWindowWorkspace):
+        try:
+            self.require_reusable()
+            context = owner._require_eagle3_window_context()
+            if (
+                inputs.proposal is not context
+                or inputs.step != owner._eagle3_window_next_step
+                or inputs.step >= owner._eagle3_window_expected_steps
+                or first is not (inputs.step == 0)
+                or ordinal != (0 if first else inputs.step - 1)
+            ):
+                raise RuntimeError("Eagle3 Graph consumer does not match the active proposal/step")
             read = draft_window_read_inputs(
-                workspace, actual_request_count=owner.input_batch.num_reqs, padded_request_count=n
+                identity.workspace, actual_request_count=owner.input_batch.num_reqs, padded_request_count=n
             )
             metadata = build_draft_window_attn_metadata(
                 owner,
@@ -185,24 +192,7 @@ class Eagle3GraphSession:
                 attn_state=owner.input_batch.attn_state if first else AscendAttentionState.DecodeOnly,
                 parallel_config=owner.draft_vllm_config.parallel_config,
             )
-            return metadata
-
-        try:
-            self.require_reusable()
-            context = owner._require_eagle3_window_context()
-            if (
-                inputs.proposal is not context
-                or inputs.step != owner._eagle3_window_next_step
-                or inputs.step >= owner._eagle3_window_expected_steps
-                or first is not (inputs.step == 0)
-                or ordinal != (0 if first else inputs.step - 1)
-            ):
-                raise RuntimeError("Eagle3 Graph consumer does not match the active proposal/step")
-            self.provider.bind_read_carrier(
-                capture_identity=identity,
-                inputs=inputs,
-                metadata_builder=build,
-            )
+            self.provider.bind_read_carrier(capture_identity=identity, inputs=inputs, metadata=metadata)
             self.provider.retire_generation(inputs)
             owner._eagle3_window_next_step = inputs.step + 1
         except BaseException:

@@ -332,18 +332,17 @@ def test_eager_cudagraph_manager_keeps_none_without_graph_owner(monkeypatch):
     speculator.init_cudagraph_manager(CUDAGraphMode.FULL_DECODE_ONLY)
     assert calls == [CUDAGraphMode.NONE]
 
-    assert not hasattr(speculator, "_dflash2_graph_contract")
+    assert not hasattr(speculator, "_draft_window_graph_binding_provider")
 
 
-@pytest.mark.parametrize("existing_contract", [False, True])
-def test_graph_manager_admits_real_selector_binding_and_owned_contract(monkeypatch, existing_contract):
+@pytest.mark.parametrize("window_on", [False, True])
+def test_graph_manager_admits_real_selector_and_checks_off_without_second_owner(monkeypatch, window_on):
     import vllm.v1.worker.gpu.spec_decode.dflash2.speculator as upstream
 
     from vllm_ascend import envs
     from vllm_ascend.worker.v2.spec_decode import draft_window_dflash2_graph as contract_module
 
-    contract = MagicMock()
-    bind = MagicMock(return_value=contract)
+    bind = MagicMock()
     config_check = MagicMock()
     monkeypatch.setattr(contract_module, "validate_dflash2_graph_source", bind)
     monkeypatch.setattr(contract_module, "validate_dflash2_graph_config", config_check)
@@ -359,13 +358,12 @@ def test_graph_manager_admits_real_selector_binding_and_owned_contract(monkeypat
     speculator = AscendDFlash2Speculator.__new__(AscendDFlash2Speculator)
     speculator.speculative_config = SimpleNamespace(enforce_eager=False)
     speculator.vllm_config = object()
-    if existing_contract:
-        speculator._dflash2_graph_contract = contract
+    if window_on:
+        speculator._draft_window_graph_binding_provider = object()
     speculator.init_cudagraph_manager(CUDAGraphMode.FULL_DECODE_ONLY)
     assert calls == [CUDAGraphMode.FULL_DECODE_ONLY]
-    assert speculator._dflash2_graph_contract is contract
     config_check.assert_not_called()
-    if existing_contract:
+    if window_on:
         bind.assert_not_called()
     else:
         bind.assert_called_once_with(speculator)
@@ -382,7 +380,7 @@ def test_graph_manager_rejects_cuda_walk_or_eager_fallback(monkeypatch):
     speculator = AscendDFlash2Speculator.__new__(AscendDFlash2Speculator)
     speculator.speculative_config = SimpleNamespace(enforce_eager=False)
     speculator.vllm_config = object()
-    speculator._dflash2_graph_contract = MagicMock()
+    speculator._draft_window_graph_binding_provider = object()
     calls = []
 
     def parent(actual, mode):

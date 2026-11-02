@@ -27,10 +27,7 @@ from vllm_ascend.compilation.updatable_graph import (
 from vllm_ascend.utils import use_updatable_graph
 from vllm_ascend.worker.v2.aclgraph_utils import collect_sorted_captured_token_sizes, model_capture_wrapper
 from vllm_ascend.worker.v2.spec_decode.dflash.capture import draft_window_dflash_capture_scope
-from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
-    resolve_parallel_draft_window_graph_route,
-    validate_draft_window_graph_capture,
-)
+from vllm_ascend.worker.v2.spec_decode.draft_window_graph import resolve_parallel_draft_window_graph_route
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph_runtime import (
     prepare_parallel_graph,
 )
@@ -117,26 +114,28 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
         count and attention metadata.
         """
         prepare_kwargs: dict[str, Any] = {"prepare_forward": prepare_forward}
-        with draft_window_dflash_capture_scope(
-            self.speculator,
-            input_buffers,
-            getattr(self, "_capture_descs", {}),
-        ) as capture_context:
-            validate_draft_window_graph_capture(self.speculator, capture_context=capture_context)
-            # Keep core544's preparation callback and canonical context slots;
-            # it receives both num_reqs and the actual built metadata.
-            with communicator_switch(), model_capture_wrapper(self.speculator, False):
-                super().capture(
-                    forward_fn,
-                    input_buffers,
-                    block_tables,
-                    attn_groups,
-                    kv_cache_config,
-                    max_model_len,
-                    causal=causal,
-                    progress_bar_desc=progress_bar_desc,
-                    **prepare_kwargs,
-                )
+        # Keep core544's preparation callback and canonical context slots;
+        # it receives both num_reqs and the actual built metadata.
+        with (
+            draft_window_dflash_capture_scope(
+                self.speculator, input_buffers, getattr(self, "_capture_descs", {})
+            ) as context,
+            communicator_switch(),
+            model_capture_wrapper(self.speculator, False),
+        ):
+            super().capture(
+                forward_fn,
+                input_buffers,
+                block_tables,
+                attn_groups,
+                kv_cache_config,
+                max_model_len,
+                causal=causal,
+                progress_bar_desc=progress_bar_desc,
+                **prepare_kwargs,
+            )
+            if context is not None:
+                context.provider.validate_captured_graphs(self.graphs)
 
     def run_fullgraph(self, desc: BatchExecutionDescriptor) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         """Override run_fullgraph to update full graph params in run_fullgraph."""
@@ -203,8 +202,6 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
 
         dp_dummy = is_parallel_graph_dp_dummy(self.speculator)
         graph_route = None if dp_dummy else resolve_parallel_draft_window_graph_route(self.speculator)
-        if graph_route is not None:
-            self.speculator._draft_window_graph_binding_provider.validate_graph(graph, route=graph_route)
         self.update_stream.wait_stream(torch.npu.current_stream())
         ret = super().run_fullgraph(desc)
         if graph_route is None:

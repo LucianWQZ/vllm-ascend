@@ -196,7 +196,7 @@ class DraftWindowGraphInputMixin:
             kv_cache_config=self.kv_cache_config,
             causal=self._group_causal,
             vllm_config=self.vllm_config,
-            dflash2_graph_contract=getattr(self, "_dflash2_graph_contract", None),
+            dflash2_graph_owner=self if self._speculator_name.lower() == "dflash2" else None,
         )
         self._draft_window_graph_binding_provider = DraftWindowGraphBindingProvider(source=capability)
         self._initialize_draft_window_graph_inputs()

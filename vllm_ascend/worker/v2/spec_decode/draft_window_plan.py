@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
-"""Scalar Draft Window intervals and projections, independent of device state.
+"""Scalar Draft Window intervals, independent of device state.
 
 All lengths and starts are absolute logical token counts. A table-column span
 must be supplied by its actual owner/provider; scheduler block sizes, physical
@@ -30,7 +30,6 @@ class DraftWindowPlan:
     full_exact_end: int
     full_horizon_end: int
     window_start: int
-    window_capacity_tokens: int
 
     @property
     def window_visible_length(self) -> int:
@@ -79,7 +78,7 @@ def compute_draft_window_plan(
     start = max(horizon - window_size, 0) // block_span_tokens * block_span_tokens
     if start > full_exact_end:
         raise ValueError("window start exceeds exact end; window is smaller than the proposal horizon requires")
-    return DraftWindowPlan(full_exact_end, horizon, start, window_capacity_tokens(window_size, block_span_tokens))
+    return DraftWindowPlan(full_exact_end, horizon, start)
 
 
 def freeze_eagle_window_plan(
@@ -108,31 +107,3 @@ def freeze_eagle_window_plan(
         block_span_tokens=block_span_tokens,
         future_offset=static_k,
     )
-
-
-@dataclass(frozen=True)
-class DirectPrefixProjection:
-    source_start_column: int
-    first_token_offset: int
-    required_columns: int
-    safe_extent_tokens: int
-
-    @property
-    def source_end_column(self) -> int:
-        return self.source_start_column + self.required_columns
-
-
-def project_draft_window_interval(
-    *, window_start: int, full_exact_end: int, block_span_tokens: int
-) -> DirectPrefixProjection:
-    """Describe columns for one interval; the provider verifies residency."""
-    _nonnegative_integer("window_start", window_start)
-    _nonnegative_integer("full_exact_end", full_exact_end)
-    _positive_integer("block_span_tokens", block_span_tokens)
-    if full_exact_end < window_start:
-        raise ValueError("window start exceeds exact end")
-    column, offset = divmod(window_start, block_span_tokens)
-    visible = full_exact_end - window_start
-    columns = (offset + visible + block_span_tokens - 1) // block_span_tokens if visible else 0
-    safe_extent = columns * block_span_tokens - offset if columns else 0
-    return DirectPrefixProjection(column, offset, columns, safe_extent)

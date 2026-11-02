@@ -71,6 +71,10 @@ def test_graph_owner_installs_only_its_admitted_source(graph_source_initializati
     assert not hasattr(c.owner, "_draft_window_source_capability")
     assert not hasattr(c.owner, "_draft_window_runtime_state")
     assert not hasattr(c.owner, "_draft_window_runtime")
+    if c.owner._speculator_name != "eagle3":
+        assert c.build_source.call_args.kwargs["dflash2_graph_owner"] is (
+            c.owner if c.owner._speculator_name == "dflash2" else None
+        )
 
 
 def test_graph_source_rejection_has_no_eager_fallback_or_partial_owner(graph_source_initialization):
@@ -175,8 +179,15 @@ def test_a_different_host_upper_cannot_be_used_as_the_actual_exact_length(bridge
 
 @pytest.mark.parametrize("actual,padded", [(1, 2), (3, 4)])
 def test_private_full_uses_one_fresh_builder_and_only_binds_its_device_lengths(monkeypatch, actual, padded):
+    from vllm.config.compilation import CUDAGraphMode
+    from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
+
     from vllm_ascend.worker.v2.spec_decode import draft_window_graph_runtime as runtime
-    from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphRoute
+    from vllm_ascend.worker.v2.spec_decode.draft_window import DraftMetadataInputs
+    from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
+        DraftWindowGraphBindingProvider,
+        DraftWindowGraphRoute,
+    )
 
     exact = torch.tensor([17 + i * 1024 for i in range(actual)] + [0] * (padded - actual), dtype=torch.int32)
     read: Any = SimpleNamespace(
@@ -186,8 +197,25 @@ def test_private_full_uses_one_fresh_builder_and_only_binds_its_device_lengths(m
         device_window_exact=exact.clone(),
     )
     group = SimpleNamespace(gid=0, layers=("draft.layer.a", "draft.layer.b"))
+    proposal: Any = SimpleNamespace(ordered_request_ids=tuple(f"req-{i}" for i in range(actual)))
+    source: Any = SimpleNamespace(group=group, policy=SimpleNamespace(normalized_method="dflash"))
+    provider = DraftWindowGraphBindingProvider(source=source)
+    inputs = DraftMetadataInputs(proposal, padded, 0, read, provider)
+    provider._active_inputs = inputs
+    descriptor = BatchExecutionDescriptor(
+        CUDAGraphMode.FULL, num_reqs=padded, num_tokens=padded * 8, uniform_token_count=8
+    )
+    monkeypatch.setattr(
+        provider,
+        "capture_identity_for",
+        Mock(return_value=SimpleNamespace(descriptor=descriptor, route=DraftWindowGraphRoute.DFLASH)),
+    )
+    bind = Mock()
+    monkeypatch.setattr(provider, "bind_read_carrier", bind)
     owner = SimpleNamespace(
-        _draft_window_graph_binding_provider=SimpleNamespace(source=SimpleNamespace(group=group)),
+        _draft_window_proposal=proposal,
+        _draft_window_selected_metadata=descriptor,
+        _draft_window_graph_binding_provider=provider,
         block_tables=SimpleNamespace(input_block_tables=[torch.full_like(read.window_block_table, 99)]),
         _group_causal=False,
     )
@@ -213,16 +241,8 @@ def test_private_full_uses_one_fresh_builder_and_only_binds_its_device_lengths(m
         return {name: fresh for name in group.layers}
 
     monkeypatch.setattr(runtime, "build_draft_window_attn_metadata", build)
-    capture: Any = SimpleNamespace(
-        route=DraftWindowGraphRoute.DFLASH,
-        descriptor=SimpleNamespace(num_reqs=padded, num_tokens=padded * 8),
-    )
-    result = runtime._build_private_graph_metadata(
-        owner,
-        workspace=read,
-        actual_request_count=actual,
-        capture_identity=capture,
-    )
+    runtime.prepare_parallel_graph(owner, descriptor)
+    result = bind.call_args.kwargs["metadata"]
     assert len(calls) == 1
     assert calls[0]["num_reqs"] == calls[0]["num_reqs_padded"] == padded
     assert calls[0]["num_tokens_padded"] == padded * 8
@@ -246,8 +266,12 @@ def test_static_capture_check_precedes_replay_and_successful_update_marks_banks(
     tree = ast.parse((SOURCE.parent / relative).read_text())
     method = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == method_name)
     calls = [node for node in ast.walk(method) if isinstance(node, ast.Call)]
-    validate = next(
-        node for node in calls if isinstance(node.func, ast.Attribute) and node.func.attr == "validate_graph"
+    capture = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "capture")
+    assert any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "validate_captured_graphs"
+        for node in ast.walk(capture)
     )
     finish = next(node for node in calls if isinstance(node.func, ast.Attribute) and node.func.attr == "finish_update")
     if relative.startswith("target_dependent_ar"):
@@ -256,7 +280,7 @@ def test_static_capture_check_precedes_replay_and_successful_update_marks_banks(
             for node in calls
             if isinstance(node.func, ast.Attribute) and node.func.attr == "_updatable_graph_replay"
         )
-        assert validate.lineno < replay.lineno < finish.lineno
+        assert replay.lineno < finish.lineno
         shared = next(
             n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_updatable_graph_replay"
         )
@@ -273,8 +297,14 @@ def test_static_capture_check_precedes_replay_and_successful_update_marks_banks(
             node for node in calls if isinstance(node.func, ast.Attribute) and node.func.attr == "run_fullgraph"
         )
         update = next(node for node in calls if isinstance(node.func, ast.Attribute) and node.func.attr == "update")
-        assert validate.lineno < replay.lineno < update.lineno < finish.lineno
-    assert all(not (isinstance(node.func, ast.Attribute) and node.func.attr == "validate_update") for node in calls)
+        assert replay.lineno < update.lineno < finish.lineno
+    assert all(
+        not (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr in ("validate_graph", "validate_update", "validate_captured_graphs")
+        )
+        for node in calls
+    )
 
 
 def test_window_off_update_keeps_the_original_two_argument_call():
@@ -325,23 +355,28 @@ def test_actual_dispatch_keeps_only_the_framework_descriptor(monkeypatch, active
 
 
 @pytest.fixture
-def full_metadata_dispatch():
+def full_metadata_dispatch(monkeypatch):
     from vllm.config.compilation import CUDAGraphMode
     from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 
+    from vllm_ascend.worker.v2.spec_decode import draft_window_graph_runtime as runtime
     from vllm_ascend.worker.v2.spec_decode.draft_window import DraftMetadataInputs
     from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphBindingProvider
-    from vllm_ascend.worker.v2.spec_decode.draft_window_graph_runtime import prepare_parallel_graph
 
-    proposal = SimpleNamespace(ordered_request_ids=("req-a", "req-b"))
+    proposal: Any = SimpleNamespace(ordered_request_ids=("req-a", "req-b"))
     provider: Any = object.__new__(DraftWindowGraphBindingProvider)
     provider._quarantined = False
     provider._source = SimpleNamespace(policy=SimpleNamespace(normalized_method="dflash"))
-    bank: Any = object()
+    bank: Any = SimpleNamespace(
+        max_num_reqs=2,
+        window_block_table=torch.ones((2, 2), dtype=torch.int32),
+        cpu_window_exact=torch.tensor([5, 7], dtype=torch.int32),
+        device_window_exact=torch.tensor([5, 7], dtype=torch.int32),
+    )
     inputs = DraftMetadataInputs(proposal, 2, 0, bank, provider)
     provider._active_inputs = inputs
     descriptor = BatchExecutionDescriptor(CUDAGraphMode.FULL, num_tokens=16, num_reqs=2, uniform_token_count=8)
-    capture = SimpleNamespace(descriptor=descriptor)
+    capture = SimpleNamespace(descriptor=descriptor, route=SimpleNamespace())
     provider.capture_identity_for = Mock(return_value=capture)
     carrier = object()
     provider.bind_read_carrier = Mock(return_value=carrier)
@@ -349,15 +384,17 @@ def full_metadata_dispatch():
         _draft_window_proposal=proposal,
         _draft_window_graph_binding_provider=provider,
         _draft_window_selected_metadata=descriptor,
+        _group_causal=False,
         model_state=SimpleNamespace(attn_metadata={"target.layer": object()}),
     )
+    monkeypatch.setattr(runtime, "build_draft_window_attn_metadata", Mock(return_value={"draft.layer": object()}))
     return SimpleNamespace(
         owner=owner,
         inputs=inputs,
         descriptor=descriptor,
         provider=provider,
         carrier=carrier,
-        prepare=prepare_parallel_graph,
+        prepare=runtime.prepare_parallel_graph,
     )
 
 

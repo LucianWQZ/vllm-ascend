@@ -34,7 +34,6 @@ from vllm_ascend.worker.v2.spec_decode.draft_window import DraftWindowWorkspace
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
     DraftWindowGraphBindingProvider,
     DraftWindowGraphBucket,
-    DraftWindowGraphRoute,
     resolve_parallel_draft_window_graph_route,
 )
 
@@ -46,19 +45,10 @@ class DraftWindowDFlashCaptureContext:
     """Temporarily bind the real provider to its Draft-private input buffers."""
 
     provider: DraftWindowGraphBindingProvider
-    route: DraftWindowGraphRoute
     input_buffers: InputBuffers
     captures: dict[tuple[int, int], DraftWindowGraphBucket]
-    active: bool = True
-
-    def validate_for_provider(self, provider: DraftWindowGraphBindingProvider) -> None:
-        if not self.active:
-            raise RuntimeError("stale Draft Window capture context is no longer active")
-        if provider is not self.provider:
-            raise RuntimeError("capture context belongs to another graph provider")
 
     def resolve(self, num_reqs: int, num_tokens: int) -> tuple[DraftWindowGraphBucket, DraftWindowWorkspace]:
-        self.validate_for_provider(self.provider)
         try:
             identity = self.captures[num_reqs, num_tokens]
         except KeyError as error:
@@ -99,7 +89,7 @@ def _build_capture_context(
         captures[key] = provider.capture_identity_for(route=route, descriptor=descriptor)
     if not captures:
         raise RuntimeError("Draft Window capture has no FULL descriptor")
-    return DraftWindowDFlashCaptureContext(provider, route, input_buffers, captures)
+    return DraftWindowDFlashCaptureContext(provider, input_buffers, captures)
 
 
 @contextmanager
@@ -123,7 +113,6 @@ def draft_window_dflash_capture_scope(
     try:
         yield context
     finally:
-        context.active = False
         if hasattr(input_buffers, _CAPTURE_CONTEXT_ATTRIBUTE):
             delattr(input_buffers, _CAPTURE_CONTEXT_ATTRIBUTE)
 

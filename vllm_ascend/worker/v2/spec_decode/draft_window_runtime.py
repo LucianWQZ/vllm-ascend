@@ -160,7 +160,7 @@ class DraftWindowRuntime:
         routes = require_direct_prefix_routes(speculator, window_size=self.window_size)
         self.native_swa_intersections = {}
         for route in routes:
-            if route.status is DraftWindowProviderStatus.NATIVE_SWA_INTERSECTION:
+            if route.status is DraftWindowProviderStatus.NATIVE_SWA:
                 if route.native_window is None:
                     raise ValueError("A native SWA provider must identify its native window")
                 self.native_swa_intersections[route.gid] = route.native_window

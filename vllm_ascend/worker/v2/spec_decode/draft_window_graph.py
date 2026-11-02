@@ -10,7 +10,7 @@ identity through the actual typed Graph UPDATE entrance.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Any
@@ -67,7 +67,6 @@ class DraftWindowGraphBindingProvider:
         self._carriers: dict[tuple[DraftWindowGraphRoute, BatchExecutionDescriptor, int], DraftWindowGraphBucket] = {}
         self._pending: list[DraftWindowGraphBucket] = []
         self._updating = False
-        self._validated_graphs: dict[Any, DraftWindowGraphRoute] = {}
 
     @property
     def source(self) -> DraftWindowGraphSource:
@@ -235,10 +234,7 @@ class DraftWindowGraphBindingProvider:
         *,
         capture_identity: DraftWindowGraphBucket,
         inputs: DraftMetadataInputs,
-        metadata_builder: Callable[
-            [DraftWindowWorkspace],
-            Mapping[str, Any],
-        ],
+        metadata: Mapping[str, Any],
     ) -> DraftWindowGraphBucket:
         """Publish this generation against its selected persistent Graph bank."""
         carrier = self._require_registered_capture(capture_identity)
@@ -262,7 +258,6 @@ class DraftWindowGraphBindingProvider:
             assert previous.inputs is not None
             if previous.route is not route or previous.inputs.proposal is not inputs.proposal:
                 raise RuntimeError("graph read carriers do not belong to the same actual proposal/route")
-        metadata = metadata_builder(carrier.workspace)
         if not isinstance(metadata, Mapping) or not metadata:
             raise RuntimeError("explicit Draft Window graph carrier produced no Draft metadata")
         inputs.publish(metadata)
@@ -291,32 +286,30 @@ class DraftWindowGraphBindingProvider:
         self._updating = True
         return tuple(metadata)
 
-    def validate_graph(self, graph: Any, *, route: DraftWindowGraphRoute) -> None:
-        """Check the captured consumer contract once, before its first replay.
+    def validate_captured_graphs(self, graphs: Mapping[BatchExecutionDescriptor, Any]) -> None:
+        """Check actual FIA tasks once, after the manager has stored its graphs.
 
-        UpdatableGraph.resolve_tasks binds its own captured tasks by provider
-        and consumer ordinal. It preserves operation, handle and event by
-        construction, so runtime does not authenticate those objects again.
+        The original manager owns these graphs by descriptor. Replays use its
+        task resolver and the already registered bank/consumer, without a
+        second graph-to-route inventory.
         """
-        if graph in self._validated_graphs:
-            if self._validated_graphs[graph] is not route:
-                raise RuntimeError("Draft Window graph route changed after capture")
-            return
         import torch_npu
 
         from vllm_ascend.attention.attention_v1 import FIAParamProvider
 
-        if not graph.tasks:
-            raise RuntimeError("Draft Window Graph captured no attention consumer")
-        for task in graph.tasks:
-            if (
-                not isinstance(task.provider, FIAParamProvider)
-                or not task.provider.is_draft_model
-                or task.provider.layer_name not in self.source.group.layers
-                or task.operation != torch_npu.npu_fused_infer_attention_score.out
-            ):
-                raise RuntimeError("Draft Window Graph requires its supported Draft FIA consumer")
-        self._validated_graphs[graph] = route
+        for descriptor, graph in graphs.items():
+            if descriptor.cg_mode.name != "FULL":
+                continue
+            if not graph.tasks:
+                raise RuntimeError("Draft Window Graph captured no attention consumer")
+            for task in graph.tasks:
+                if (
+                    not isinstance(task.provider, FIAParamProvider)
+                    or not task.provider.is_draft_model
+                    or task.provider.layer_name not in self.source.group.layers
+                    or task.operation != torch_npu.npu_fused_infer_attention_score.out
+                ):
+                    raise RuntimeError("Draft Window Graph requires its supported Draft FIA consumer")
 
     def finish_update(self, *, route: DraftWindowGraphRoute) -> None:
         """Mark successful Host UPDATE; stream/event order still owns reuse."""
@@ -357,25 +350,6 @@ def resolve_parallel_draft_window_graph_route(
     if method == "dspark":
         return DraftWindowGraphRoute.DSPARK
     raise RuntimeError(f"parallel Draft Window graph manager cannot consume method {method!r}")
-
-
-def validate_draft_window_graph_capture(
-    owner: Any,
-    *,
-    capture_context: Any = None,
-) -> None:
-    """Require the startup context belonging to this instance and provider."""
-    provider = getattr(owner, "_draft_window_graph_binding_provider", None)
-    if provider is None:
-        return
-    if not isinstance(provider, DraftWindowGraphBindingProvider):
-        raise TypeError("invalid instance-owned Draft Window graph binding provider")
-    if capture_context is None:
-        raise RuntimeError("Draft Window Graph capture has no owner-bound persistent read context")
-    validate = getattr(capture_context, "validate_for_provider", None)
-    if not callable(validate):
-        raise TypeError("invalid Draft Window startup capture context")
-    validate(provider)
 
 
 def consume_draft_window_graph_metadata(

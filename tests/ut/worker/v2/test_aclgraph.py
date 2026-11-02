@@ -78,7 +78,7 @@ def test_init_draft_decode_graph():
 
 def test_run_fullgraph_uses_updatable_graph():
     """Verify full-graph replay uses the updatable graph path."""
-    manager = AutoRegressiveAclGraphManager.__new__(AutoRegressiveAclGraphManager)
+    manager: Any = AutoRegressiveAclGraphManager.__new__(AutoRegressiveAclGraphManager)
     manager.update_stream = MagicMock()
     manager.is_draft_model_prefill = False
     backend = object()
@@ -108,7 +108,7 @@ def test_run_fullgraph_uses_updatable_graph():
 
 def test_run_fullgraph_uses_legacy_graph():
     """Verify full-graph replay falls back to the legacy graph path."""
-    manager = AutoRegressiveAclGraphManager.__new__(AutoRegressiveAclGraphManager)
+    manager: Any = AutoRegressiveAclGraphManager.__new__(AutoRegressiveAclGraphManager)
     manager.update_stream = MagicMock()
     manager.is_draft_model_prefill = False
     backend = object()
@@ -148,7 +148,7 @@ def test_capture_draft_prefill_delegates_to_parent():
     model_state = object()
     input_buffers = object()
     block_tables = object()
-    attn_groups = object()
+    attn_groups: list[list[Any]] = []
     kv_cache_config = object()
     with (
         patch(
@@ -173,6 +173,48 @@ def test_capture_draft_prefill_delegates_to_parent():
     )
 
 
+@pytest.mark.parametrize("first", [False, True])
+@pytest.mark.parametrize("fail", [False, True])
+def test_window_capture_checks_tasks_only_after_the_actual_manager_capture(first, fail):
+    manager = AutoRegressiveAclGraphManager.__new__(AutoRegressiveAclGraphManager)
+    manager.is_draft_model_prefill = first
+    graphs: dict[Any, Any] = {}
+    events: list[str] = []
+
+    def validate(actual):
+        assert actual is graphs and events == ["captured"]
+        events.append("validated")
+
+    session = SimpleNamespace(provider=SimpleNamespace(validate_captured_graphs=validate))
+    manager.speculator = SimpleNamespace(_eagle3_graph_session=session)
+
+    def capture(*args, **kwargs):
+        events.append("captured")
+        if fail:
+            raise RuntimeError("capture failed")
+        manager.graphs = graphs
+
+    parent = (
+        "vllm_ascend.worker.v2.spec_decode.target_dependent_ar.aclgraph.SpeculatorCudaGraphManager.capture"
+        if first
+        else "vllm_ascend.worker.v2.spec_decode.target_dependent_ar.aclgraph.CudaGraphManager.capture"
+    )
+    with (
+        patch("vllm_ascend.worker.v2.spec_decode.target_dependent_ar.aclgraph.communicator_switch", nullcontext),
+        patch(
+            "vllm_ascend.worker.v2.spec_decode.target_dependent_ar.aclgraph.model_capture_wrapper",
+            return_value=nullcontext(),
+        ),
+        patch(parent, side_effect=capture),
+    ):
+        if fail:
+            with pytest.raises(RuntimeError, match="capture failed"):
+                manager.capture(MagicMock(), object(), object(), object(), [], object())
+        else:
+            manager.capture(MagicMock(), object(), object(), object(), [], object())
+    assert events == (["captured"] if fail else ["captured", "validated"])
+
+
 def test_capture_draft_decode_prepares_inputs_and_runs_forward():
     """Verify draft decode capture prepares inputs and invokes the forward path."""
     manager = AutoRegressiveAclGraphManager.__new__(AutoRegressiveAclGraphManager)
@@ -186,7 +228,7 @@ def test_capture_draft_decode_prepares_inputs_and_runs_forward():
     model_state = object()
     input_buffers = SimpleNamespace(seq_lens_cpu=torch.tensor([10, 20, 30], dtype=torch.int32))
     block_tables = object()
-    attn_groups = object()
+    attn_groups: list[list[Any]] = []
     kv_cache_config = object()
     desc_fields = {"num_tokens": 4, "num_reqs": None, "cg_mode": CUDAGraphMode.FULL}
     # vLLM main (#58275) reads max_query_len/uniform_token_count off the

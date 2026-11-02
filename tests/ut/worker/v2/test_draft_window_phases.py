@@ -102,10 +102,11 @@ def test_canonical_count_gather_rejects_invalid_mapping(full_source, mapping):
 
 def _materialize(full_source, batch, exact, counts, frozen=None):
     from vllm_ascend.worker.v2.spec_decode.draft_window import DraftMetadataInputs, DraftWindowWorkspace
+    from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphBindingProvider
 
     bank = DraftWindowWorkspace(max_num_reqs=len(exact), table_capacity_columns=4, table_template=full_source.table)
     proposal = DraftWindowProposalContext.from_batch(batch)
-    inputs = DraftMetadataInputs(proposal, len(exact), 0, bank, None)
+    inputs = DraftMetadataInputs(proposal, len(exact), 0, bank, DraftWindowGraphBindingProvider(source=full_source))
     bank.materialize(
         inputs=inputs,
         source=full_source,

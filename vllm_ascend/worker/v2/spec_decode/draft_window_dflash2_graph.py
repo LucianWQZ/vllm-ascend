@@ -11,7 +11,6 @@ this module neither clones those algorithms nor creates another Graph owner.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, field
 from typing import Any
 
 
@@ -25,14 +24,13 @@ def _capture_tensor(
     name: str,
     shape: tuple[int, ...],
     dtype: str,
-) -> Any:
+) -> None:
     tensor = getattr(parent, name)
     _require(
         tuple(tensor.shape) == shape and str(tensor.dtype) == dtype,
         f"{name} shape/dtype does not match static K/selector capacity",
     )
     _require(tensor.is_contiguous() and tensor.data_ptr() != 0, f"{name} must have live contiguous persistent storage")
-    return tensor
 
 
 def _attention_impl_type():
@@ -83,55 +81,45 @@ def validate_dflash2_graph_config(vllm_config: Any) -> None:
     )
 
 
-@dataclass(frozen=True, slots=True)
-class DFlash2GraphContract:
-    query_width: int
-    max_num_reqs: int
-    block_tables: Any = field(repr=False, compare=False)
-    # The fixed speculator initializes these once and only updates their
-    # contents. Retain the actual inputs for capture's entire lifetime, without
-    # certifying the same private model structure before every proposal.
-    buffers: tuple[Any, ...] = field(repr=False, compare=False)
-    native_windows: tuple[tuple[str, int | None], ...]
-
-    def validate_source(self, group: Any, *, causal: bool | Mapping[int, bool], window_size: int) -> None:
-        """Check DFlash2's native read band on the shared backend inventory.
-
-        Inventory certifies Full-retention storage and canonical block geometry;
-        only the noncausal native mask and extra-Window subset are method-specific.
-        """
-        gid, kernel, native = group.gid, group.table_column_span, group.native_window
-        _require(type(window_size) is int and window_size > 0, "positive integer Window required")
+def validate_dflash2_graph_read_source(
+    owner: Any, group: Any, *, causal: bool | Mapping[int, bool], window_size: int
+) -> None:
+    """Qualify the real owner and its inventory without a second buffer owner."""
+    validate_dflash2_graph_source(owner)
+    gid, kernel, native = group.gid, group.table_column_span, group.native_window
+    _require(type(window_size) is int and window_size > 0, "positive integer Window required")
+    context = owner.vllm_config.compilation_config.static_forward_context
+    _require(
+        len(group.layers) == len(owner.draft_attn_layer_names)
+        and set(group.layers) == owner.draft_attn_layer_names
+        and all(context[name].impl.sliding_window == native for name in group.layers),
+        "incomplete actual Draft layer inventory",
+    )
+    _require(
+        (causal if type(causal) is bool else causal.get(gid)) is False,
+        "DFlash2 Graph source requires actual noncausal attention",
+    )
+    table = owner.block_tables.input_block_tables[gid]
+    expansion = owner.block_tables.blocks_per_kv_block[gid]
+    _require(
+        expansion == group.scheduler_block_size // kernel
+        and len(table.shape) == 2
+        and table.shape[0] == owner.max_num_reqs
+        and table.shape[1] > 0
+        and table.shape[1] % expansion == 0
+        and tuple(table.stride()) == (table.shape[1], 1)
+        and str(table.dtype) == "torch.int32",
+        "canonical source must retain the actual complete expanded int32 table rows",
+    )
+    if native is not None:
         _require(
-            len(group.layers) == len(self.native_windows)
-            and dict(self.native_windows) == dict.fromkeys(group.layers, native),
-            "incomplete actual Draft layer inventory",
+            window_size + kernel - 1 + owner.num_query_per_req <= native,
+            "Window + block - 1 + query width exceeds the original noncausal native band",
         )
-        _require(
-            (causal if type(causal) is bool else causal.get(gid)) is False,
-            "DFlash2 Graph source requires actual noncausal attention",
-        )
-        table = self.block_tables.input_block_tables[gid]
-        expansion = self.block_tables.blocks_per_kv_block[gid]
-        _require(
-            expansion == group.scheduler_block_size // kernel
-            and len(table.shape) == 2
-            and table.shape[0] == self.max_num_reqs
-            and table.shape[1] > 0
-            and table.shape[1] % expansion == 0
-            and tuple(table.stride()) == (table.shape[1], 1)
-            and str(table.dtype) == "torch.int32",
-            "canonical source must retain the actual complete expanded int32 table rows",
-        )
-        if native is not None:
-            _require(
-                window_size + kernel - 1 + self.query_width <= native,
-                "Window + block - 1 + query width exceeds the original noncausal native band",
-            )
 
 
-def validate_dflash2_graph_source(owner: Any) -> DFlash2GraphContract:
-    """Bind one loaded DFlash2 model's existing addresses, never allocate KV.
+def validate_dflash2_graph_source(owner: Any) -> None:
+    """Validate the loaded owner's fixed capture inputs without allocating KV.
 
     Called after set_attn has published the actual Draft consumers and before
     its Source inventory is admitted; Graph OFF uses the same execution check
@@ -182,11 +170,10 @@ def validate_dflash2_graph_source(owner: Any) -> DFlash2GraphContract:
         ("seeds", (capacity,), "torch.int64"),
         ("draft_tokens", (capacity, k), "torch.int64"),
     )
-    buffers = (
-        _capture_tensor(sampler, "scores", (capacity, k, top_k), "torch.float32"),
-        _capture_tensor(sampler, "cached_candidate_ids", (capacity, k, top_k), "torch.int64"),
-        *(_capture_tensor(owner, *args) for args in fields),
-    )
+    _capture_tensor(sampler, "scores", (capacity, k, top_k), "torch.float32")
+    _capture_tensor(sampler, "cached_candidate_ids", (capacity, k, top_k), "torch.int64")
+    for args in fields:
+        _capture_tensor(owner, *args)
     _require(config.draft_sample_method in ("greedy", "probabilistic"), "unknown candidate sampling mode")
     probabilistic = config.draft_sample_method == "probabilistic"
     _require(
@@ -194,15 +181,15 @@ def validate_dflash2_graph_source(owner: Any) -> DFlash2GraphContract:
         "probabilistic selector requires its existing full-vocab cache; greedy must not add one",
     )
     if probabilistic:
-        buffers += (_capture_tensor(owner, "draft_logits", (capacity, k, owner.vocab_size), "torch.float32"),)
+        _capture_tensor(owner, "draft_logits", (capacity, k, owner.vocab_size), "torch.float32")
     impl_type = _attention_impl_type()
-    layers = []
     context = owner.vllm_config.compilation_config.static_forward_context
     _require(
         owner.attn_vllm_config.compilation_config.static_forward_context is context,
         "Draft attention and model execution do not share the actual static context owner",
     )
-    for name in sorted(owner.draft_attn_layer_names):
+    _require(bool(owner.draft_attn_layer_names), "no actual Draft attention layers")
+    for name in owner.draft_attn_layer_names:
         impl = context[name].impl
         _require(type(impl) is impl_type, "DFlash2 native Graph requires the actual dense FIA implementation")
         native = impl.sliding_window
@@ -216,13 +203,11 @@ def validate_dflash2_graph_source(owner: Any) -> DFlash2GraphContract:
             native is None or (mask is not None and mask.data_ptr() != 0),
             "noncausal native mask was not created by the DFlash2 loader",
         )
-        layers.append((name, native))
-        if mask is not None:
-            buffers += (mask,)
-    _require(bool(layers), "no actual Draft attention layers")
     for layer in model.model.layers:
         for name in ("attention_conv", "mlp_conv"):
             conv = getattr(layer, name)
             _require(conv.block_size == q, "convolution must reset at the original anchor-plus-K query boundary")
-    _require(len(model.model.layers) == len(layers), "DFlash2 convolution/attention layer inventory differs")
-    return DFlash2GraphContract(q, capacity, owner.block_tables, buffers, tuple(layers))
+    _require(
+        len(model.model.layers) == len(owner.draft_attn_layer_names),
+        "DFlash2 convolution/attention layer inventory differs",
+    )

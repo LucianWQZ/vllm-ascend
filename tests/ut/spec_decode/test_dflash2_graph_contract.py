@@ -166,8 +166,9 @@ def route(native=2048, *, scheduler=128):
     )
 
 
-def validate_source(contract, owner, actual_route=None, **kwargs):
-    return contract.validate_source(
+def validate_source(module, owner, actual_route=None, **kwargs):
+    return module.validate_dflash2_graph_read_source(
+        owner,
         actual_route or route(),
         causal=kwargs.pop("causal", {0: False}),
         window_size=kwargs.pop("window_size", 1024),
@@ -176,20 +177,49 @@ def validate_source(contract, owner, actual_route=None, **kwargs):
 
 
 def test_native_source_keeps_actual_mask_and_exact_boundary(module, owner):
-    contract = module.validate_dflash2_graph_source(owner)
+    module.validate_dflash2_graph_source(owner)
     mask = owner.vllm_config.compilation_config.static_forward_context["draft.0"].impl._dflash2_native_swa_mask
-    validate_source(contract, owner)
-    validate_source(contract, owner, window_size=1913)
+    validate_source(module, owner)
+    validate_source(module, owner, window_size=1913)
     with pytest.raises(ValueError, match="original noncausal native band"):
-        validate_source(contract, owner, window_size=1914)
-    assert any(buffer is mask for buffer in contract.buffers)
-    assert contract.native_windows == (("draft.0", 2048),)
+        validate_source(module, owner, window_size=1914)
+    assert owner.vllm_config.compilation_config.static_forward_context["draft.0"].impl._dflash2_native_swa_mask is mask
+
+
+def test_graph_factory_qualifies_the_real_dflash2_owner(monkeypatch, owner):
+    # This integration boundary imports the paired worker; header-only checks
+    # above still load the qualification module without device dependencies.
+    from vllm_ascend.worker.v2.spec_decode import draft_window, draft_window_dflash2_graph, draft_window_graph_runtime
+    from vllm_ascend.worker.v2.spec_decode.draft_window_policy import resolve_draft_window_policy
+
+    actual_route = route()
+    monkeypatch.setattr(draft_window_graph_runtime, "validate_graph_context", lambda *_: None)
+    monkeypatch.setattr(draft_window, "inventory_draft_window_groups", lambda **_: (actual_route,))
+    monkeypatch.setattr(draft_window_dflash2_graph, "_attention_impl_type", lambda: DenseImpl)
+    kwargs = dict(
+        policy=resolve_draft_window_policy(requested_window_size=1024, method="dflash", is_dflash2=True),
+        runtime_route="dflash2",
+        attn_groups=(),
+        block_tables=owner.block_tables,
+        kv_cache_config=None,
+        causal=False,
+        vllm_config=owner.vllm_config,
+        dflash2_graph_owner=owner,
+    )
+    source = draft_window._build_draft_window_source_capability_for_context(**kwargs)
+    assert source.table is owner.block_tables.input_block_tables[0]
+    owner.candidate_sampler.scores.shape = (4, 7, 3)
+    with pytest.raises(ValueError, match="shape/dtype"):
+        draft_window._build_draft_window_source_capability_for_context(**kwargs)
+    kwargs["dflash2_graph_owner"] = None
+    with pytest.raises(TypeError, match="actual model owner"):
+        draft_window._build_draft_window_source_capability_for_context(**kwargs)
 
 
 def test_full_only_source_host_contract_does_not_fake_native_model(module, owner):
     owner.vllm_config.compilation_config.static_forward_context["draft.0"].impl = DenseImpl(None)
-    contract = module.validate_dflash2_graph_source(owner)
-    validate_source(contract, owner, route(None))
+    module.validate_dflash2_graph_source(owner)
+    validate_source(module, owner, route(None))
 
 
 @pytest.mark.parametrize("sampling", ["greedy", "probabilistic"])
@@ -197,9 +227,7 @@ def test_actual_conditional_full_vocab_logits_allocation(module, owner, sampling
     owner.speculative_config.draft_sample_method = sampling
     if sampling == "probabilistic":
         owner.draft_logits = TensorHeader((4, 7, 8), "torch.float32")
-    contract = module.validate_dflash2_graph_source(owner)
-    assert any(buffer is owner.draft_tokens for buffer in contract.buffers)
-    assert any(buffer is owner.draft_logits for buffer in contract.buffers) is (sampling == "probabilistic")
+    module.validate_dflash2_graph_source(owner)
     owner.draft_logits = None if sampling == "probabilistic" else TensorHeader((4, 7, 8), "torch.float32")
     with pytest.raises(ValueError, match="full-vocab cache"):
         module.validate_dflash2_graph_source(owner)
@@ -234,15 +262,6 @@ def test_malformed_capture_contract_is_rejected(module, owner, mutation, message
         module.validate_dflash2_graph_source(owner)
 
 
-def test_contract_holds_actual_fixed_buffers_without_identity_mirrors(module, owner):
-    contract = module.validate_dflash2_graph_source(owner)
-    assert contract.buffers[0] is owner.candidate_sampler.scores
-    assert any(buffer is owner.draft_tokens for buffer in contract.buffers)
-    assert contract.native_windows == (("draft.0", 2048),)
-    assert contract.query_width == 8
-    assert not hasattr(contract, "validate_owner")
-
-
 @pytest.mark.parametrize("field,value", [("sinks", object()), ("use_bnsd_kv_cache", True)])
 def test_unsupported_loaded_attention_fails_before_capture(module, owner, field, value):
     setattr(owner.vllm_config.compilation_config.static_forward_context["draft.0"].impl, field, value)
@@ -251,28 +270,28 @@ def test_unsupported_loaded_attention_fails_before_capture(module, owner, field,
 
 
 def test_shared_inventory_native_band_and_actual_layers_are_checked(module, owner):
-    contract = module.validate_dflash2_graph_source(owner)
+    module.validate_dflash2_graph_source(owner)
     with pytest.raises(ValueError, match="layer inventory"):
-        validate_source(contract, owner, route(1024))
+        validate_source(module, owner, route(1024))
     wrong = route()
     wrong.layers = ("draft.0", "draft.0")
     with pytest.raises(ValueError, match="layer inventory"):
-        validate_source(contract, owner, wrong)
+        validate_source(module, owner, wrong)
     with pytest.raises(ValueError, match="noncausal"):
-        validate_source(contract, owner, causal=True)
+        validate_source(module, owner, causal=True)
 
 
 def test_actual_ascend_expanded_manager_blocks_use_kernel_span(module, owner):
     owner.block_tables.block_sizes = [512]
     owner.block_tables.blocks_per_kv_block = [4]
     actual_route = route(scheduler=512)
-    contract = module.validate_dflash2_graph_source(owner)
-    validate_source(contract, owner, actual_route, window_size=1913)
+    module.validate_dflash2_graph_source(owner)
+    validate_source(module, owner, actual_route, window_size=1913)
     with pytest.raises(ValueError, match="original noncausal native band"):
-        validate_source(contract, owner, actual_route, window_size=1914)
+        validate_source(module, owner, actual_route, window_size=1914)
     owner.block_tables.input_block_tables[0].shape = (4, 1023)
     with pytest.raises(ValueError, match="complete expanded"):
-        validate_source(contract, owner, actual_route)
+        validate_source(module, owner, actual_route)
 
 
 @pytest.mark.parametrize(

@@ -38,10 +38,7 @@ from vllm_ascend.worker.v2.aclgraph_utils import (
     collect_sorted_captured_token_sizes,
     model_capture_wrapper,
 )
-from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
-    DraftWindowGraphRoute,
-    validate_draft_window_graph_capture,
-)
+from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphRoute
 from vllm_ascend.worker.v2.utils import communicator_switch
 
 
@@ -175,7 +172,6 @@ class AutoRegressiveAclGraphManager(SpeculatorCudaGraphManager):
 
         session = getattr(self.speculator, "_eagle3_graph_session", None)
         if session is not None:
-            validate_draft_window_graph_capture(self.speculator, capture_context=session)
             actual_forward = forward_fn
 
             def forward_fn(*args, **kwargs):
@@ -199,6 +195,8 @@ class AutoRegressiveAclGraphManager(SpeculatorCudaGraphManager):
                     kv_cache_config,
                     progress_bar_desc=progress_bar_desc,
                 )
+                if session is not None:
+                    session.provider.validate_captured_graphs(self.graphs)
                 return
 
             def create_forward_fn(desc: BatchExecutionDescriptor, warmup: bool):
@@ -235,6 +233,8 @@ class AutoRegressiveAclGraphManager(SpeculatorCudaGraphManager):
                 )
 
             CudaGraphManager.capture(self, create_forward_fn, progress_bar_desc=progress_bar_desc)
+            if session is not None:
+                session.provider.validate_captured_graphs(self.graphs)
 
     def run_fullgraph(self, desc: BatchExecutionDescriptor) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         """Replay the draft ACL graph and update its attention parameters."""
@@ -382,8 +382,6 @@ class AutoRegressiveAclGraphManager(SpeculatorCudaGraphManager):
                 if self.is_draft_model_prefill
                 else DraftWindowGraphRoute.EAGLE3_AR_STEP
             )
-            graph = self.graphs[desc]
-            session.provider.validate_graph(graph, route=route)
             # SharedSource filters by layer. Each layer's provider_index is the
             # consumer ordinal, so AR1 and AR2 retain their own table/length bank.
             params = [

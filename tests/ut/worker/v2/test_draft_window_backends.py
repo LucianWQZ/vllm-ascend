@@ -4,6 +4,7 @@
 
 from dataclasses import replace
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -11,8 +12,7 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_backends import (
     DraftWindowBackendTypes,
     DraftWindowProviderStatus,
     inventory_draft_window_groups,
-    require_compatible_direct_prefix_routes,
-    select_native_swa_subset_routes,
+    require_direct_prefix_routes,
 )
 
 
@@ -121,6 +121,44 @@ def inventory(
     )
 
 
+def require_routes(
+    routes,
+    *,
+    window_size=1024,
+    max_query_tokens=8,
+    future_offset_bound=7,
+    context=None,
+    dense_impl_type=DenseBuilder,
+    group_causal=True,
+    noncausal_dflash2=False,
+    query_width=8,
+):
+    config = SimpleNamespace(
+        parallel_config=None,
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=max_query_tokens, max_num_scheduled_tokens=None),
+        compilation_config=SimpleNamespace(static_forward_context=context or {}),
+    )
+    owner = SimpleNamespace(
+        attn_vllm_config=config,
+        attn_groups=(),
+        kv_cache_config=None,
+        block_tables=None,
+        draft_attn_layer_names=[name for route in routes for name in route.layers],
+        speculative_config=SimpleNamespace(method="dflash"),
+        num_query_per_req=query_width,
+        num_speculative_steps=future_offset_bound,
+        _group_causal=group_causal,
+        draft_model_config=SimpleNamespace(architectures=["DFlash2DraftModel"] if noncausal_dflash2 else []),
+    )
+    with (
+        patch(
+            "vllm_ascend.worker.v2.spec_decode.draft_window_backends.inventory_draft_window_groups", return_value=routes
+        ),
+        patch("vllm_ascend.attention.attention_v1.AscendAttentionBackendImpl", dense_impl_type),
+    ):
+        return require_direct_prefix_routes(owner, window_size=window_size)
+
+
 def test_dflash2_reference_full_allocation_keeps_native_read_provider(types, parallel_config):
     spec = FullSpec()
     spec.sliding_window = 2048
@@ -129,7 +167,7 @@ def test_dflash2_reference_full_allocation_keeps_native_read_provider(types, par
     assert original.status is DraftWindowProviderStatus.DIRECT_DENSE
     assert original.native_window == 2048  # Full retention is not Full attention.
     (reference,) = inventory(kinds, parallel_config, specs=[spec], full_retention_dflash2=True)
-    assert reference.status is DraftWindowProviderStatus.NATIVE_SWA_CANDIDATE
+    assert reference.status is DraftWindowProviderStatus.NATIVE_SWA
     assert reference.native_window == 2048
 
 
@@ -138,9 +176,7 @@ def test_dflash2_full_retention_keeps_full_and_native_consumers(types, parallel_
     spec = FullSpec()
     spec.sliding_window = native
     (route,) = inventory(types, parallel_config, specs=[spec], full_retention_dflash2=True)
-    expected = (
-        DraftWindowProviderStatus.DIRECT_DENSE if native is None else DraftWindowProviderStatus.NATIVE_SWA_CANDIDATE
-    )
+    expected = DraftWindowProviderStatus.DIRECT_DENSE if native is None else DraftWindowProviderStatus.NATIVE_SWA
     assert route.status is expected
     assert route.native_window == native
 
@@ -190,7 +226,7 @@ def test_kernel_column_span_is_not_scheduler_block_size(types, parallel_config):
     assert route.scheduler_block_size == 256
     assert route.table_column_span == 128
     assert route.status is DraftWindowProviderStatus.DIRECT_DENSE
-    require_compatible_direct_prefix_routes((route,))
+    require_routes((route,))
 
 
 def test_same_named_unregistered_builder_cannot_gain_dense_capability(types, parallel_config):
@@ -217,16 +253,16 @@ def native_swa_bundle(types, parallel_config):
     return routes, impl, context
 
 
-def test_native_swa_candidate_is_not_a_residency_or_read_provider(types, parallel_config):
+def test_native_layout_does_not_bypass_actual_window_qualification(types, parallel_config):
     routes, _, _ = native_swa_bundle(types, parallel_config)
-    assert routes[0].status is DraftWindowProviderStatus.NATIVE_SWA_CANDIDATE
+    assert routes[0].status is DraftWindowProviderStatus.NATIVE_SWA
     with pytest.raises(NotImplementedError, match="Native SWA"):
-        require_compatible_direct_prefix_routes(routes)
+        require_routes(routes, window_size=None)
 
 
 def test_covered_swa_keeps_only_full_group_projection(types, parallel_config):
     routes, _, context = native_swa_bundle(types, parallel_config)
-    selected = select_native_swa_subset_routes(
+    selected = require_routes(
         routes,
         window_size=32768,
         max_query_tokens=2048,
@@ -235,13 +271,12 @@ def test_covered_swa_keeps_only_full_group_projection(types, parallel_config):
         dense_impl_type=DenseBuilder,
     )
     assert selected == (routes[1],)
-    require_compatible_direct_prefix_routes(selected)
     assert context["draft.layers.0"].impl.sliding_window == 4096
 
 
 def test_smaller_extra_window_selects_native_intersection(types, parallel_config):
     routes, _, context = native_swa_bundle(types, parallel_config)
-    selected = select_native_swa_subset_routes(
+    selected = require_routes(
         routes,
         window_size=1024,
         max_query_tokens=8,
@@ -250,15 +285,14 @@ def test_smaller_extra_window_selects_native_intersection(types, parallel_config
         dense_impl_type=DenseBuilder,
     )
     assert len(selected) == 2
-    assert selected[0].status is DraftWindowProviderStatus.NATIVE_SWA_INTERSECTION
+    assert selected[0] == routes[0]
     assert selected[1] == routes[1]
-    require_compatible_direct_prefix_routes(selected)
 
 
 @pytest.mark.parametrize("window", [1024, 32768])
 def test_native_only_dflash2_keeps_a_typed_builder_without_a_full_group(types, parallel_config, window):
     routes, _, context = native_swa_bundle(types, parallel_config)
-    selected = select_native_swa_subset_routes(
+    selected = require_routes(
         routes[:1],
         window_size=window,
         max_query_tokens=8,
@@ -267,9 +301,8 @@ def test_native_only_dflash2_keeps_a_typed_builder_without_a_full_group(types, p
         dense_impl_type=DenseBuilder,
     )
     assert len(selected) == 1
-    assert selected[0].status is DraftWindowProviderStatus.NATIVE_SWA_INTERSECTION
+    assert selected[0] == routes[0]
     assert selected[0].native_window == 4096
-    require_compatible_direct_prefix_routes(selected)
 
 
 @pytest.mark.parametrize("allowed,window", [(True, 1024), (False, 1024), (True, 4096)])
@@ -286,11 +319,11 @@ def test_noncausal_native_only_dflash2_needs_explicit_resident_certificate(types
         query_width=8,
     )
     if allowed and window == 1024:
-        (route,) = select_native_swa_subset_routes(routes[:1], **options)
-        assert route.status is DraftWindowProviderStatus.NATIVE_SWA_INTERSECTION
+        (route,) = require_routes(routes[:1], **options)
+        assert route == routes[0]
     else:
         with pytest.raises(NotImplementedError, match="non-causal|resident"):
-            select_native_swa_subset_routes(routes[:1], **options)
+            require_routes(routes[:1], **options)
 
 
 def test_unmasked_rebased_read_covers_future_queries_without_fabricating_a_causal_band():
@@ -312,7 +345,7 @@ def test_native_swa_actual_consumer_must_match_certificate(types, parallel_confi
     for name, value in change.items():
         setattr(impl, name, value)
     with pytest.raises(NotImplementedError, match="coverage certificate"):
-        select_native_swa_subset_routes(
+        require_routes(
             routes,
             window_size=32768,
             max_query_tokens=2048,
@@ -327,7 +360,7 @@ def test_native_swa_coverage_against_absolute_read_sets(types, parallel_config, 
     routes, _, context = native_swa_bundle(types, parallel_config)
     width, native_window = 8, 4096
     window = native_window + width + future
-    select_native_swa_subset_routes(
+    selected = require_routes(
         routes,
         window_size=window,
         max_query_tokens=width,
@@ -335,6 +368,7 @@ def test_native_swa_coverage_against_absolute_read_sets(types, parallel_config, 
         context=context,
         dense_impl_type=DenseBuilder,
     )
+    assert selected == (routes[1],)
     for end in (8, 1151, 1152, 4095, 4096, 4223, 33023):
         for block in (64, 128):
             start = max(end + future - window, 0) // block * block
@@ -407,7 +441,15 @@ def test_invalid_geometry_is_not_zero_padded_or_repaired(types, parallel_config,
 
 def test_empty_inventory_is_not_success():
     with pytest.raises(ValueError, match="at least one"):
-        require_compatible_direct_prefix_routes(())
+        inventory_draft_window_groups(
+            attn_groups=[],
+            kv_cache_config=SimpleNamespace(kv_cache_groups=[]),
+            block_tables=SimpleNamespace(block_sizes=[], kernel_block_sizes=[]),
+            parallel_config=SimpleNamespace(prefill_context_parallel_size=1, decode_context_parallel_size=1),
+            types=DraftWindowBackendTypes(
+                DenseBackend, DenseBuilder, FullSpec, UniformSpec, lambda spec: spec.block_size, lambda spec: 1
+            ),
+        )
 
 
 def test_unknown_second_gid_is_never_ignored(types, parallel_config):
@@ -418,7 +460,7 @@ def test_unknown_second_gid_is_never_ignored(types, parallel_config):
 @pytest.mark.parametrize("anchor,second", [(256, 128), (128, 64), (128, 128)])
 def test_multi_group_projection_preserves_first_group_start(types, parallel_config, anchor, second):
     routes = inventory(types, parallel_config, specs=[FullSpec(256), FullSpec(256)], spans=[anchor, second])
-    require_compatible_direct_prefix_routes(routes)
+    require_routes(routes)
     # The logical read start is decided once using the first group's B.
     end, window, future = 2051, 1024, 8
     start = max(end + future - window, 0) // anchor * anchor
@@ -433,7 +475,7 @@ def test_incompatible_multi_group_alignment_rejected_before_request_arrives(type
     # Accepting only the first request would create a serving-time failure.
     assert [128 // route.table_column_span for route in routes] == [2, 1]
     with pytest.raises(NotImplementedError, match="first group span 64"):
-        require_compatible_direct_prefix_routes(routes)
+        require_routes(routes)
 
 
 class MLABuilder:
@@ -458,7 +500,7 @@ def test_plain_mla_provider_requires_actual_builder_and_spec(types, parallel_con
     )
     (route,) = inventory(mla_types, parallel_config, specs=[MLASpec()], builders=[MLABuilder()])
     assert route.status is DraftWindowProviderStatus.DIRECT_MLA
-    require_compatible_direct_prefix_routes((route,))
+    require_routes((route,))
 
 
 @pytest.mark.parametrize(
@@ -489,7 +531,7 @@ def test_flashmla_has_separate_persistent_state_contract(types, parallel_config)
 
 def test_small_window_native_intersection_gap(types, parallel_config):
     routes, _, context = native_swa_bundle(types, parallel_config)
-    selected = select_native_swa_subset_routes(
+    selected = require_routes(
         routes,
         window_size=1024,
         max_query_tokens=8,
@@ -498,7 +540,7 @@ def test_small_window_native_intersection_gap(types, parallel_config):
         dense_impl_type=DenseBuilder,
     )
     assert len(selected) == 2
-    assert selected[0].status is DraftWindowProviderStatus.NATIVE_SWA_INTERSECTION
+    assert selected[0] == routes[0]
     assert selected[1].gid == routes[1].gid
 
 

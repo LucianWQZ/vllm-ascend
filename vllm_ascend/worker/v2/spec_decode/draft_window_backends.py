@@ -8,15 +8,14 @@ selection describes an addressing contract, not device qualification.
 """
 
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from enum import Enum
-from typing import Any
+from typing import Any, cast
 
 
 class DraftWindowProviderStatus(str, Enum):
     DIRECT_DENSE = "DIRECT_DENSE"
-    NATIVE_SWA_CANDIDATE = "NATIVE_SWA_CANDIDATE"
-    NATIVE_SWA_INTERSECTION = "NATIVE_SWA_INTERSECTION"
+    NATIVE_SWA = "NATIVE_SWA"
     DIRECT_MLA = "DIRECT_MLA"
 
 
@@ -129,7 +128,7 @@ def _select_read_provider(
     if native:
         if not uniform_windows or native_window is None or native_window <= 0:
             raise NotImplementedError("Native SWA group has inconsistent windows")
-        selected = status.NATIVE_SWA_CANDIDATE
+        selected = status.NATIVE_SWA
     if selected is None:
         raise NotImplementedError(f"No read-view provider for {backend.__name__}/{type(builder).__name__}")
     return selected
@@ -228,110 +227,15 @@ def inventory_draft_window_groups(
     return tuple(routes)
 
 
-def require_compatible_direct_prefix_routes(routes: Sequence[DraftWindowGroupRoute]) -> None:
-    """Keep the first group's window alignment and project it into all groups.
-
-    Requiring each group span to divide the first span ensures every future
-    aligned start is expressible, without changing the window to an LCM or
-    failing after an ordinary request crosses a block boundary.
-    """
-    if not routes:
-        raise ValueError("Draft Window requires at least one attention consumer")
-    if any(route.status is DraftWindowProviderStatus.NATIVE_SWA_CANDIDATE for route in routes):
-        raise NotImplementedError("Native SWA requires its checked subset/intersection provider")
-    prefix_routes = tuple(
-        route for route in routes if route.status is not DraftWindowProviderStatus.NATIVE_SWA_INTERSECTION
-    )
-    if not prefix_routes:
-        # Native-band builders validate and rebase their own coordinates;
-        # unlike a direct-prefix reader, they need no companion Full group.
-        return
-    anchor_span = prefix_routes[0].table_column_span
-    for route in prefix_routes:
-        if anchor_span % route.table_column_span:
-            raise NotImplementedError(
-                "Draft Window provider missing: "
-                f"gid={route.gid} span {route.table_column_span} cannot represent every start "
-                f"aligned to the first group span {anchor_span}"
-            )
-
-
-def select_native_swa_subset_routes(
-    routes: Sequence[DraftWindowGroupRoute],
-    *,
-    window_size: int,
-    max_query_tokens: int,
-    future_offset_bound: int,
-    context: Any,
-    dense_impl_type: type[Any],
-    group_causal: dict[int, bool] | bool = True,
-    noncausal_dflash2: bool = False,
-    query_width: int | None = None,
-) -> tuple[DraftWindowGroupRoute, ...]:
-    """Keep a certified native SWA reader unchanged, never claim its residency.
-
-    S <= max(E+f-W, 0). A native P-window's earliest query reads no
-    earlier than max(E-Q-P, 0). W >= P+Q+f proves that its complete
-    existing read set lies inside the requested extra Window. Smaller W
-    selects a typed native-band intersection, whose original builder exact
-    pair is reused after build. Neither route claims a resident Full prefix.
-    """
-    if max_query_tokens < 1 or future_offset_bound < 0:
-        raise ValueError("Native SWA coverage requires a positive query bound")
-    native_only = bool(routes) and all(
-        route.status is DraftWindowProviderStatus.NATIVE_SWA_CANDIDATE for route in routes
-    )
-    projected = []
-    for route in routes:
-        if route.status is not DraftWindowProviderStatus.NATIVE_SWA_CANDIDATE:
-            projected.append(route)
-            continue
-        native_window = route.native_window
-        if native_window is None or native_window <= 0:
-            raise NotImplementedError(f"Draft Window gid={route.gid} has no native-SWA geometry")
-        causal = group_causal.get(route.gid) if isinstance(group_causal, dict) else group_causal
-        if type(causal) is not bool:
-            raise ValueError("Native SWA requires an explicit per-group causal declaration")
-        if not causal:
-            if not (noncausal_dflash2 and native_only):
-                raise NotImplementedError("Draft Window non-causal native groups require the DFlash2 resident provider")
-            # sparse_mode=0 reads the entire projected interval, including
-            # future query positions. It must not inherit a causal-band
-            # certificate or assume an evicted Full prefix is resident.
-            if (
-                query_width is None
-                or query_width < 1
-                or window_size + route.table_column_span - 1 + query_width > native_window
-            ):
-                raise NotImplementedError(
-                    "DFlash2 non-causal draft_window_size plus column alignment and query width "
-                    "must fit its resident native window"
-                )
-        for name in route.layers:
-            impl = getattr(context.get(name), "impl", None)
-            if (
-                type(impl) is not dense_impl_type
-                or impl.sliding_window != native_window
-                or impl.sinks is not None
-                or impl.use_bnsd_kv_cache
-            ):
-                raise NotImplementedError(f"Draft Window native SWA consumer {name} has no coverage certificate")
-        if native_only or window_size < native_window + max_query_tokens + future_offset_bound:
-            projected.append(
-                replace(
-                    route,
-                    status=DraftWindowProviderStatus.NATIVE_SWA_INTERSECTION,
-                )
-            )
-    if not projected:
-        raise NotImplementedError("Draft Window requires at least one certified read group")
-    return tuple(projected)
-
-
 def require_direct_prefix_routes(
     speculator: Any, *, window_size: int | None = None
 ) -> tuple[DraftWindowGroupRoute, ...]:
-    """Select all direct-prefix consumers before any proposal work is submitted."""
+    """Admit actual consumers once, retaining only groups that need projection.
+
+    Inventory tags describe layouts, not read qualification. Native consumers
+    keep their original band and require the method's real causal/residency
+    contract here. Each admitted route is the original inventory object.
+    """
     config = speculator.attn_vllm_config
     routes = inventory_draft_window_groups(
         attn_groups=speculator.attn_groups,
@@ -342,28 +246,72 @@ def require_direct_prefix_routes(
     )
     if {name for route in routes for name in route.layers} != set(speculator.draft_attn_layer_names):
         raise ValueError("Draft Window providers do not cover the actual draft attention layers")
-    if any(route.status is DraftWindowProviderStatus.NATIVE_SWA_CANDIDATE for route in routes):
+    native = tuple(route for route in routes if route.status is DraftWindowProviderStatus.NATIVE_SWA)
+    if native:
         if window_size is None or speculator.speculative_config.method != "dflash":
             raise NotImplementedError("Native SWA coverage is only certified for the DFlash extra-Window route")
         from vllm_ascend.attention.attention_v1 import AscendAttentionBackendImpl
 
-        config = speculator.attn_vllm_config
         scheduler = config.scheduler_config
         query_bound = max(
             scheduler.max_num_batched_tokens,
             scheduler.max_num_scheduled_tokens or 0,
             speculator.num_query_per_req,
         )
-        routes = select_native_swa_subset_routes(
-            routes,
-            window_size=window_size,
-            max_query_tokens=query_bound,
-            future_offset_bound=speculator.num_speculative_steps,
-            context=config.compilation_config.static_forward_context,
-            dense_impl_type=AscendAttentionBackendImpl,
-            group_causal=getattr(speculator, "_group_causal", True),
-            noncausal_dflash2=getattr(speculator.draft_model_config, "architectures", ()) == ["DFlash2DraftModel"],
-            query_width=speculator.num_query_per_req,
-        )
-    require_compatible_direct_prefix_routes(routes)
+        future = speculator.num_speculative_steps
+        if query_bound < 1 or future < 0:
+            raise ValueError("Native SWA coverage requires a positive query bound")
+        native_only = len(native) == len(routes)
+        context = config.compilation_config.static_forward_context
+        declared = getattr(speculator, "_group_causal", True)
+        omitted: set[DraftWindowGroupRoute] = set()
+        for route in native:
+            # Inventory already established a positive, homogeneous native P.
+            native_window = cast(int, route.native_window)
+            causal = declared.get(route.gid) if isinstance(declared, dict) else declared
+            if type(causal) is not bool:
+                raise ValueError("Native SWA requires an explicit per-group causal declaration")
+            if not causal:
+                if not (
+                    native_only and getattr(speculator.draft_model_config, "architectures", ()) == ["DFlash2DraftModel"]
+                ):
+                    raise NotImplementedError(
+                        "Draft Window non-causal native groups require the DFlash2 resident provider"
+                    )
+                # sparse_mode=0 reads the complete rebased interval, including
+                # future queries: it cannot inherit the causal-band proof.
+                width = speculator.num_query_per_req
+                if width < 1 or window_size + route.table_column_span - 1 + width > native_window:
+                    raise NotImplementedError(
+                        "DFlash2 non-causal draft_window_size plus column alignment and query width "
+                        "must fit its resident native window"
+                    )
+            for name in route.layers:
+                impl = getattr(context.get(name), "impl", None)
+                if (
+                    type(impl) is not AscendAttentionBackendImpl
+                    or impl.sliding_window != native_window
+                    or impl.sinks is not None
+                    or impl.use_bnsd_kv_cache
+                ):
+                    raise NotImplementedError(f"Draft Window native SWA consumer {name} has no coverage certificate")
+            # S <= max(E+f-W, 0); the first native query reads from
+            # max(E-Q-P, 0). W >= P+Q+f contains that complete read set.
+            # It then needs no projection beside Full groups. Native-only
+            # batches still need their own builder for the proposal scope.
+            if not native_only and window_size >= native_window + query_bound + future:
+                omitted.add(route)
+        routes = tuple(route for route in routes if route not in omitted)
+    prefix = tuple(route for route in routes if route.status is not DraftWindowProviderStatus.NATIVE_SWA)
+    if prefix:
+        # Every group must represent any start aligned to the first span;
+        # checking only the current request would miss later block boundaries.
+        anchor = prefix[0].table_column_span
+        for route in prefix:
+            if anchor % route.table_column_span:
+                raise NotImplementedError(
+                    "Draft Window provider missing: "
+                    f"gid={route.gid} span {route.table_column_span} cannot represent every start "
+                    f"aligned to the first group span {anchor}"
+                )
     return routes

@@ -19,10 +19,7 @@ from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 import vllm_ascend.envs as envs
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.device.hardware_profile import AttentionBackendFamily, get_current_hardware_profile
-from vllm_ascend.worker.v2.spec_decode.draft_window import (
-    DraftMetadataInputs,
-    DraftWindowWorkspace,
-)
+from vllm_ascend.worker.v2.spec_decode.draft_window import DraftMetadataInputs
 from vllm_ascend.worker.v2.spec_decode.draft_window_eager import (
     build_draft_window_attn_metadata,
     draft_window_read_inputs,
@@ -118,29 +115,10 @@ def prepare_parallel_graph(
 
     # FULL dispatch deferred its unused temporary metadata. Build and publish
     # exactly this generation once, backed by the persistent Graph read bank.
-    carrier = provider.bind_read_carrier(
-        capture_identity=capture_identity,
-        inputs=inputs,
-        metadata_builder=lambda workspace: _build_private_graph_metadata(
-            owner,
-            workspace=workspace,
-            actual_request_count=len(inputs.proposal.ordered_request_ids),
-            capture_identity=capture_identity,
-        ),
-    )
-    return carrier
-
-
-def _build_private_graph_metadata(
-    owner: Any,
-    *,
-    workspace: DraftWindowWorkspace,
-    actual_request_count: int,
-    capture_identity: DraftWindowGraphBucket,
-) -> Mapping[str, Any]:
+    workspace = inputs.workspace
     read_inputs = draft_window_read_inputs(
         workspace,
-        actual_request_count=actual_request_count,
+        actual_request_count=len(inputs.proposal.ordered_request_ids),
         padded_request_count=workspace.max_num_reqs,
     )
     metadata = build_draft_window_attn_metadata(
@@ -158,4 +136,4 @@ def _build_private_graph_metadata(
         if capture_identity.route is DraftWindowGraphRoute.DSPARK
         else None,
     )
-    return metadata
+    return provider.bind_read_carrier(capture_identity=capture_identity, inputs=inputs, metadata=metadata)

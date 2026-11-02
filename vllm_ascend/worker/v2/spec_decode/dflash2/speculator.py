@@ -139,14 +139,6 @@ class AscendDFlash2Speculator(DFlash2Speculator, AscendDFlashSpeculator):
         self._dflash2_full_kv_reference = True
         return model
 
-    def _initialize_draft_window_source_capability(self) -> None:
-        from vllm_ascend.worker.v2.spec_decode.draft_window_dflash2_graph import validate_dflash2_graph_source
-
-        # set_attn has already published the actual groups/model/native cache
-        # spec. Install this contract before the shared Source inventory runs.
-        self._dflash2_graph_contract = validate_dflash2_graph_source(self)
-        super()._initialize_draft_window_source_capability()
-
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         if self.speculative_config.enforce_eager:
             # Preserve the existing typed eager path and its independent owner.
@@ -171,9 +163,8 @@ class AscendDFlash2Speculator(DFlash2Speculator, AscendDFlashSpeculator):
             # installed Ascend patch is already used by ordinary DFlash2 eager.
             if upstream_dflash2._selector_walk_kernel is not _selector_walk_kernel_ascend:
                 raise RuntimeError("DFlash2 Graph requires the actual Ascend selector-walk kernel binding")
-            contract = getattr(self, "_dflash2_graph_contract", None)
-            if contract is None:
-                self._dflash2_graph_contract = validate_dflash2_graph_source(self)
+            if not hasattr(self, "_draft_window_graph_binding_provider"):
+                validate_dflash2_graph_source(self)
         super().init_cudagraph_manager(cudagraph_mode)
         if (
             cudagraph_mode.decode_mode() is CUDAGraphMode.FULL

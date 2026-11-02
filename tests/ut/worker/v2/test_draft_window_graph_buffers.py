@@ -131,7 +131,7 @@ def _bind(case, inputs):
     return case.provider.bind_read_carrier(
         capture_identity=case.capture,
         inputs=inputs,
-        metadata_builder=metadata_builder,
+        metadata=metadata_builder(inputs.workspace),
     )
 
 
@@ -402,6 +402,36 @@ def test_parallel_capture_uses_exact_manager_descriptor_and_preserves_full_table
         _build_capture_context(owner, buffers, {CUDAGraphMode.FULL: [replace(desc, max_query_len=1)]})
 
 
+@pytest.mark.parametrize("capture_fails", [False, True])
+def test_parallel_capture_scope_owns_its_attachment_until_normal_or_error_exit(graph_buffers, capture_fails):
+    from vllm_ascend.worker.v2.spec_decode.dflash import capture
+
+    case = graph_buffers
+    buffers = case.input_buffers
+    owner = SimpleNamespace(input_buffers=buffers, _draft_window_graph_binding_provider=case.provider)
+    descriptors = {CUDAGraphMode.FULL: [case.capture.descriptor]}
+    full_before = case.owner.input_block_tables[0].clone()
+    slots_before = case.owner.slot_mappings.clone()
+    try:
+        with capture.draft_window_dflash_capture_scope(owner, buffers, descriptors) as context:
+            assert getattr(buffers, capture._CAPTURE_CONTEXT_ATTRIBUTE) is context
+            assert context is not None
+            bucket, bank = context.resolve(2, 2)
+            assert bucket is case.capture and bank is case.capture.workspace
+            with (
+                pytest.raises(RuntimeError, match="already attached"),
+                capture.draft_window_dflash_capture_scope(owner, buffers, descriptors),
+            ):
+                pytest.fail("nested capture must not start")
+            if capture_fails:
+                raise RuntimeError("capture failed")
+    except RuntimeError as error:
+        assert capture_fails and str(error) == "capture failed"
+    assert not hasattr(buffers, capture._CAPTURE_CONTEXT_ATTRIBUTE)
+    assert torch.equal(case.owner.input_block_tables[0], full_before)
+    assert torch.equal(case.owner.slot_mappings, slots_before)
+
+
 def test_window_capture_delegates_original_dummy_preparation_then_only_rebinds_reads(graph_buffers, monkeypatch):
     from vllm.v1.worker.gpu.cudagraph_utils import AttentionState
 
@@ -573,7 +603,7 @@ def test_actual_eagle_bank_rejects_an_intra_block_frozen_anchor(graph_buffers):
             proposal=_proposal(),
             cpu_full_exact=torch.tensor([4], dtype=torch.int32),
             cpu_valid_num_blocks=torch.tensor([4], dtype=torch.int32),
-            frozen_row_plans=(DraftWindowPlan(4, 7, 1, 7),),
+            frozen_row_plans=(DraftWindowPlan(4, 7, 1),),
             num_reqs_padded=1,
             step=0,
             output_workspace=bank,
@@ -605,7 +635,7 @@ def test_original_task_resolver_binds_current_metadata_without_replacing_capture
     from vllm_ascend.compilation.updatable_graph import ContextSource, UpdatableGraph
 
     c = typed_update_guard
-    c.case.provider.validate_graph(c.graph, route=c.case.capture.route)
+    c.case.provider.validate_captured_graphs({c.case.capture.descriptor: c.graph})
     resolved = UpdatableGraph.resolve_tasks(c.graph, ContextSource(c.metadata))
     assert len(resolved) == 1
     actual = resolved[0]
@@ -626,18 +656,41 @@ def test_capture_contract_rejects_an_unsupported_native_consumer(typed_update_gu
     c = typed_update_guard
     setattr(c.task, field, object())
     with pytest.raises(RuntimeError, match="supported Draft FIA consumer"):
-        c.case.provider.validate_graph(c.graph, route=c.case.capture.route)
+        c.case.provider.validate_captured_graphs({c.case.capture.descriptor: c.graph})
 
 
-def test_static_graph_consumer_contract_is_not_rechecked_each_generation(typed_update_guard):
+def test_parallel_capture_checks_tasks_after_the_original_manager_stores_its_graphs(typed_update_guard, monkeypatch):
+    from contextlib import nullcontext
+
+    from vllm_ascend.worker.v2.spec_decode.dflash import aclgraph, capture
+
     c = typed_update_guard
-    c.case.provider.validate_graph(c.graph, route=c.case.capture.route)
-    assert c.case.provider._validated_graphs[c.graph] is c.case.capture.route
-    # Captured tasks belong to the immutable graph. Replays use its resolver,
-    # not a second hand-built task inventory or handle authentication pass.
-    c.case.provider.validate_graph(c.graph, route=c.case.capture.route)
-    with pytest.raises(RuntimeError, match="route changed"):
-        c.case.provider.validate_graph(c.graph, route=DraftWindowGraphRoute.EAGLE3_FIRST_PASS)
+    manager = object.__new__(aclgraph.DFlashAclGraphManager)
+    manager.speculator = SimpleNamespace(
+        input_buffers=c.case.input_buffers,
+        _draft_window_graph_binding_provider=c.case.provider,
+    )
+    manager._capture_descs = {CUDAGraphMode.FULL: [c.case.capture.descriptor]}
+    manager.graphs = {}
+    checked: list[dict[Any, Any]] = []
+    validate = c.case.provider.validate_captured_graphs
+
+    def upstream(self, *_args, **_kwargs):
+        assert not checked
+        self.graphs[c.case.capture.descriptor] = c.graph
+
+    def after_capture(graphs):
+        assert graphs[c.case.capture.descriptor] is c.graph
+        checked.append(graphs)
+        validate(graphs)
+
+    monkeypatch.setattr(aclgraph.DFlashCudaGraphManager, "capture", upstream)
+    monkeypatch.setattr(aclgraph, "communicator_switch", nullcontext)
+    monkeypatch.setattr(aclgraph, "model_capture_wrapper", lambda *_args: nullcontext())
+    monkeypatch.setattr(c.case.provider, "validate_captured_graphs", after_capture)
+    manager.capture(lambda: None, c.case.input_buffers, c.case.owner, [], object(), 16)
+    assert checked == [manager.graphs]
+    assert not hasattr(c.case.input_buffers, capture._CAPTURE_CONTEXT_ATTRIBUTE)
 
 
 def test_publication_uses_the_bank_fields_from_the_real_builder(graph_buffers):
@@ -713,7 +766,7 @@ def test_actual_proposal_scope_owns_fresh_inputs_and_quarantines_failed_update(g
     expected = pytest.raises(RuntimeError, match="native UPDATE failed") if fail else nullcontext()
     with expected, owner._draft_window_proposal_scope(batch, dummy_run=False, is_profile=False):
         context = owner._draft_window_proposal
-        assert context.input_batch is batch
+        assert context is not None and context.input_batch is batch
         context.validate(batch)
         with (
             pytest.raises(RuntimeError, match="already active"),
@@ -815,3 +868,41 @@ def test_captured_consumer_cannot_skip_the_actual_serial_ordinal(graph_buffers):
     case.provider.quarantine_generation(inputs)
     with pytest.raises(RuntimeError, match="quarantined"):
         case.provider.prepare_workspace(skipped)
+
+
+@pytest.mark.parametrize("span", [1, 4, 128])
+@pytest.mark.parametrize("boundary", [-1, 0, 1])
+def test_actual_aligned_bank_reads_only_the_plan_interval_across_block_boundaries(span, boundary):
+    window, end = 7, span + boundary
+    columns = max((end + span - 1) // span, (window + 2 * span - 2) // span)
+    table = torch.arange(columns, dtype=torch.int32).view(1, columns)
+    counts = torch.tensor([[(end + span - 1) // span]], dtype=torch.int32)
+    full = SimpleNamespace(
+        input_block_tables=[table],
+        num_blocks=SimpleNamespace(cpu=counts, gpu=counts),
+        block_sizes=[span],
+        kernel_block_sizes=[span],
+    )
+    group = DraftWindowGroupRoute(0, ("draft.layer",), span, span, DraftWindowProviderStatus.DIRECT_DENSE)
+    source = DraftWindowGraphSource(
+        resolve_draft_window_policy(requested_window_size=window, method="dflash"), group, full
+    )
+    provider = DraftWindowGraphBindingProvider(source=source)
+    descriptor = BatchExecutionDescriptor(CUDAGraphMode.FULL, num_tokens=1, num_reqs=1, uniform_token_count=1)
+    bucket = provider.register_capture_identity(route=DraftWindowGraphRoute.DFLASH, descriptor=descriptor)
+    bank = provider.prepare_workspace(bucket)
+    provider.materialize(
+        proposal=_proposal(),
+        cpu_full_exact=torch.tensor([end], dtype=torch.int32),
+        cpu_valid_num_blocks=counts[0],
+        num_reqs_padded=1,
+        step=0,
+        output_workspace=bank,
+    )
+    # Literal aligned-token interval, independent of the removed projection DTO.
+    start = max(range(0, max(end - window, 0) + 1, span))
+    expected = table[0, start // span : (end + span - 1) // span]
+    torch.testing.assert_close(bank.window_block_table[0, : expected.numel()], expected, atol=0, rtol=0)
+    assert not bank.window_block_table[0, expected.numel() :].any()
+    assert bank.cpu_window_exact.tolist() == bank.device_window_exact.tolist() == [len(range(start, end))]
+    assert table.tolist() == [list(range(columns))]

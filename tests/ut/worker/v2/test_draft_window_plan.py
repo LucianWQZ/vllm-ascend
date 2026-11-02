@@ -6,7 +6,6 @@ import pytest
 from vllm_ascend.worker.v2.spec_decode.draft_window_plan import (
     compute_draft_window_plan,
     freeze_eagle_window_plan,
-    project_draft_window_interval,
     window_capacity_tokens,
 )
 
@@ -26,7 +25,7 @@ def test_exact_window_boundaries_against_literal_token_oracle():
                     expected = list(range(max(legal_starts), end))
                     assert list(range(plan.window_start, plan.full_exact_end)) == expected
                     assert plan.window_visible_length == len(expected)
-                    assert plan.window_visible_length <= plan.window_capacity_tokens
+                    assert plan.window_visible_length <= window_capacity_tokens(window, block)
                     assert plan.full_horizon_end == horizon
 
 
@@ -67,23 +66,9 @@ def test_eagle_invalid_configuration_rejected_before_request_execution():
         plan.at_exact_end(1033)
 
 
-def test_each_group_projects_same_logical_interval_without_lcm():
-    for span in (8, 16, 32, 64):
-        projected = project_draft_window_interval(window_start=96, full_exact_end=137, block_span_tokens=span)
-        assert projected.source_start_column * span + projected.first_token_offset == 96
-        source_blocks = [list(range(start, start + span)) for start in range(0, 192, span)]
-        selected = source_blocks[projected.source_start_column : projected.source_end_column]
-        tokens = [token for block in selected for token in block]
-        assert tokens[projected.first_token_offset : projected.first_token_offset + 41] == list(range(96, 137))
-        assert projected.safe_extent_tokens >= 41
-        assert projected.safe_extent_tokens < 41 + span
-    assert (projected.source_start_column, projected.first_token_offset, projected.required_columns) == (1, 32, 2)
-
-
-def test_empty_request_does_not_invent_padding_or_read_columns():
-    projection = project_draft_window_interval(window_start=0, full_exact_end=0, block_span_tokens=128)
-    assert projection.required_columns == 0
-    assert projection.safe_extent_tokens == 0
+def test_empty_interval_keeps_its_actual_zero_visible_length():
+    plan = compute_draft_window_plan(full_exact_end=0, window_size=1024, block_span_tokens=128)
+    assert plan.window_start == plan.full_exact_end == plan.window_visible_length == 0
     assert window_capacity_tokens(1024, 128) == 1151
 
 
