@@ -11,17 +11,14 @@ output snapshot, artifact writer, or oracle participates in this path.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from contextlib import ExitStack
 from dataclasses import dataclass
 from typing import Any
 
-import torch
 from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 
 import vllm_ascend.envs as envs
 from vllm_ascend.device.hardware_profile import AttentionBackendFamily, get_current_hardware_profile
-from vllm_ascend.worker.v2.attn_utils import build_attn_metadata_factory, build_attn_metadata_wrapper
 from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftMetadataInputs,
     DraftWindowPolicyDecision,
@@ -38,8 +35,6 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
     DraftWindowGraphCaptureIdentity,
     DraftWindowGraphReadCarrier,
     DraftWindowGraphRoute,
-    DraftWindowGraphWriteSideReference,
-    _tensor_identity,
     resolve_parallel_draft_window_graph_route,
 )
 
@@ -199,7 +194,6 @@ def prepare_parallel_graph(
     target_metadata = owner.model_state.attn_metadata
     if not isinstance(target_metadata, Mapping) or not target_metadata:
         raise RuntimeError("Draft Window Graph requires real non-empty Target metadata")
-    write_side = _build_write_side_reference(owner, capture_identity, target_metadata)
 
     from vllm_ascend.worker.v2.spec_decode.draft_window_graph_metadata import (
         validate_deferred_parallel_graph_metadata,
@@ -216,49 +210,11 @@ def prepare_parallel_graph(
             owner,
             workspace=workspace,
             actual_request_count=len(inputs.identity.proposal.ordered_request_ids),
-            write_side=write_side,
             capture_identity=capture_identity,
         ),
         target_metadata=target_metadata,
-        write_side_reference=write_side,
     )
     return carrier
-
-
-def _bind_parallel_graph_device_lengths(
-    metadata: Any,
-    workspace: DraftWindowWorkspace,
-    query_width: int,
-) -> None:
-    """Bind the private FULL consumer after checking the fresh builder owners.
-
-    The a982 builder uses CPU exact lengths while assembling its metadata and
-    separately carries the device view as seq_lens_gpu. FULL FIA consumes
-    seq_lens, so that field must use the persistent Graph device bank. This
-    adapter runs only after Target isolation; no copy, sync, or projection is
-    added and the eager/baseline builder selection is left unchanged.
-    """
-    expected = (
-        ("block_tables", workspace.window_block_table),
-        ("seq_lens", workspace.cpu_window_exact),
-        ("seq_lens_cpu", workspace.cpu_window_exact),
-        ("seq_lens_gpu", workspace.device_window_exact),
-    )
-    for name, source in expected:
-        actual = getattr(metadata, name, None)
-        actual_identity = _tensor_identity(actual) if isinstance(actual, torch.Tensor) else None
-        expected_identity = _tensor_identity(source)
-        if actual_identity != expected_identity:
-            raise RuntimeError(
-                f"private Graph builder lost its current {name} owner: "
-                f"actual={actual_identity}, expected={expected_identity}"
-            )
-    query_lengths = [(i + 1) * query_width for i in range(workspace.max_num_reqs)]
-    if metadata.actual_seq_lengths_q != query_lengths:
-        raise RuntimeError("private Graph builder changed its captured padded query layout")
-    if metadata.seq_lens_list != workspace.cpu_window_exact.tolist():
-        raise RuntimeError("private Graph builder changed its current exact length values")
-    metadata.seq_lens = workspace.device_window_exact
 
 
 def _build_private_graph_metadata(
@@ -266,86 +222,28 @@ def _build_private_graph_metadata(
     *,
     workspace: DraftWindowWorkspace,
     actual_request_count: int,
-    write_side: DraftWindowGraphWriteSideReference,
     capture_identity: DraftWindowGraphCaptureIdentity,
 ) -> Mapping[str, Any]:
-    typed_read_inputs = draft_window_read_inputs(
+    read_inputs = draft_window_read_inputs(
         workspace,
         actual_request_count=actual_request_count,
         padded_request_count=workspace.max_num_reqs,
         block_tables=owner.block_tables.input_block_tables,
         global_group_id=owner._draft_window_graph_binding_provider.source.group.gid,
     )
-    with ExitStack() as stack:
-        stack.enter_context(build_attn_metadata_wrapper())
-        if capture_identity.route is DraftWindowGraphRoute.DSPARK:
-            stack.enter_context(
-                build_attn_metadata_factory(
-                    owner.input_buffers.positions,
-                    capture_identity.descriptor.num_tokens,
-                    torch.from_numpy(owner.input_batch.is_prefilling_np),
-                )
-            )
-        metadata = build_draft_window_attn_metadata(
-            owner,
-            # FULL attention consumes the captured padded Q, including PAD
-            # slots. Keep that uniform layout in the builder itself, avoiding
-            # a second synthetic request. Generation identity stays active-only.
-            num_reqs=workspace.max_num_reqs,
-            num_reqs_padded=workspace.max_num_reqs,
-            num_tokens_padded=capture_identity.descriptor.num_tokens,
-            read_inputs=typed_read_inputs,
-            causal=write_side.causal,
-            query_start_loc_np=None,
-            dcp_local_seq_lens=None,
-        )
-
-    from vllm_ascend.worker.v2.spec_decode.draft_window_graph_metadata import copy_draft_attention_metadata
-
-    metadata = copy_draft_attention_metadata(metadata)
-    window_layers = owner._draft_window_graph_binding_provider.source.group.layers
-    bound_metadata_ids: set[int] = set()
-    for layer_name in window_layers:
-        layer_metadata = metadata.get(layer_name)
-        if layer_metadata is not None and id(layer_metadata) not in bound_metadata_ids:
-            _bind_parallel_graph_device_lengths(
-                layer_metadata,
-                workspace,
-                (capture_identity.descriptor.num_tokens // capture_identity.descriptor.num_reqs),
-            )
-            bound_metadata_ids.add(id(layer_metadata))
-    for layer_metadata in metadata.values():
-        if layer_metadata is None:
-            continue
-        layer_metadata.slot_mapping = write_side.slot_mapping
-        layer_metadata.query_start_loc = write_side.query_start_loc
-        layer_metadata.actual_seq_lengths_q = list(write_side.actual_seq_lengths_q)
-        layer_metadata.attn_state = write_side.attn_state
-        layer_metadata.num_actual_tokens = write_side.num_actual_tokens
-        layer_metadata.causal = write_side.causal
-    return metadata
-
-
-def _build_write_side_reference(
-    owner: Any,
-    capture_identity: DraftWindowGraphCaptureIdentity,
-    target_metadata: Mapping[Any, Any],
-) -> DraftWindowGraphWriteSideReference:
-    gid = owner._draft_window_graph_binding_provider.source.group.gid
-    token_count = capture_identity.descriptor.num_tokens
-    request_count = capture_identity.descriptor.num_reqs
-    query_width = capture_identity.descriptor.num_tokens // capture_identity.descriptor.num_reqs
-    target_layer = next((value for value in target_metadata.values() if value is not None), None)
-    if target_layer is None:
-        raise RuntimeError("Draft Window Graph Target metadata contains no layer state")
-    causal = owner._group_causal
-    if isinstance(causal, Mapping):
-        causal = causal[gid]
-    return DraftWindowGraphWriteSideReference(
-        slot_mapping=owner.block_tables.slot_mappings[gid, :token_count],
-        query_start_loc=owner.input_buffers.query_start_loc[: request_count + 1],
-        actual_seq_lengths_q=tuple((row + 1) * query_width for row in range(request_count)),
-        attn_state=getattr(target_layer, "attn_state", None),
-        num_actual_tokens=token_count,
-        causal=bool(causal),
+    metadata = build_draft_window_attn_metadata(
+        owner,
+        # FULL FIA includes the real capture padding in its uniform Q layout.
+        num_reqs=workspace.max_num_reqs,
+        num_reqs_padded=workspace.max_num_reqs,
+        num_tokens_padded=capture_identity.descriptor.num_tokens,
+        read_inputs=read_inputs,
+        causal=owner._group_causal,
+        query_start_loc_np=None,
+        dcp_local_seq_lens=None,
     )
+    for layer_name in owner._draft_window_graph_binding_provider.source.group.layers:
+        # The normal builder uses CPU exact while preparing tiling. FULL FIA
+        # capture/update additionally reads the persistent device length bank.
+        metadata[layer_name].seq_lens = workspace.device_window_exact
+    return metadata

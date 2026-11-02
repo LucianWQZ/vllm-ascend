@@ -371,7 +371,8 @@ class AutoRegressiveAclGraphManager(SpeculatorCudaGraphManager):
                 bank = session.provider.prepare_workspace(
                     session.resolve(first=True, n=desc.num_reqs, tokens=desc.num_tokens, ordinal=0)
                 )
-                inputs = owner._materialize_eagle3_first_pass(
+                inputs = owner._materialize_eagle3_step(
+                    step=0,
                     num_reqs=owner.input_batch.num_reqs,
                     num_reqs_padded=desc.num_reqs,
                     output_workspace=bank,
@@ -387,16 +388,10 @@ class AutoRegressiveAclGraphManager(SpeculatorCudaGraphManager):
                 if self.is_draft_model_prefill
                 else DraftWindowGraphRoute.EAGLE3_AR_STEP
             )
-            session.provider.assert_metadata_batch(
-                route=route,
-                draft_attn_metadatas=metadata_batch,
-                num_reqs=desc.num_reqs,
-                num_tokens=desc.num_tokens,
-                graph_mode=desc.cg_mode.name,
-            )
             graph = self.graphs[desc]
             if not isinstance(graph, UpdatableGraph):
                 raise RuntimeError("Eagle3 Window requires the inventoried typed FIA Graph")
+            session.provider.validate_graph(graph, route=route)
             expected = 1 if self.is_draft_model_prefill else owner.num_speculative_steps - 1
             if len(metadata_batch) != expected:
                 raise RuntimeError("Eagle3 Graph omitted a real first-pass/AR consumer")
@@ -416,11 +411,8 @@ class AutoRegressiveAclGraphManager(SpeculatorCudaGraphManager):
             resolved = graph.resolve_tasks(SharedSource(params))
             self.update_stream.wait_stream(torch.npu.current_stream())
             ret = super().run_fullgraph(desc)
-            # Keep typed backend validation and optional UPDATE observations in
-            # the same configuration that owns this captured graph manager.
-            with set_current_vllm_config(self.vllm_config):
-                session.provider.validate_update(graph, resolved, route=route)
-                graph.update(self.update_stream, resolved)
+            graph.update(self.update_stream, resolved)
+            session.provider.finish_update(route=route)
             return ret
         except BaseException:
             owner._quarantine_eagle3_window()

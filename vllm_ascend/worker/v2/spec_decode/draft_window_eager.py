@@ -15,7 +15,6 @@ from typing import Any
 
 import numpy as np
 import torch
-import vllm.v1.worker.gpu.spec_decode.speculator as upstream_speculator_module
 from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu.input_batch import InputBatch
 
@@ -25,7 +24,6 @@ from vllm_ascend.worker.v2.spec_decode.draft_window import (
     gather_valid_num_blocks_cpu,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphBindingProvider
-from vllm_ascend.worker.v2.spec_decode.draft_window_graph_metadata import copy_draft_attention_metadata
 from vllm_ascend.worker.v2.spec_decode.draft_window_nongraph import (
     DraftWindowBatchPhasePlan,
     build_phase_aware_materialization_plan,
@@ -209,6 +207,7 @@ def build_draft_window_attn_metadata(
     query_start_loc_np: np.ndarray | None,
     dcp_local_seq_lens: torch.Tensor | None,
     attn_groups: Any = None,
+    attn_state: Any = None,
 ) -> dict[str, Any]:
     """Assemble canonical query/write fields with one explicit Window read view.
 
@@ -244,7 +243,13 @@ def build_draft_window_attn_metadata(
             owner.block_tables.cp_rank,
             owner.block_tables.cp_interleave,
         )
-    return upstream_speculator_module.build_attn_metadata(
+    # Use the fixed Ascend builder directly. Window assembly does not need to
+    # replace the upstream module function or inherit an enclosing factory.
+    from vllm_ascend.worker.v2.attn_utils import build_attn_metadata
+
+    if attn_state is None:
+        attn_state = next(layer.attn_state for layer in owner.model_state.attn_metadata.values() if layer is not None)
+    metadata = build_attn_metadata(
         draft_window_read_inputs=read_inputs,
         attn_groups=owner.attn_groups if attn_groups is None else attn_groups,
         num_reqs=num_reqs_padded,
@@ -261,7 +266,17 @@ def build_draft_window_attn_metadata(
         kv_cache_config=owner.kv_cache_config,
         causal=causal,
         seq_lens_cpu_upper_bound=read_inputs.seq_lens_cpu_upper_bound,
+        positions=owner.input_buffers.positions[:num_tokens_padded],
+        is_prefilling=torch.from_numpy(owner.input_batch.is_prefilling_np),
+        parallel_config=owner.vllm_config.parallel_config,
+        attn_state=attn_state,
     )
+    # The generic builder also makes a temporary GPU query-layout copy.
+    # Capture/replay owns the original persistent input-buffer address.
+    for layer in metadata.values():
+        if layer is not None:
+            layer.query_start_loc = owner.input_buffers.query_start_loc[: num_reqs_padded + 1]
+    return metadata
 
 
 class DraftWindowGraphInputMixin:
@@ -583,7 +598,6 @@ class DraftWindowGraphInputMixin:
             raise RuntimeError("eligible P4a route produced no Draft metadata")
         if self.model_state.attn_metadata is not target_metadata:
             raise RuntimeError("Target metadata owner changed during Draft metadata build")
-        metadata = copy_draft_attention_metadata(metadata)
         inputs.publish(metadata, target_metadata=target_metadata)
         return metadata
 

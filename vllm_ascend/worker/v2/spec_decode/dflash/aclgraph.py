@@ -2,7 +2,7 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 import torch
-from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import get_forward_context, set_forward_context
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -158,17 +158,6 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
             desc.num_reqs,
             self.speculator.input_batch.seq_lens_cpu_upper_bound,
         )
-        if graph_route is not None:
-            graph_mode_name = getattr(desc.cg_mode, "name", None)
-            if not isinstance(graph_mode_name, str):
-                raise RuntimeError("Draft Window Graph requires an explicit replay mode")
-            self.speculator._draft_window_graph_binding_provider.assert_metadata_batch(
-                route=graph_route,
-                draft_attn_metadatas=draft_attn_metadatas,
-                num_reqs=desc.num_reqs,
-                num_tokens=num_tokens,
-                graph_mode=graph_mode_name,
-            )
         if use_updatable_graph(attn_backend):
             return self._updatable_graph_replay(desc, draft_attn_metadatas)
         else:
@@ -214,17 +203,14 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
 
         dp_dummy = is_parallel_graph_dp_dummy(self.speculator)
         graph_route = None if dp_dummy else resolve_parallel_draft_window_graph_route(self.speculator)
+        if graph_route is not None:
+            self.speculator._draft_window_graph_binding_provider.validate_graph(graph, route=graph_route)
         self.update_stream.wait_stream(torch.npu.current_stream())
         ret = super().run_fullgraph(desc)
         if graph_route is None:
             # Exact existing OFF updatable call; no Window-only construction.
             graph.update(self.update_stream, resolved_tasks)
         else:
-            # Backend dispatch resolves CP classes from the captured manager's
-            # configuration, also when this path is entered outside a model forward.
-            with set_current_vllm_config(self.vllm_config):
-                self.speculator._draft_window_graph_binding_provider.validate_update(
-                    graph, resolved_tasks, route=graph_route
-                )
-                graph.update(self.update_stream, resolved_tasks)
+            graph.update(self.update_stream, resolved_tasks)
+            self.speculator._draft_window_graph_binding_provider.finish_update(route=graph_route)
         return ret

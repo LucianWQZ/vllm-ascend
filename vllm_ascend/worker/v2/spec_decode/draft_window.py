@@ -506,22 +506,18 @@ class DraftWindowWorkspace:
         max_num_reqs: int,
         table_capacity_columns: int,
         table_template: torch.Tensor,
-        valid_count_template: torch.Tensor,
     ) -> None:
         if max_num_reqs <= 0:
             raise ValueError("workspace request capacity must be greater than 0")
         if table_capacity_columns <= 0:
             raise ValueError("workspace table capacity must be greater than 0")
-        if table_template.ndim != 2 or valid_count_template.ndim != 1:
-            raise ValueError("Draft workspace templates require a table and one-dimensional valid counts")
-        if table_template.dtype != torch.int32 or valid_count_template.dtype != torch.int32:
-            raise TypeError("Draft workspace tables and valid counts must use int32")
-        if table_template.device != valid_count_template.device:
-            raise ValueError("Draft workspace table and valid-count templates must share a device")
+        if table_template.ndim != 2:
+            raise ValueError("Draft workspace requires a two-dimensional source table")
+        if table_template.dtype != torch.int32:
+            raise TypeError("Draft workspace tables must use int32")
         self.max_num_reqs = max_num_reqs
         self.table_capacity_columns = table_capacity_columns
         self.window_block_table = table_template.new_zeros((max_num_reqs, table_capacity_columns))
-        self.valid_num_blocks = valid_count_template.new_zeros(max_num_reqs)
         self.device_window_exact = torch.zeros(
             max_num_reqs,
             dtype=torch.int32,
@@ -530,7 +526,6 @@ class DraftWindowWorkspace:
         self.cpu_window_exact = torch.zeros(max_num_reqs, dtype=torch.int32)
         self.cpu_window_upper = torch.zeros(max_num_reqs, dtype=torch.int32)
         self._bound_identity: DraftWindowGenerationIdentity | None = None
-        self._active_table_columns: tuple[int, ...] = ()
         self._needs_clear = False
 
     @property
@@ -575,7 +570,6 @@ class DraftWindowWorkspace:
         )
         workspace_tensors = (
             self.window_block_table,
-            self.valid_num_blocks,
             self.device_window_exact,
             self.cpu_window_exact,
             self.cpu_window_upper,
@@ -610,9 +604,6 @@ class DraftWindowWorkspace:
         try:
             if self._needs_clear:
                 self._zero_all()
-            if actual:
-                self.valid_num_blocks[:actual].copy_(cpu_valid_num_blocks[:actual])
-            active_columns: list[int] = []
             for row, descriptor in enumerate(identity.read_descriptors):
                 if descriptor.global_group_id != global_group_id:
                     raise ValueError("read descriptor global gid does not match the runtime source")
@@ -656,12 +647,10 @@ class DraftWindowWorkspace:
                             descriptor.source_start_column : descriptor.source_end_column,
                         ]
                     )
-                active_columns.append(required)
             if actual:
                 self.device_window_exact[:actual].copy_(cpu_window_exact[:actual])
                 self.cpu_window_exact[:actual].copy_(cpu_window_exact[:actual])
                 self.cpu_window_upper[:actual].copy_(cpu_window_upper[:actual])
-            self._active_table_columns = tuple(active_columns)
             self._bound_identity = identity
         except BaseException:
             if not preserve_on_failure:
@@ -679,16 +668,13 @@ class DraftWindowWorkspace:
             self._zero_all()
         else:
             self._bound_identity = None
-            self._active_table_columns = ()
             self._needs_clear = True
 
     def _zero_all(self) -> None:
         self.window_block_table.zero_()
-        self.valid_num_blocks.zero_()
         self.device_window_exact.zero_()
         self.cpu_window_exact.zero_()
         self.cpu_window_upper.zero_()
-        self._active_table_columns = ()
         self._bound_identity = None
         self._needs_clear = False
 

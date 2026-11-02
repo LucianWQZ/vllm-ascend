@@ -11,6 +11,7 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import Mock
 
 import pytest
@@ -107,7 +108,7 @@ def source_contract():
 
     parallel = SimpleNamespace(tensor_parallel_size=16)
     capability = SimpleNamespace(parallel_config=parallel, tensor_parallel_rank=7)
-    owner = object.__new__(DraftWindowGraphBindingProvider)
+    owner: Any = object.__new__(DraftWindowGraphBindingProvider)
     owner._source = capability
     owner._tp_identity = (16, 7)
     return owner, DraftWindowGraphBindingProvider
@@ -222,175 +223,67 @@ def test_existing_projection_owner_is_not_overwritten(bridge):
         bridge.read.certify_common_metadata(0, bridge.common)
 
 
-@pytest.fixture
-def graph_device_binding():
-    from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphBindingProvider
-    from vllm_ascend.worker.v2.spec_decode.draft_window_graph_runtime import _bind_parallel_graph_device_lengths
-
-    def make(actual, padded):
-        assert (actual, padded) in ((1, 2), (3, 4))
-        values = [17 + i * 1024 for i in range(actual)] + [0] * (padded - actual)
-        table = torch.arange(padded * 2, dtype=torch.int32).reshape(padded, 2)
-        exact = torch.tensor(values, dtype=torch.int32)
-        device = exact.clone()
-        read = SimpleNamespace(
-            max_num_reqs=padded,
-            window_block_table=table,
-            cpu_window_exact=exact,
-            device_window_exact=device,
-        )
-        slots, positions = object(), object()
-        metadata = SimpleNamespace(
-            block_tables=table,
-            seq_lens=exact,
-            seq_lens_cpu=exact,
-            seq_lens_gpu=device,
-            seq_lens_list=exact.tolist(),
-            actual_seq_lengths_q=[(i + 1) * 8 for i in range(padded)],
-            slot_mapping=slots,
-            positions=positions,
-        )
-        return read, metadata
-
-    return SimpleNamespace(
-        make=make,
-        bind=_bind_parallel_graph_device_lengths,
-        guard=DraftWindowGraphBindingProvider._validate_metadata_uses_read_carrier,
-    )
-
-
 @pytest.mark.parametrize("actual,padded", [(1, 2), (3, 4)])
-def test_private_full_binds_device_after_old_cpu_operand_is_rejected(
-    graph_device_binding,
-    actual,
-    padded,
-):
-    read, metadata = graph_device_binding.make(actual, padded)
-    slots, positions = metadata.slot_mapping, metadata.positions
-    with pytest.raises(RuntimeError, match="carrier device lengths"):
-        graph_device_binding.guard({"draft.layer": metadata}, read)
-    graph_device_binding.bind(metadata, read, 8)
-    # Use the actual unchanged provider guard, not a successful helper self-report.
-    graph_device_binding.guard({"draft.layer": metadata}, read)
-    assert metadata.seq_lens is read.device_window_exact
-    assert metadata.seq_lens_gpu is read.device_window_exact
-    assert metadata.seq_lens_cpu is read.cpu_window_exact
-    assert metadata.seq_lens_list == read.cpu_window_exact.tolist()
-    assert metadata.slot_mapping is slots and metadata.positions is positions
-    assert read.max_num_reqs == padded
+def test_private_full_uses_one_fresh_builder_and_only_binds_its_device_lengths(monkeypatch, actual, padded):
+    from vllm_ascend.worker.v2.spec_decode import draft_window_graph_runtime as runtime
+    from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphRoute
 
-
-@pytest.mark.parametrize("field", ["seq_lens", "seq_lens_cpu", "seq_lens_gpu", "block_tables"])
-def test_private_full_rejects_same_values_with_wrong_builder_owner(graph_device_binding, field):
-    read, metadata = graph_device_binding.make(3, 4)
-    original = getattr(metadata, field)
-    setattr(metadata, field, original.clone())
-    with pytest.raises(RuntimeError, match="lost its current " + field + " owner"):
-        graph_device_binding.bind(metadata, read, 8)
-    assert metadata.seq_lens is not read.device_window_exact
-
-
-@pytest.mark.parametrize("query", [[8, 16, 24, 24, 32], [8, 16, 24, 31]])
-def test_private_full_rejects_clamped_or_wrong_padded_query_layout(graph_device_binding, query):
-    read, metadata = graph_device_binding.make(3, 4)
-    metadata.actual_seq_lengths_q = query
-    with pytest.raises(RuntimeError, match="captured padded query layout"):
-        graph_device_binding.bind(metadata, read, 8)
-
-
-def test_private_full_rejects_stale_exact_list_despite_correct_header_owners(graph_device_binding):
-    read, metadata = graph_device_binding.make(3, 4)
-    metadata.seq_lens_list = [17, 1041, 2065, 1]
-    with pytest.raises(RuntimeError, match="current exact length values"):
-        graph_device_binding.bind(metadata, read, 8)
-
-
-def test_private_full_uses_padded_builder_then_isolates_before_binding():
-    runtime = ast.parse(SOURCE.with_name("draft_window_graph_runtime.py").read_text())
-    private = next(
-        n for n in runtime.body if isinstance(n, ast.FunctionDef) and n.name == "_build_private_graph_metadata"
+    exact = torch.tensor([17 + i * 1024 for i in range(actual)] + [0] * (padded - actual), dtype=torch.int32)
+    read: Any = SimpleNamespace(
+        max_num_reqs=padded,
+        window_block_table=torch.arange(padded * 2, dtype=torch.int32).reshape(padded, 2),
+        cpu_window_exact=exact,
+        cpu_window_upper=exact.clone(),
+        device_window_exact=exact.clone(),
     )
-    calls = [
-        n
-        for n in ast.walk(private)
-        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "build_draft_window_attn_metadata"
-    ]
-    assert len(calls) == 1
-    passed = {kw.arg: ast.unparse(kw.value) for kw in calls[0].keywords}
-    assert passed["num_reqs"] == passed["num_reqs_padded"] == "workspace.max_num_reqs"
-    private_statements = [ast.unparse(n) for n in private.body]
-    isolation = next(
-        i for i, text in enumerate(private_statements) if "copy_draft_attention_metadata(metadata)" in text
+    group = SimpleNamespace(gid=0, layers=("draft.layer.a", "draft.layer.b"))
+    owner = SimpleNamespace(
+        _draft_window_graph_binding_provider=SimpleNamespace(source=SimpleNamespace(group=group)),
+        block_tables=SimpleNamespace(input_block_tables=[torch.full_like(read.window_block_table, 99)]),
+        _group_causal=False,
     )
-    binding = next(i for i, text in enumerate(private_statements) if "_bind_parallel_graph_device_lengths(" in text)
-    assert isolation < binding
-
-
-def _run_actual_private_binding_loop(graph_device_binding, read, metadata_by_layer):
-    """Execute only the actual caller loop, using the existing strict binder."""
-    source = SOURCE.with_name("draft_window_graph_runtime.py")
-    tree = ast.parse(source.read_text())
-    private = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_build_private_graph_metadata")
-    loop = next(
-        n for n in private.body if isinstance(n, ast.For) and "_bind_parallel_graph_device_lengths(" in ast.unparse(n)
+    slots, query, state = object(), object(), object()
+    fresh = SimpleNamespace(
+        block_tables=read.window_block_table,
+        seq_lens=read.cpu_window_exact,
+        seq_lens_cpu=read.cpu_window_exact,
+        seq_lens_gpu=read.device_window_exact,
+        seq_lens_list=read.cpu_window_exact.tolist(),
+        actual_seq_lengths_q=[(i + 1) * 8 for i in range(padded)],
+        slot_mapping=slots,
+        query_start_loc=query,
+        attn_state=state,
+        num_actual_tokens=padded * 8,
+        causal=False,
     )
-    initializers = [
-        n
-        for n in private.body
-        if isinstance(n, (ast.Assign, ast.AnnAssign))
-        and any(
-            isinstance(t, ast.Name) and t.id == "bound_metadata_ids"
-            for t in (n.targets if isinstance(n, ast.Assign) else [n.target])
-        )
-    ]
     calls = []
 
-    def strict_bind(metadata, current_read, query_width):
-        calls.append(metadata)
-        return graph_device_binding.bind(metadata, current_read, query_width)
+    def build(actual_owner, **kwargs):
+        assert actual_owner is owner
+        calls.append(kwargs)
+        return {name: fresh for name in group.layers}
 
-    namespace = dict(
-        window_layers=tuple(metadata_by_layer),
-        metadata=metadata_by_layer,
+    monkeypatch.setattr(runtime, "build_draft_window_attn_metadata", build)
+    capture: Any = SimpleNamespace(
+        route=DraftWindowGraphRoute.DFLASH,
+        descriptor=SimpleNamespace(num_reqs=padded, num_tokens=padded * 8),
+    )
+    result = runtime._build_private_graph_metadata(
+        owner,
         workspace=read,
-        capture_identity=SimpleNamespace(
-            descriptor=SimpleNamespace(num_tokens=read.max_num_reqs * 8, num_reqs=read.max_num_reqs)
-        ),
-        _bind_parallel_graph_device_lengths=strict_bind,
+        actual_request_count=actual,
+        capture_identity=capture,
     )
-    exec(
-        compile(
-            ast.fix_missing_locations(ast.Module(body=[*initializers, loop], type_ignores=[])), str(source), "exec"
-        ),
-        namespace,
-    )
-    return calls
-
-
-def test_private_full_shared_group_metadata_binds_once(graph_device_binding):
-    read, metadata = graph_device_binding.make(3, 4)
-    slots, positions = metadata.slot_mapping, metadata.positions
-    # Ascend's real group builder maps one metadata object to every layer;
-    # Target isolation memoization preserves that legitimate shared object.
-    by_layer = {f"draft.layer.{i}": metadata for i in range(5)}
-    calls = _run_actual_private_binding_loop(graph_device_binding, read, by_layer)
-    assert calls == [metadata]
-    graph_device_binding.guard(by_layer, read)
-    assert metadata.seq_lens is read.device_window_exact
-    assert metadata.seq_lens_cpu is read.cpu_window_exact
-    assert metadata.slot_mapping is slots and metadata.positions is positions
-
-
-def test_private_full_distinct_bad_owner_after_shared_group_is_rejected(graph_device_binding):
-    read, metadata = graph_device_binding.make(3, 4)
-    bad = SimpleNamespace(**vars(metadata))
-    bad.seq_lens = read.cpu_window_exact.clone()
-    by_layer = {f"draft.layer.{i}": metadata for i in range(5)}
-    by_layer["other.distinct.layer"] = bad
-    with pytest.raises(RuntimeError, match="lost its current seq_lens owner"):
-        _run_actual_private_binding_loop(graph_device_binding, read, by_layer)
-    assert metadata.seq_lens is read.device_window_exact
-    assert bad.seq_lens is not read.device_window_exact
+    assert len(calls) == 1
+    assert calls[0]["num_reqs"] == calls[0]["num_reqs_padded"] == padded
+    assert calls[0]["num_tokens_padded"] == padded * 8
+    assert result["draft.layer.a"] is result["draft.layer.b"] is fresh
+    assert fresh.seq_lens is read.device_window_exact
+    assert fresh.seq_lens_cpu is read.cpu_window_exact
+    assert fresh.slot_mapping is slots and fresh.query_start_loc is query
+    assert fresh.attn_state is state and fresh.num_actual_tokens == padded * 8 and fresh.causal is False
+    assert fresh.actual_seq_lengths_q == [(i + 1) * 8 for i in range(padded)]
+    runtime.DraftWindowGraphBindingProvider._validate_metadata_uses_read_carrier(result, read)
 
 
 @pytest.mark.parametrize(
@@ -400,104 +293,18 @@ def test_private_full_distinct_bad_owner_after_shared_group_is_rejected(graph_de
         ("target_dependent_ar/aclgraph.py", "_run_eagle_window_fullgraph"),
     ],
 )
-@pytest.mark.parametrize("failure", [None, "validation", "update"])
-def test_typed_update_uses_manager_config_and_restores_context(relative, method_name, failure):
-    """Strict Window validation and original UPDATE share the actual owner config."""
-    from contextlib import contextmanager
-    from contextvars import ContextVar
-
-    source = SOURCE.parent / relative
-    tree = ast.parse(source.read_text())
+def test_static_capture_check_precedes_replay_and_successful_update_marks_banks(relative, method_name):
+    tree = ast.parse((SOURCE.parent / relative).read_text())
     method = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == method_name)
-    statements = [
-        n
-        for n in ast.walk(method)
-        if isinstance(n, ast.With)
-        and any(ast.unparse(item.context_expr) == "set_current_vllm_config(self.vllm_config)" for item in n.items)
-    ]
-    assert len(statements) == 1
-    statement = statements[0]
-    assert len(statement.body) == 2
-    validation, update_call = statement.body
-    assert isinstance(validation, ast.Expr) and isinstance(validation.value, ast.Call)
-    assert isinstance(update_call, ast.Expr) and isinstance(update_call.value, ast.Call)
-    assert isinstance(validation.value.func, ast.Attribute) and validation.value.func.attr == "validate_update"
-    assert ast.unparse(update_call.value.func) == "graph.update"
-    assert len(update_call.value.args) == 2 and not update_call.value.keywords
-    current: ContextVar[object | None] = ContextVar("current_vllm_config", default=None)
-    manager_config, ambient_config = object(), object()
-    context_entries: list[object] = []
-    observations: list[str] = []
-    backend, route = object(), object()
-    resolved = object()
-
-    @contextmanager
-    def set_current_vllm_config(config):
-        context_entries.append(config)
-        token = current.set(config)
-        try:
-            yield
-        finally:
-            current.reset(token)
-
-    def validate(graph_owner, tasks, *, route):
-        assert current.get() is manager_config, "Current vLLM config is not set"
-        assert graph_owner is graph and tasks is resolved
-        assert route is namespace["route"]
-        observations.append("validated")
-        if failure == "validation":
-            raise RuntimeError("original validation failure")
-
-    def update(stream, tasks):
-        assert current.get() is manager_config
-        assert stream is self.update_stream and tasks is resolved
-        assert observations == ["validated"]
-        observations.append("updated")
-        if failure == "update":
-            raise RuntimeError("original UPDATE failure")
-
-    self = SimpleNamespace(
-        vllm_config=manager_config,
-        update_stream=object(),
-        speculator=SimpleNamespace(
-            attn_backends={"draft": backend},
-            _draft_window_graph_binding_provider=SimpleNamespace(validate_update=validate),
-        ),
+    calls = [node for node in ast.walk(method) if isinstance(node, ast.Call)]
+    validate = next(
+        node for node in calls if isinstance(node.func, ast.Attribute) and node.func.attr == "validate_graph"
     )
-    graph = SimpleNamespace(update=update)
-    namespace = dict(
-        self=self,
-        graph=graph,
-        desc=SimpleNamespace(num_tokens=16),
-        resolved=resolved,
-        resolved_tasks=resolved,
-        route=route,
-        graph_route=route,
-        session=SimpleNamespace(provider=SimpleNamespace(validate_update=validate)),
-        owner=SimpleNamespace(attn_backend=backend),
-        set_current_vllm_config=set_current_vllm_config,
-    )
-
-    def execute(nodes):
-        module = ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[]))
-        exec(compile(module, str(source), "exec"), namespace)
-
-    with pytest.raises(AssertionError, match="Current vLLM config is not set"):
-        execute([validation])
-    assert observations == [] and context_entries == []
-    token = current.set(ambient_config)
-    try:
-        if failure:
-            with pytest.raises(RuntimeError, match="original"):
-                execute([statement])
-        else:
-            execute([statement])
-        assert current.get() is ambient_config
-    finally:
-        current.reset(token)
-    assert current.get() is None
-    assert context_entries == [manager_config]
-    assert observations == (["validated"] if failure == "validation" else ["validated", "updated"])
+    replay = next(node for node in calls if isinstance(node.func, ast.Attribute) and node.func.attr == "run_fullgraph")
+    update = next(node for node in calls if isinstance(node.func, ast.Attribute) and node.func.attr == "update")
+    finish = next(node for node in calls if isinstance(node.func, ast.Attribute) and node.func.attr == "finish_update")
+    assert validate.lineno < replay.lineno < update.lineno < finish.lineno
+    assert all(not (isinstance(node.func, ast.Attribute) and node.func.attr == "validate_update") for node in calls)
 
 
 def test_window_off_update_keeps_the_original_two_argument_call():
@@ -543,7 +350,7 @@ def full_metadata_dispatch():
     identity = SimpleNamespace(proposal=proposal, padded_request_count=2)
     inputs = SimpleNamespace(identity=identity, metadata=None)
     inputs.validate_for = lambda expected: None if expected is identity else (_ for _ in ()).throw(ValueError("stale"))
-    provider = object.__new__(DraftWindowGraphBindingProvider)
+    provider: Any = object.__new__(DraftWindowGraphBindingProvider)
     provider._active_inputs = inputs
     provider._source = SimpleNamespace(policy=SimpleNamespace(normalized_method="dflash"))
     owner = SimpleNamespace(
@@ -618,46 +425,3 @@ def test_full_metadata_dispatch_does_not_replace_published_metadata(full_metadat
     c.inputs.metadata = object()
     with pytest.raises(RuntimeError, match="existing publication"):
         c.defer_parallel_graph_metadata(c.owner, c.inputs, padded_requests=2, padded_tokens=16)
-
-
-@pytest.fixture
-def full_metadata_finalization():
-    """Finalize one private mapping without inventing a second reader group."""
-    source = SOURCE.with_name("draft_window_graph_runtime.py")
-    tree = ast.parse(source.read_text())
-    function = next(
-        n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_build_private_graph_metadata"
-    )
-    loop = next(n for n in function.body if isinstance(n, ast.For) and ast.unparse(n.iter) == "metadata.values()")
-    writes = SimpleNamespace(
-        slot_mapping=object(),
-        query_start_loc=object(),
-        actual_seq_lengths_q=(8,),
-        attn_state=object(),
-        num_actual_tokens=8,
-        causal=False,
-    )
-
-    def finalize(metadata):
-        exec(
-            compile(ast.fix_missing_locations(ast.Module(body=[loop], type_ignores=[])), str(source), "exec"),
-            {"metadata": metadata, "write_side": writes},
-        )
-        return metadata
-
-    return SimpleNamespace(finalize=finalize, writes=writes)
-
-
-def test_full_graph_final_metadata_preserves_group_aliases_and_canonical_write_state(full_metadata_finalization):
-    case = full_metadata_finalization
-    from vllm_ascend.attention.attention_v1 import AscendAttentionState, AscendMetadata
-
-    layer = AscendMetadata(attn_state=AscendAttentionState.ChunkedPrefill)
-    metadata = {"draft.a": layer, "draft.b": layer, "unused": None}
-    result = case.finalize(metadata)
-    assert result is metadata and result["draft.a"] is result["draft.b"] is layer
-    assert layer.causal is False and layer.slot_mapping is case.writes.slot_mapping
-    assert not hasattr(layer, "positions")
-    assert layer.query_start_loc is case.writes.query_start_loc
-    assert layer.actual_seq_lengths_q == [8] and layer.num_actual_tokens == 8
-    assert layer.attn_state is case.writes.attn_state and result["unused"] is None

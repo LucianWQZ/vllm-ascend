@@ -51,10 +51,24 @@ def assembly(monkeypatch):
             slot_mappings=torch.arange(32).reshape(1, 32),
             cp_size=1,
         ),
-        input_buffers=SimpleNamespace(query_start_loc=torch.arange(5, dtype=torch.int32)),
+        input_buffers=SimpleNamespace(
+            query_start_loc=torch.arange(5, dtype=torch.int32),
+            positions=torch.arange(32, dtype=torch.int64),
+        ),
+        input_batch=SimpleNamespace(is_prefilling_np=np.array([False] * 4)),
+        vllm_config=SimpleNamespace(parallel_config=object()),
+        model_state=SimpleNamespace(attn_metadata={"target": SimpleNamespace(attn_state="decode")}),
         kv_cache_config=object(),
     )
-    monkeypatch.setattr(draft_window_eager.upstream_speculator_module, "build_attn_metadata", lambda **kwargs: kwargs)
+    from vllm_ascend.worker.v2 import attn_utils
+
+    owner.assembly_calls = []
+
+    def builder(**kwargs):
+        owner.assembly_calls.append(kwargs)
+        return {"draft": SimpleNamespace(**kwargs)}
+
+    monkeypatch.setattr(attn_utils, "build_attn_metadata", builder)
     return owner, read
 
 
@@ -82,6 +96,13 @@ def test_shared_assembler_preserves_uniform_full_capture_and_nonuniform_queries(
         query_start_loc_np=query,
         dcp_local_seq_lens=None,
     )
+    assert len(owner.assembly_calls) == 1
+    assert result["draft"].query_start_loc.data_ptr() == owner.input_buffers.query_start_loc.data_ptr()
+    assert result["draft"].query_start_loc.shape == (5,)
+    result = owner.assembly_calls[0]
+    assert result["positions"].data_ptr() == owner.input_buffers.positions.data_ptr()
+    assert result["attn_state"] == "decode"
+    assert result["parallel_config"] is owner.vllm_config.parallel_config
     assert result["query_start_loc_cpu"].tolist() == expected
     assert result["max_query_len"] == max_query
     assert result["draft_window_read_inputs"] is read

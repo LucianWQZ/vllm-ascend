@@ -25,7 +25,6 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowProp
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
     DraftWindowGraphBindingProvider,
     DraftWindowGraphRoute,
-    DraftWindowGraphWriteSideReference,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_nongraph import DraftWindowBatchPhasePlan
 from vllm_ascend.worker.v2.spec_decode.draft_window_plan import compute_draft_window_plan
@@ -121,7 +120,6 @@ def _materialize(case, *, epoch=0, ends=(11, 14), quarantine=False):
 def _bank_tensors(bank):
     return (
         bank.window_block_table,
-        bank.valid_num_blocks,
         bank.device_window_exact,
         bank.cpu_window_exact,
         bank.cpu_window_upper,
@@ -134,7 +132,7 @@ def _bind(case, inputs):
     query_width = case.capture.descriptor.num_tokens // case.capture.descriptor.num_reqs
     tokens = actual * query_width
     query_lengths = tuple(row * query_width for row in range(1, actual + 1)) + (tokens,) * (padded - actual)
-    reference = DraftWindowGraphWriteSideReference(
+    reference = SimpleNamespace(
         slot_mapping=case.owner.slot_mappings[0, :tokens],
         query_start_loc=torch.tensor((0,) + query_lengths, dtype=torch.int32),
         actual_seq_lengths_q=query_lengths,
@@ -164,7 +162,6 @@ def _bind(case, inputs):
         inputs=inputs,
         metadata_builder=metadata_builder,
         target_metadata=case.target_metadata,
-        write_side_reference=reference,
     )
 
 
@@ -210,8 +207,7 @@ def test_retirement_preserves_bank_until_next_generation_then_clears_tail(graph_
     second = _materialize(case, epoch=1, ends=(4,))
     assert [tensor.data_ptr() for tensor in _bank_tensors(bank)] == pointers
     assert second.workspace.window_block_table.tolist() == [[11, 0], [0, 0]]
-    assert second.workspace.valid_num_blocks.tolist() == [4, 0]
-    for tensor in _bank_tensors(bank)[2:]:
+    for tensor in _bank_tensors(bank)[1:]:
         assert tensor.tolist() == [4, 0]
     with pytest.raises(RuntimeError, match="retired Draft inputs"):
         first.validate_for(first.identity)
@@ -436,9 +432,7 @@ def test_capture_token_cannot_be_forged_or_cross_provider(graph_buffers):
         case.provider.prepare_workspace(foreign)
 
 
-@pytest.mark.parametrize(
-    "field", ["window_block_table", "valid_num_blocks", "device_window_exact", "cpu_window_exact", "cpu_window_upper"]
-)
+@pytest.mark.parametrize("field", ["window_block_table", "device_window_exact", "cpu_window_exact", "cpu_window_upper"])
 def test_capture_bank_rejects_replaced_operand_before_materialization(graph_buffers, field):
     case = graph_buffers
     carrier = case.provider._carriers[case.capture]
@@ -489,7 +483,7 @@ def test_parallel_capture_uses_exact_manager_descriptor_and_preserves_full_table
     before = full.clone()
     maximum = _seed_capture_workspace(identity, read, (full,), max_model_len=16, provider=case.provider)
     assert maximum == 7 and read.cpu_window_exact.tolist() == read.cpu_window_upper.tolist() == [7, 7]
-    assert read.device_window_exact.tolist() == [7, 7] and read.valid_num_blocks.tolist() == [2, 2]
+    assert read.device_window_exact.tolist() == [7, 7]
     assert torch.equal(full, before)
     assert torch.equal(read.window_block_table, full[:, :2])
     with pytest.raises(RuntimeError, match="does not resolve exactly one"):
@@ -533,13 +527,10 @@ def test_materialization_rejects_actual_canonical_source_owner_replacement(graph
         _materialize(case)
 
 
-@pytest.mark.parametrize("field", ["table", "counts"])
-def test_workspace_rejects_invalid_native_dtype_at_its_creation_boundary(field):
-    table = torch.zeros((2, 4), dtype=torch.int64 if field == "table" else torch.int32)
-    counts = torch.zeros(2, dtype=torch.int64 if field == "counts" else torch.int32)
+def test_workspace_rejects_invalid_native_table_dtype_at_its_creation_boundary():
     with pytest.raises(TypeError, match="must use int32"):
         DraftWindowWorkspace(
-            max_num_reqs=2, table_capacity_columns=2, table_template=table, valid_count_template=counts
+            max_num_reqs=2, table_capacity_columns=2, table_template=torch.zeros((2, 4), dtype=torch.int64)
         )
 
 
@@ -615,66 +606,72 @@ def typed_update_guard(graph_buffers):
     import torch_npu
 
     from vllm_ascend.attention.attention_v1 import FIAParamProvider
+    from vllm_ascend.compilation.updatable_graph import GraphUpdateTask
 
-    case = graph_buffers
-    inputs = _materialize(case)
-    carrier = _bind(case, inputs)
-    batch = case.provider.consume_metadata(route=case.capture.route, expected_consumer_count=1)
-    case.provider.assert_metadata_batch(route=case.capture.route, draft_attn_metadatas=batch)
-    metadata = batch[0]["draft.layer"]
-    provider = FIAParamProvider(layer_name="draft.layer", sliding_window=None, is_draft_model=True)
-    captured = SimpleNamespace(handle=object(), event=object(), provider=provider, provider_index=0)
-    task = SimpleNamespace(
-        handle=captured.handle,
-        event=captured.event,
-        provider=provider,
-        provider_index=0,
-        operation=torch_npu.npu_fused_infer_attention_score.out,
-        kwargs={
-            "block_table": metadata.block_tables,
-            "actual_seq_lengths_kv": metadata.seq_lens_list,
-            "actual_seq_lengths": metadata.actual_seq_lengths_q,
-        },
-    )
-    return SimpleNamespace(case=case, carrier=carrier, graph=SimpleNamespace(tasks=[captured]), task=task)
-
-
-def test_update_uses_actual_submitted_metadata_and_marks_only_that_bank_updated(typed_update_guard):
-    from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphCarrierState
-
-    c = typed_update_guard
-    c.case.provider.validate_update(c.graph, [c.task], route=c.case.capture.route)
-    assert c.carrier.state is DraftWindowGraphCarrierState.UPDATED
-
-
-@pytest.mark.parametrize(
-    "field",
-    ["handle", "event", "provider_index", "operation", "block_table", "actual_seq_lengths_kv", "actual_seq_lengths"],
-)
-def test_update_rejects_stale_handles_or_replaced_operands(typed_update_guard, field):
-    from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphCarrierState
-
-    c = typed_update_guard
-    if field == "provider_index":
-        c.task.provider_index = 1
-    elif field in c.task.kwargs:
-        c.task.kwargs[field] = object()
-    else:
-        setattr(c.task, field, object())
-    with pytest.raises(RuntimeError):
-        c.case.provider.validate_update(c.graph, [c.task], route=c.case.capture.route)
-    assert c.carrier.state is DraftWindowGraphCarrierState.SUBMITTED
-
-
-@pytest.mark.parametrize("field", ["slot_mapping", "query_start_loc", "block_tables", "seq_lens"])
-def test_pre_replay_rejects_replaced_canonical_writes_or_window_reads(graph_buffers, field):
     case = graph_buffers
     carrier = _bind(case, _materialize(case))
     batch = case.provider.consume_metadata(route=case.capture.route, expected_consumer_count=1)
-    metadata = batch[0]["draft.layer"]
-    setattr(metadata, field, getattr(metadata, field).clone())
-    with pytest.raises(RuntimeError, match="preserve|carrier"):
-        case.provider.assert_metadata_batch(route=case.capture.route, draft_attn_metadatas=batch)
+    provider = FIAParamProvider(layer_name="draft.layer", sliding_window=None, is_draft_model=True)
+    task = GraphUpdateTask(torch_npu.npu_fused_infer_attention_score.out, {}, provider, 0, object(), object())
+
+    class Graph:
+        tasks = [task]
+        provider_sizes = {provider: 1}
+
+    return SimpleNamespace(case=case, carrier=carrier, graph=Graph(), metadata=batch[0], task=task)
+
+
+def test_original_task_resolver_binds_current_metadata_without_replacing_capture_state(typed_update_guard):
+    from vllm_ascend.compilation.updatable_graph import ContextSource, UpdatableGraph
     from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphCarrierState
 
-    assert carrier.state is DraftWindowGraphCarrierState.SUBMITTED
+    c = typed_update_guard
+    c.case.provider.validate_graph(c.graph, route=c.case.capture.route)
+    resolved = UpdatableGraph.resolve_tasks(c.graph, ContextSource(c.metadata))
+    assert len(resolved) == 1
+    actual = resolved[0]
+    assert actual.operation is c.task.operation
+    assert actual.handle is c.task.handle and actual.event is c.task.event
+    assert actual.provider is c.task.provider and actual.provider_index == 0
+    assert actual.kwargs["block_table"] is c.metadata["draft.layer"].block_tables
+    assert actual.kwargs["actual_seq_lengths_kv"] is c.metadata["draft.layer"].seq_lens_list
+    assert actual.kwargs["actual_seq_lengths"] is c.metadata["draft.layer"].actual_seq_lengths_q
+    assert c.carrier.state is DraftWindowGraphCarrierState.SUBMITTED
+    c.case.provider.finish_update(route=c.case.capture.route)
+    assert c.carrier.state is DraftWindowGraphCarrierState.UPDATED
+
+
+@pytest.mark.parametrize("field", ["provider", "operation"])
+def test_capture_contract_rejects_an_unsupported_native_consumer(typed_update_guard, field):
+    c = typed_update_guard
+    setattr(c.task, field, object())
+    with pytest.raises(RuntimeError, match="supported Draft FIA consumer"):
+        c.case.provider.validate_graph(c.graph, route=c.case.capture.route)
+
+
+def test_static_graph_consumer_contract_is_not_rechecked_each_generation(typed_update_guard):
+    c = typed_update_guard
+    c.case.provider.validate_graph(c.graph, route=c.case.capture.route)
+    assert c.case.provider._validated_graphs[c.graph] is c.case.capture.route
+    # Captured tasks belong to the immutable graph. Replays use its resolver,
+    # not a second hand-built task inventory or handle authentication pass.
+    c.case.provider.validate_graph(c.graph, route=c.case.capture.route)
+    with pytest.raises(RuntimeError, match="route changed"):
+        c.case.provider.validate_graph(c.graph, route=DraftWindowGraphRoute.EAGLE3_FIRST_PASS)
+
+
+@pytest.mark.parametrize("field", ["block_tables", "seq_lens", "seq_lens_cpu", "seq_lens_list"])
+def test_publication_rejects_a_builder_that_lost_the_actual_read_bank(graph_buffers, monkeypatch, field):
+    case = graph_buffers
+    inputs = _materialize(case)
+    original = case.provider._validate_metadata_uses_read_carrier
+
+    def corrupt(metadata, workspace):
+        layer = metadata["draft.layer"]
+        value = getattr(layer, field)
+        setattr(layer, field, value.clone() if isinstance(value, torch.Tensor) else [999, 999])
+        original(metadata, workspace)
+
+    monkeypatch.setattr(case.provider, "_validate_metadata_uses_read_carrier", corrupt)
+    with pytest.raises(RuntimeError, match="carrier"):
+        _bind(case, inputs)
