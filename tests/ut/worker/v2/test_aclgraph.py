@@ -363,8 +363,8 @@ def test_graph_replay_updates_full_graph_params():
 
 @pytest.mark.parametrize("use_dcp,architecture", [(False, "GQA"), (True, "GQA"), (True, "MLA")])
 @pytest.mark.parametrize("is_prefill", [False, True])
-@pytest.mark.parametrize("prepared_window_params", [False, True])
-def test_updatable_graph_replay_reuses_shared_source(use_dcp, architecture, is_prefill, prepared_window_params):
+@pytest.mark.parametrize("prepared_window_source", [False, True])
+def test_updatable_graph_replay_reuses_shared_source(use_dcp, architecture, is_prefill, prepared_window_source):
     """Build every draft step from the first metadata with one shared-source update."""
     manager = AutoRegressiveAclGraphManager.__new__(AutoRegressiveAclGraphManager)
     manager.update_stream = MagicMock()
@@ -404,14 +404,15 @@ def test_updatable_graph_replay_reuses_shared_source(use_dcp, architecture, is_p
         ) as parent_replay,
     ):
         result = manager._updatable_graph_replay(
-            desc, steps, **({"fia_params": fia_params} if prepared_window_params else {})
+            desc, steps, **({"window_source": source} if prepared_window_source else {})
         )
 
-    if prepared_window_params:
+    if prepared_window_source:
         manager.speculator.build_fia_params.assert_not_called()
+        shared_source.assert_not_called()
     else:
         manager.speculator.build_fia_params.assert_called_once_with(2, steps[0], is_prefill)
-    shared_source.assert_called_once_with(fia_params)
+        shared_source.assert_called_once_with(fia_params)
     assert result == "result"
     graph.resolve_tasks.assert_called_once_with(source)
     manager.update_stream.wait_stream.assert_called_once_with(current_stream)

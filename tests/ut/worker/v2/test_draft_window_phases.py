@@ -18,7 +18,6 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_backends import (
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_eager import (
     DraftWindowProposalContext,
-    _requires_prefill_baseline_bypass,
     classify_draft_window_batch_phase,
 )
 
@@ -58,16 +57,17 @@ def _batch(rows):
 def test_bypass_requires_every_real_row_to_be_continuing(rows, full_rows, bypass):
     batch = _batch(rows)
     assert classify_draft_window_batch_phase(batch) == full_rows
-    assert _requires_prefill_baseline_bypass(batch) is bypass
+    assert (bool(full_rows) and all(full_rows)) is bypass
 
 
-@pytest.mark.parametrize("field", ["req_ids", "idx_mapping_np", "num_scheduled_tokens"])
-def test_epoch_still_rejects_changed_requests_mapping_or_phases(field):
+def test_proposal_rejects_a_different_batch_or_request_count():
     batch = _batch([(0, 8, 2)])
     context = DraftWindowProposalContext.from_batch(batch)
-    replacement = {"req_ids": ["replacement"], "idx_mapping_np": np.array([1]), "num_scheduled_tokens": np.array([8])}
-    setattr(batch, field, replacement[field])
-    with pytest.raises(RuntimeError, match="ordering|idx_mapping|row phases"):
+    assert context.full_read_rows == (True,)
+    with pytest.raises(RuntimeError, match="batch|request count"):
+        context.validate(_batch([(0, 8, 2)]))
+    batch.num_reqs = 0
+    with pytest.raises(RuntimeError, match="batch|request count"):
         context.validate(batch)
 
 

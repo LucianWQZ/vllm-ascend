@@ -17,13 +17,8 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 
 import vllm_ascend.envs as envs
-from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.device.hardware_profile import AttentionBackendFamily, get_current_hardware_profile
 from vllm_ascend.worker.v2.spec_decode.draft_window import DraftMetadataInputs
-from vllm_ascend.worker.v2.spec_decode.draft_window_eager import (
-    build_draft_window_attn_metadata,
-    draft_window_read_inputs,
-)
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
     DraftWindowGraphBindingProvider,
     DraftWindowGraphBucket,
@@ -105,35 +100,8 @@ def prepare_parallel_graph(
     proposal_context = owner._draft_window_proposal
     if proposal_context is not inputs.proposal:
         raise RuntimeError("Draft Window Graph proposal identity is stale")
-    route = resolve_parallel_draft_window_graph_route(owner)
-    assert route is not None
-    capture_identity = provider.capture_identity_for(route=route, descriptor=descriptor)
-    if inputs.padded_request_count != capture_identity.descriptor.num_reqs:
-        raise RuntimeError("Draft Window Graph generation does not match the capture request bucket")
-    if owner._draft_window_selected_metadata != descriptor or inputs.metadata is not None:
+    capture_identity = owner._draft_window_selected_metadata
+    if capture_identity is None or capture_identity.descriptor != descriptor or inputs.params is not None:
         raise RuntimeError("Draft Window replay does not own the selected unconsumed FULL dispatch")
 
-    # FULL dispatch deferred its unused temporary metadata. Build and publish
-    # exactly this generation once, backed by the persistent Graph read bank.
-    workspace = inputs.workspace
-    read_inputs = draft_window_read_inputs(
-        workspace,
-        actual_request_count=len(inputs.proposal.ordered_request_ids),
-        padded_request_count=workspace.max_num_reqs,
-    )
-    metadata = build_draft_window_attn_metadata(
-        owner,
-        # FULL FIA includes the real capture padding in its uniform Q layout.
-        num_reqs=workspace.max_num_reqs,
-        num_reqs_padded=workspace.max_num_reqs,
-        num_tokens_padded=capture_identity.descriptor.num_tokens,
-        read_inputs=read_inputs,
-        causal=owner._group_causal,
-        query_start_loc_np=None,
-        # DSpark's normal Draft builder uses this state even when Target is
-        # decode-only; the Target's heterogeneous metadata is not its contract.
-        attn_state=AscendAttentionState.ChunkedPrefill
-        if capture_identity.route is DraftWindowGraphRoute.DSPARK
-        else None,
-    )
-    return provider.bind_read_carrier(capture_identity=capture_identity, inputs=inputs, metadata=metadata)
+    return provider.bind_read_carrier(capture_identity=capture_identity, inputs=inputs)

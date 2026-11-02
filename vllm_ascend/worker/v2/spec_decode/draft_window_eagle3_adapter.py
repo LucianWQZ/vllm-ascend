@@ -20,10 +20,11 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_eagle3 import (
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
     DraftWindowGraphBindingProvider,
-    DraftWindowGraphRoute,
-    consume_draft_window_graph_metadata,
 )
-from vllm_ascend.worker.v2.spec_decode.draft_window_graph_metadata import copy_draft_attention_metadata
+from vllm_ascend.worker.v2.spec_decode.draft_window_graph_metadata import (
+    bind_draft_window_read,
+    copy_draft_attention_metadata,
+)
 from vllm_ascend.worker.v2.spec_decode.target_dependent_ar.speculator import AscendTargetDependentARSpeculator
 
 
@@ -84,7 +85,7 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentA
         session = getattr(self, "_eagle3_graph_session", None)
         prefill_inputs = None
         if session is not None and session._capture_call is not None:
-            attn_metadata, _ = session.capture_metadata(attn_metadata)
+            attn_metadata = session.capture_metadata(attn_metadata)
         elif self._eagle3_window_is_active():
             if (
                 session is None
@@ -119,13 +120,11 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentA
             self.block_tables.gather_block_tables(self.input_batch.idx_mapping, num_reqs_padded=n)
             prefill_inputs = self._materialize_eagle3_step(step=0, num_reqs=n, num_reqs_padded=n, output_workspace=bank)
             attn_metadata = copy_draft_attention_metadata(attn_metadata)
+            max_seq_len = int(bank.cpu_window_exact.max().item())
             for layer in attn_metadata.values():
                 if layer is not None:
-                    layer.block_tables = bank.window_block_table
-                    layer.seq_lens = layer.seq_lens_gpu = bank.device_window_exact
-                    layer.seq_lens_cpu = bank.cpu_window_exact
-                    layer.seq_lens_list = bank.cpu_window_exact.tolist()
-                    layer.max_seq_len = int(bank.cpu_window_exact.max().item())
+                    bind_draft_window_read(layer, bank, max_seq_len)
+                    layer.seq_lens_gpu = bank.device_window_exact
                     layer.attn_state = AscendAttentionState.ChunkedPrefill
         try:
             output = super()._run_model(
@@ -169,16 +168,8 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentA
                 padded = batch_desc.num_reqs or num_reqs
                 self._snapshot_eagle3_decode_step_one(num_reqs=num_reqs, num_reqs_padded=padded)
                 for step in range(1, self.num_speculative_steps):
-                    bank = session.provider.prepare_workspace(
-                        session.resolve(first=False, n=padded, tokens=batch_desc.num_tokens, ordinal=step - 1)
-                    )
-                    inputs = self._materialize_eagle3_step(
-                        step=step,
-                        num_reqs=num_reqs,
-                        num_reqs_padded=padded,
-                        output_workspace=bank,
-                    )
-                    session.stage(inputs, first=False, n=padded, tokens=batch_desc.num_tokens, ordinal=step - 1)
+                    capture = session.resolve(first=False, n=padded, tokens=batch_desc.num_tokens, ordinal=step - 1)
+                    session.stage(capture, step)
             except BaseException:
                 self._quarantine_eagle3_window()
                 raise
@@ -189,16 +180,4 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentA
             num_tokens_across_dp,
             seq_lens_cpu_upper_bound,
             num_speculative_steps,
-        )
-
-    def build_draft_attn_metadatas(self, num_reqs_padded, num_tokens_padded, is_draft_model_prefill):
-        if getattr(self, "_eagle3_graph_session", None) is None or not self._eagle3_window_is_active():
-            return super().build_draft_attn_metadatas(num_reqs_padded, num_tokens_padded, is_draft_model_prefill)
-        route = (
-            DraftWindowGraphRoute.EAGLE3_FIRST_PASS if is_draft_model_prefill else DraftWindowGraphRoute.EAGLE3_AR_STEP
-        )
-        return consume_draft_window_graph_metadata(
-            self,
-            route=route,
-            expected_consumer_count=1 if is_draft_model_prefill else self.num_speculative_steps - 1,
         )

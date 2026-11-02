@@ -54,10 +54,6 @@ from vllm_ascend.worker.v2.spec_decode.dflash.speculator import (
     prepare_dflash_inputs_factory,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowGraphInputMixin
-from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
-    DraftWindowGraphRoute,
-    consume_draft_window_graph_metadata,
-)
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph_runtime import (
     draft_window_graph_enabled,
     install_parallel_graph,
@@ -317,14 +313,6 @@ class AscendDSparkSpeculator(DraftWindowGraphInputMixin, LmheadTPDraftSamplingMi
 
     # Graph capture builds metadata from the padded request shape.
     def build_draft_attn_metadatas(self, num_reqs_padded, seq_lens_cpu_upper_bound):
-        from vllm_ascend.worker.v2.spec_decode.draft_window_graph_metadata import is_parallel_graph_dp_dummy
-
-        if hasattr(self, "_draft_window_graph_binding_provider") and not is_parallel_graph_dp_dummy(self):
-            graph_metadata = consume_draft_window_graph_metadata(
-                self, route=DraftWindowGraphRoute.DSPARK, expected_consumer_count=1
-            )
-            if graph_metadata is not None:
-                return list(graph_metadata)
         assert self.input_batch is not None
         num_tokens_padded = num_reqs_padded * self.num_query_per_req
         seq_lens_cpu, is_prefilling = self._prepare_draft_dcp_metadata_inputs(

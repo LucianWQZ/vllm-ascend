@@ -8,74 +8,22 @@ this does not claim device completion, model correctness or Graph qualification.
 
 from __future__ import annotations
 
-import ast
-import builtins
-import importlib.util
-import sys
 import unittest
 from contextlib import contextmanager, nullcontext
-from pathlib import Path
 from types import MethodType, SimpleNamespace
 from typing import Any
+from unittest.mock import PropertyMock, patch
 
-ROOT = Path(__file__).resolve().parents[3]
-SPEC = ROOT / "vllm_ascend/worker/v2/spec_decode/dflash/speculator.py"
-EAGER = ROOT / "vllm_ascend/worker/v2/spec_decode/draft_window_eager.py"
-LIFETIME = ROOT / "vllm_ascend/worker/v2/spec_decode/draft_window_lifetime.py"
+import numpy as np
 
-
-def load_lifetime():
-    name = "_r8_pr017_parallel_owner_lifetime"
-    spec = importlib.util.spec_from_file_location(name, LIFETIME)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-LIFETIME_MODULE = load_lifetime()
-
-
-def extract(path, names, namespace):
-    tree = ast.parse(path.read_text())
-    nodes = [node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name in names]
-    assert {node.name for node in nodes} == set(names)
-    module = ast.Module(
-        body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), *nodes],
-        type_ignores=[],
-    )
-    exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
-
-
-def load_seam(completion):
-    runtime = SimpleNamespace(_NPUCompletion=completion)
-    name = "_parallel_owner_graph_support"
-    spec = importlib.util.spec_from_file_location(
-        name, ROOT / "vllm_ascend/worker/v2/spec_decode/draft_graph_review_limits.py"
-    )
-    assert spec is not None and spec.loader is not None
-    guard_module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = guard_module
-    spec.loader.exec_module(guard_module)
-    original_import = builtins.__import__
-
-    def importing(name, globals=None, locals=None, fromlist=(), level=0):
-        if name == "vllm_ascend.worker.v2.spec_decode.draft_window_lifetime":
-            return LIFETIME_MODULE
-        if name == "vllm_ascend.worker.v2.spec_decode.draft_window_runtime":
-            return runtime
-        if name == "vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits":
-            return guard_module
-        return original_import(name, globals, locals, fromlist, level)
-
-    namespace = {
-        "contextmanager": contextmanager,
-        "nullcontext": nullcontext,
-        "__builtins__": dict(vars(builtins), __import__=importing),
-    }
-    extract(SPEC, {"_draft_window_context_kv_scope", "_draft_window_owner_scope"}, namespace)
-    return namespace
+from vllm_ascend.worker.v2.spec_decode import draft_window_runtime
+from vllm_ascend.worker.v2.spec_decode.dflash import aclgraph as dflash_graph
+from vllm_ascend.worker.v2.spec_decode.dflash import speculator as dflash
+from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import DraftGraphSupport
+from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowGraphInputMixin
+from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphRoute
+from vllm_ascend.worker.v2.spec_decode.draft_window_lifetime import DraftWindowOwnerPool
+from vllm_ascend.worker.v2.spec_decode.dspark import speculator as dspark
 
 
 class Completion:
@@ -94,7 +42,9 @@ class Completion:
 class ParallelOwnerTests(unittest.TestCase):
     def setUp(self):
         Completion.recorded = 0
-        self.seam = load_seam(Completion)
+        completion = patch.object(draft_window_runtime, "_NPUCompletion", Completion)
+        completion.start()
+        self.addCleanup(completion.stop)
         self.batch = SimpleNamespace(is_dummy=False)
         self.owner = SimpleNamespace(
             _draft_window_graph_binding_provider=SimpleNamespace(quarantined=False),
@@ -113,7 +63,7 @@ class ParallelOwnerTests(unittest.TestCase):
         self.owner._draft_window_proposal_scope = normal_scope
 
     def scope(self, tokens, **kwargs):
-        return self.seam["_draft_window_owner_scope"](self.owner, self.batch, num_speculative_tokens=tokens, **kwargs)
+        return dflash._draft_window_owner_scope(self.owner, self.batch, num_speculative_tokens=tokens, **kwargs)
 
     def test_zero_uses_real_completion_pool_without_graph_reader(self):
         with self.scope(0):
@@ -121,6 +71,7 @@ class ParallelOwnerTests(unittest.TestCase):
         self.assertFalse(self.owner._draft_window_context_kv_active)
         self.assertEqual(Completion.recorded, 1)
         self.assertEqual(self.normal, [])
+        self.assertIsInstance(self.owner._draft_window_context_kv_pool, DraftWindowOwnerPool)
         self.assertFalse(self.owner._draft_window_context_kv_pool._poisoned)
         self.assertFalse(hasattr(self.owner, "_draft_window_runtime"))
         self.assertIsNone(self.owner._draft_window_proposal)
@@ -135,9 +86,9 @@ class ParallelOwnerTests(unittest.TestCase):
         self.assertIs(seen.exception, first)
         self.assertTrue(self.owner._draft_window_context_kv_pool._poisoned)
         self.assertTrue(self.owner._draft_window_graph_submission_uncertain)
-        actual = {"contextmanager": contextmanager}
-        extract(EAGER, {"_draft_window_proposal_scope"}, actual)
-        self.owner._draft_window_proposal_scope = MethodType(actual["_draft_window_proposal_scope"], self.owner)
+        self.owner._draft_window_proposal_scope = MethodType(
+            DraftWindowGraphInputMixin._draft_window_proposal_scope, self.owner
+        )
         with (
             self.assertRaisesRegex(RuntimeError, "quarantined"),
             self.scope(8),
@@ -164,7 +115,9 @@ class ParallelOwnerTests(unittest.TestCase):
             def __init__(self):
                 raise first
 
-        self.seam = load_seam(BrokenCompletion)
+        broken = patch.object(draft_window_runtime, "_NPUCompletion", BrokenCompletion)
+        broken.start()
+        self.addCleanup(broken.stop)
         with (
             self.assertRaises(RuntimeError) as seen,
             self.scope(0),
@@ -228,8 +181,7 @@ class ParallelOwnerTests(unittest.TestCase):
 
     def test_full8_target_padding_is_not_a_zero_branch_draft_query(self):
         # Use the actual immutable support type required by the production guard.
-        guard_name = "_parallel_owner_graph_support"
-        self.owner._draft_graph_review_limit = sys.modules[guard_name].DraftGraphSupport(40960, 7, 1, 1, "dflash", 8)
+        self.owner._draft_graph_review_limit = DraftGraphSupport(40960, 7, 1, 1, "dflash", 8)
         self.owner.max_model_len = 40960
         self.owner.num_query_per_req = 8
         self.owner.vllm_config.model_config = SimpleNamespace(max_model_len=40960)
@@ -261,67 +213,68 @@ class ParallelOwnerTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "cannot share"):
             self.scope(0)
 
-    def test_544_propose_interfaces_guard_first_and_forward_real_count(self):
-        for relative in ("dflash/speculator.py", "dspark/speculator.py"):
-            path = ROOT / "vllm_ascend/worker/v2/spec_decode" / relative
-            tree = ast.parse(path.read_text())
-            propose = [node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "propose"]
-            self.assertEqual(len(propose), 1)
-            function = propose[0]
-            self.assertIn("dp_sync_state", [arg.arg for arg in function.args.args])
-            self.assertIn("num_speculative_tokens", [arg.arg for arg in function.args.args])
-            first = function.body[0]
-            assert isinstance(first, ast.Assign) and isinstance(first.value, ast.Call)
-            assert isinstance(first.value.func, ast.Name)
-            self.assertEqual(first.value.func.id, "_draft_window_owner_scope")
-            forwarded = [
-                node
-                for node in ast.walk(function)
-                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "propose"
-            ]
-            self.assertEqual(len(forwarded), 1)
-            count = [kw.value for kw in forwarded[0].keywords if kw.arg == "num_speculative_tokens"]
-            self.assertEqual(len(count), 1)
-            assert isinstance(count[0], ast.Name)
-            self.assertEqual(count[0].id, "num_speculative_tokens")
+    def test_544_propose_guards_before_owner_change_and_forwards_real_count(self):
+        for module, cls, parent in (
+            (dflash, dflash.AscendDFlashSpeculator, dflash.DFlashSpeculator),
+            (dspark, dspark.AscendDSparkSpeculator, dspark.DSparkSpeculator),
+        ):
+            with (
+                self.subTest(method=cls.__name__),
+                patch.object(
+                    cls,
+                    "attn_vllm_config",
+                    new_callable=PropertyMock,
+                    return_value=SimpleNamespace(parallel_config=object()),
+                ),
+            ):
+                owner = object.__new__(cls)
+                original_batch = owner.input_batch = object()
+                owner.replicated_pcp = owner.enable_adaptive_verification = owner.use_dcp = False
+                owner.input_buffers = SimpleNamespace(positions=object())
+                owner.max_num_tokens = 1024
+                batch = SimpleNamespace(is_prefilling_np=np.array([False]))
+                rejected = RuntimeError("guard before replacing owner")
+                with (
+                    patch.object(module, "_draft_window_owner_scope", side_effect=rejected),
+                    self.assertRaises(RuntimeError) as seen,
+                ):
+                    owner.propose(batch, *([None] * 10), num_speculative_tokens=7)
+                self.assertIs(seen.exception, rejected)
+                self.assertIs(owner.input_batch, original_batch)
+                result = object()
+                with (
+                    patch.object(module, "_draft_window_owner_scope", return_value=nullcontext()),
+                    patch.object(module, "build_attn_metadata_wrapper", return_value=nullcontext()),
+                    patch.object(module, "build_attn_metadata_factory", return_value=nullcontext()),
+                    patch.object(parent, "propose", return_value=result) as propose,
+                ):
+                    self.assertIs(owner.propose(batch, *([None] * 10), num_speculative_tokens=7), result)
+                self.assertIs(owner.input_batch, batch)
+                self.assertEqual(propose.call_args.kwargs["num_speculative_tokens"], 7)
 
-    def test_capture_keeps_544_callback_and_graph_scope(self):
-        path = ROOT / "vllm_ascend/worker/v2/spec_decode/dflash/aclgraph.py"
-        tree = ast.parse(path.read_text())
-        capture = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "capture")
-        self.assertTrue(
-            any(
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Name)
-                and node.func.id == "draft_window_dflash_capture_scope"
-                for node in ast.walk(capture)
-            )
-        )
-        values = [node for node in ast.walk(capture) if isinstance(node, ast.Dict)]
-        self.assertTrue(
-            any(
-                any(isinstance(key, ast.Constant) and key.value == "prepare_forward" for key in node.keys)
-                for node in values
-            )
-        )
-        replay = next(
-            node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "run_fullgraph"
-        )
-        guard = next(
-            node
-            for node in ast.walk(replay)
-            if isinstance(node, ast.Raise)
-            and isinstance(node.exc, ast.Call)
-            and getattr(node.exc.func, "id", None) == "NotImplementedError"
-        )
-        fast_path = next(
-            node
-            for node in ast.walk(replay)
-            if isinstance(node, ast.If)
-            and isinstance(node.test, ast.Call)
-            and getattr(node.test.func, "id", None) == "all"
-        )
-        self.assertLess(guard.lineno, fast_path.lineno)
+    def test_capture_forwards_544_callback_and_window_scope(self):
+        manager = object.__new__(dflash_graph.DFlashAclGraphManager)
+        manager.speculator = object()
+        manager._capture_descs = {}
+        callback = object()
+        with (
+            patch.object(dflash_graph, "draft_window_dflash_capture_scope", return_value=nullcontext()) as scope,
+            patch.object(dflash_graph, "communicator_switch", return_value=nullcontext()),
+            patch.object(dflash_graph, "model_capture_wrapper", return_value=nullcontext()),
+            patch.object(dflash_graph.DFlashCudaGraphManager, "capture") as capture,
+        ):
+            manager.capture(object(), object(), object(), [], object(), 4096, prepare_forward=callback)
+        scope.assert_called_once()
+        self.assertIs(capture.call_args.kwargs["prepare_forward"], callback)
+        manager.speculator = SimpleNamespace(attn_backends={"draft": dflash_graph.AscendFlashAttentionBackend})
+        with (
+            patch.object(
+                dflash_graph, "resolve_parallel_draft_window_graph_route", return_value=DraftWindowGraphRoute.DFLASH
+            ),
+            patch.object(dflash_graph, "use_updatable_graph", return_value=False),
+            self.assertRaisesRegex(NotImplementedError, "updatable backend"),
+        ):
+            manager.run_fullgraph(SimpleNamespace(num_tokens=8))
 
 
 if __name__ == "__main__":

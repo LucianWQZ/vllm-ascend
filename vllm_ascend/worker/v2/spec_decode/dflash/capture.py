@@ -13,10 +13,8 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
 from typing import Any
 
-import torch
 from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.block_table import BlockTables
@@ -33,34 +31,19 @@ from vllm.v1.worker.utils import AttentionGroup
 from vllm_ascend.worker.v2.spec_decode.draft_window import DraftWindowWorkspace
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
     DraftWindowGraphBindingProvider,
-    DraftWindowGraphBucket,
+    DraftWindowGraphRoute,
     resolve_parallel_draft_window_graph_route,
 )
+from vllm_ascend.worker.v2.spec_decode.draft_window_graph_metadata import bind_draft_window_read
 
 _CAPTURE_CONTEXT_ATTRIBUTE = "_ascend_draft_window_capture_context"
-
-
-@dataclass(slots=True)
-class DraftWindowDFlashCaptureContext:
-    """Temporarily bind the real provider to its Draft-private input buffers."""
-
-    provider: DraftWindowGraphBindingProvider
-    input_buffers: InputBuffers
-    captures: dict[tuple[int, int], DraftWindowGraphBucket]
-
-    def resolve(self, num_reqs: int, num_tokens: int) -> tuple[DraftWindowGraphBucket, DraftWindowWorkspace]:
-        try:
-            identity = self.captures[num_reqs, num_tokens]
-        except KeyError as error:
-            raise RuntimeError("Draft Window capture has no exact persistent bank") from error
-        return identity, self.provider.startup_capture_workspace(identity)
 
 
 def _build_capture_context(
     owner: Any,
     input_buffers: InputBuffers,
     capture_descs: Mapping[CUDAGraphMode, Sequence[BatchExecutionDescriptor]],
-) -> DraftWindowDFlashCaptureContext | None:
+) -> DraftWindowGraphBindingProvider | None:
     provider = getattr(owner, "_draft_window_graph_binding_provider", None)
     if provider is None:
         return None
@@ -79,17 +62,13 @@ def _build_capture_context(
         for descriptor in entries
         if descriptor.cg_mode is CUDAGraphMode.FULL
     )
-    captures = {}
     for descriptor in descriptors:
         if descriptor.num_reqs is None:
             raise RuntimeError("FULL Draft Window capture requires a request count")
-        key = descriptor.num_reqs, descriptor.num_tokens
-        if key in captures:
-            raise RuntimeError("Draft Window capture descriptor mapping is ambiguous")
-        captures[key] = provider.capture_identity_for(route=route, descriptor=descriptor)
-    if not captures:
+        provider.capture_identity_for(route=route, descriptor=descriptor)
+    if not descriptors:
         raise RuntimeError("Draft Window capture has no FULL descriptor")
-    return DraftWindowDFlashCaptureContext(provider, input_buffers, captures)
+    return provider
 
 
 @contextmanager
@@ -97,7 +76,7 @@ def draft_window_dflash_capture_scope(
     owner: Any,
     input_buffers: InputBuffers,
     capture_descs: Mapping[CUDAGraphMode, Sequence[BatchExecutionDescriptor]],
-) -> Iterator[DraftWindowDFlashCaptureContext | None]:
+) -> Iterator[DraftWindowGraphBindingProvider | None]:
     """Attach a capture context to one Draft-private input owner and clean it."""
     if hasattr(input_buffers, _CAPTURE_CONTEXT_ATTRIBUTE):
         raise RuntimeError("Draft Window capture context is already attached")
@@ -118,24 +97,15 @@ def draft_window_dflash_capture_scope(
 
 
 def _seed_capture_workspace(
-    identity: DraftWindowGraphBucket,
     workspace: DraftWindowWorkspace,
-    input_block_tables: Sequence[torch.Tensor],
     *,
     max_model_len: int,
     provider: DraftWindowGraphBindingProvider,
 ) -> int:
-    gid = provider.source.group.gid
-    if not 0 <= gid < len(input_block_tables):
-        raise RuntimeError("Draft Window capture gid is absent from dummy full tables")
-    source = input_block_tables[gid]
+    # The actual provider borrows this same canonical BlockTables owner.
+    # Capture prepares its Full dummy tables before seeding the private bank.
+    source = provider.source.table[: workspace.max_num_reqs]
     destination = workspace.window_block_table
-    if source.ndim != 2 or destination.ndim != 2:
-        raise RuntimeError("Draft Window capture tables must be two-dimensional")
-    if source.shape[0] != identity.descriptor.num_reqs:
-        raise RuntimeError("Draft Window capture full table row count is inconsistent")
-    if destination.shape[0] != identity.descriptor.num_reqs:
-        raise RuntimeError("Draft Window capture backing row count is inconsistent")
 
     capture_upper = min(
         max_model_len,
@@ -179,11 +149,9 @@ def ascend_prepare_dflash_inputs_to_capture(
             skip_attn,
             causal,
         )
-    if not isinstance(context, DraftWindowDFlashCaptureContext):
-        raise TypeError("invalid Draft Window capture context on Draft input buffers")
-    if context.input_buffers is not input_buffers:
-        raise RuntimeError("Draft Window capture context owner mismatch")
-    identity, workspace = context.resolve(num_reqs, num_tokens)
+    route = DraftWindowGraphRoute.DSPARK if context.method == "dspark" else DraftWindowGraphRoute.DFLASH
+    identity = context.capture_banks_for(route=route, num_reqs=num_reqs, num_tokens=num_tokens)[0]
+    workspace = context.startup_capture_workspace(identity)
 
     # Keep dummy InputBatch, Full slots, query geometry and model-specific
     # metadata construction in the fixed MRV2 helper. Only replace the actual
@@ -201,16 +169,10 @@ def ascend_prepare_dflash_inputs_to_capture(
     )
     if not state.attn_metadata:
         raise RuntimeError("Draft Window capture builder produced no attention metadata")
-    tables = tuple(table[:num_reqs] for table in block_tables.input_block_tables)
-    capacity = _seed_capture_workspace(
-        identity, workspace, tables, max_model_len=max_model_len, provider=context.provider
-    )
-    for name in context.provider.source.group.layers:
+    capacity = _seed_capture_workspace(workspace, max_model_len=max_model_len, provider=context)
+    for name in context.source.group.layers:
         layer = state.attn_metadata[name]
-        layer.block_tables = workspace.window_block_table
-        layer.seq_lens = layer.seq_lens_gpu = workspace.device_window_exact
-        layer.seq_lens_cpu = workspace.cpu_window_exact
-        layer.seq_lens_list = workspace.cpu_window_exact.tolist()
-        layer.max_seq_len = capacity
+        bind_draft_window_read(layer, workspace, capacity)
+        layer.seq_lens_gpu = workspace.device_window_exact
         layer.query_start_loc = input_buffers.query_start_loc[: num_reqs + 1]
     return state

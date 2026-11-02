@@ -197,7 +197,7 @@ class DraftWindowWorkspace:
         frozen_row_plans: tuple[DraftWindowPlan, ...] | None,
     ) -> None:
         """Rewrite all active and inert state from the canonical full source."""
-        actual = len(inputs.proposal.ordered_request_ids)
+        actual = len(inputs.proposal.full_read_rows)
         padded = inputs.padded_request_count
         if padded > self.max_num_reqs:
             raise RuntimeError(f"draft-window request capacity exceeded: padded={padded} capacity={self.max_num_reqs}")
@@ -281,7 +281,7 @@ class DraftMetadataInputs:
     step: int
     workspace: DraftWindowWorkspace = field(repr=False, compare=False)
     _owner: "DraftWindowGraphBindingProvider" = field(repr=False, compare=False)
-    metadata: Mapping[str, Any] | None = field(init=False, default=None, repr=False, compare=False)
+    params: dict[str, Any] | None = field(init=False, default=None, repr=False, compare=False)
 
     def validate(self) -> None:
         if self._owner._active_inputs is not self:

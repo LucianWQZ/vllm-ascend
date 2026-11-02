@@ -90,8 +90,13 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
             num_reqs, num_tokens, uniform_token_count, num_active_loras, max_query_len, num_ubatches
         )
         if hasattr(self.speculator, "_draft_window_graph_binding_provider"):
+            provider = self.speculator._draft_window_graph_binding_provider
             self.speculator._draft_window_selected_metadata = (
-                descriptor if self.speculator._draft_window_proposal is not None else None
+                provider.capture_identity_for(
+                    route=resolve_parallel_draft_window_graph_route(self.speculator), descriptor=descriptor
+                )
+                if self.speculator._draft_window_proposal is not None
+                else None
             )
         return descriptor
 
@@ -135,7 +140,7 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
                 **prepare_kwargs,
             )
             if context is not None:
-                context.provider.validate_captured_graphs(self.graphs)
+                context.validate_captured_graphs(self.graphs)
 
     def run_fullgraph(self, desc: BatchExecutionDescriptor) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         """Override run_fullgraph to update full graph params in run_fullgraph."""
@@ -153,12 +158,24 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
             return super().run_fullgraph(desc)
         if not dp_dummy:
             prepare_parallel_graph(self.speculator, desc)
-        draft_attn_metadatas = self.speculator.build_draft_attn_metadatas(
-            desc.num_reqs,
-            self.speculator.input_batch.seq_lens_cpu_upper_bound,
-        )
+        if graph_route is None:
+            draft_attn_metadatas = self.speculator.build_draft_attn_metadatas(
+                desc.num_reqs,
+                self.speculator.input_batch.seq_lens_cpu_upper_bound,
+            )
+        else:
+            draft_attn_metadatas = self.speculator._draft_window_graph_binding_provider.consume_metadata(
+                route=graph_route, expected_consumer_count=1
+            )
         if use_updatable_graph(attn_backend):
-            return self._updatable_graph_replay(desc, draft_attn_metadatas)
+            ret = self._updatable_graph_replay(
+                desc,
+                draft_attn_metadatas if graph_route is None else None,
+                window_source=None if graph_route is None else draft_attn_metadatas,
+            )
+            if graph_route is not None:
+                self.speculator._draft_window_graph_binding_provider.finish_update(route=graph_route)
+            return ret
         else:
             # Ordinary OFF/eager Target policy keeps the original fallback.
             return self._graph_replay(desc, attn_backend, num_tokens, draft_attn_metadatas)
@@ -194,20 +211,13 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
             )
         return ret
 
-    def _updatable_graph_replay(self, desc, draft_attn_metadatas):
+    def _updatable_graph_replay(self, desc, draft_attn_metadatas, *, window_source=None):
         graph = self.graphs[desc]
         assert isinstance(graph, UpdatableGraph)
-        resolved_tasks = graph.resolve_tasks(ContextSource(draft_attn_metadatas[0]))
-        from vllm_ascend.worker.v2.spec_decode.draft_window_graph_metadata import is_parallel_graph_dp_dummy
-
-        dp_dummy = is_parallel_graph_dp_dummy(self.speculator)
-        graph_route = None if dp_dummy else resolve_parallel_draft_window_graph_route(self.speculator)
+        resolved_tasks = graph.resolve_tasks(
+            ContextSource(draft_attn_metadatas[0]) if window_source is None else window_source
+        )
         self.update_stream.wait_stream(torch.npu.current_stream())
         ret = super().run_fullgraph(desc)
-        if graph_route is None:
-            # Exact existing OFF updatable call; no Window-only construction.
-            graph.update(self.update_stream, resolved_tasks)
-        else:
-            graph.update(self.update_stream, resolved_tasks)
-            self.speculator._draft_window_graph_binding_provider.finish_update(route=graph_route)
+        graph.update(self.update_stream, resolved_tasks)
         return ret

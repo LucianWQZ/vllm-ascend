@@ -22,32 +22,28 @@ from vllm_ascend.worker.v2.spec_decode.draft_window import (
     gather_valid_num_blocks_cpu,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphBindingProvider
-from vllm_ascend.worker.v2.spec_decode.draft_window_read import DraftReadView
 from vllm_ascend.worker.v2.spec_decode.draft_window_runtime import continuing_prefill_rows
 
 
 @dataclass(frozen=True, slots=True, eq=False)
 class DraftWindowProposalContext:
-    """Caller-owned identity for one real outer ``propose`` invocation."""
+    """One real propose scope and its fixed full/window row semantics.
+
+    The fixed runner prepares request mapping and prompt progress before the
+    synchronous propose call; only device lengths and consumer steps change
+    inside it. Keep one phase snapshot, not repeated copies of runner IDs.
+    """
 
     input_batch: InputBatch | Any
-    ordered_request_ids: tuple[str, ...]
-    idx_mapping_fingerprint: tuple[int, ...]
     full_read_rows: tuple[bool, ...]
 
     @classmethod
     def from_batch(cls, input_batch: InputBatch | Any) -> "DraftWindowProposalContext":
-        requests, mapping = _proposal_fingerprint(input_batch)
-        return cls(input_batch, requests, mapping, classify_draft_window_batch_phase(input_batch))
+        return cls(input_batch, classify_draft_window_batch_phase(input_batch))
 
     def validate(self, input_batch: InputBatch | Any) -> None:
-        if input_batch is not self.input_batch:
-            raise RuntimeError("proposal input batch object changed")
-        requests, mapping = _proposal_fingerprint(input_batch)
-        if requests != self.ordered_request_ids or mapping != self.idx_mapping_fingerprint:
-            raise RuntimeError("proposal request ordering or idx_mapping changed")
-        if classify_draft_window_batch_phase(input_batch) != self.full_read_rows:
-            raise RuntimeError("proposal row phases changed")
+        if input_batch is not self.input_batch or input_batch.num_reqs != len(self.full_read_rows):
+            raise RuntimeError("proposal input batch or request count changed")
 
 
 def classify_draft_window_batch_phase(input_batch: Any) -> tuple[bool, ...]:
@@ -67,109 +63,6 @@ def classify_draft_window_batch_phase(input_batch: Any) -> tuple[bool, ...]:
     if bool(getattr(input_batch, "has_prefill", False)) != bool(np.any(actual_prefill)):
         raise RuntimeError("InputBatch has_prefill disagrees with row phase state")
     return tuple(bool(value) for value in continuing)
-
-
-def draft_window_read_inputs(
-    workspace: Any,
-    *,
-    actual_request_count: int,
-    padded_request_count: int,
-) -> DraftReadView:
-    """Borrow the selected persistent bank through the common read interface."""
-    exact = workspace.cpu_window_exact[:padded_request_count]
-    active_exact = exact[:actual_request_count]
-    return DraftReadView(
-        block_table=workspace.window_block_table[:padded_request_count],
-        seq_lens=workspace.device_window_exact[:padded_request_count],
-        seq_lens_cpu=exact,
-        seq_lens_cpu_upper_bound=exact,
-        max_seq_len=int(active_exact.max().item()) if active_exact.numel() else 0,
-        num_reqs=padded_request_count,
-    )
-
-
-def build_draft_window_attn_metadata(
-    owner: Any,
-    *,
-    num_reqs: int,
-    num_reqs_padded: int,
-    num_tokens_padded: int,
-    read_inputs: DraftReadView,
-    query_width: int | None = None,
-    causal: bool | Mapping[int, bool],
-    query_start_loc_np: np.ndarray | None,
-    attn_groups: Any = None,
-    attn_state: Any = None,
-    parallel_config: Any = None,
-) -> dict[str, Any]:
-    """Assemble canonical query/write fields with one explicit Window read view.
-
-    The fixed upstream assembler reads Full buffers from its owner. Keep this
-    small Ascend seam shared by parallel drafting and Eagle's first/AR reads;
-    proposal, position, write-slot preparation and sampling remain upstream.
-    """
-    if query_width is None:
-        query_width = owner.num_query_per_req
-    if query_start_loc_np is None:
-        query_start_loc_cpu = torch.from_numpy(
-            np.minimum(owner.arange_np[: num_reqs_padded + 1], num_reqs) * query_width
-        )
-        max_query_len = query_width
-    else:
-        query_start_loc_cpu = torch.empty(num_reqs_padded + 1, dtype=torch.int32)
-        query_start_loc_cpu[: num_reqs + 1] = torch.from_numpy(query_start_loc_np[: num_reqs + 1])
-        query_start_loc_cpu[num_reqs:] = query_start_loc_cpu[num_reqs]
-        lengths = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
-        max_query_len = int(lengths.max().item()) if lengths.numel() else 0
-    if read_inputs.seq_lens.shape[0] != num_reqs_padded:
-        raise ValueError("Draft attention read lengths do not match the padded request count")
-    # Use the fixed Ascend builder directly. Window assembly does not need to
-    # replace the upstream module function or inherit an enclosing factory.
-    from vllm_ascend.worker.v2.attn_utils import build_attn_metadata
-
-    if attn_state is None:
-        # Target metadata also contains indexer/cache entries without a state.
-        # Use the same current-batch input as the normal Target builder.
-        attn_state = owner.input_batch.attn_state
-    if parallel_config is None:
-        parallel_config = owner.attn_vllm_config.parallel_config
-    window_group = owner._draft_window_graph_binding_provider.source.group
-    window_gid = window_group.gid
-    tables = list(owner.block_tables.input_block_tables)
-    tables[window_gid] = read_inputs.block_table
-
-    def bind_window_read(gid, common):
-        if gid == window_gid:
-            read_inputs.apply(common)
-
-    metadata = build_attn_metadata(
-        common_metadata_callback=bind_window_read,
-        attn_groups=owner.attn_groups if attn_groups is None else attn_groups,
-        num_reqs=num_reqs_padded,
-        num_tokens=num_tokens_padded,
-        query_start_loc_gpu=owner.input_buffers.query_start_loc[: num_reqs_padded + 1],
-        query_start_loc_cpu=query_start_loc_cpu,
-        max_query_len=max_query_len,
-        seq_lens=read_inputs.seq_lens,
-        seq_lens_cpu=read_inputs.seq_lens_cpu,
-        max_seq_len=read_inputs.max_seq_len,
-        block_tables=tables,
-        slot_mappings=owner.block_tables.slot_mappings[:, :num_tokens_padded],
-        kv_cache_config=owner.kv_cache_config,
-        causal=causal,
-        seq_lens_cpu_upper_bound=read_inputs.seq_lens_cpu_upper_bound,
-        positions=owner.input_buffers.positions[:num_tokens_padded],
-        is_prefilling=torch.from_numpy(owner.input_batch.is_prefilling_np),
-        parallel_config=parallel_config,
-        attn_state=attn_state,
-    )
-    # One executable group is admitted at initialization. The original
-    # builder shares its newly created metadata across that group's layers.
-    # Bind the two Graph-specific device operands once on this actual object.
-    layer = metadata[window_group.layers[0]]
-    layer.query_start_loc = owner.input_buffers.query_start_loc[: num_reqs_padded + 1]
-    layer.seq_lens = read_inputs.seq_lens
-    return metadata
 
 
 class DraftWindowGraphInputMixin:
@@ -245,9 +138,8 @@ class DraftWindowGraphInputMixin:
             self, "_draft_window_graph_submission_uncertain", False
         ):
             raise RuntimeError("draft-window backing is quarantined after uncertain Graph submission")
-        bypass_for_prefill = False
-        if not dummy_run and not is_profile:
-            bypass_for_prefill = _requires_prefill_baseline_bypass(input_batch)
+        context = None if dummy_run or is_profile else DraftWindowProposalContext.from_batch(input_batch)
+        bypass_for_prefill = context is not None and bool(context.full_read_rows) and all(context.full_read_rows)
         if dummy_run or is_profile or bypass_for_prefill:
             self._draft_window_bypass_active = True
             # Only a real all-continuing prefill may select the established
@@ -267,8 +159,8 @@ class DraftWindowGraphInputMixin:
             try:
                 # Startup/profile and pure-prefill proposals exercise the
                 # unmodified upstream metadata path without allocating a
-                # production Window generation. Mixed prefill/decode remains
-                # unsupported and is rejected by the classifier above.
+                # production Window generation. Mixed rows retain the phase
+                # snapshot for their actual per-row Window reads.
                 yield
             except BaseException:
                 if self._draft_window_dp_dummy_active:
@@ -282,7 +174,7 @@ class DraftWindowGraphInputMixin:
                 self._draft_window_prefill_bypass_active = False
                 self._draft_window_dp_dummy_active = False
             return
-        context = DraftWindowProposalContext.from_batch(input_batch)
+        assert context is not None
         self._draft_window_proposal = context
         self._draft_window_selected_metadata = None
         succeeded = False
@@ -340,13 +232,8 @@ class DraftWindowGraphInputMixin:
         selected = self._draft_window_selected_metadata
         if selected is None:
             raise RuntimeError("Draft Window input preparation requires the actual FULL dispatch")
-        from vllm_ascend.worker.v2.spec_decode.draft_window_graph import resolve_parallel_draft_window_graph_route
-
         provider = self._draft_window_graph_binding_provider
-        route = resolve_parallel_draft_window_graph_route(self)
-        assert route is not None
-        capture_identity = provider.capture_identity_for(route=route, descriptor=selected)
-        output_workspace = provider.prepare_workspace(capture_identity)
+        output_workspace = provider.prepare_workspace(selected)
 
         cpu_full_exact = self._snapshot_prepared_draft_seq_lens(num_reqs_padded)
         capability = self._draft_window_graph_binding_provider.source
@@ -402,7 +289,8 @@ class DraftWindowGraphInputMixin:
             or tokens != padded * self.num_query_per_req
             or query_start_loc_np.shape != expected_query.shape
             or not np.array_equal(query_start_loc_np, expected_query)
-            or self._draft_window_selected_metadata != batch_desc
+            or self._draft_window_selected_metadata is None
+            or self._draft_window_selected_metadata.descriptor != batch_desc
         ):
             raise RuntimeError("Draft Window requires its actual uniform FULL dispatch; no eager fallback")
         from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import (
@@ -430,34 +318,3 @@ class DraftWindowGraphInputMixin:
         if context is None:
             raise RuntimeError("Draft Window metadata build has no active proposal")
         return context
-
-
-def _proposal_fingerprint(
-    input_batch: InputBatch | Any,
-) -> tuple[tuple[str, ...], tuple[int, ...]]:
-    num_reqs = int(input_batch.num_reqs)
-    request_ids = tuple(input_batch.req_ids[:num_reqs])
-    if len(request_ids) != num_reqs:
-        raise ValueError("proposal request IDs do not match num_reqs")
-    mapping = np.asarray(input_batch.idx_mapping_np)
-    if mapping.ndim != 1 or mapping.shape[0] < num_reqs:
-        raise ValueError("proposal CPU idx_mapping does not cover active requests")
-    if not np.issubdtype(mapping.dtype, np.integer):
-        raise TypeError("proposal CPU idx_mapping must contain integers")
-    if any(not isinstance(request, str) or not request for request in request_ids) or len(set(request_ids)) != num_reqs:
-        raise ValueError("proposal requires unique nonempty request IDs")
-    return request_ids, tuple(int(value) for value in mapping[:num_reqs])
-
-
-def _requires_prefill_baseline_bypass(
-    input_batch: InputBatch | Any,
-) -> bool:
-    """Bypass only an all-continuing scheduler-prefill batch.
-
-    Terminal rows transition into speculative decode and mixed batches carry
-    an explicit row-wise full/window contract.  This helper remains for the
-    existing proposal-scope call sites; the immutable phase plan is bound to
-    the proposal epoch before any materialization.
-    """
-    full_read_rows = classify_draft_window_batch_phase(input_batch)
-    return bool(full_read_rows) and all(full_read_rows)

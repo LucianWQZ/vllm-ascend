@@ -15,7 +15,6 @@ from vllm_ascend.worker.v2.spec_decode.draft_window import (
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_eager import (
     DraftWindowProposalContext,
-    _requires_prefill_baseline_bypass,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphBindingProvider
 from vllm_ascend.worker.v2.spec_decode.draft_window_plan import DraftWindowPlan, compute_draft_window_plan
@@ -82,9 +81,10 @@ class Eagle3DraftWindowMixin:
         graph_session = getattr(self, "_eagle3_graph_session", None)
         if graph_session is not None:
             graph_session.require_reusable()
-        bypass_for_prefill = False
-        if not dummy_run and not is_profile:
-            bypass_for_prefill = _requires_prefill_baseline_bypass(input_batch)
+        context = None
+        if not dummy_run and not is_profile and not bool(getattr(input_batch, "is_dummy", False)):
+            context = DraftWindowProposalContext.from_batch(input_batch)
+        bypass_for_prefill = context is not None and bool(context.full_read_rows) and all(context.full_read_rows)
         if dummy_run or is_profile or bool(getattr(input_batch, "is_dummy", False)) or bypass_for_prefill:
             self._eagle3_window_bypass_active = True
             self._eagle3_window_continuing_prefill = bypass_for_prefill
@@ -100,7 +100,7 @@ class Eagle3DraftWindowMixin:
 
         if graph_session is None:
             raise RuntimeError("Eagle3 Draft Window business proposals require their installed Graph manager")
-        context = DraftWindowProposalContext.from_batch(input_batch)
+        assert context is not None
         self._eagle3_window_proposal = context
         self._eagle3_window_proposal_plan = None
         self._eagle3_window_decode_step_one_exact = None

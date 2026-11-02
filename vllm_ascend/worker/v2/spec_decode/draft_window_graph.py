@@ -64,7 +64,7 @@ class DraftWindowGraphBindingProvider:
         self._source = source
         self._active_inputs: DraftMetadataInputs | None = None
         self._quarantined = False
-        self._carriers: dict[tuple[DraftWindowGraphRoute, BatchExecutionDescriptor, int], DraftWindowGraphBucket] = {}
+        self._carriers: dict[tuple[DraftWindowGraphRoute, int, int], tuple[DraftWindowGraphBucket, ...]] = {}
         self._pending: list[DraftWindowGraphBucket] = []
         self._updating = False
 
@@ -102,7 +102,7 @@ class DraftWindowGraphBindingProvider:
             type(step) is not int
             or step < 0
             or type(num_reqs_padded) is not int
-            or num_reqs_padded < len(proposal.ordered_request_ids)
+            or num_reqs_padded < len(proposal.full_read_rows)
         ):
             raise ValueError("Draft Window consumer step or active/padded geometry is invalid")
         if frozen_row_plans is not None and self.method != "eagle3":
@@ -136,6 +136,15 @@ class DraftWindowGraphBindingProvider:
         if self._active_inputs is not None or self._pending:
             raise RuntimeError("Draft Window proposal has unfinished Graph consumers")
 
+    def capture_banks_for(
+        self, *, route: DraftWindowGraphRoute, num_reqs: int, num_tokens: int
+    ) -> tuple[DraftWindowGraphBucket, ...]:
+        """The fixed capture callbacks expose geometry, so index it once here."""
+        try:
+            return self._carriers[route, num_reqs, num_tokens]
+        except KeyError as error:
+            raise RuntimeError("Draft Window has no captured consumer for this geometry") from error
+
     def capture_identity_for(
         self,
         *,
@@ -143,12 +152,10 @@ class DraftWindowGraphBindingProvider:
         descriptor: BatchExecutionDescriptor,
         consumer_ordinal: int = 0,
     ) -> DraftWindowGraphBucket:
-        """Select the bank using the actual manager's complete descriptor."""
-        key = route, descriptor, consumer_ordinal
-        try:
-            return self._carriers[key]
-        except KeyError as error:
-            raise RuntimeError(f"runtime descriptor does not resolve a captured consumer: {descriptor!r}") from error
+        banks = self.capture_banks_for(route=route, num_reqs=descriptor.num_reqs, num_tokens=descriptor.num_tokens)
+        if banks[0].descriptor != descriptor or not 0 <= consumer_ordinal < len(banks):
+            raise RuntimeError(f"runtime descriptor does not resolve a captured consumer: {descriptor!r}")
+        return banks[consumer_ordinal]
 
     def startup_capture_workspace(
         self,
@@ -191,9 +198,12 @@ class DraftWindowGraphBindingProvider:
             raise ValueError("capture query width differs from the actual descriptor")
         if route is DraftWindowGraphRoute.EAGLE3_AR_STEP and query_width != 1:
             raise ValueError("Eagle3 AR capture requires query width 1")
-        key = route, descriptor, consumer_ordinal
-        if key in self._carriers:
-            raise RuntimeError("capture consumer identity is already registered")
+        key = route, num_reqs, descriptor.num_tokens
+        banks = self._carriers.get(key, ())
+        if banks and banks[0].descriptor != descriptor:
+            raise RuntimeError("Draft Window capture descriptor geometry is ambiguous")
+        if consumer_ordinal != len(banks):
+            raise RuntimeError("capture consumer identity is duplicate or outside serial ordinal order")
         source = self.source
         if num_reqs > source.table.shape[0]:
             raise RuntimeError("capture request bucket exceeds source capacity")
@@ -203,7 +213,7 @@ class DraftWindowGraphBindingProvider:
             table_template=source.table,
         )
         bucket = DraftWindowGraphBucket(route, descriptor, consumer_ordinal, backing)
-        self._carriers[key] = bucket
+        self._carriers[key] = (*banks, bucket)
         return bucket
 
     def prepare_workspace(self, capture_identity: DraftWindowGraphBucket) -> DraftWindowWorkspace:
@@ -235,12 +245,11 @@ class DraftWindowGraphBindingProvider:
         *,
         capture_identity: DraftWindowGraphBucket,
         inputs: DraftMetadataInputs,
-        metadata: Mapping[str, Any],
     ) -> DraftWindowGraphBucket:
         """Publish this generation against its selected persistent Graph bank."""
         carrier = self._require_registered_capture(capture_identity)
         inputs.validate()
-        if inputs.metadata is not None:
+        if inputs.params is not None:
             raise RuntimeError("cannot overwrite active draft metadata")
         if carrier in self._pending:
             raise RuntimeError("cannot overwrite an active Draft Window graph read carrier")
@@ -261,9 +270,19 @@ class DraftWindowGraphBindingProvider:
             assert previous.inputs is not None
             if previous.route is not route or previous.inputs.proposal is not inputs.proposal:
                 raise RuntimeError("graph read carriers do not belong to the same actual proposal/route")
-        if not isinstance(metadata, Mapping) or not metadata:
-            raise RuntimeError("explicit Draft Window graph carrier produced no Draft metadata")
-        object.__setattr__(inputs, "metadata", metadata)
+        descriptor = carrier.descriptor
+        query_width = descriptor.num_tokens // descriptor.num_reqs
+        # Capture owns all query/write/position addresses. UPDATE changes only
+        # the same three operands that the fixed FIAParamProvider resolves.
+        object.__setattr__(
+            inputs,
+            "params",
+            {
+                "actual_seq_lengths": [query_width * (row + 1) for row in range(descriptor.num_reqs)],
+                "actual_seq_lengths_kv": carrier.workspace.cpu_window_exact.tolist(),
+                "block_table": carrier.workspace.window_block_table,
+            },
+        )
         object.__setattr__(carrier, "inputs", inputs)
         self._pending.append(carrier)
         return carrier
@@ -273,8 +292,8 @@ class DraftWindowGraphBindingProvider:
         *,
         route: DraftWindowGraphRoute,
         expected_consumer_count: int,
-    ) -> tuple[Mapping[str, Any], ...]:
-        """Submit exactly one explicit carrier set; baseline metadata is forbidden."""
+    ) -> DraftWindowGraphBindingProvider:
+        """Select the current banks as the fixed UpdatableGraph ParamSource."""
         if (
             expected_consumer_count <= 0
             or len(self._pending) != expected_consumer_count
@@ -282,12 +301,18 @@ class DraftWindowGraphBindingProvider:
             or self._updating
         ):
             raise RuntimeError("Graph Window requires its complete unconsumed consumer batch")
-        metadata = []
-        for carrier in self._pending:
-            assert carrier.inputs is not None and carrier.inputs.metadata is not None
-            metadata.append(carrier.inputs.metadata)
         self._updating = True
-        return tuple(metadata)
+        return self
+
+    def get(self, _provider: Any) -> tuple[dict[str, Any], ...]:
+        """Resolve one payload per actual layer consumer, in capture order."""
+        if not self._updating:
+            raise RuntimeError("Draft Window UPDATE has no submitted consumer batch")
+        result = []
+        for carrier in self._pending:
+            assert carrier.inputs is not None and carrier.inputs.params is not None
+            result.append(carrier.inputs.params)
+        return tuple(result)
 
     def validate_captured_graphs(self, graphs: Mapping[BatchExecutionDescriptor, Any]) -> None:
         """Check actual FIA tasks once, after the manager has stored its graphs.
@@ -309,6 +334,7 @@ class DraftWindowGraphBindingProvider:
                 if (
                     not isinstance(task.provider, FIAParamProvider)
                     or not task.provider.is_draft_model
+                    or task.provider.is_non_pa
                     or task.provider.layer_name not in self.source.group.layers
                     or task.operation != torch_npu.npu_fused_infer_attention_score.out
                 ):
@@ -325,8 +351,10 @@ class DraftWindowGraphBindingProvider:
         self,
         capture_identity: DraftWindowGraphBucket,
     ) -> DraftWindowGraphBucket:
-        carrier = self._carriers.get(
-            (capture_identity.route, capture_identity.descriptor, capture_identity.consumer_ordinal)
+        carrier = self.capture_identity_for(
+            route=capture_identity.route,
+            descriptor=capture_identity.descriptor,
+            consumer_ordinal=capture_identity.consumer_ordinal,
         )
         if carrier is not capture_identity:
             raise RuntimeError("capture identity/bucket is not registered by this Draft provider")
@@ -353,21 +381,3 @@ def resolve_parallel_draft_window_graph_route(
     if method == "dspark":
         return DraftWindowGraphRoute.DSPARK
     raise RuntimeError(f"parallel Draft Window graph manager cannot consume method {method!r}")
-
-
-def consume_draft_window_graph_metadata(
-    owner: Any,
-    *,
-    route: DraftWindowGraphRoute,
-    expected_consumer_count: int,
-) -> tuple[Mapping[str, Any], ...] | None:
-    """Return explicit carrier metadata, or preserve exact OFF behavior."""
-    provider = getattr(owner, "_draft_window_graph_binding_provider", None)
-    if provider is None:
-        return None
-    if not isinstance(provider, DraftWindowGraphBindingProvider):
-        raise TypeError("invalid instance-owned Draft Window graph binding provider")
-    return provider.consume_metadata(
-        route=route,
-        expected_consumer_count=expected_consumer_count,
-    )

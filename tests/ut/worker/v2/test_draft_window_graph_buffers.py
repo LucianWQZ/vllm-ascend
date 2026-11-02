@@ -5,6 +5,7 @@
 from dataclasses import FrozenInstanceError, replace
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -31,7 +32,7 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_policy import resolve_draft_
 
 
 def _proposal(epoch=0, requests=("request-a",)):
-    return DraftWindowProposalContext(object(), requests, tuple(range(len(requests))), (False,) * len(requests))
+    return DraftWindowProposalContext(object(), (False,) * len(requests))
 
 
 @pytest.fixture
@@ -95,41 +96,7 @@ def _bank_tensors(bank):
 
 
 def _bind(case, inputs):
-    actual = len(inputs.proposal.ordered_request_ids)
-    padded = inputs.padded_request_count
-    query_width = case.capture.descriptor.num_tokens // case.capture.descriptor.num_reqs
-    tokens = actual * query_width
-    query_lengths = tuple(row * query_width for row in range(1, actual + 1)) + (tokens,) * (padded - actual)
-    reference = SimpleNamespace(
-        slot_mapping=case.owner.slot_mappings[0, :tokens],
-        query_start_loc=torch.tensor((0,) + query_lengths, dtype=torch.int32),
-        actual_seq_lengths_q=query_lengths,
-        attn_state=object(),
-        num_actual_tokens=tokens,
-        causal=True,
-    )
-
-    def metadata_builder(read):
-        return {
-            "draft.layer": SimpleNamespace(
-                block_tables=read.window_block_table,
-                seq_lens=read.device_window_exact,
-                seq_lens_cpu=read.cpu_window_exact,
-                seq_lens_list=read.cpu_window_exact.tolist(),
-                slot_mapping=reference.slot_mapping,
-                query_start_loc=reference.query_start_loc,
-                actual_seq_lengths_q=list(reference.actual_seq_lengths_q),
-                attn_state=reference.attn_state,
-                num_actual_tokens=reference.num_actual_tokens,
-                causal=reference.causal,
-            )
-        }
-
-    return case.provider.bind_read_carrier(
-        capture_identity=case.capture,
-        inputs=inputs,
-        metadata=metadata_builder(inputs.workspace),
-    )
+    return case.provider.bind_read_carrier(capture_identity=case.capture, inputs=inputs)
 
 
 def test_direct_capture_bank_never_allocates_scratch_or_mutates_full_source(graph_buffers):
@@ -227,10 +194,10 @@ def test_repeated_binding_preserves_the_actual_published_metadata_and_pending_ba
     inputs = _materialize(case)
     before = [tensor.clone() for tensor in _bank_tensors(inputs.workspace)]
     bucket = _bind(case, inputs)
-    metadata = inputs.metadata
+    metadata = inputs.params
     with pytest.raises(RuntimeError, match="overwrite active draft metadata"):
         _bind(case, inputs)
-    assert inputs.metadata is metadata and bucket.inputs is inputs
+    assert inputs.params is metadata and bucket.inputs is inputs
     assert case.provider._active_inputs is inputs
     assert all(torch.equal(tensor, old) for tensor, old in zip(_bank_tensors(inputs.workspace), before))
     with pytest.raises(RuntimeError, match="active Draft Window"):
@@ -267,7 +234,7 @@ def test_eagle_serialized_steps_own_distinct_banks_and_preserve_previous_consume
     case.owner.slot_mappings = torch.arange(8, dtype=torch.int64).reshape(1, 8)
     proposal_plan = compute_draft_window_plan(full_exact_end=11, future_offset=3, window_size=4, block_span_tokens=4)
     retained: list[tuple[DraftWindowWorkspace, list[torch.Tensor]]] = []
-    for step, (padded, query_width) in enumerate(((2, 4), (1, 1), (2, 1))):
+    for step, (padded, query_width) in enumerate(((2, 4), (2, 1), (2, 1))):
         route = DraftWindowGraphRoute.EAGLE3_FIRST_PASS if step == 0 else DraftWindowGraphRoute.EAGLE3_AR_STEP
         descriptor = BatchExecutionDescriptor(
             CUDAGraphMode.FULL, num_tokens=padded * query_width, num_reqs=padded, uniform_token_count=query_width
@@ -327,8 +294,25 @@ def test_runtime_capture_resolves_all_actual_descriptor_fields(graph_buffers, fi
     route = DraftWindowGraphRoute.DFLASH
     assert hash(descriptor) == hash(replace(descriptor))
     assert provider.capture_identity_for(route=route, descriptor=replace(descriptor)) is graph_buffers.capture
-    with pytest.raises(RuntimeError, match="descriptor does not resolve"):
+    with pytest.raises(RuntimeError, match="descriptor does not resolve|no captured consumer"):
         provider.capture_identity_for(route=route, descriptor=replace(descriptor, **{field: value}))
+
+
+def test_capture_geometry_cannot_hide_a_different_full_descriptor(graph_buffers):
+    case = graph_buffers
+    with pytest.raises(RuntimeError, match="geometry is ambiguous"):
+        case.provider.register_capture_identity(
+            route=case.capture.route, descriptor=replace(case.capture.descriptor, max_query_len=1)
+        )
+
+
+def test_actual_binding_rejects_changed_padded_rows_before_publication(graph_buffers):
+    case = graph_buffers
+    inputs = _materialize(case)
+    object.__setattr__(inputs, "padded_request_count", 4)
+    with pytest.raises(RuntimeError, match="padded request count mismatch"):
+        _bind(case, inputs)
+    assert inputs.params is None and case.capture.inputs is None
 
 
 @pytest.mark.parametrize("field,value", [("num_active_loras", 1), ("num_ubatches", 2)])
@@ -385,11 +369,12 @@ def test_parallel_capture_uses_exact_manager_descriptor_and_preserves_full_table
     desc = case.capture.descriptor
     ctx = _build_capture_context(owner, buffers, {CUDAGraphMode.FULL: [desc]})
     assert ctx is not None
-    identity, read = ctx.resolve(2, 2)
+    identity = ctx.capture_banks_for(route=case.capture.route, num_reqs=2, num_tokens=2)[0]
+    read = ctx.startup_capture_workspace(identity)
     assert identity is case.capture
     full = case.source.table
     before = full.clone()
-    maximum = _seed_capture_workspace(identity, read, (full,), max_model_len=16, provider=case.provider)
+    maximum = _seed_capture_workspace(read, max_model_len=16, provider=case.provider)
     assert maximum == 7 and read.cpu_window_exact.tolist() == [7, 7]
     assert read.device_window_exact.tolist() == [7, 7]
     assert torch.equal(full, before)
@@ -412,7 +397,8 @@ def test_parallel_capture_scope_owns_its_attachment_until_normal_or_error_exit(g
         with capture.draft_window_dflash_capture_scope(owner, buffers, descriptors) as context:
             assert getattr(buffers, capture._CAPTURE_CONTEXT_ATTRIBUTE) is context
             assert context is not None
-            bucket, bank = context.resolve(2, 2)
+            bucket = context.capture_banks_for(route=case.capture.route, num_reqs=2, num_tokens=2)[0]
+            bank = context.startup_capture_workspace(bucket)
             assert bucket is case.capture and bank is case.capture.workspace
             with (
                 pytest.raises(RuntimeError, match="already attached"),
@@ -491,7 +477,7 @@ def test_piecewise_context_only_descriptor_does_not_register_an_attention_bank(g
             route=case.capture.route,
             descriptor=replace(case.capture.descriptor, cg_mode=CUDAGraphMode.PIECEWISE, num_reqs=None),
         )
-    assert tuple(case.provider._carriers.values()) == (case.capture,)
+    assert tuple(case.provider._carriers.values()) == ((case.capture,),)
 
 
 def test_materialization_reads_current_canonical_table_without_a_stale_source_mirror(graph_buffers):
@@ -510,32 +496,14 @@ def test_workspace_rejects_invalid_native_table_dtype_at_its_creation_boundary()
         )
 
 
-def test_actual_capture_bank_supplies_exact_cpu_as_its_own_valid_upper(graph_buffers):
-    from vllm_ascend.worker.v2.spec_decode.draft_window_eager import draft_window_read_inputs
-
+def test_captured_payload_uses_exact_current_lengths_and_inert_padding(graph_buffers):
     case = graph_buffers
-    plan = compute_draft_window_plan(full_exact_end=11, future_offset=0, window_size=4, block_span_tokens=4)
-    inputs = case.provider.materialize(
-        proposal=_proposal(),
-        cpu_full_exact=torch.tensor([plan.full_exact_end], dtype=torch.int32),
-        cpu_valid_num_blocks=torch.tensor([4], dtype=torch.int32),
-        num_reqs_padded=1,
-        step=0,
-        output_workspace=case.provider.prepare_workspace(case.capture),
-    )
-    assert inputs.workspace.window_block_table.shape[0] == 2
-    inputs.validate()
-    read = draft_window_read_inputs(
-        inputs.workspace,
-        actual_request_count=1,
-        padded_request_count=1,
-    )
-    assert read.block_table.shape == (1, 4)
-    assert read.seq_lens.shape == read.seq_lens_cpu.shape == read.seq_lens_cpu_upper_bound.shape == (1,)
-    assert read.block_table.data_ptr() == inputs.workspace.window_block_table.data_ptr()
-    assert read.seq_lens.data_ptr() == inputs.workspace.device_window_exact.data_ptr()
-    assert read.seq_lens_cpu_upper_bound.data_ptr() == read.seq_lens_cpu.data_ptr()
-    assert read.seq_lens_cpu_upper_bound.item() == read.seq_lens_cpu.item()
+    inputs = _materialize(case, ends=(11,))
+    bucket = _bind(case, inputs)
+    assert inputs.params["actual_seq_lengths_kv"] == [7, 0]
+    assert inputs.params["actual_seq_lengths"] == [1, 2]
+    assert inputs.params["block_table"] is bucket.workspace.window_block_table
+    assert inputs.params["block_table"][1].tolist() == [0, 0, 0, 0]
     case.provider.retire_generation(inputs)
     with pytest.raises(RuntimeError, match="retired Draft inputs"):
         inputs.validate()
@@ -624,23 +592,23 @@ def typed_update_guard(graph_buffers):
         tasks = [task]
         provider_sizes = {provider: 1}
 
-    return SimpleNamespace(case=case, carrier=carrier, graph=Graph(), metadata=batch[0], task=task)
+    return SimpleNamespace(case=case, carrier=carrier, graph=Graph(), source=batch, task=task)
 
 
 def test_original_task_resolver_binds_current_metadata_without_replacing_capture_state(typed_update_guard):
-    from vllm_ascend.compilation.updatable_graph import ContextSource, UpdatableGraph
+    from vllm_ascend.compilation.updatable_graph import UpdatableGraph
 
     c = typed_update_guard
     c.case.provider.validate_captured_graphs({c.case.capture.descriptor: c.graph})
-    resolved = UpdatableGraph.resolve_tasks(c.graph, ContextSource(c.metadata))
+    resolved = UpdatableGraph.resolve_tasks(c.graph, c.source)
     assert len(resolved) == 1
     actual = resolved[0]
     assert actual.operation is c.task.operation
     assert actual.handle is c.task.handle and actual.event is c.task.event
     assert actual.provider is c.task.provider and actual.provider_index == 0
-    assert actual.kwargs["block_table"] is c.metadata["draft.layer"].block_tables
-    assert actual.kwargs["actual_seq_lengths_kv"] is c.metadata["draft.layer"].seq_lens_list
-    assert actual.kwargs["actual_seq_lengths"] is c.metadata["draft.layer"].actual_seq_lengths_q
+    assert actual.kwargs["block_table"] is c.carrier.inputs.params["block_table"]
+    assert actual.kwargs["actual_seq_lengths_kv"] is c.carrier.inputs.params["actual_seq_lengths_kv"]
+    assert actual.kwargs["actual_seq_lengths"] is c.carrier.inputs.params["actual_seq_lengths"]
     with pytest.raises(RuntimeError, match="active Draft Window"):
         c.case.provider.prepare_workspace(c.case.capture)
     c.case.provider.finish_update(route=c.case.capture.route)
@@ -653,6 +621,93 @@ def test_capture_contract_rejects_an_unsupported_native_consumer(typed_update_gu
     setattr(c.task, field, object())
     with pytest.raises(RuntimeError, match="supported Draft FIA consumer"):
         c.case.provider.validate_captured_graphs({c.case.capture.descriptor: c.graph})
+
+
+@pytest.mark.parametrize("window", [False, True])
+@pytest.mark.parametrize("update_fails", [False, True])
+def test_actual_parallel_manager_updates_after_replay_and_only_then_retires_banks(
+    graph_buffers, monkeypatch, window, update_fails
+):
+    from vllm_ascend.attention.attention_v1 import FIAParamProvider
+    from vllm_ascend.compilation.updatable_graph import GraphUpdateTask, UpdatableGraph
+    from vllm_ascend.worker.v2.spec_decode.dflash import aclgraph
+
+    case = graph_buffers
+    inputs = _materialize(case) if window else None
+    owner = SimpleNamespace(
+        attn_backends={"draft.layer": object()},
+        input_batch=SimpleNamespace(seq_lens_cpu_upper_bound=torch.tensor([16, 16])),
+        build_draft_attn_metadatas=Mock(
+            return_value=[
+                {
+                    "draft.layer": SimpleNamespace(
+                        actual_seq_lengths_q=[1, 2], seq_lens_list=[11, 14], block_tables=case.source.table
+                    )
+                }
+            ]
+        ),
+    )
+    if window:
+        owner._draft_window_graph_binding_provider = case.provider
+        owner._draft_window_proposal = inputs.proposal
+        owner._draft_window_selected_metadata = case.capture
+    provider = FIAParamProvider("draft.layer", None, is_draft_model=True)
+    task = GraphUpdateTask(object(), {}, provider, 0, object(), object())
+    events, resolved = [], []
+
+    class Graph:
+        provider_sizes = {provider: 1}
+        tasks = [task]
+
+        def resolve_tasks(self, source):
+            events.append("resolve")
+            result = UpdatableGraph.resolve_tasks(self, source)
+            resolved.extend(result)
+            return result
+
+        def update(self, stream, tasks):
+            assert tasks[0] is resolved[0]
+            events.append("update")
+            if update_fails:
+                raise RuntimeError("native UPDATE failed")
+
+    manager = object.__new__(aclgraph.DFlashAclGraphManager)
+    manager.speculator = owner
+    manager.graphs = {case.capture.descriptor: Graph()}
+    manager.update_stream = SimpleNamespace(wait_stream=lambda stream: events.append("wait"))
+    monkeypatch.setattr(aclgraph, "UpdatableGraph", Graph)
+    monkeypatch.setattr(aclgraph, "use_updatable_graph", lambda backend: True)
+    monkeypatch.setattr(torch.npu, "current_stream", lambda: object())
+    output = object()
+
+    def replay(self, descriptor):
+        events.append("replay")
+        return output
+
+    monkeypatch.setattr(aclgraph.DFlashCudaGraphManager, "run_fullgraph", replay)
+    if update_fails:
+        with pytest.raises(RuntimeError, match="native UPDATE failed"):
+            manager.run_fullgraph(case.capture.descriptor)
+    else:
+        assert manager.run_fullgraph(case.capture.descriptor) is output
+    assert events == ["resolve", "wait", "replay", "update"]
+    actual = resolved[0]
+    assert actual.handle is task.handle and actual.event is task.event and actual.provider is provider
+    assert actual.kwargs["actual_seq_lengths"] == [1, 2]
+    if window:
+        owner.build_draft_attn_metadatas.assert_not_called()
+        assert actual.kwargs["actual_seq_lengths_kv"] == [7, 6]
+        assert actual.kwargs["block_table"] is case.capture.workspace.window_block_table
+        assert case.provider._updating is update_fails
+        assert bool(case.provider._pending) is update_fails
+        assert case.capture.inputs is inputs and inputs.params is not None
+    else:
+        owner.build_draft_attn_metadatas.assert_called_once()
+        assert actual.kwargs["actual_seq_lengths_kv"] == [11, 14]
+        assert actual.kwargs["block_table"] is case.source.table
+    assert case.source.table.tolist() == [[11, 12, 13, 14], [21, 22, 23, 24]]
+    assert case.owner.slot_mappings.tolist() == [[40, 80]]
+    assert case.target_metadata["target.layer"].seq_lens_list == [91, 92]
 
 
 def test_parallel_capture_checks_tasks_after_the_original_manager_stores_its_graphs(typed_update_guard, monkeypatch):
@@ -689,15 +744,15 @@ def test_parallel_capture_checks_tasks_after_the_original_manager_stores_its_gra
     assert not hasattr(c.case.input_buffers, capture._CAPTURE_CONTEXT_ATTRIBUTE)
 
 
-def test_publication_uses_the_bank_fields_from_the_real_builder(graph_buffers):
+def test_publication_retains_only_fia_update_operands_and_capture_bank(graph_buffers):
     case = graph_buffers
     inputs = _materialize(case)
     carrier = _bind(case, inputs)
-    metadata = carrier.inputs.metadata["draft.layer"]
-    assert metadata.block_tables is inputs.workspace.window_block_table
-    assert metadata.seq_lens is inputs.workspace.device_window_exact
-    assert metadata.seq_lens_cpu is inputs.workspace.cpu_window_exact
-    assert metadata.seq_lens_list == inputs.workspace.cpu_window_exact.tolist()
+    assert set(inputs.params) == {"block_table", "actual_seq_lengths", "actual_seq_lengths_kv"}
+    assert inputs.params["block_table"] is carrier.workspace.window_block_table
+    assert inputs.params["actual_seq_lengths_kv"] == carrier.workspace.cpu_window_exact.tolist()
+    with pytest.raises(RuntimeError, match="no submitted consumer batch"):
+        case.provider.get(object())
 
 
 def test_eagle_first_bank_retains_full_table_capacity_for_a_mixed_prefill(graph_buffers):
@@ -836,7 +891,7 @@ def test_incomplete_or_wrong_update_cannot_release_the_real_pending_bank(graph_b
     case.provider.finish_update(route=route)
     assert case.provider.prepare_workspace(case.capture) is bucket.workspace
     # Host UPDATE release does not drop the real CPU metadata/bank owners.
-    assert bucket.inputs is inputs and bucket.inputs.metadata is not None
+    assert bucket.inputs is inputs and bucket.inputs.params is not None
 
 
 def test_pending_eagle_consumers_reject_a_different_proposal_without_releasing_old_bank(graph_buffers):

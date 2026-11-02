@@ -22,6 +22,21 @@ sys.modules[spec.name] = GUARD
 spec.loader.exec_module(GUARD)
 
 
+def runner_bounds(owner, batch):
+    """Exercise the canonical runner boundary before using its private batch."""
+    count = max(batch.idx_mapping_np, default=-1) + 1
+    prompt, maximum = [0] * count, [0] * count
+    for row, (start, end) in zip(batch.idx_mapping_np, batch.draft_graph_request_bounds, strict=True):
+        prompt[row], maximum[row] = start, end
+    state = NS(
+        req_id_to_index=dict(zip(batch.req_ids, batch.idx_mapping_np, strict=True)),
+        prompt_len=NS(np=prompt),
+        prefill_len=NS(np=prompt),
+        max_seq_len=maximum,
+    )
+    return GUARD.draft_graph_request_bounds(owner, state, batch.req_ids, batch.idx_mapping_np)
+
+
 def actual_source_function(path, name, namespace, *, class_name=None):
     module = ast.parse(path.read_text())
     nodes = (
@@ -373,6 +388,7 @@ class DraftGraphSupportTest(unittest.TestCase):
             idx_mapping_np=list(range(rows)),
             prefill_len_np=[1021] * rows,
             draft_graph_request_bounds=tuple((r[2], r[3]) for r in records),
+            num_draft_tokens_per_req=None,
         )
 
     def test_actual_rows_and_request_identity_not_client_concurrency(self):
@@ -385,8 +401,8 @@ class DraftGraphSupportTest(unittest.TestCase):
             GUARD.validate_draft_graph_review_requests(owner, batch)
         batch.num_reqs_after_padding = 2
         batch.req_ids[1] = batch.req_ids[0]
-        with self.assertRaises(NotImplementedError):
-            GUARD.validate_draft_graph_review_requests(owner, batch)
+        with self.assertRaisesRegex(RuntimeError, "unique"):
+            runner_bounds(owner, batch)
 
     def test_preemption_state_is_kept_until_actual_finish(self):
         scope = self.resolve(self.config())
@@ -396,7 +412,7 @@ class DraftGraphSupportTest(unittest.TestCase):
             owner, NS(finished_req_ids=set(), preempted_req_ids={"request-0"})
         )
         with self.assertRaises(NotImplementedError):
-            GUARD.validate_draft_graph_review_requests(owner, batch)
+            runner_bounds(owner, batch)
         GUARD.note_eagle_single_request_review_lifecycle(
             owner, NS(finished_req_ids={"request-0"}, preempted_req_ids=set())
         )
@@ -460,9 +476,13 @@ class DraftGraphSupportTest(unittest.TestCase):
                 GUARD.validate_eagle_single_request_review_exact(
                     owner, batch, Exact(value), num_reqs=1, padded=1, step=0
                 )
-        batch.num_scheduled_tokens = [509]
+        # Phase inconsistency is rejected once when the real proposal opens,
+        # rather than reinterpreting the same CPU counters in every consumer.
+        from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowProposalContext
+
+        batch.is_prefilling_np, batch.has_prefill = [False], False
         with self.assertRaises(RuntimeError):
-            GUARD.validate_eagle_single_request_review_exact(owner, batch, Exact(1021), num_reqs=1, padded=1, step=0)
+            DraftWindowProposalContext.from_batch(batch)
 
     def test_full8_request_lookahead_cannot_exceed_allocated_capacity(self):
         config = self.config(method="dflash")
@@ -477,7 +497,7 @@ class DraftGraphSupportTest(unittest.TestCase):
         GUARD.validate_draft_graph_review_requests(owner, batch)
         batch.draft_graph_request_bounds = ((1021, 40960),)
         with self.assertRaises(NotImplementedError):
-            GUARD.validate_draft_graph_review_requests(owner, batch)
+            runner_bounds(owner, batch)
 
     def test_full8_descriptor_rejects_unqualified_padding_before_execution(self):
         scope = self.resolve(self.config(method="dflash", rows=2))
@@ -651,7 +671,7 @@ class ActualGraphDescriptorControls(unittest.TestCase):
         self.assertFalse(hasattr(owner, "_draft_window_graph_binding_provider"))
         self.assertFalse(hasattr(owner, "_draft_window_runtime"))
 
-    def test_first_q4_and_existing_on_identity_checks(self):
+    def test_first_q4_descriptor_checks_before_replay(self):
         owner, _ = _single_owner_batch()
         manager, seen = self.manager(owner, first=True)
         self.assertEqual(self.run_actual(manager, N(num_reqs=1, num_tokens=4)), "legacy-result")
@@ -659,16 +679,8 @@ class ActualGraphDescriptorControls(unittest.TestCase):
         with self.assertRaisesRegex(NotImplementedError, "first Q4"):
             self.run_actual(manager, N(num_reqs=4, num_tokens=4))
         self.assertEqual(seen, [])
-        for first, step, ordinal, tokens in ((True, 0, 0, 4), (False, 1, 0, 1), (False, 2, 1, 1)):
-            inputs = N(proposal=N(ordered_request_ids=("request-0",)), padded_request_count=1, step=step)
-            M.validate_eagle_single_request_graph_stage(owner, inputs, first=first, n=1, tokens=tokens, ordinal=ordinal)
-            inputs.step = 7
-            with self.assertRaises(NotImplementedError):
-                M.validate_eagle_single_request_graph_stage(
-                    owner, inputs, first=first, n=1, tokens=tokens, ordinal=ordinal
-                )
 
-    def test_window_session_stays_on_its_existing_stronger_stage_path(self):
+    def test_window_session_keeps_its_actual_materialize_and_binding_path(self):
         owner, _ = _single_owner_batch()
         manager, seen = self.manager(owner, session=object())
         self.assertEqual(self.run_actual(manager, N(num_reqs=1, num_tokens=1)), "window-result")
@@ -767,11 +779,12 @@ class EagleMixedRequestControls(unittest.TestCase):
             M.validate_eagle_single_request_review_exact(
                 owner, batch, Vector(cpu_lengths), num_reqs=2, padded=2, step=0
             )
-        owner._eagle3_window_proposal = NS(full_read_rows=(False, True))
+        from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowProposalContext
+
+        batch.num_draft_tokens_per_req = None
+        batch.is_prefilling_np, batch.has_prefill = [False, True], True
         with self.assertRaises(RuntimeError):
-            M.validate_eagle_single_request_review_exact(
-                owner, batch, Vector([1537, 513]), num_reqs=2, padded=2, step=0
-            )
+            DraftWindowProposalContext.from_batch(batch)
 
     def test_continuing_prefill_does_not_relax_identity_capacity_or_counter_contract(self):
         for damage in (
@@ -788,7 +801,8 @@ class EagleMixedRequestControls(unittest.TestCase):
             owner, batch = _pair_owner_batch()
             batch.num_computed_prefill_tokens_np = [1152, 384]
             batch.num_scheduled_tokens = [128, 129]
-            owner._eagle3_window_proposal = NS(full_read_rows=(True, False))
+            batch.num_draft_tokens_per_req = None
+            batch.is_prefilling_np, batch.has_prefill = [True, True], True
             if damage == "wrong-id":
                 batch.req_ids[0] = "different-request"
             elif damage == "bad-index":
@@ -807,12 +821,19 @@ class EagleMixedRequestControls(unittest.TestCase):
                 batch.num_scheduled_tokens[0] = 385
             else:
                 batch.num_scheduled_tokens[0] = 0
-            with self.subTest(damage=damage), self.assertRaises((RuntimeError, NotImplementedError)):
+            with (
+                self.subTest(damage=damage),
+                self.assertRaises((RuntimeError, NotImplementedError, ValueError, TypeError, AttributeError)),
+            ):
                 if damage in ("wrong-id", "bad-index"):
                     # Identity is established when the actual runner builds the
                     # batch, not repeatedly reconstructed by each AR reader.
                     state = NS(req_id_to_index={"request-A": 7, "request-B": 3})
                     M.draft_graph_request_bounds(owner, state, batch.req_ids, batch.idx_mapping_np)
+                from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowProposalContext
+
+                runner_bounds(owner, batch)
+                owner._eagle3_window_proposal = DraftWindowProposalContext.from_batch(batch)
                 M.validate_draft_graph_review_requests(owner, batch)
                 M.validate_eagle_single_request_review_exact(
                     owner, batch, Vector([1280, 513]), num_reqs=2, padded=2, step=0

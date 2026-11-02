@@ -74,45 +74,13 @@ def _eagle_ar_capture_config(vllm_config: VllmConfig, cudagraph_mode: CUDAGraphM
     from vllm_ascend import envs
     from vllm_ascend.ascend_config import _eagle3_tp4_graph_review
 
-    dp = vllm_config.parallel_config.data_parallel_size
-    if type(dp) is not int or dp not in (1, 2):
-        return vllm_config
     if not envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH or not _eagle3_tp4_graph_review(vllm_config):
         return vllm_config
-    draft_parallel = speculative.draft_parallel_config
-    if (
-        draft_parallel is None
-        or draft_parallel.use_sequence_parallel_moe is not False
-        or draft_parallel.enable_expert_parallel is not False
-    ):
-        raise NotImplementedError("Eagle AR capture adaptation requires the independent non-SP dense Draft descriptor")
+    # The qualified startup contract already checks every admitted first Q4
+    # bucket, its capacity and the independent non-SP Draft. Reuse those same
+    # request counts for Q1 AR; never renormalize them through Target SP.
     compilation = vllm_config.compilation_config
-    maximum = vllm_config.scheduler_config.max_num_seqs
-    first_query = speculative.num_speculative_tokens + 1
-    sizes = compilation.cudagraph_capture_sizes
-    if (
-        type(maximum) is not int
-        or maximum <= 0
-        or type(compilation.max_cudagraph_capture_size) is not int
-        or compilation.max_cudagraph_capture_size <= 0
-        or not sizes
-        or any(type(size) is not int or size <= 0 for size in sizes)
-    ):
-        raise ValueError("Eagle AR capture requires typed positive Target first-pass bucket inputs")
-    # This matches the already legal first Q4 FULL descriptors, not arbitrary
-    # new request counts or a guessed minimum bucket. Do not call platform
-    # normalization on the private descriptor: it would apply Target SP again.
-    requests = sorted(
-        {
-            size // first_query
-            for size in sizes
-            if size % first_query == 0
-            and size <= compilation.max_cudagraph_capture_size
-            and 0 < size // first_query <= maximum
-        }
-    )
-    if not requests:
-        raise NotImplementedError("Eagle AR capture has no admitted first-pass request bucket to preserve")
+    requests = list(range(1, vllm_config.scheduler_config.max_num_seqs + 1))
     draft_config = copy(vllm_config)
     draft_config.compilation_config = copy(compilation)
     draft_config.compilation_config.cudagraph_capture_sizes = requests
@@ -315,19 +283,20 @@ class AutoRegressiveAclGraphManager(SpeculatorCudaGraphManager):
             )
         return ret
 
-    def _updatable_graph_replay(self, desc, draft_attn_metadatas, *, fia_params=None):
+    def _updatable_graph_replay(self, desc, draft_attn_metadatas, *, window_source=None):
         from vllm_ascend.worker.v2.spec_decode.draft_window_eagle3_dp import validate_eagle_dp_dummy_replay
 
         dp_dummy = validate_eagle_dp_dummy_replay(self.speculator, self, desc, draft_attn_metadatas)
         graph = self.graphs[desc]
         assert isinstance(graph, UpdatableGraph)
-        if fia_params is None:
+        if window_source is None:
             fia_params = self.speculator.build_fia_params(
                 desc.num_reqs,
                 draft_attn_metadatas[0],
                 self.is_draft_model_prefill,
             )
-        resolved_tasks = graph.resolve_tasks(SharedSource(fia_params))
+            window_source = SharedSource(fia_params)
+        resolved_tasks = graph.resolve_tasks(window_source)
         self.update_stream.wait_stream(torch.npu.current_stream())
         ret = super().run_fullgraph(desc)
         if dp_dummy:
@@ -362,40 +331,18 @@ class AutoRegressiveAclGraphManager(SpeculatorCudaGraphManager):
         try:
             session.require_reusable()
             if self.is_draft_model_prefill:
-                bank = session.provider.prepare_workspace(
-                    session.resolve(first=True, n=desc.num_reqs, tokens=desc.num_tokens, ordinal=0)
-                )
-                inputs = owner._materialize_eagle3_step(
-                    step=0,
-                    num_reqs=owner.input_batch.num_reqs,
-                    num_reqs_padded=desc.num_reqs,
-                    output_workspace=bank,
-                )
-                session.stage(inputs, first=True, n=desc.num_reqs, tokens=desc.num_tokens, ordinal=0)
-            metadata_batch = owner.build_draft_attn_metadatas(
-                desc.num_reqs,
-                desc.num_tokens,
-                self.is_draft_model_prefill,
-            )
+                capture = session.resolve(first=True, n=desc.num_reqs, tokens=desc.num_tokens, ordinal=0)
+                session.stage(capture, 0)
             route = (
                 DraftWindowGraphRoute.EAGLE3_FIRST_PASS
                 if self.is_draft_model_prefill
                 else DraftWindowGraphRoute.EAGLE3_AR_STEP
             )
-            # SharedSource filters by layer. Each layer's provider_index is the
-            # consumer ordinal, so AR1 and AR2 retain their own table/length bank.
-            params = [
-                {
-                    "layer_name": name,
-                    "actual_seq_lengths": metadata.actual_seq_lengths_q,
-                    "actual_seq_lengths_kv": metadata.seq_lens_list,
-                    "block_table": metadata.block_tables,
-                }
-                for consumer in metadata_batch
-                for name, metadata in consumer.items()
-                if metadata is not None
-            ]
-            ret = self._updatable_graph_replay(desc, metadata_batch, fia_params=params)
+            source = session.provider.consume_metadata(
+                route=route,
+                expected_consumer_count=1 if self.is_draft_model_prefill else owner.num_speculative_steps - 1,
+            )
+            ret = self._updatable_graph_replay(desc, (), window_source=source)
             session.provider.finish_update(route=route)
             return ret
         except BaseException:

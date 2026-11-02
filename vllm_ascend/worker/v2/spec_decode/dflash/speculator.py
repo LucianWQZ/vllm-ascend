@@ -21,10 +21,6 @@ from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm_ascend.ops.triton.v2.spec_decode.prepare_dflash_inputs import prepare_dflash_inputs_triton
 from vllm_ascend.worker.v2.attn_utils import build_attn_metadata_factory, build_attn_metadata_wrapper
 from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowGraphInputMixin
-from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
-    DraftWindowGraphRoute,
-    consume_draft_window_graph_metadata,
-)
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph_runtime import (
     draft_window_graph_enabled,
     install_parallel_graph,
@@ -235,14 +231,6 @@ class AscendDFlashSpeculator(DraftWindowGraphInputMixin, LmheadTPDraftSamplingMi
         return model
 
     def build_draft_attn_metadatas(self, num_reqs_padded, seq_lens_cpu_upper_bound):
-        from vllm_ascend.worker.v2.spec_decode.draft_window_graph_metadata import is_parallel_graph_dp_dummy
-
-        if hasattr(self, "_draft_window_graph_binding_provider") and not is_parallel_graph_dp_dummy(self):
-            graph_metadata = consume_draft_window_graph_metadata(
-                self, route=DraftWindowGraphRoute.DFLASH, expected_consumer_count=1
-            )
-            if graph_metadata is not None:
-                return list(graph_metadata)
         num_tokens_padded = num_reqs_padded * self.num_query_per_req
         with build_attn_metadata_wrapper():
             # vLLM main (#56181) replaced _build_draft_attn_metadata with

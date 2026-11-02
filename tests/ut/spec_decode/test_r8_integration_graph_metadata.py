@@ -8,17 +8,12 @@ model, numerical, capture and lifetime evidence remains separate.
 
 from __future__ import annotations
 
-import ast
-from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock
 
 import pytest
 import torch
-
-SOURCE_ROOT = Path(__file__).resolve().parents[3]
-SOURCE = SOURCE_ROOT / "vllm_ascend/worker/v2/spec_decode/draft_window_eager.py"
 
 
 @pytest.fixture(params=["dspark", "dflash", "dflash2", "eagle3"])
@@ -177,178 +172,30 @@ def test_a_different_host_upper_cannot_be_used_as_the_actual_exact_length(bridge
         bridge.read.exact_cpu_for(bridge.common)
 
 
-@pytest.mark.parametrize("actual,padded", [(1, 2), (3, 4)])
-def test_private_full_uses_one_fresh_builder_and_only_binds_its_device_lengths(monkeypatch, actual, padded):
-    from vllm.config.compilation import CUDAGraphMode
-    from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
-
-    from vllm_ascend.worker.v2.spec_decode import draft_window_graph_runtime as runtime
-    from vllm_ascend.worker.v2.spec_decode.draft_window import DraftMetadataInputs
-    from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
-        DraftWindowGraphBindingProvider,
-        DraftWindowGraphRoute,
-    )
-
-    exact = torch.tensor([17 + i * 1024 for i in range(actual)] + [0] * (padded - actual), dtype=torch.int32)
-    read: Any = SimpleNamespace(
-        max_num_reqs=padded,
-        window_block_table=torch.arange(padded * 2, dtype=torch.int32).reshape(padded, 2),
-        cpu_window_exact=exact,
-        device_window_exact=exact.clone(),
-    )
-    group = SimpleNamespace(gid=0, layers=("draft.layer.a", "draft.layer.b"))
-    proposal: Any = SimpleNamespace(ordered_request_ids=tuple(f"req-{i}" for i in range(actual)))
-    source: Any = SimpleNamespace(group=group, policy=SimpleNamespace(normalized_method="dflash"))
-    provider = DraftWindowGraphBindingProvider(source=source)
-    inputs = DraftMetadataInputs(proposal, padded, 0, read, provider)
-    provider._active_inputs = inputs
-    descriptor = BatchExecutionDescriptor(
-        CUDAGraphMode.FULL, num_reqs=padded, num_tokens=padded * 8, uniform_token_count=8
-    )
-    monkeypatch.setattr(
-        provider,
-        "capture_identity_for",
-        Mock(return_value=SimpleNamespace(descriptor=descriptor, route=DraftWindowGraphRoute.DFLASH)),
-    )
-    bind = Mock()
-    monkeypatch.setattr(provider, "bind_read_carrier", bind)
-    owner = SimpleNamespace(
-        _draft_window_proposal=proposal,
-        _draft_window_selected_metadata=descriptor,
-        _draft_window_graph_binding_provider=provider,
-        block_tables=SimpleNamespace(input_block_tables=[torch.full_like(read.window_block_table, 99)]),
-        _group_causal=False,
-    )
-    slots, query, state = object(), object(), object()
-    fresh = SimpleNamespace(
-        block_tables=read.window_block_table,
-        seq_lens=read.device_window_exact,
-        seq_lens_cpu=read.cpu_window_exact,
-        seq_lens_gpu=read.device_window_exact,
-        seq_lens_list=read.cpu_window_exact.tolist(),
-        actual_seq_lengths_q=[(i + 1) * 8 for i in range(padded)],
-        slot_mapping=slots,
-        query_start_loc=query,
-        attn_state=state,
-        num_actual_tokens=padded * 8,
-        causal=False,
-    )
-    calls = []
-
-    def build(actual_owner, **kwargs):
-        assert actual_owner is owner
-        calls.append(kwargs)
-        return {name: fresh for name in group.layers}
-
-    monkeypatch.setattr(runtime, "build_draft_window_attn_metadata", build)
-    runtime.prepare_parallel_graph(owner, descriptor)
-    result = bind.call_args.kwargs["metadata"]
-    assert len(calls) == 1
-    assert calls[0]["num_reqs"] == calls[0]["num_reqs_padded"] == padded
-    assert calls[0]["num_tokens_padded"] == padded * 8
-    assert result["draft.layer.a"] is result["draft.layer.b"] is fresh
-    assert fresh.seq_lens.data_ptr() == read.device_window_exact.data_ptr()
-    assert fresh.seq_lens.shape == read.device_window_exact.shape
-    assert fresh.seq_lens_cpu is read.cpu_window_exact
-    assert fresh.slot_mapping is slots and fresh.query_start_loc is query
-    assert fresh.attn_state is state and fresh.num_actual_tokens == padded * 8 and fresh.causal is False
-    assert fresh.actual_seq_lengths_q == [(i + 1) * 8 for i in range(padded)]
-
-
-@pytest.mark.parametrize(
-    "relative,method_name",
-    [
-        ("dflash/aclgraph.py", "_updatable_graph_replay"),
-        ("target_dependent_ar/aclgraph.py", "_run_eagle_window_fullgraph"),
-    ],
-)
-def test_static_capture_check_precedes_replay_and_successful_update_marks_banks(relative, method_name):
-    tree = ast.parse((SOURCE.parent / relative).read_text())
-    method = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == method_name)
-    calls = [node for node in ast.walk(method) if isinstance(node, ast.Call)]
-    capture = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "capture")
-    assert any(
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "validate_captured_graphs"
-        for node in ast.walk(capture)
-    )
-    finish = next(node for node in calls if isinstance(node.func, ast.Attribute) and node.func.attr == "finish_update")
-    if relative.startswith("target_dependent_ar"):
-        replay = next(
-            node
-            for node in calls
-            if isinstance(node.func, ast.Attribute) and node.func.attr == "_updatable_graph_replay"
-        )
-        assert replay.lineno < finish.lineno
-        shared = next(
-            n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_updatable_graph_replay"
-        )
-        shared_calls = [node for node in ast.walk(shared) if isinstance(node, ast.Call)]
-        replay = next(
-            node for node in shared_calls if isinstance(node.func, ast.Attribute) and node.func.attr == "run_fullgraph"
-        )
-        update = next(
-            node for node in shared_calls if isinstance(node.func, ast.Attribute) and node.func.attr == "update"
-        )
-        assert replay.lineno < update.lineno
-    else:
-        replay = next(
-            node for node in calls if isinstance(node.func, ast.Attribute) and node.func.attr == "run_fullgraph"
-        )
-        update = next(node for node in calls if isinstance(node.func, ast.Attribute) and node.func.attr == "update")
-        assert replay.lineno < update.lineno < finish.lineno
-    assert all(
-        not (
-            isinstance(node.func, ast.Attribute)
-            and node.func.attr in ("validate_graph", "validate_update", "validate_captured_graphs")
-        )
-        for node in calls
-    )
-
-
-def test_window_off_update_keeps_the_original_two_argument_call():
-    for relative in ["dflash/aclgraph.py", "target_dependent_ar/aclgraph.py"]:
-        tree = ast.parse((SOURCE.parent / relative).read_text())
-        method = next(
-            n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_updatable_graph_replay"
-        )
-        if relative.startswith("dflash"):
-            branch = next(
-                n for n in method.body if isinstance(n, ast.If) and ast.unparse(n.test) == "graph_route is None"
-            )
-            actual = branch.body
-        else:
-            branch = next(n for n in method.body if isinstance(n, ast.If) and ast.unparse(n.test) == "dp_dummy")
-            # The actual idle-DP branch needs the pinned manager config while
-            # preserving the same UPDATE/event API. Business OFF remains the
-            # original two-argument call without a Window binding.
-            actual = branch.orelse
-            dummy_update = branch.body[0]
-            assert isinstance(dummy_update, ast.With)
-            assert ast.unparse(dummy_update.items[0].context_expr) == "set_current_vllm_config(self.vllm_config)"
-            assert ast.dump(ast.Module(body=dummy_update.body, type_ignores=[])) == ast.dump(
-                ast.Module(body=ast.parse("graph.update(self.update_stream, resolved_tasks)").body, type_ignores=[])
-            )
-        expected = ast.parse("graph.update(self.update_stream, resolved_tasks)").body
-        assert ast.dump(ast.Module(body=actual, type_ignores=[])) == ast.dump(
-            ast.Module(body=expected, type_ignores=[])
-        )
-
-
 @pytest.mark.parametrize("active", [False, True])
-def test_actual_dispatch_keeps_only_the_framework_descriptor(monkeypatch, active):
+def test_actual_dispatch_selects_the_capture_bank_once(monkeypatch, active):
     from vllm_ascend.worker.v2.spec_decode.dflash.aclgraph import DFlashAclGraphManager, DFlashCudaGraphManager
 
     descriptor = SimpleNamespace()
+    bucket = object()
+    select = Mock(return_value=bucket)
+    provider = SimpleNamespace(capture_identity_for=select)
     monkeypatch.setattr(DFlashCudaGraphManager, "dispatch", lambda *args: descriptor)
     manager = object.__new__(DFlashAclGraphManager)
     manager.speculator = SimpleNamespace(
-        _draft_window_graph_binding_provider=object(),
+        _draft_window_graph_binding_provider=provider,
         _draft_window_proposal=object() if active else None,
     )
+    monkeypatch.setattr(
+        "vllm_ascend.worker.v2.spec_decode.dflash.aclgraph.resolve_parallel_draft_window_graph_route",
+        lambda owner: "dflash",
+    )
     assert manager.dispatch(1, 8, 8, 0) is descriptor
-    assert manager.speculator._draft_window_selected_metadata is (descriptor if active else None)
+    assert manager.speculator._draft_window_selected_metadata is (bucket if active else None)
+    if active:
+        select.assert_called_once_with(route="dflash", descriptor=descriptor)
+    else:
+        select.assert_not_called()
     manager.speculator = SimpleNamespace()
     assert manager.dispatch(1, 8, 8, 0) is descriptor
     assert not hasattr(manager.speculator, "_draft_window_selected_metadata")
@@ -363,7 +210,7 @@ def full_metadata_dispatch(monkeypatch):
     from vllm_ascend.worker.v2.spec_decode.draft_window import DraftMetadataInputs
     from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphBindingProvider
 
-    proposal: Any = SimpleNamespace(ordered_request_ids=("req-a", "req-b"))
+    proposal: Any = SimpleNamespace(full_read_rows=(False, False))
     provider: Any = object.__new__(DraftWindowGraphBindingProvider)
     provider._quarantined = False
     provider._source = SimpleNamespace(policy=SimpleNamespace(normalized_method="dflash"))
@@ -377,17 +224,15 @@ def full_metadata_dispatch(monkeypatch):
     provider._active_inputs = inputs
     descriptor = BatchExecutionDescriptor(CUDAGraphMode.FULL, num_tokens=16, num_reqs=2, uniform_token_count=8)
     capture = SimpleNamespace(descriptor=descriptor, route=SimpleNamespace())
-    provider.capture_identity_for = Mock(return_value=capture)
     carrier = object()
     provider.bind_read_carrier = Mock(return_value=carrier)
     owner = SimpleNamespace(
         _draft_window_proposal=proposal,
         _draft_window_graph_binding_provider=provider,
-        _draft_window_selected_metadata=descriptor,
+        _draft_window_selected_metadata=capture,
         _group_causal=False,
         model_state=SimpleNamespace(attn_metadata={"target.layer": object()}),
     )
-    monkeypatch.setattr(runtime, "build_draft_window_attn_metadata", Mock(return_value={"draft.layer": object()}))
     return SimpleNamespace(
         owner=owner,
         inputs=inputs,
@@ -407,17 +252,15 @@ def test_actual_replay_uses_the_current_provider_bank_without_a_second_generatio
     assert not hasattr(c.owner, "_draft_window_deferred_metadata")
 
 
-@pytest.mark.parametrize("damage", ["proposal", "padded_rows", "descriptor", "published", "retired"])
+@pytest.mark.parametrize("damage", ["proposal", "descriptor", "published", "retired"])
 def test_actual_replay_rejects_stale_rows_bucket_or_already_published_generation(full_metadata_dispatch, damage):
     c = full_metadata_dispatch
     if damage == "proposal":
         c.owner._draft_window_proposal = object()
-    elif damage == "padded_rows":
-        object.__setattr__(c.inputs, "padded_request_count", 4)
     elif damage == "descriptor":
-        c.owner._draft_window_selected_metadata = object()
+        c.owner._draft_window_selected_metadata = SimpleNamespace(descriptor=object())
     elif damage == "published":
-        object.__setattr__(c.inputs, "metadata", {"old": object()})
+        object.__setattr__(c.inputs, "params", {"old": object()})
     else:
         c.provider._active_inputs = None
     with pytest.raises(RuntimeError, match="proposal|bucket|unconsumed|generation|retired"):

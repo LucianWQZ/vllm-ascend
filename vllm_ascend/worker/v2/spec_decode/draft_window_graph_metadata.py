@@ -45,6 +45,15 @@ def copy_draft_attention_metadata(metadata: Mapping[str, Any]) -> dict[str, Any]
     return result
 
 
+def bind_draft_window_read(layer: Any, bank: Any, max_seq_len: int) -> None:
+    """Bind only common Draft read operands; query/write/state stay method-owned."""
+    layer.block_tables = bank.window_block_table
+    layer.seq_lens = bank.device_window_exact
+    layer.seq_lens_cpu = bank.cpu_window_exact
+    layer.seq_lens_list = bank.cpu_window_exact.tolist()
+    layer.max_seq_len = max_seq_len
+
+
 def is_parallel_graph_dp_dummy(owner: Any) -> bool:
     """Require the explicit no-generation scope before using baseline operands.
 
