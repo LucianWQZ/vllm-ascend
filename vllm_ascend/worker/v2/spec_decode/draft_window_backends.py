@@ -31,7 +31,6 @@ class DraftWindowBackendTypes:
     dense_builder: type
     full_attention_spec: type
     uniform_spec: type[Any]
-    context_parallel_builders: tuple[type, ...]
     storage_block_size: Callable[[Any], int]
     compression_ratio: Callable[[Any], int]
     mla_backend: type | None = None
@@ -55,10 +54,6 @@ class DraftWindowBackendTypes:
 
         from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionMetadataBuilder
         from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
-        from vllm_ascend.attention.context_parallel.sfa_cp import (
-            AscendSFADSACPMetadataBuilder,
-            AscendSFADSADCPMetadataBuilder,
-        )
         from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder, AscendDSASWABackend
         from vllm_ascend.attention.indexer import AscendSFAIndexerBackend, AscendSFAIndexerMetadataBuilder
         from vllm_ascend.attention.mla_v1 import AscendMLABackend, AscendMLAMetadataBuilder
@@ -76,7 +71,6 @@ class DraftWindowBackendTypes:
             AscendAttentionMetadataBuilder,
             FullAttentionSpec,
             UniformTypeKVCacheSpecs,
-            (AscendDSACPMetadataBuilder, AscendSFADSADCPMetadataBuilder, AscendSFADSACPMetadataBuilder),
             get_storage_block_size,
             get_kv_cache_compression_ratio,
             mla_backend=AscendMLABackend,
@@ -101,7 +95,6 @@ class DraftWindowGroupRoute:
     layers: tuple[str, ...]
     scheduler_block_size: int
     table_column_span: int
-    read_semantics: str
     status: DraftWindowProviderStatus
     native_window: int | None = None
 
@@ -180,7 +173,7 @@ def _select_read_provider(
                 raise NotImplementedError("SFA indexer rank-local read coordinates need a separate provider")
             if any(item.cache_sparse_li_c4 or item.sfa_dcp_replicated_indexer_size != 1 for item in specs):
                 raise NotImplementedError("Packed C4 or replicated indexer pages need a separate provider")
-            return status.DIRECT_SFA_INDEXER
+            selected = status.DIRECT_SFA_INDEXER
         if selected in (status.DIRECT_MLA, status.DIRECT_SFA) and any(
             item.model_version is not None
             or item.cache_sparse_sfa_c8
@@ -261,19 +254,6 @@ def inventory_draft_window_groups(
                 consumer_specs = specs
             builder = group.get_metadata_builder(0)
             backend = group.backend
-            # The target can enable DSA-CP while the draft is dense GQA.
-            # Selection of the actual builder, not the global flag, decides
-            # whether this reader uses legacy DSA-CP coordinates.
-            legacy_cp = isinstance(builder, types.context_parallel_builders) or (
-                types.indexer_builder is not None and isinstance(builder, types.indexer_builder) and builder.use_dsa_cp
-            )
-            read_semantics = (
-                "dsa_cp_derived"
-                if legacy_cp
-                else "dcp_interleaved"
-                if parallel_config.decode_context_parallel_size > 1
-                else "replicated"
-            )
             windows = {getattr(item, "sliding_window", None) for item in consumer_specs}
             native_window = next(iter(windows)) if len(windows) == 1 else None
             try:
@@ -296,7 +276,6 @@ def inventory_draft_window_groups(
                     layers=tuple(group.layer_names),
                     scheduler_block_size=scheduler_span,
                     table_column_span=column_span,
-                    read_semantics=read_semantics,
                     status=status,
                     native_window=native_window,
                 )

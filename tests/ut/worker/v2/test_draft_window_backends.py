@@ -59,7 +59,6 @@ def types():
         dense_builder=DenseBuilder,
         full_attention_spec=FullSpec,
         uniform_spec=UniformSpec,
-        context_parallel_builders=(),
         storage_block_size=lambda spec: spec.block_size // spec.tokens_per_state,
         compression_ratio=lambda spec: spec.tokens_per_state,
     )
@@ -409,12 +408,6 @@ def test_incompatible_multi_group_alignment_rejected_before_request_arrives(type
         require_compatible_direct_prefix_routes(routes)
 
 
-def test_actual_cp_builder_remains_missing_even_when_requested_flag_is_false(types, parallel_config):
-    cp_types = replace(types, context_parallel_builders=(CompressedBuilder,))
-    with pytest.raises(NotImplementedError):
-        inventory(cp_types, parallel_config, builders=[CompressedBuilder()])
-
-
 class MLABuilder:
     flashmla_state: object | None = None
 
@@ -434,7 +427,6 @@ def test_plain_mla_provider_requires_actual_builder_and_spec(types, parallel_con
         mla_backend=DenseBackend,
         mla_builder=MLABuilder,
         mla_spec=MLASpec,
-        context_parallel_builders=(),
     )
     (route,) = inventory(mla_types, parallel_config, specs=[MLASpec()], builders=[MLABuilder()])
     assert route.status is DraftWindowProviderStatus.DIRECT_MLA
@@ -492,7 +484,6 @@ def sparse_types(types):
         indexer_backend=DenseBackend,
         indexer_builder=IndexerBuilder,
         indexer_spec=IndexerSpec,
-        context_parallel_builders=(),
     )
 
 
@@ -577,7 +568,6 @@ def dsa_types(types):
         dsa_builder=DSABuilder,
         dsa_cp_builder=DSACPBuilder,
         dsa_spec=DSASpec,
-        context_parallel_builders=(DSACPBuilder,),
     )
 
 
@@ -589,7 +579,6 @@ def test_uncompressed_dsa_requires_native_window_and_actual_owner(types, paralle
         return
     (route,) = inventory(dsa_types(types), parallel_config, specs=[DSASpec()], builders=[builder])
     assert route.status.value == status
-    assert route.read_semantics == "replicated"
 
 
 @pytest.mark.parametrize(
@@ -622,3 +611,29 @@ def test_small_window_native_intersection_gap(types, parallel_config):
     assert len(selected) == 2
     assert selected[0].status is DraftWindowProviderStatus.NATIVE_SWA_INTERSECTION
     assert selected[1].gid == routes[1].gid
+
+
+@pytest.mark.parametrize("field", ["prefill_context_parallel_size", "decode_context_parallel_size"])
+@pytest.mark.parametrize("kind", ["dense", "mla", "sfa", "indexer", "dsa", "native"])
+def test_all_admitted_read_providers_use_the_actual_draft_parallel_contract(types, parallel_config, kind, field):
+    candidates = {
+        "dense": (types, FullSpec(), DenseBuilder()),
+        "mla": (
+            replace(types, mla_backend=DenseBackend, mla_builder=MLABuilder, mla_spec=MLASpec),
+            MLASpec(),
+            MLABuilder(),
+        ),
+        "sfa": (sparse_types(types), MLASpec(), SFABuilder()),
+        "indexer": (sparse_types(types), IndexerSpec(), IndexerBuilder()),
+        "dsa": (dsa_types(types), DSASpec(), DSABuilder()),
+        "native": (replace(types, sliding_window_spec=SlidingSpec), SlidingSpec(), DenseBuilder()),
+    }
+    kinds, spec, builder = candidates[kind]
+    if kind == "native":
+        spec.sliding_window = 128
+    # This is the same Draft config passed to its actual metadata builders,
+    # not a Target-global CP flag. Indexer may not bypass this guard merely
+    # because a stale builder object reports use_pcp/use_dcp=False.
+    setattr(parallel_config, field, 2)
+    with pytest.raises(NotImplementedError, match="Context-parallel"):
+        inventory(kinds, parallel_config, specs=[spec], builders=[builder])
