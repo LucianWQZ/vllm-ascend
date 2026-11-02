@@ -23,8 +23,7 @@ pytestmark = pytest.mark.skipif(
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("query_width", [1, 8, 9])
 @pytest.mark.parametrize("exact_ends", [(127, 128), (129, 257), (513, 641)])
-@pytest.mark.parametrize("prepared_rows", [False, True])
-def test_same_window_attention_from_canonical_rows(causal, query_width, exact_ends, prepared_rows):
+def test_same_window_attention_from_canonical_rows(causal, query_width, exact_ends):
     generator = torch.Generator().manual_seed(21021)
     block_size, heads, kv_heads, head_size = 128, 8, 2, 64
     window_size = 129
@@ -51,7 +50,7 @@ def test_same_window_attention_from_canonical_rows(causal, query_width, exact_en
         for end in exact_ends
     ]
     starts = torch.tensor([plan.window_start for plan in plans], dtype=torch.int32)
-    retained = []
+    retained: list[torch.Tensor] = []
     read = materialize_direct_prefix(
         source,
         exact_cpu=ends,
@@ -59,7 +58,7 @@ def test_same_window_attention_from_canonical_rows(causal, query_width, exact_en
         upper_cpu=ends + 3,
         starts_cpu=starts,
         padded_rows=3,
-        row_indices=torch.tensor(request_rows, dtype=torch.int64).npu() if prepared_rows else None,
+        row_indices=torch.tensor(request_rows, dtype=torch.int64).npu(),
         retain=lambda *objects: retained.extend(objects),
     )
     torch.testing.assert_close(read.seq_lens.cpu(), read.seq_lens_cpu, rtol=0, atol=0)
@@ -141,7 +140,7 @@ def test_same_window_mla_latent_and_rope(query_width, causal):
         ],
         dtype=torch.int32,
     )
-    retained = []
+    retained: list[torch.Tensor] = []
     read = materialize_direct_prefix(
         source,
         exact_cpu=ends,
@@ -150,6 +149,7 @@ def test_same_window_mla_latent_and_rope(query_width, causal):
         starts_cpu=starts,
         padded_rows=2,
         retain=lambda *objects: retained.extend(objects),
+        row_indices=torch.tensor(source.request_rows, dtype=torch.int64).npu(),
     )
     mask = torch.ones((2048, 2048), dtype=torch.bool).triu(1).npu() if causal else None
     output, _ = torch_npu.npu_fused_infer_attention_score_v2(

@@ -92,9 +92,10 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
         descriptor = super().dispatch(
             num_reqs, num_tokens, uniform_token_count, num_active_loras, max_query_len, num_ubatches
         )
-        epoch = getattr(self.speculator, "_draft_window_epoch_source", None)
-        if epoch is not None:
-            self.speculator._draft_window_selected_metadata = descriptor if epoch._active is not None else None
+        if hasattr(self.speculator, "_draft_window_graph_binding_provider"):
+            self.speculator._draft_window_selected_metadata = (
+                descriptor if self.speculator._draft_window_proposal is not None else None
+            )
         return descriptor
 
     def capture(

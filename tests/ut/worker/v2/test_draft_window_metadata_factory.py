@@ -23,10 +23,9 @@ CALLBACK_NAMES = ("common_metadata_callback", "metadata_builder_callback")
 def metadata_isolation():
     from vllm_ascend.worker.v2.spec_decode.draft_window_graph_metadata import (
         copy_draft_attention_metadata,
-        validate_draft_metadata_isolation,
     )
 
-    return copy_draft_attention_metadata, validate_draft_metadata_isolation
+    return copy_draft_attention_metadata
 
 
 def _attention_metadata():
@@ -45,9 +44,8 @@ def _attention_metadata():
 
 
 def test_metadata_copy_owns_mutable_fields_and_borrows_read_only_operands(metadata_isolation):
-    copy_metadata, validate = metadata_isolation
+    copy_metadata = metadata_isolation
     layer = _attention_metadata()
-    target = {"target": layer}
     private = copy_metadata({"draft": layer})
     copied = private["draft"]
     assert copied is not layer
@@ -57,7 +55,6 @@ def test_metadata_copy_owns_mutable_fields_and_borrows_read_only_operands(metada
     # dictionary belongs to the per-build metadata object.
     assert copied.qfa_metadata_cache is not layer.qfa_metadata_cache
     assert copied.qfa_metadata_cache["lengths"] is layer.qfa_metadata_cache["lengths"]
-    validate(private, target_metadata=target)
     copied.attn_state = "draft"
     copied.seq_lens_list[0] = 99
     copied.actual_seq_lengths_q.append(3)
@@ -71,7 +68,7 @@ def test_metadata_copy_owns_mutable_fields_and_borrows_read_only_operands(metada
 def test_real_ascend_metadata_preserves_canonical_full_operands(metadata_isolation):
     from vllm_ascend.attention.attention_v1 import AscendAttentionState, AscendMetadata
 
-    copy_metadata, validate = metadata_isolation
+    copy_metadata = metadata_isolation
     layer = AscendMetadata(**vars(_attention_metadata()))
     private = copy_metadata({"draft": layer})
     copied = private["draft"]
@@ -80,36 +77,18 @@ def test_real_ascend_metadata_preserves_canonical_full_operands(metadata_isolati
     assert layer.attn_state == "target" and layer.seq_lens_list == [3, 4]
     assert copied.slot_mapping is layer.slot_mapping
     assert copied.query_start_loc is layer.query_start_loc
-    validate(private, target_metadata={"target": layer})
 
 
 def test_metadata_copy_preserves_group_aliases_and_missing_layers(metadata_isolation):
-    copy_metadata, validate = metadata_isolation
+    copy_metadata = metadata_isolation
     layer = _attention_metadata()
     private = copy_metadata({"a": layer, "b": layer, "unused": None})
     assert private["a"] is private["b"] and private["a"] is not layer
     assert private["unused"] is None
-    validate(private, target_metadata={"target": layer})
-
-
-@pytest.mark.parametrize("field", [None, "seq_lens_list", "actual_seq_lengths_q", "qfa_metadata_cache"])
-def test_publication_guard_rejects_actual_target_mutation_aliases(metadata_isolation, field):
-    copy_metadata, validate = metadata_isolation
-    target_layer = _attention_metadata()
-    target = {"target": target_layer}
-    draft = copy_metadata({"draft": target_layer})
-    if field is None:
-        draft["draft"] = target_layer
-    else:
-        setattr(draft["draft"], field, getattr(target_layer, field))
-    with pytest.raises(ValueError, match="alias Target"):
-        validate(draft, target_metadata=target)
-    with pytest.raises(ValueError, match="alias Target"):
-        validate(target, target_metadata=target)
 
 
 def test_frozen_slotted_metadata_is_copied_before_field_replacement(metadata_isolation):
-    copy_metadata, validate = metadata_isolation
+    copy_metadata = metadata_isolation
 
     @dataclass(frozen=True, slots=True)
     class Metadata:
@@ -124,11 +103,10 @@ def test_frozen_slotted_metadata_is_copied_before_field_replacement(metadata_iso
     private["draft"].seq_lens_list[0] = 9
     assert layer.seq_lens_list == [3]
     assert private["draft"].block_tables is table
-    validate(private, target_metadata={"target": layer})
 
 
 def test_metadata_copy_rejects_invalid_known_host_fields(metadata_isolation):
-    copy_metadata, validate = metadata_isolation
+    copy_metadata = metadata_isolation
     for field, value in (
         ("seq_lens_list", (3, 4)),
         ("actual_seq_lengths_q", torch.tensor([1, 2])),
@@ -140,8 +118,78 @@ def test_metadata_copy_rejects_invalid_known_host_fields(metadata_isolation):
             copy_metadata({"draft": layer})
     with pytest.raises(ValueError, match="non-empty layer mapping"):
         copy_metadata({})
-    with pytest.raises(ValueError, match="layer mappings"):
-        validate({}, target_metadata=None)
+
+
+def test_real_builder_constructs_private_window_metadata_without_touching_target(monkeypatch):
+    from copy import copy
+
+    from vllm_ascend.attention.attention_v1 import (
+        AscendAttentionMetadataBuilder,
+        AscendAttentionState,
+        AscendMetadata,
+    )
+    from vllm_ascend.worker.v2.spec_decode.draft_window_eager import draft_window_read_inputs
+
+    # Only pinning and backend phase/mask dependencies are isolated. The real
+    # builder creates both metadata objects and all mutable Host containers.
+    monkeypatch.setattr(torch.Tensor, "pin_memory", lambda tensor: tensor)
+    builder = SimpleNamespace(
+        use_pcp=False,
+        device=torch.device("cpu"),
+        kv_cache_spec=object(),
+        speculative_config=None,
+        model_config=SimpleNamespace(runner_type="generate"),
+        vllm_config=SimpleNamespace(use_v2_model_runner=True, model_config=object()),
+        attn_mask_builder=SimpleNamespace(get_attention_mask=lambda *args: None),
+        _split_decodes_and_prefills=lambda common: (2, 0, 2, 0),
+        _build_backend_metadata=lambda *args, **kwargs: {},
+        metadata_cls=AscendMetadata,
+    )
+    exact = torch.tensor([11, 14], dtype=torch.int32)
+    query = torch.tensor([0, 1, 2], dtype=torch.int32)
+    slots = torch.tensor([40, 80], dtype=torch.int64)
+    table = torch.tensor([[11, 12, 13, 14], [21, 22, 23, 24]], dtype=torch.int32)
+    common = SimpleNamespace(
+        num_reqs=2,
+        num_actual_tokens=2,
+        num_input_tokens=2,
+        query_start_loc=query,
+        query_start_loc_cpu=query,
+        max_query_len=1,
+        attn_state=AscendAttentionState.DecodeOnly,
+        is_prefilling=torch.tensor([False, False]),
+        causal=True,
+        block_table_tensor=table,
+        slot_mapping=slots,
+        seq_lens=exact,
+        seq_lens_cpu=exact,
+        _seq_lens_cpu=exact,
+        seq_lens_cpu_upper_bound=exact,
+        max_seq_len=14,
+    )
+    target = AscendAttentionMetadataBuilder.build(builder, 0, common)
+    bank = SimpleNamespace(
+        window_block_table=torch.tensor([[12, 13], [23, 24]], dtype=torch.int32),
+        device_window_exact=torch.tensor([7, 6], dtype=torch.int32),
+        cpu_window_exact=torch.tensor([7, 6], dtype=torch.int32),
+    )
+    draft_common = copy(common)
+    draft_window_read_inputs(bank, actual_request_count=2, padded_request_count=2).apply(draft_common)
+    draft = AscendAttentionMetadataBuilder.build(builder, 0, draft_common)
+    assert draft is not target
+    assert draft.block_tables.data_ptr() == bank.window_block_table.data_ptr()
+    assert draft.block_tables.shape == bank.window_block_table.shape
+    assert draft.seq_lens_cpu.data_ptr() == bank.cpu_window_exact.data_ptr()
+    assert draft.seq_lens_list == [7, 6] and draft.seq_lens_list is not target.seq_lens_list
+    assert draft.actual_seq_lengths_q is not target.actual_seq_lengths_q
+    assert draft.slot_mapping.data_ptr() == target.slot_mapping.data_ptr() == slots.data_ptr()
+    assert draft.query_start_loc_gpu is target.query_start_loc_gpu is query
+    draft.seq_lens_list[0] = 99
+    draft.actual_seq_lengths_q.append(3)
+    assert target.seq_lens_list == [11, 14] and target.actual_seq_lengths_q == [1, 2]
+    assert target.block_tables is common.block_table_tensor is table
+    assert target.seq_lens_cpu.data_ptr() == exact.data_ptr()
+    assert common.max_seq_len == 14 and common.seq_lens.tolist() == [11, 14]
 
 
 @pytest.fixture

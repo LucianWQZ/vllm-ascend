@@ -97,8 +97,8 @@ class ParallelOwnerTests(unittest.TestCase):
         self.seam = load_seam(Completion)
         self.batch = SimpleNamespace(is_dummy=False)
         self.owner = SimpleNamespace(
-            _draft_window_graph_binding_provider=SimpleNamespace(quarantined_identity=None),
-            _draft_window_epoch_source=SimpleNamespace(_active=None),
+            _draft_window_graph_binding_provider=SimpleNamespace(quarantined=False),
+            _draft_window_proposal=None,
             _draft_window_bypass_active=False,
             vllm_config=SimpleNamespace(max_concurrent_batches=2),
             num_speculative_steps=8,
@@ -123,7 +123,7 @@ class ParallelOwnerTests(unittest.TestCase):
         self.assertEqual(self.normal, [])
         self.assertFalse(self.owner._draft_window_context_kv_pool._poisoned)
         self.assertFalse(hasattr(self.owner, "_draft_window_runtime"))
-        self.assertIsNone(self.owner._draft_window_epoch_source._active)
+        self.assertIsNone(self.owner._draft_window_proposal)
 
     def test_zero_original_error_quarantines_and_actual_normal_scope_rejects(self):
         first = RuntimeError("native context write stand-in")
@@ -145,9 +145,9 @@ class ParallelOwnerTests(unittest.TestCase):
             self.fail("normal Graph body must not execute")
 
     def test_normal_uncertain_or_quarantined_refuses_zero_before_native(self):
-        for identity, uncertain in [(object(), False), (None, True)]:
+        for quarantined, uncertain in [(True, False), (False, True)]:
             with self.subTest(uncertain=uncertain):
-                self.owner._draft_window_graph_binding_provider.quarantined_identity = identity
+                self.owner._draft_window_graph_binding_provider.quarantined = quarantined
                 self.owner._draft_window_graph_submission_uncertain = uncertain
                 with (
                     self.assertRaisesRegex(RuntimeError, "quarantined"),
@@ -180,7 +180,7 @@ class ParallelOwnerTests(unittest.TestCase):
                 self.scope(8)
             with self.assertRaisesRegex(RuntimeError, "already active"):
                 self.scope(0)
-        self.owner._draft_window_epoch_source._active = object()
+        self.owner._draft_window_proposal = object()
         with (
             self.assertRaisesRegex(RuntimeError, "already active"),
             self.scope(0),

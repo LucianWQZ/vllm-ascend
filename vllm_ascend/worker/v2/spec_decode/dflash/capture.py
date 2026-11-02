@@ -33,7 +33,7 @@ from vllm.v1.worker.utils import AttentionGroup
 from vllm_ascend.worker.v2.spec_decode.draft_window import DraftWindowWorkspace
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
     DraftWindowGraphBindingProvider,
-    DraftWindowGraphCaptureIdentity,
+    DraftWindowGraphBucket,
     DraftWindowGraphRoute,
     resolve_parallel_draft_window_graph_route,
 )
@@ -48,7 +48,7 @@ class DraftWindowDFlashCaptureContext:
     provider: DraftWindowGraphBindingProvider
     route: DraftWindowGraphRoute
     input_buffers: InputBuffers
-    captures: dict[tuple[int, int], DraftWindowGraphCaptureIdentity]
+    captures: dict[tuple[int, int], DraftWindowGraphBucket]
     active: bool = True
 
     def validate_for_provider(self, provider: DraftWindowGraphBindingProvider) -> None:
@@ -57,7 +57,7 @@ class DraftWindowDFlashCaptureContext:
         if provider is not self.provider:
             raise RuntimeError("capture context belongs to another graph provider")
 
-    def resolve(self, num_reqs: int, num_tokens: int) -> tuple[DraftWindowGraphCaptureIdentity, DraftWindowWorkspace]:
+    def resolve(self, num_reqs: int, num_tokens: int) -> tuple[DraftWindowGraphBucket, DraftWindowWorkspace]:
         self.validate_for_provider(self.provider)
         try:
             identity = self.captures[num_reqs, num_tokens]
@@ -129,7 +129,7 @@ def draft_window_dflash_capture_scope(
 
 
 def _seed_capture_workspace(
-    identity: DraftWindowGraphCaptureIdentity,
+    identity: DraftWindowGraphBucket,
     workspace: DraftWindowWorkspace,
     input_block_tables: Sequence[torch.Tensor],
     *,

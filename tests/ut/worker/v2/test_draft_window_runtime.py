@@ -48,7 +48,7 @@ def setup(monkeypatch):
         vllm_config=SimpleNamespace(max_concurrent_batches=2),
         num_query_per_req=3,
         num_speculative_steps=3,
-        use_fused_multi_step_decode=False,
+        supports_decode_metadata_update=False,
         input_buffers=SimpleNamespace(positions=torch.tensor([11, 26])),
         last_token_indices=torch.tensor([0, 1]),
         block_tables=SimpleNamespace(
@@ -131,10 +131,12 @@ def test_eagle_window_checks_current_decode_metadata_update_capability(setup, cu
 
 
 def batch(*, rows=(1, 3), computed=(8, 24), prompt=(16, 16), scheduled=(7, 3), drafts=(3, 2)):
+    mapping = np.array(rows, dtype=np.int64)
     return SimpleNamespace(
         num_reqs=len(rows),
         req_ids=[f"request-{row}" for row in rows],
-        idx_mapping_np=np.array(rows),
+        idx_mapping_np=mapping,
+        idx_mapping=torch.from_numpy(mapping),
         num_computed_prefill_tokens_np=np.array(computed),
         prefill_len_np=np.array(prompt),
         num_scheduled_tokens=np.array(scheduled),
@@ -294,7 +296,7 @@ def test_eagle_uniform_first_pass_reads_current_device_end_without_host_snapshot
             assert read.query_width == width
 
 
-def test_eagle_host_fallback_reuses_the_same_device_first_pass_anchor(setup):
+def test_eagle_host_fallback_reuses_the_same_device_first_pass_anchor(setup, monkeypatch):
     runtime, spec, _, _ = setup
     runtime.method, runtime.static_k, runtime.window_size = "eagle3", 3, 1035
     runtime.anchor_block_span = 128
@@ -306,6 +308,15 @@ def test_eagle_host_fallback_reuses_the_same_device_first_pass_anchor(setup):
     spec.last_token_indices = torch.tensor([3, 6])
     state = batch(computed=(1150, 1150), prompt=(1, 1))
     state.idx_mapping = torch.tensor(state.idx_mapping_np, dtype=torch.int64)
+    source_builds = []
+    make_source = runtime_module.DirectPrefixSource.from_block_tables
+
+    def build_source(*args):
+        source = make_source(*args)
+        source_builds.append(source)
+        return source
+
+    monkeypatch.setattr(runtime_module.DirectPrefixSource, "from_block_tables", build_source)
     with runtime.proposal_context(spec, state):
         for step, ends, width in [(0, (1159, 1160), 4), (1, (1160, 1160), 1), (2, (1161, 1161), 1)]:
             # A later loose workspace bound exceeds initialized columns. The
@@ -317,6 +328,9 @@ def test_eagle_host_fallback_reuses_the_same_device_first_pass_anchor(setup):
             runtime.metadata_callback(step, 2)(0, metadata)
             assert metadata.seq_lens[:2].tolist() == ([1159, 1159] if step == 0 else list(ends))
         assert runtime._eagle_plans is not None
+    assert len(source_builds) == 1
+    assert source_builds[0].table is spec.block_tables.block_tables[0].gpu
+    assert not runtime._sources
 
 
 def test_reorder_row_replacement_and_in_place_mapping_refresh_each_proposal(setup):
@@ -809,9 +823,9 @@ def test_eagle_cannot_select_parallel_context_only_scope(setup):
         pytest.fail("Eagle3 must not enter a context-only scope")
 
 
-def test_eagle_fused_mode_cannot_bypass_per_step_reads(setup):
+def test_eagle_metadata_update_cannot_bypass_per_step_reads(setup):
     _, spec, _, _ = setup
-    spec.use_fused_multi_step_decode = True
+    spec.supports_decode_metadata_update = True
     policy = resolve_draft_window_policy(requested_window_size=8, method="eagle3")
     with pytest.raises(NotImplementedError, match="per-step metadata"):
         DraftWindowRuntime(spec, policy)
@@ -1074,7 +1088,7 @@ def test_eagle_prompt_only_terminal_rows_reuse_exact_without_d2h(setup, monkeypa
             if all_terminal and step > 0:
                 assert (torch.tensor(ends) - metadata._draft_window_device_read.seq_lens).tolist() == expected_starts
             else:
-                assert metadata._draft_window_read.starts_cpu.tolist() == expected_starts
+                assert (torch.tensor(ends) - metadata.seq_lens[:2]).tolist() == expected_starts
             assert metadata.seq_lens[:2].tolist() == [
                 ends[0] - expected_starts[0],
                 ends[1] - expected_starts[1],
@@ -1202,7 +1216,9 @@ def test_parallel_continuing_prefill_reuses_certified_prompt_exact_without_full_
         runtime.metadata_callback(8, 2)(0, metadata)
         assert not hasattr(metadata, "_draft_window_device_read"), "Full prompt unexpectedly gathered private FP32 KV"
         read = metadata._draft_window_read
-        assert read.starts_cpu.tolist() == [0, 0]
+        expected_table = table[state.idx_mapping_np, :11].clone()
+        expected_table[0, 9:] = 0
+        assert torch.equal(metadata.block_table_tensor[:2], expected_table)
         assert read.seq_lens.cpu().tolist() == [1151, 1281, 0]
         assert read.exact_cpu_for(metadata)[:2].tolist() == [1151, 1281]
         assert metadata.slot_mapping is slots and metadata.positions is positions

@@ -71,10 +71,13 @@ def test_v2_loader_selects_flash_attn_and_restores_target_context(monkeypatch, c
         "cache_config": CacheConfig(cache_dtype="fp8"),
         "load_config": object(),
         "parallel_config": SimpleNamespace(pipeline_parallel_size=1),
+        "quant_config": None,
     }
     config_cls = make_dataclass("LoaderConfig", [(name, object) for name in fields])
     config = config_cls(**fields)
-    draft_model = SimpleNamespace(model=object(), config=draft_config.hf_config)
+    draft_model = SimpleNamespace(
+        model=SimpleNamespace(layers=[]), config=draft_config.hf_config, get_draft_attn_causal=lambda: []
+    )
     target_model = SimpleNamespace(model=object())
     monkeypatch.setattr(loader, "get_draft_load_config", lambda _: config.load_config)
     monkeypatch.setattr(loader, "get_pp_safe_draft_load_config", lambda value: value)
@@ -86,7 +89,7 @@ def test_v2_loader_selects_flash_attn_and_restores_target_context(monkeypatch, c
         lambda: SimpleNamespace(supports=lambda _: True, attention_backend_family=AttentionBackendFamily.STANDARD),
     )
     monkeypatch.setattr(platform, "_validate_fa3_backend", lambda *_: False)
-    monkeypatch.setattr("vllm.platforms.current_platform", platform.NPUPlatform)
+    monkeypatch.setattr("vllm.platforms.current_platform", platform.NPUPlatform())
     monkeypatch.setattr(selector_module, "resolve_obj_by_qualname", lambda path: path)
     select = selector_module._cached_get_attn_backend
     target_selector = AttentionSelectorConfig(
@@ -294,7 +297,10 @@ def test_init_speculator_routes_dflash2_draft_model(monkeypatch):
         d2.assert_not_called()
 
 
-def test_eager_speculator_keeps_target_compilation_and_graph_config():
+def test_eager_speculator_keeps_target_compilation_and_graph_config(monkeypatch):
+    monkeypatch.setattr(
+        "vllm_ascend.worker.v2.spec_decode.get_ascend_config", lambda: SimpleNamespace(draft_window_size=None)
+    )
     spec = _spec_config("DFlash2DraftModel")
     spec.enforce_eager = True
     config = SimpleNamespace(
@@ -358,9 +364,8 @@ def test_graph_manager_admits_real_selector_binding_and_owned_contract(monkeypat
     speculator.init_cudagraph_manager(CUDAGraphMode.FULL_DECODE_ONLY)
     assert calls == [CUDAGraphMode.FULL_DECODE_ONLY]
     assert speculator._dflash2_graph_contract is contract
-    config_check.assert_called_once_with(speculator.vllm_config)
+    config_check.assert_not_called()
     if existing_contract:
-        contract.validate_owner.assert_called_once_with(speculator)
         bind.assert_not_called()
     else:
         bind.assert_called_once_with(speculator)
@@ -423,18 +428,13 @@ def test_unqualified_graph_modes_are_not_called_supported(monkeypatch, mode):
     parent.assert_not_called()
 
 
-def test_capture_delegates_virtual_dflash2_forward_and_checks_same_owner(monkeypatch):
+def test_capture_reuses_original_virtual_dflash2_forward(monkeypatch):
     speculator = AscendDFlash2Speculator.__new__(AscendDFlash2Speculator)
-    speculator._dflash2_graph_contract = MagicMock()
     calls = []
     monkeypatch.setattr(AscendDFlashSpeculator, "capture", lambda actual: calls.append(actual))
+    assert AscendDFlash2Speculator.capture is AscendDFlashSpeculator.capture
     speculator.capture()
     assert calls == [speculator]
-    assert speculator._dflash2_graph_contract.validate_owner.call_count == 2
-    assert all(
-        call.args == (speculator,) and not call.kwargs
-        for call in speculator._dflash2_graph_contract.validate_owner.call_args_list
-    )
 
 
 @pytest.mark.parametrize("selector_fails", [False, True])
@@ -445,7 +445,8 @@ def test_window_scope_covers_dflash2_selector_and_candidate_walk(monkeypatch, se
     active = False
 
     @contextmanager
-    def proposal_context(actual, batch, dummy_run, is_profile):
+    def proposal_context(actual, batch, dummy_run, is_profile, *, context_kv_only=False):
+        assert context_kv_only is False
         nonlocal active
         assert actual is speculator
         active = True

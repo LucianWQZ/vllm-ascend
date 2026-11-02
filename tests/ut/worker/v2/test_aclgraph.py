@@ -44,7 +44,9 @@ def test_init_draft_prefill_graph():
         ) as set_prefill,
         patch("vllm_ascend.worker.v2.spec_decode.target_dependent_ar.aclgraph.set_draft_graph_params") as set_decode,
     ):
-        manager = AutoRegressiveAclGraphManager(object(), torch.device("cpu"), CUDAGraphMode.FULL, decode_query_len=2)
+        manager = AutoRegressiveAclGraphManager(
+            SimpleNamespace(speculative_config=None), torch.device("cpu"), CUDAGraphMode.FULL, decode_query_len=2
+        )
     assert manager.capture_sizes == [4, 8]
     assert manager.is_draft_model_prefill is True
     assert manager.speculator is None
@@ -66,7 +68,9 @@ def test_init_draft_decode_graph():
         ) as set_prefill,
         patch("vllm_ascend.worker.v2.spec_decode.target_dependent_ar.aclgraph.set_draft_graph_params") as set_decode,
     ):
-        manager = AutoRegressiveAclGraphManager(object(), torch.device("cpu"), CUDAGraphMode.FULL, decode_query_len=1)
+        manager = AutoRegressiveAclGraphManager(
+            SimpleNamespace(speculative_config=None), torch.device("cpu"), CUDAGraphMode.FULL, decode_query_len=1
+        )
     assert manager.is_draft_model_prefill is False
     set_decode.assert_called_once_with([4, 8])
     set_prefill.assert_not_called()
@@ -317,7 +321,8 @@ def test_graph_replay_updates_full_graph_params():
 
 @pytest.mark.parametrize("use_dcp,architecture", [(False, "GQA"), (True, "GQA"), (True, "MLA")])
 @pytest.mark.parametrize("is_prefill", [False, True])
-def test_updatable_graph_replay_reuses_shared_source(use_dcp, architecture, is_prefill):
+@pytest.mark.parametrize("prepared_window_params", [False, True])
+def test_updatable_graph_replay_reuses_shared_source(use_dcp, architecture, is_prefill, prepared_window_params):
     """Build every draft step from the first metadata with one shared-source update."""
     manager = AutoRegressiveAclGraphManager.__new__(AutoRegressiveAclGraphManager)
     manager.update_stream = MagicMock()
@@ -356,9 +361,14 @@ def test_updatable_graph_replay_reuses_shared_source(use_dcp, architecture, is_p
             return_value="result",
         ) as parent_replay,
     ):
-        result = manager._updatable_graph_replay(desc, steps)
+        result = manager._updatable_graph_replay(
+            desc, steps, **({"fia_params": fia_params} if prepared_window_params else {})
+        )
 
-    manager.speculator.build_fia_params.assert_called_once_with(2, steps[0], is_prefill)
+    if prepared_window_params:
+        manager.speculator.build_fia_params.assert_not_called()
+    else:
+        manager.speculator.build_fia_params.assert_called_once_with(2, steps[0], is_prefill)
     shared_source.assert_called_once_with(fia_params)
     assert result == "result"
     graph.resolve_tasks.assert_called_once_with(source)

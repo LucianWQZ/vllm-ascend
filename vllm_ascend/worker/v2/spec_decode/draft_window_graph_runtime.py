@@ -10,7 +10,7 @@ output snapshot, artifact writer, or oracle participates in this path.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from typing import Any
 
 from vllm.config.compilation import CUDAGraphMode
@@ -21,10 +21,7 @@ from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.device.hardware_profile import AttentionBackendFamily, get_current_hardware_profile
 from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftMetadataInputs,
-    DraftWindowPolicyDecision,
-    DraftWindowSourceCapability,
     DraftWindowWorkspace,
-    _build_draft_window_source_capability_for_context,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_eager import (
     build_draft_window_attn_metadata,
@@ -32,8 +29,7 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_eager import (
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
     DraftWindowGraphBindingProvider,
-    DraftWindowGraphCaptureIdentity,
-    DraftWindowGraphReadCarrier,
+    DraftWindowGraphBucket,
     DraftWindowGraphRoute,
     resolve_parallel_draft_window_graph_route,
 )
@@ -62,50 +58,13 @@ def validate_graph_context(vllm_config: Any, block_tables: Any) -> None:
         raise RuntimeError("Draft Window Graph requires PP=PCP=DCP=1 and unsharded Draft tables")
 
 
-def build_parallel_graph_source(
-    *,
-    policy: DraftWindowPolicyDecision,
-    runtime_route: str,
-    attn_groups: Sequence[Sequence[Any]],
-    block_tables: Any,
-    kv_cache_config: Any,
-    causal: bool | Mapping[int, bool],
-    vllm_config: Any,
-    dflash2_graph_contract: Any = None,
-) -> DraftWindowSourceCapability:
-    """Build Source ownership only after the real Graph route is gated."""
-    if not draft_window_graph_enabled():
-        raise RuntimeError("internal Draft Window Graph flag is not enabled")
-    validate_graph_context(vllm_config, block_tables)
-    if runtime_route not in {"dflash", "dflash2", "dspark"}:
-        raise NotImplementedError("Draft Window Graph supports only DFlash and eligible DSpark")
-    if runtime_route == "dflash2":
-        from vllm_ascend.worker.v2.spec_decode.draft_window_dflash2_graph import DFlash2GraphContract
-
-        if not isinstance(dflash2_graph_contract, DFlash2GraphContract):
-            raise NotImplementedError("DFlash2 Graph has no admitted model/selector/native reader contract")
-    elif dflash2_graph_contract is not None:
-        raise RuntimeError("DFlash2 source contract belongs to a different method")
-    capability = _build_draft_window_source_capability_for_context(
-        policy=policy,
-        runtime_route=runtime_route,
-        attn_groups=attn_groups,
-        block_tables=block_tables,
-        kv_cache_config=kv_cache_config,
-        causal=causal,
-        vllm_config=vllm_config,
-        dflash2_graph_contract=dflash2_graph_contract,
-    )
-    return capability
-
-
 def install_parallel_graph(owner: Any) -> DraftWindowGraphBindingProvider:
     """Install one provider and register every real startup capture bucket."""
-    if hasattr(owner, "_draft_window_graph_session"):
-        raise RuntimeError("Draft Window Graph is already installed on this speculator")
     provider = getattr(owner, "_draft_window_graph_binding_provider", None)
     if not isinstance(provider, DraftWindowGraphBindingProvider):
         raise RuntimeError("Draft Window Graph requires its initialized source owner")
+    if provider._carriers:
+        raise RuntimeError("Draft Window Graph capture buckets are already installed")
     manager = getattr(owner, "query_cudagraph_manager", None)
     capture_descs = getattr(manager, "_capture_descs", None)
     if not isinstance(capture_descs, Mapping) or not capture_descs:
@@ -122,17 +81,6 @@ def install_parallel_graph(owner: Any) -> DraftWindowGraphBindingProvider:
     )
     if not descriptors:
         raise RuntimeError("Draft Window Graph manager has no capture descriptors")
-    descriptor_keys = tuple(
-        (
-            descriptor.cg_mode.name,
-            descriptor.num_reqs,
-            descriptor.num_tokens,
-        )
-        for descriptor in descriptors
-    )
-    if len(set(descriptor_keys)) != len(descriptor_keys):
-        raise NotImplementedError("Draft Window Graph does not support ambiguous LoRA capture buckets")
-
     if int(owner.speculative_config.num_speculative_tokens) <= 0:
         raise ValueError("Draft Window Graph static K must be positive")
     for descriptor in descriptors:
@@ -140,38 +88,31 @@ def install_parallel_graph(owner: Any) -> DraftWindowGraphBindingProvider:
             route=route,
             descriptor=descriptor,
         )
-    owner._draft_window_graph_session = provider
     return provider
 
 
 def prepare_parallel_graph(
     owner: Any,
     descriptor: BatchExecutionDescriptor,
-) -> DraftWindowGraphReadCarrier | None:
+) -> DraftWindowGraphBucket | None:
     """Bind the current proposal inputs before Graph metadata consumption."""
-    provider = getattr(owner, "_draft_window_graph_session", None)
+    provider = getattr(owner, "_draft_window_graph_binding_provider", None)
     if provider is None:
         return None
-    if provider is not owner._draft_window_graph_binding_provider:
-        raise TypeError("invalid instance-owned Draft Window Graph provider")
     if descriptor.cg_mode is not CUDAGraphMode.FULL:
         raise RuntimeError("runtime Draft Window Graph requires a FULL replay descriptor")
     inputs = provider._active_inputs
     if not isinstance(inputs, DraftMetadataInputs):
         raise RuntimeError("Draft Window Graph replay has no current proposal inputs")
-    inputs.validate_for(inputs.identity)
-    proposal_context = owner._draft_window_epoch_source._active
-    if proposal_context is not inputs.identity.proposal:
+    inputs.validate()
+    proposal_context = owner._draft_window_proposal
+    if proposal_context is not inputs.proposal:
         raise RuntimeError("Draft Window Graph proposal identity is stale")
     route = resolve_parallel_draft_window_graph_route(owner)
     assert route is not None
     capture_identity = provider.capture_identity_for(route=route, descriptor=descriptor)
-    if inputs.identity.padded_request_count != capture_identity.descriptor.num_reqs:
+    if inputs.padded_request_count != capture_identity.descriptor.num_reqs:
         raise RuntimeError("Draft Window Graph generation does not match the capture request bucket")
-    target_metadata = owner.model_state.attn_metadata
-    if not isinstance(target_metadata, Mapping) or not target_metadata:
-        raise RuntimeError("Draft Window Graph requires real non-empty Target metadata")
-
     if owner._draft_window_selected_metadata != descriptor or inputs.metadata is not None:
         raise RuntimeError("Draft Window replay does not own the selected unconsumed FULL dispatch")
 
@@ -183,10 +124,9 @@ def prepare_parallel_graph(
         metadata_builder=lambda workspace: _build_private_graph_metadata(
             owner,
             workspace=workspace,
-            actual_request_count=len(inputs.identity.proposal.ordered_request_ids),
+            actual_request_count=len(inputs.proposal.ordered_request_ids),
             capture_identity=capture_identity,
         ),
-        target_metadata=target_metadata,
     )
     return carrier
 
@@ -196,7 +136,7 @@ def _build_private_graph_metadata(
     *,
     workspace: DraftWindowWorkspace,
     actual_request_count: int,
-    capture_identity: DraftWindowGraphCaptureIdentity,
+    capture_identity: DraftWindowGraphBucket,
 ) -> Mapping[str, Any]:
     read_inputs = draft_window_read_inputs(
         workspace,
@@ -218,8 +158,4 @@ def _build_private_graph_metadata(
         if capture_identity.route is DraftWindowGraphRoute.DSPARK
         else None,
     )
-    for layer_name in owner._draft_window_graph_binding_provider.source.group.layers:
-        # The normal builder uses CPU exact while preparing tiling. FULL FIA
-        # capture/update additionally reads the persistent device length bank.
-        metadata[layer_name].seq_lens = workspace.device_window_exact
     return metadata

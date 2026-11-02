@@ -18,6 +18,7 @@ from vllm.v1.worker.gpu.input_batch import InputBatch
 
 from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftMetadataInputs,
+    _build_draft_window_source_capability_for_context,
     gather_valid_num_blocks_cpu,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphBindingProvider
@@ -28,75 +29,28 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_nongraph import (
 from vllm_ascend.worker.v2.spec_decode.draft_window_read import DraftReadView
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, eq=False)
 class DraftWindowProposalContext:
     """Caller-owned identity for one real outer ``propose`` invocation."""
 
-    mapping_epoch: int
-    input_batch_id: int
+    input_batch: InputBatch | Any
     ordered_request_ids: tuple[str, ...]
     idx_mapping_fingerprint: tuple[int, ...]
     phase_plan: DraftWindowBatchPhasePlan
 
-    def __post_init__(self) -> None:
-        if type(self.mapping_epoch) is not int or self.mapping_epoch < 0:
-            raise ValueError("proposal mapping epoch must be a nonnegative Python int")
-        requests = self.ordered_request_ids
-        if any(not isinstance(request, str) or not request for request in requests) or len(set(requests)) != len(
-            requests
-        ):
-            raise ValueError("proposal requires unique nonempty ordered request IDs")
-        if len(self.idx_mapping_fingerprint) != len(requests):
-            raise ValueError("proposal CPU mapping must match its ordered request count")
-        if len(self.phase_plan.full_read_rows) != len(requests):
-            raise ValueError("proposal Full-read markers must match its ordered request count")
+    @classmethod
+    def from_batch(cls, input_batch: InputBatch | Any) -> "DraftWindowProposalContext":
+        requests, mapping = _proposal_fingerprint(input_batch)
+        return cls(input_batch, requests, mapping, classify_draft_window_batch_phase(input_batch))
 
-
-class DraftWindowProposalEpochSource:
-    """Issue exactly one monotonic mapping epoch per real proposal."""
-
-    def __init__(self) -> None:
-        self._next_epoch = 0
-        self._active: DraftWindowProposalContext | None = None
-
-    def begin(self, input_batch: InputBatch | Any) -> DraftWindowProposalContext:
-        if self._active is not None:
-            raise RuntimeError("a draft-window proposal epoch is already active")
-        request_ids, mapping = _proposal_fingerprint(input_batch)
-        phase_plan = classify_draft_window_batch_phase(input_batch)
-        context = DraftWindowProposalContext(
-            mapping_epoch=self._next_epoch,
-            input_batch_id=id(input_batch),
-            ordered_request_ids=request_ids,
-            idx_mapping_fingerprint=mapping,
-            phase_plan=phase_plan,
-        )
-        self._next_epoch += 1
-        self._active = context
-        return context
-
-    def validate(
-        self,
-        expected: DraftWindowProposalContext,
-        input_batch: InputBatch | Any,
-    ) -> None:
-        if self._active is not expected:
-            raise RuntimeError("stale proposal epoch is not the active generation")
-        if id(input_batch) != expected.input_batch_id:
-            raise RuntimeError("proposal input batch object changed within one epoch")
-        request_ids, mapping = _proposal_fingerprint(input_batch)
-        if request_ids != expected.ordered_request_ids:
-            raise RuntimeError("proposal request ordering changed within one epoch")
-        if mapping != expected.idx_mapping_fingerprint:
-            raise RuntimeError("proposal idx_mapping changed within one epoch")
-        phase_plan = classify_draft_window_batch_phase(input_batch)
-        if phase_plan != expected.phase_plan:
-            raise RuntimeError("proposal row phases changed within one epoch")
-
-    def finish(self, expected: DraftWindowProposalContext) -> None:
-        if self._active is not expected:
-            raise RuntimeError("stale proposal epoch cannot finish the active generation")
-        self._active = None
+    def validate(self, input_batch: InputBatch | Any) -> None:
+        if input_batch is not self.input_batch:
+            raise RuntimeError("proposal input batch object changed")
+        requests, mapping = _proposal_fingerprint(input_batch)
+        if requests != self.ordered_request_ids or mapping != self.idx_mapping_fingerprint:
+            raise RuntimeError("proposal request ordering or idx_mapping changed")
+        if classify_draft_window_batch_phase(input_batch) != self.phase_plan:
+            raise RuntimeError("proposal row phases changed")
 
 
 def draft_window_read_inputs(
@@ -113,7 +67,6 @@ def draft_window_read_inputs(
         seq_lens=workspace.device_window_exact[:padded_request_count],
         seq_lens_cpu=exact,
         seq_lens_cpu_upper_bound=exact,
-        starts_cpu=None,
         max_seq_len=int(active_exact.max().item()) if active_exact.numel() else 0,
         num_reqs=padded_request_count,
     )
@@ -164,7 +117,8 @@ def build_draft_window_attn_metadata(
         attn_state = owner.input_batch.attn_state
     if parallel_config is None:
         parallel_config = owner.attn_vllm_config.parallel_config
-    window_gid = owner._draft_window_graph_binding_provider.source.group.gid
+    window_group = owner._draft_window_graph_binding_provider.source.group
+    window_gid = window_group.gid
     tables = list(owner.block_tables.input_block_tables)
     tables[window_gid] = read_inputs.block_table
 
@@ -193,11 +147,12 @@ def build_draft_window_attn_metadata(
         parallel_config=parallel_config,
         attn_state=attn_state,
     )
-    # The generic builder also makes a temporary GPU query-layout copy.
-    # Capture/replay owns the original persistent input-buffer address.
-    for layer in metadata.values():
-        if layer is not None:
-            layer.query_start_loc = owner.input_buffers.query_start_loc[: num_reqs_padded + 1]
+    # One executable group is admitted at initialization. The original
+    # builder shares its newly created metadata across that group's layers.
+    # Bind the two Graph-specific device operands once on this actual object.
+    layer = metadata[window_group.layers[0]]
+    layer.query_start_loc = owner.input_buffers.query_start_loc[: num_reqs_padded + 1]
+    layer.seq_lens = read_inputs.seq_lens
     return metadata
 
 
@@ -207,7 +162,7 @@ class DraftWindowGraphInputMixin:
     _speculator_name: str
     _group_causal: bool | Mapping[int, bool]
     _draft_window_graph_binding_provider: DraftWindowGraphBindingProvider
-    _draft_window_epoch_source: DraftWindowProposalEpochSource
+    _draft_window_proposal: DraftWindowProposalContext | None
     _draft_window_bypass_active: bool
     _draft_window_prefill_bypass_active: bool
     _draft_window_dp_dummy_active: bool
@@ -219,7 +174,6 @@ class DraftWindowGraphInputMixin:
     draft_attn_layer_names: set[str] | None
     arange: torch.Tensor
     arange_np: np.ndarray
-    _draft_window_graph_session: Any
     attn_groups: Any
     kv_cache_config: Any
     num_query_per_req: int
@@ -234,9 +188,7 @@ class DraftWindowGraphInputMixin:
             raise RuntimeError("draft-window runtime ownership is already initialized")
         if hasattr(self, "_draft_window_runtime"):
             raise RuntimeError("Graph Window cannot replace the typed eager runtime")
-        from vllm_ascend.worker.v2.spec_decode.draft_window_graph_runtime import build_parallel_graph_source
-
-        capability = build_parallel_graph_source(
+        capability = _build_draft_window_source_capability_for_context(
             policy=policy,
             runtime_route=self._speculator_name.lower(),
             attn_groups=self.attn_groups,
@@ -252,9 +204,9 @@ class DraftWindowGraphInputMixin:
     def _initialize_draft_window_graph_inputs(self) -> None:
         if not hasattr(self, "_draft_window_graph_binding_provider"):
             raise RuntimeError("Draft Window Graph inputs require an initialized Source owner")
-        if hasattr(self, "_draft_window_epoch_source"):
+        if hasattr(self, "_draft_window_proposal"):
             raise RuntimeError("Draft Window Graph inputs are already initialized")
-        self._draft_window_epoch_source = DraftWindowProposalEpochSource()
+        self._draft_window_proposal = None
         self._draft_window_bypass_active = False
         self._draft_window_prefill_bypass_active = False
         self._draft_window_dp_dummy_active = False
@@ -268,15 +220,12 @@ class DraftWindowGraphInputMixin:
         dummy_run: bool,
         is_profile: bool,
     ) -> Iterator[None]:
-        epoch_source: DraftWindowProposalEpochSource | None = getattr(
-            self,
-            "_draft_window_epoch_source",
-            None,
-        )
-        if epoch_source is None:
+        if not hasattr(self, "_draft_window_graph_binding_provider"):
             yield
             return
-        if self._draft_window_graph_binding_provider.quarantined_identity is not None or getattr(
+        if self._draft_window_bypass_active or self._draft_window_proposal is not None:
+            raise RuntimeError("a draft-window proposal scope is already active")
+        if self._draft_window_graph_binding_provider.quarantined or getattr(
             self, "_draft_window_graph_submission_uncertain", False
         ):
             raise RuntimeError("draft-window backing is quarantined after uncertain Graph submission")
@@ -284,8 +233,6 @@ class DraftWindowGraphInputMixin:
         if not dummy_run and not is_profile:
             bypass_for_prefill = _requires_prefill_baseline_bypass(input_batch)
         if dummy_run or is_profile or bypass_for_prefill:
-            if self._draft_window_bypass_active or self._draft_window_epoch_source._active is not None:
-                raise RuntimeError("a draft-window proposal scope is already active")
             self._draft_window_bypass_active = True
             # Only a real all-continuing prefill may select the established
             # full-read baseline. Dummy/profile bypasses are not this phase.
@@ -299,7 +246,7 @@ class DraftWindowGraphInputMixin:
                 and not is_profile
                 and type(dp_size) is int
                 and dp_size > 1
-                and hasattr(self, "_draft_window_graph_session")
+                and bool(self._draft_window_graph_binding_provider._carriers)
             )
             try:
                 # Startup/profile and pure-prefill proposals exercise the
@@ -319,7 +266,8 @@ class DraftWindowGraphInputMixin:
                 self._draft_window_prefill_bypass_active = False
                 self._draft_window_dp_dummy_active = False
             return
-        context = epoch_source.begin(input_batch)
+        context = DraftWindowProposalContext.from_batch(input_batch)
+        self._draft_window_proposal = context
         self._draft_window_selected_metadata = None
         succeeded = False
         try:
@@ -331,22 +279,23 @@ class DraftWindowGraphInputMixin:
                 self._draft_window_graph_submission_uncertain = True
             live_inputs = self._draft_window_graph_binding_provider._active_inputs
             try:
-                if live_inputs is not None and not live_inputs.retired:
+                if live_inputs is not None:
                     if succeeded:
                         try:
-                            self._draft_window_graph_binding_provider.retire_generation(live_inputs.identity)
+                            self._draft_window_graph_binding_provider.retire_generation(live_inputs)
+                            self._draft_window_graph_binding_provider.finish_proposal()
                         except BaseException:
                             self._draft_window_graph_submission_uncertain = True
                             succeeded = False
                             raise
                     else:
                         # Retain uncertain backing without device RPC on unwind.
-                        self._draft_window_graph_binding_provider.quarantine_generation(live_inputs.identity)
+                        self._draft_window_graph_binding_provider.quarantine_generation(live_inputs)
                 elif succeeded:
                     raise RuntimeError("Draft Graph proposal completed without consuming its current inputs")
             finally:
                 self._draft_window_selected_metadata = None
-                epoch_source.finish(context)
+                self._draft_window_proposal = None
 
     def _snapshot_prepared_draft_seq_lens(
         self,
@@ -386,17 +335,15 @@ class DraftWindowGraphInputMixin:
         cpu_full_exact = self._snapshot_prepared_draft_seq_lens(num_reqs_padded)
         capability = self._draft_window_graph_binding_provider.source
         valid_num_blocks = gather_valid_num_blocks_cpu(
-            capability.full_source,
-            global_group_id=capability.group.gid,
+            capability,
             idx_mapping_np=input_batch.idx_mapping_np,
             num_reqs=num_reqs,
             num_reqs_padded=num_reqs_padded,
         )
         # Recheck request order after the controlled exact-length snapshot.
-        self._draft_window_epoch_source.validate(context, input_batch)
+        context.validate(input_batch)
         inputs = self._draft_window_graph_binding_provider.materialize(
             proposal=context,
-            idx_mapping=input_batch.idx_mapping,
             cpu_full_exact=cpu_full_exact,
             cpu_valid_num_blocks=valid_num_blocks,
             num_reqs_padded=num_reqs_padded,
@@ -463,9 +410,9 @@ class DraftWindowGraphInputMixin:
     def _require_current_draft_window_proposal(
         self,
     ) -> DraftWindowProposalContext:
-        context = self._draft_window_epoch_source._active
+        context = self._draft_window_proposal
         if context is None:
-            raise RuntimeError("Draft Window metadata build has no active proposal epoch")
+            raise RuntimeError("Draft Window metadata build has no active proposal")
         return context
 
 
@@ -481,6 +428,8 @@ def _proposal_fingerprint(
         raise ValueError("proposal CPU idx_mapping does not cover active requests")
     if not np.issubdtype(mapping.dtype, np.integer):
         raise TypeError("proposal CPU idx_mapping must contain integers")
+    if any(not isinstance(request, str) or not request for request in request_ids) or len(set(request_ids)) != num_reqs:
+        raise ValueError("proposal requires unique nonempty request IDs")
     return request_ids, tuple(int(value) for value in mapping[:num_reqs])
 
 

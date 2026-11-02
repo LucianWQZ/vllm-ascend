@@ -263,6 +263,7 @@ def test_explicit_full_write_mapping_preserves_upstream_signature(contract):
 
 def test_callback_final_writer_updates_real_common_cpu_mirrors_and_keeps_full_operands(contract):
     retained: list[Any] = []
+    read_retained: list[Any] = []
     called: list[Any] = []
     read = contract.read
     exact = torch.tensor([21], dtype=torch.int32)
@@ -273,6 +274,8 @@ def test_callback_final_writer_updates_real_common_cpu_mirrors_and_keeps_full_op
         upper_cpu=torch.tensor([25], dtype=torch.int32),
         starts_cpu=torch.tensor([12], dtype=torch.int32),
         padded_rows=1,
+        row_indices=torch.tensor([0]),
+        retain=lambda *items: read_retained.extend(items),
     )
 
     def callback(gid, common):
@@ -306,6 +309,7 @@ def test_callback_final_writer_updates_real_common_cpu_mirrors_and_keeps_full_op
     assert contract.obj.input_buffers.seq_lens.tolist() == [21]
     assert contract.table.tolist() == [list(range(8))]
     assert retained == [result]
+    assert any(value is view.block_table for value in read_retained)
     runtime.metadata_callback.assert_called_once_with(3, 1)
     runtime.metadata_builder_callback.assert_called_once_with(3)
     select_builder.assert_called_once_with(0, contract.backend, ["draft.a", "draft.b"])
@@ -681,6 +685,7 @@ def test_dspark_mla_reuses_prepared_exact_cpu_without_another_transfer(contract,
     obj.input_batch.num_reqs = 1
     obj.input_batch.req_ids = ["current-request"]
     obj.input_batch.idx_mapping_np = np.array([0])
+    obj.input_batch.idx_mapping = torch.tensor([0])
     obj.input_batch.num_computed_prefill_tokens_np = np.array([16])
     obj.input_batch.prefill_len_np = np.array([16])
     obj.input_batch.num_scheduled_tokens = np.array([3])

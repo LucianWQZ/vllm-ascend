@@ -16,29 +16,24 @@ from typing import Any
 
 import torch
 
+from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftWindowWorkspace,
     _build_draft_window_source_capability_for_context,
 )
+from vllm_ascend.worker.v2.spec_decode.draft_window_eager import (
+    build_draft_window_attn_metadata,
+    draft_window_read_inputs,
+)
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
-    DraftWindowGraphBindingProvider,
-    DraftWindowGraphCaptureIdentity,
-    DraftWindowGraphCarrierState,
-    DraftWindowGraphReadCarrier,
+    DraftWindowGraphBucket,
     DraftWindowGraphRoute,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph_metadata import copy_draft_attention_metadata
-from vllm_ascend.worker.v2.spec_decode.draft_window_graph_runtime import (
-    draft_window_graph_enabled,
-    validate_graph_context,
-)
 
 
 def build_eagle3_graph_source(owner: Any):
     """Bind the actual consumer Source after normal Graph configuration."""
-    if not draft_window_graph_enabled():
-        raise RuntimeError("Eagle3 Graph Window requires the default-off experimental gate")
-    validate_graph_context(owner.vllm_config, owner.block_tables)
     if owner.method != "eagle3" or owner.speculative_config.uses_dynamic_speculative_decoding():
         raise NotImplementedError("Eagle3 Graph requires normalized Eagle3 and static K")
     return _build_draft_window_source_capability_for_context(
@@ -56,16 +51,14 @@ class Eagle3GraphSession:
     """Separate persistent bank per descriptor x real AR consumer ordinal."""
 
     def __init__(self, owner: Any) -> None:
-        validate_graph_context(owner.vllm_config, owner.block_tables)
         self.owner = owner
         self.provider = owner._draft_window_graph_binding_provider
-        if not isinstance(self.provider, DraftWindowGraphBindingProvider):
-            raise TypeError("Eagle3 Graph requires its initialized source owner")
-        self._carriers: list[DraftWindowGraphReadCarrier] = []
-        self._captures: dict[tuple[DraftWindowGraphRoute, int, int, int], DraftWindowGraphCaptureIdentity] = {}
+        self._captures: dict[tuple[DraftWindowGraphRoute, int, int, int], DraftWindowGraphBucket] = {}
         self._capture_call: tuple[DraftWindowGraphRoute, int, int] | None = None
         self._capture_ordinal = 0
         for first, manager in ((True, owner.prefill_cudagraph_manager), (False, owner.decode_cudagraph_manager)):
+            if owner.update_stream is None or manager.update_stream is not owner.update_stream:
+                raise RuntimeError("Eagle3 capture managers must share their owner UPDATE stream")
             route = DraftWindowGraphRoute.EAGLE3_FIRST_PASS if first else DraftWindowGraphRoute.EAGLE3_AR_STEP
             q = owner.num_speculative_steps + 1 if first else 1
             group = self.provider.source.group
@@ -100,18 +93,11 @@ class Eagle3GraphSession:
             raise RuntimeError("Eagle3 Graph backing is quarantined; process isolation required")
         self.provider.require_reusable()
 
-    def finish(self) -> None:
-        """Check real UPDATE attribution; Host retirement is not completion."""
-        self.require_reusable()
-        if any(carrier.state is not DraftWindowGraphCarrierState.UPDATED for carrier in self._carriers):
-            raise RuntimeError("Eagle3 Graph banks lack actual backend UPDATE attribution")
-        self._carriers.clear()
-
     def validate_for_provider(self, provider: Any) -> None:
         if provider is not self.provider or not self._captures:
             raise RuntimeError("Eagle3 startup carrier belongs to another provider or has no inventory")
 
-    def resolve(self, *, first: bool, n: int, tokens: int, ordinal: int) -> DraftWindowGraphCaptureIdentity:
+    def resolve(self, *, first: bool, n: int, tokens: int, ordinal: int) -> DraftWindowGraphBucket:
         route = DraftWindowGraphRoute.EAGLE3_FIRST_PASS if first else DraftWindowGraphRoute.EAGLE3_AR_STEP
         try:
             return self._captures[route, n, tokens, ordinal]
@@ -148,31 +134,24 @@ class Eagle3GraphSession:
             self.provider.source.window_size + self.provider.source.group.table_column_span - 1,
         )
         private = copy_draft_attention_metadata(metadata)
-        result: dict[str, Any] = {}
-        for name, layer in private.items():
+        query = self.owner.input_buffers.query_start_loc
+        if query.dtype != torch.int32 or query.ndim != 1 or query.numel() < n + 1:
+            raise RuntimeError("Eagle3 capture requires its owned int32 Full input query")
+        for layer in private.values():
             if layer is None:
-                result[name] = None
                 continue
-            source = metadata[name]
             layer.block_tables = read.window_block_table
             layer.seq_lens = read.device_window_exact
             layer.seq_lens_cpu = read.cpu_window_exact
             layer.seq_lens_list = read.cpu_window_exact.tolist()
             layer.max_seq_len = capacity
             layer.causal = True
-            # Full write/query fields are preserved, never derived from V/S.
-            for attr in ("slot_mapping", "positions"):
-                if hasattr(source, attr):
-                    setattr(layer, attr, getattr(source, attr))
+            # The shallow metadata copy retains canonical Full write operands.
             # Match runtime write_reference: bind the owned Full input query,
             # not a builder's transient auxiliary GPU copy. FIA's padded Host
             # cumulative lengths remain a distinct field and are preserved.
-            query = self.owner.input_buffers.query_start_loc
-            if query.dtype != torch.int32 or query.ndim != 1 or query.numel() < n + 1:
-                raise RuntimeError("Eagle3 capture requires its owned int32 Full input query")
             layer.query_start_loc = query[: n + 1]
-            result[name] = layer
-        return result, identity
+        return private, identity
 
     def stage(self, inputs: Any, *, first: bool, n: int, tokens: int, ordinal: int) -> None:
         from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import (
@@ -189,46 +168,43 @@ class Eagle3GraphSession:
         )
         identity = self.resolve(first=first, n=n, tokens=tokens, ordinal=ordinal)
         owner = self.owner
-        target = owner._require_eagle3_target_metadata()
 
         def build(workspace: DraftWindowWorkspace):
-            private = owner._build_eagle3_graph_metadata(
-                inputs=inputs,
-                workspace=workspace,
-                num_reqs=len(inputs.identity.proposal.ordered_request_ids),
+            read = draft_window_read_inputs(
+                workspace, actual_request_count=owner.input_batch.num_reqs, padded_request_count=n
+            )
+            metadata = build_draft_window_attn_metadata(
+                owner,
+                num_reqs=owner.input_batch.num_reqs,
                 num_reqs_padded=n,
                 num_tokens_padded=tokens,
+                read_inputs=read,
+                query_width=1,
+                causal=True,
                 query_start_loc_np=owner.input_batch.query_start_loc_np if first else None,
-                target_metadata=target,
-                first_pass=first,
+                attn_state=owner.input_batch.attn_state if first else AscendAttentionState.DecodeOnly,
+                parallel_config=owner.draft_vllm_config.parallel_config,
             )
-            return private
+            return metadata
 
         try:
             self.require_reusable()
-            current = inputs.identity
-            inputs.validate_for(current)
             context = owner._require_eagle3_window_context()
             if (
-                current.proposal is not context
-                or current.step != owner._eagle3_window_next_step
-                or current.step >= owner._eagle3_window_expected_steps
-                or first is not (current.step == 0)
-                or ordinal != (0 if first else current.step - 1)
+                inputs.proposal is not context
+                or inputs.step != owner._eagle3_window_next_step
+                or inputs.step >= owner._eagle3_window_expected_steps
+                or first is not (inputs.step == 0)
+                or ordinal != (0 if first else inputs.step - 1)
             ):
                 raise RuntimeError("Eagle3 Graph consumer does not match the active proposal/step")
-            carrier = self.provider.bind_read_carrier(
+            self.provider.bind_read_carrier(
                 capture_identity=identity,
                 inputs=inputs,
                 metadata_builder=build,
-                target_metadata=target,
             )
-            if carrier.state is not DraftWindowGraphCarrierState.BOUND:
-                raise RuntimeError("Eagle3 consumer has no bound persistent destination")
-            self.require_reusable()
-            self.provider.retire_generation(current)
-            self._carriers.append(carrier)
-            owner._eagle3_window_next_step = current.step + 1
+            self.provider.retire_generation(inputs)
+            owner._eagle3_window_next_step = inputs.step + 1
         except BaseException:
             owner._quarantine_eagle3_window()
             raise

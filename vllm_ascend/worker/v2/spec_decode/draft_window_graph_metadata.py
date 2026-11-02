@@ -45,37 +45,6 @@ def copy_draft_attention_metadata(metadata: Mapping[str, Any]) -> dict[str, Any]
     return result
 
 
-def validate_draft_metadata_isolation(metadata: Mapping[str, Any], *, target_metadata: Mapping[str, Any]) -> None:
-    """Guard the actual metadata mutation boundary, not arbitrary object graphs.
-
-    Read-only Tensor sharing is intentional. The Graph provider separately
-    checks the precise window bank and canonical Full write/query operands.
-    """
-    if not isinstance(metadata, Mapping) or not isinstance(target_metadata, Mapping):
-        raise ValueError("Draft and Target metadata must be layer mappings")
-    mutable_fields = ("seq_lens_list", "actual_seq_lengths_q", "qfa_metadata_cache")
-    target_objects = {id(layer) for layer in target_metadata.values() if layer is not None}
-    target_containers = {
-        id(value)
-        for layer in target_metadata.values()
-        if layer is not None
-        for field in mutable_fields
-        if isinstance(value := getattr(layer, field, None), (list, dict))
-    }
-    if metadata is target_metadata or any(
-        layer is not None
-        and (
-            id(layer) in target_objects
-            or any(
-                isinstance(value := getattr(layer, field, None), (list, dict)) and id(value) in target_containers
-                for field in mutable_fields
-            )
-        )
-        for layer in metadata.values()
-    ):
-        raise ValueError("Draft metadata mutable fields alias Target metadata")
-
-
 def is_parallel_graph_dp_dummy(owner: Any) -> bool:
     """Require the explicit no-generation scope before using baseline operands.
 
@@ -96,7 +65,7 @@ def is_parallel_graph_dp_dummy(owner: Any) -> bool:
         or dp_size <= 1
         or getattr(owner, "_draft_window_bypass_active", False) is not True
         or getattr(owner, "_draft_window_prefill_bypass_active", False) is not False
-        or owner._draft_window_epoch_source._active is not None
+        or owner._draft_window_proposal is not None
         or not isinstance(provider, DraftWindowGraphBindingProvider)
         or provider._active_inputs is not None
         or provider.method not in ("dflash", "dspark")

@@ -77,7 +77,6 @@ def _select_read_provider(
     builder: Any,
     specs: Sequence[Any],
     types: DraftWindowBackendTypes,
-    parallel_config: Any,
     *,
     uncompressed: bool,
     native_window: int | None,
@@ -90,16 +89,19 @@ def _select_read_provider(
     if not uncompressed:
         raise NotImplementedError("Compressed or packed cache geometry needs a separate read provider")
 
-    def matches(backend_type: type | None, builder_types: tuple[type | None, ...], spec_type: type | None) -> bool:
+    def matches(backend_type: type | None, builder_type: type | None, spec_type: type | None) -> bool:
         return (
-            backend_type is not None
-            and backend is backend_type
-            and type(builder) in builder_types
-            and all(type(item) is spec_type for item in specs)
+            backend is backend_type and type(builder) is builder_type and all(type(item) is spec_type for item in specs)
         )
 
-    native = matches(types.dense_backend, (types.dense_builder,), types.sliding_window_spec)
-    if matches(types.dense_backend, (types.dense_builder,), types.full_attention_spec):
+    if full_retention_dflash2 and any(
+        type(item) is not types.full_attention_spec or getattr(item, "attention_chunk_size", None) is not None
+        for item in specs
+    ):
+        raise NotImplementedError("DFlash2 requires Full-retention FullAttentionSpec without chunked attention")
+
+    native = matches(types.dense_backend, types.dense_builder, types.sliding_window_spec)
+    if matches(types.dense_backend, types.dense_builder, types.full_attention_spec):
         if (
             all(getattr(item, "attention_chunk_size", None) is None for item in specs)
             and uniform_windows
@@ -111,7 +113,7 @@ def _select_read_provider(
         else:
             raise NotImplementedError("Dense chunked or nonuniform native attention needs a separate provider")
     elif not native:
-        if matches(types.mla_backend, (types.mla_builder,), types.mla_spec):
+        if matches(types.mla_backend, types.mla_builder, types.mla_spec):
             if builder.flashmla_state is not None:
                 raise NotImplementedError("FlashMLA persistent derived state needs a separate provider")
             selected = status.DIRECT_MLA
@@ -130,8 +132,6 @@ def _select_read_provider(
         selected = status.NATIVE_SWA_CANDIDATE
     if selected is None:
         raise NotImplementedError(f"No read-view provider for {backend.__name__}/{type(builder).__name__}")
-    if parallel_config.prefill_context_parallel_size != 1 or parallel_config.decode_context_parallel_size != 1:
-        raise NotImplementedError("Context-parallel read coordinates need a separate provider")
     return selected
 
 
@@ -153,6 +153,8 @@ def inventory_draft_window_groups(
     """
     if types is None:
         types = DraftWindowBackendTypes.load()
+    if parallel_config.prefill_context_parallel_size != 1 or parallel_config.decode_context_parallel_size != 1:
+        raise NotImplementedError("Context-parallel read coordinates need a separate provider")
     cache_groups = kv_cache_config.kv_cache_groups
     if not (
         len(attn_groups) == len(cache_groups) == len(block_tables.block_sizes) == len(block_tables.kernel_block_sizes)
@@ -168,12 +170,13 @@ def inventory_draft_window_groups(
         specs = tuple(spec.kv_cache_specs.values()) if isinstance(spec, types.uniform_spec) else (spec,)
         if not specs:
             raise ValueError(f"Draft KV group {gid} has no cache spec")
-        spans = {int(item.block_size) for item in specs}
-        ratios = {int(types.compression_ratio(item)) for item in specs}
-        storage_sizes = {int(types.storage_block_size(item)) for item in specs}
-        if len(spans) != 1 or len(ratios) != 1 or len(storage_sizes) != 1:
+        geometries = {
+            (int(item.block_size), int(types.compression_ratio(item)), int(types.storage_block_size(item)))
+            for item in specs
+        }
+        if len(geometries) != 1:
             raise ValueError(f"Draft KV group {gid} has inconsistent cache geometry")
-        scheduler_span, ratio, storage_size = spans.pop(), ratios.pop(), storage_sizes.pop()
+        scheduler_span, ratio, storage_size = geometries.pop()
         if int(block_tables.block_sizes[gid]) != scheduler_span:
             raise ValueError(f"Draft KV group {gid} scheduler and canonical table spans disagree")
         column_span = int(block_tables.kernel_block_sizes[gid])
@@ -203,7 +206,6 @@ def inventory_draft_window_groups(
                     builder,
                     consumer_specs,
                     types,
-                    parallel_config,
                     uncompressed=ratio == 1 and storage_size == scheduler_span,
                     native_window=native_window,
                     uniform_windows=len(windows) == 1,

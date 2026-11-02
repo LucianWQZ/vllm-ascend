@@ -9,21 +9,12 @@ kernels, model weights, or the upstream autoregressive loop.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from typing import Any
 
 from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.worker.gpu.spec_decode.eagle.speculator import EagleSpeculator
 
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
-from vllm_ascend.worker.v2.spec_decode.draft_window import (
-    DraftMetadataInputs,
-    DraftWindowWorkspace,
-)
-from vllm_ascend.worker.v2.spec_decode.draft_window_eager import (
-    build_draft_window_attn_metadata,
-    draft_window_read_inputs,
-)
 from vllm_ascend.worker.v2.spec_decode.draft_window_eagle3 import (
     Eagle3DraftWindowMixin,
 )
@@ -41,7 +32,7 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentA
     _eagle3_window_next_step: int
 
     def _initialize_draft_window_source_capability(self) -> None:
-        """Atomically bind eligible P2 source and P3 ownership state."""
+        """Initialize the validated Graph source and its proposal state."""
         policy = getattr(self, "_draft_window_policy", None)
         if policy is None:
             return
@@ -51,11 +42,7 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentA
 
         capability = build_eagle3_graph_source(self)
         self._draft_window_graph_binding_provider = DraftWindowGraphBindingProvider(source=capability)
-        try:
-            self._initialize_eagle3_draft_window_state()
-        except BaseException:
-            del self._draft_window_graph_binding_provider
-            raise
+        self._initialize_eagle3_draft_window_state()
 
     def _configure_decode_metadata_update(self) -> None:
         super()._configure_decode_metadata_update()
@@ -140,7 +127,7 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentA
                     layer.seq_lens_list = bank.cpu_window_exact.tolist()
                     layer.max_seq_len = int(bank.cpu_window_exact.max().item())
                     layer.attn_state = AscendAttentionState.ChunkedPrefill
-            prefill_inputs.publish(attn_metadata, target_metadata=self._require_eagle3_target_metadata())
+            prefill_inputs.publish(attn_metadata)
         try:
             output = super()._run_model(
                 num_tokens,
@@ -153,7 +140,7 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentA
             if prefill_inputs is not None:
                 # Host retirement is not device completion. The capture bank
                 # remains owned, and reuse stays on the checked current stream.
-                self._draft_window_graph_binding_provider.retire_generation(prefill_inputs.identity)
+                self._draft_window_graph_binding_provider.retire_generation(prefill_inputs)
                 self._eagle3_window_next_step = 1
             return output
         except BaseException:
@@ -216,62 +203,3 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentA
             route=route,
             expected_consumer_count=1 if is_draft_model_prefill else self.num_speculative_steps - 1,
         )
-
-    def _build_eagle3_graph_metadata(
-        self,
-        *,
-        inputs: DraftMetadataInputs,
-        workspace: DraftWindowWorkspace,
-        num_reqs: int,
-        num_reqs_padded: int,
-        num_tokens_padded: int,
-        query_start_loc_np,
-        target_metadata: Mapping[Any, Any],
-        first_pass: bool,
-    ) -> dict[str, Any]:
-        """Use the normal builder with this consumer's persistent read bank."""
-        inputs.validate_for(inputs.identity)
-        if self.block_tables.cp_size != 1:
-            raise NotImplementedError("MRV2 Eagle3 Draft Window does not support DCP")
-        if self.model_state.attn_metadata is not target_metadata:
-            raise RuntimeError("Target metadata owner changed before Eagle3 Draft metadata build")
-        view = draft_window_read_inputs(
-            workspace,
-            actual_request_count=num_reqs,
-            padded_request_count=num_reqs_padded,
-        )
-        state = next(layer.attn_state for layer in target_metadata.values() if layer is not None)
-        metadata = build_draft_window_attn_metadata(
-            self,
-            num_reqs=num_reqs,
-            num_reqs_padded=num_reqs_padded,
-            num_tokens_padded=num_tokens_padded,
-            read_inputs=view,
-            query_width=1,
-            causal=True,
-            query_start_loc_np=query_start_loc_np,
-            attn_state=state if first_pass else AscendAttentionState.DecodeOnly,
-            parallel_config=self.draft_vllm_config.parallel_config,
-        )
-        if not metadata:
-            raise RuntimeError("eligible Eagle3 Window route produced no Draft metadata")
-        if self.model_state.attn_metadata is not target_metadata:
-            raise RuntimeError("Target metadata owner changed during Eagle3 Draft metadata build")
-        for layer in metadata.values():
-            if layer is None:
-                continue
-            layer.seq_lens = workspace.device_window_exact
-            layer.seq_lens_cpu = workspace.cpu_window_exact
-            layer.seq_lens_list = workspace.cpu_window_exact.tolist()
-        return metadata
-
-    def _require_eagle3_target_metadata(
-        self,
-        passed_metadata: dict[str, Any] | None = None,
-    ) -> Mapping[Any, Any]:
-        target_metadata = self.model_state.attn_metadata
-        if not isinstance(target_metadata, Mapping) or not target_metadata:
-            raise ValueError("Window ON requires non-empty Target metadata from model_state.attn_metadata")
-        if passed_metadata is not None and passed_metadata is not target_metadata:
-            raise RuntimeError("Eagle3 first pass did not receive the real Target metadata owner")
-        return target_metadata

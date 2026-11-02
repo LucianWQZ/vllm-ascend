@@ -10,12 +10,9 @@ this module neither clones those algorithms nor creates another Graph owner.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
-
-if TYPE_CHECKING:
-    from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphTensorIdentity
+from typing import Any
 
 
 def _require(condition: bool, message: str) -> None:
@@ -28,39 +25,21 @@ def _capture_tensor(
     name: str,
     shape: tuple[int, ...],
     dtype: str,
-) -> tuple[Any, str, Any, DraftWindowGraphTensorIdentity]:
-    from vllm_ascend.worker.v2.spec_decode.draft_window_graph import _tensor_identity
-
+) -> Any:
     tensor = getattr(parent, name)
     _require(
         tuple(tensor.shape) == shape and str(tensor.dtype) == dtype,
         f"{name} shape/dtype does not match static K/selector capacity",
     )
     _require(tensor.is_contiguous() and tensor.data_ptr() != 0, f"{name} must have live contiguous persistent storage")
-    return parent, name, tensor, _tensor_identity(tensor)
+    return tensor
 
 
-@dataclass(frozen=True, slots=True)
-class _NativeLayer:
-    name: str
-    impl: Any = field(repr=False, compare=False)
-    native_window: int | None
-    mask: Any = field(repr=False, compare=False)
-    mask_address: int | None
+def _attention_impl_type():
+    # Worker-only import; CONFIG_OFF/policy evaluation stays host-only.
+    from vllm_ascend.attention.attention_v1 import AscendAttentionBackendImpl
 
-
-def _source_types():
-    # Worker-only imports; importing this contract or doing CONFIG_OFF/policy
-    # resolution does not import an attention backend or inspect devices.
-    from vllm.v1.kv_cache_interface import FullAttentionSpec
-
-    from vllm_ascend.attention.attention_v1 import (
-        AscendAttentionBackend,
-        AscendAttentionBackendImpl,
-        AscendAttentionMetadataBuilder,
-    )
-
-    return FullAttentionSpec, AscendAttentionBackend, AscendAttentionBackendImpl, AscendAttentionMetadataBuilder
+    return AscendAttentionBackendImpl
 
 
 def validate_dflash2_graph_config(vllm_config: Any) -> None:
@@ -106,121 +85,37 @@ def validate_dflash2_graph_config(vllm_config: Any) -> None:
 
 @dataclass(frozen=True, slots=True)
 class DFlash2GraphContract:
-    num_steps: int
     query_width: int
-    top_k: int
     max_num_reqs: int
-    sampling_mode: str
-    model: Any = field(repr=False, compare=False)
-    selector: Any = field(repr=False, compare=False)
-    sampler: Any = field(repr=False, compare=False)
-    static_context: Any = field(repr=False, compare=False)
     block_tables: Any = field(repr=False, compare=False)
-    buffers: tuple[tuple[Any, str, Any, DraftWindowGraphTensorIdentity], ...]
-    layers: tuple[_NativeLayer, ...]
-    convolution_owners: tuple[tuple[Any, int], ...] = field(repr=False, compare=False)
+    # The fixed speculator initializes these once and only updates their
+    # contents. Retain the actual inputs for capture's entire lifetime, without
+    # certifying the same private model structure before every proposal.
+    buffers: tuple[Any, ...] = field(repr=False, compare=False)
+    native_windows: tuple[tuple[str, int | None], ...]
 
-    def validate_owner(self, owner: Any) -> None:
-        """Before submission, reject stale captured addresses without a D2H.
+    def validate_source(self, group: Any, *, causal: bool | Mapping[int, bool], window_size: int) -> None:
+        """Check DFlash2's native read band on the shared backend inventory.
 
-        These checks are not completion evidence. The existing DFlash stream,
-        Graph bank and context-only owner contracts still protect the readers.
+        Inventory certifies Full-retention storage and canonical block geometry;
+        only the noncausal native mask and extra-Window subset are method-specific.
         """
-        if (
-            owner.num_speculative_steps != self.num_steps
-            or owner.num_query_per_req != self.query_width
-            or owner.top_k != self.top_k
-            or owner.max_num_reqs != self.max_num_reqs
-            or owner.speculative_config.draft_sample_method != self.sampling_mode
-            or (self.sampling_mode == "greedy" and owner.draft_logits is not None)
-            or owner.use_fp64_gumbel is not False
-            or owner.enable_adaptive_verification
-            or owner.model is not self.model
-            or owner.model.model.candidate_selector is not self.selector
-            or owner.candidate_sampler is not self.sampler
-            or owner.vllm_config.compilation_config.static_forward_context is not self.static_context
-        ):
-            raise RuntimeError("DFlash2 Graph model/selector/static shape owner changed")
-        from vllm_ascend.worker.v2.spec_decode.draft_window_graph import _tensor_identity
-
-        for parent, name, tensor, captured in self.buffers:
-            actual = getattr(parent, name)
-            if actual is not tensor or _tensor_identity(actual) != captured:
-                raise RuntimeError(f"DFlash2 Graph captured input owner changed: {name}")
-        context = owner.vllm_config.compilation_config.static_forward_context
-        for layer in self.layers:
-            if (
-                context.get(layer.name) is None
-                or context[layer.name].impl is not layer.impl
-                or layer.impl.sliding_window != layer.native_window
-                or getattr(layer.impl, "_dflash2_native_swa_mask", None) is not layer.mask
-                or (layer.mask is not None and layer.mask.data_ptr() != layer.mask_address)
-            ):
-                raise RuntimeError("DFlash2 Graph attention/mask owner changed")
-        for convolution, block_size in self.convolution_owners:
-            if convolution.block_size != block_size:
-                raise RuntimeError("DFlash2 Graph convolution query grouping changed")
-
-    def validate_source(
-        self,
-        attn_groups: Sequence[Sequence[Any]],
-        block_tables: Any,
-        causal: bool | Mapping[int, bool],
-        window_size: int,
-        query_width: int,
-    ) -> dict[int, int | None]:
-        """Validate storage addressing separately from the native read mask.
-
-        A FullAttentionSpec with native P is full-retention storage, not Full
-        attention. For noncausal native SWA the entire aligned extra-Window
-        interval must fit its original symmetric P-band. No P or mask is erased.
-        First integration admits one homogeneous global Draft group only.
-        """
-        full_spec, backend, impl_type, builder = _source_types()
-        _require(block_tables is self.block_tables, "canonical BlockTables owner changed")
+        gid, kernel, native = group.gid, group.table_column_span, group.native_window
         _require(type(window_size) is int and window_size > 0, "positive integer Window required")
-        _require(type(query_width) is int and query_width == self.query_width, "captured query width changed")
-        groups = [(gid, group) for gid, consumers in enumerate(attn_groups) for group in consumers]
-        _require(len(groups) == 1, "one homogeneous Draft global group is required; mixed groups are unqualified")
-        gid, group = groups[0]
         _require(
-            type(group.kv_cache_group_id) is int and group.kv_cache_group_id == gid,
-            "AttentionGroup global id differs from its actual table owner",
+            len(group.layers) == len(self.native_windows)
+            and dict(self.native_windows) == dict.fromkeys(group.layers, native),
+            "incomplete actual Draft layer inventory",
         )
         _require(
-            group.backend is backend and type(group.get_metadata_builder(0)) is builder,
-            "only the actual dense Ascend FIA backend/builder is qualified",
+            (causal if type(causal) is bool else causal.get(gid)) is False,
+            "DFlash2 Graph source requires actual noncausal attention",
         )
-        spec = group.kv_cache_spec
+        table = self.block_tables.input_block_tables[gid]
+        expansion = self.block_tables.blocks_per_kv_block[gid]
         _require(
-            type(spec) is full_spec and getattr(spec, "attention_chunk_size", None) is None,
-            "native/recycling KV specs cannot masquerade as full-retention storage",
-        )
-        _require(
-            gid < len(block_tables.block_sizes)
-            and gid < len(block_tables.kernel_block_sizes)
-            and gid < len(block_tables.blocks_per_kv_block)
-            and gid < len(block_tables.input_block_tables),
-            "missing actual block-table geometry",
-        )
-        logical, kernel = block_tables.block_sizes[gid], block_tables.kernel_block_sizes[gid]
-        _require(
-            type(logical) is int
-            and type(kernel) is int
-            and logical > 0
-            and kernel > 0
-            and logical == spec.block_size
-            and logical % kernel == 0,
-            "native resident Graph requires divisible actual logical/kernel block spans",
-        )
-        expansion = block_tables.blocks_per_kv_block[gid]
-        _require(
-            type(expansion) is int and expansion == logical // kernel,
-            "block-table kernel column expansion disagrees with logical/kernel spans",
-        )
-        table = block_tables.input_block_tables[gid]
-        _require(
-            len(table.shape) == 2
+            expansion == group.scheduler_block_size // kernel
+            and len(table.shape) == 2
             and table.shape[0] == self.max_num_reqs
             and table.shape[1] > 0
             and table.shape[1] % expansion == 0
@@ -228,38 +123,11 @@ class DFlash2GraphContract:
             and str(table.dtype) == "torch.int32",
             "canonical source must retain the actual complete expanded int32 table rows",
         )
-        native = getattr(spec, "sliding_window", None)
-        _require(native is None or type(native) is int and native > 0, "invalid native window")
-        names = tuple(group.layer_names)
-        _require(
-            len(names) == len(set(names)) == len(self.layers) and set(names) == {layer.name for layer in self.layers},
-            "incomplete actual Draft layer inventory",
-        )
-        group_causal = causal if type(causal) is bool else causal.get(gid)
-        _require(group_causal is False, "first DFlash2 Graph source requires actual noncausal attention")
-        for layer in self.layers:
-            actual = layer.impl
-            _require(
-                type(actual) is impl_type and actual.sliding_window == layer.native_window == native,
-                "model native window and full-retention KV spec disagree",
-            )
-            _require(
-                actual.sinks is None and actual.use_bnsd_kv_cache is False,
-                "sinks/packed KV need a separate native Graph contract",
-            )
-            mask = getattr(actual, "_dflash2_native_swa_mask", None)
-            _require(mask is layer.mask, "native noncausal mask owner changed")
-            if native is not None:
-                _require(
-                    mask is not None and mask.data_ptr() == layer.mask_address,
-                    "missing or replaced native noncausal mask backing",
-                )
         if native is not None:
             _require(
-                window_size + kernel - 1 + query_width <= native,
+                window_size + kernel - 1 + self.query_width <= native,
                 "Window + block - 1 + query width exceeds the original noncausal native band",
             )
-        return {gid: native}
 
 
 def validate_dflash2_graph_source(owner: Any) -> DFlash2GraphContract:
@@ -327,8 +195,8 @@ def validate_dflash2_graph_source(owner: Any) -> DFlash2GraphContract:
     )
     if probabilistic:
         buffers += (_capture_tensor(owner, "draft_logits", (capacity, k, owner.vocab_size), "torch.float32"),)
-    _, _, impl_type, _ = _source_types()
-    layers, convolutions = [], []
+    impl_type = _attention_impl_type()
+    layers = []
     context = owner.vllm_config.compilation_config.static_forward_context
     _require(
         owner.attn_vllm_config.compilation_config.static_forward_context is context,
@@ -340,29 +208,21 @@ def validate_dflash2_graph_source(owner: Any) -> DFlash2GraphContract:
         native = impl.sliding_window
         _require(native is None or type(native) is int and native > 0, "invalid model native window")
         mask = getattr(impl, "_dflash2_native_swa_mask", None)
-        _require(native is None or mask is not None, "noncausal native mask was not created by the DFlash2 loader")
-        layers.append(_NativeLayer(name, impl, native, mask, None if mask is None else mask.data_ptr()))
+        _require(
+            impl.sinks is None and impl.use_bnsd_kv_cache is False,
+            "sinks/packed KV need a separate native Graph contract",
+        )
+        _require(
+            native is None or (mask is not None and mask.data_ptr() != 0),
+            "noncausal native mask was not created by the DFlash2 loader",
+        )
+        layers.append((name, native))
+        if mask is not None:
+            buffers += (mask,)
     _require(bool(layers), "no actual Draft attention layers")
     for layer in model.model.layers:
         for name in ("attention_conv", "mlp_conv"):
             conv = getattr(layer, name)
             _require(conv.block_size == q, "convolution must reset at the original anchor-plus-K query boundary")
-            convolutions.append((conv, q))
-    _require(len(convolutions) == 2 * len(layers), "DFlash2 convolution/attention layer inventory differs")
-    contract = DFlash2GraphContract(
-        k,
-        q,
-        top_k,
-        capacity,
-        config.draft_sample_method,
-        model,
-        selector,
-        sampler,
-        context,
-        owner.block_tables,
-        buffers,
-        tuple(layers),
-        tuple(convolutions),
-    )
-    contract.validate_owner(owner)
-    return contract
+    _require(len(model.model.layers) == len(layers), "DFlash2 convolution/attention layer inventory differs")
+    return DFlash2GraphContract(q, capacity, owner.block_tables, buffers, tuple(layers))

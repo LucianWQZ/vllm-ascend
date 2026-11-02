@@ -197,22 +197,11 @@ def prepare_dense_draft_read(
     _assert_async through a synchronizing scalar copy.
     """
     n = len(source.request_rows)
-    if (
-        n < 1
-        or window_size < 1
-        or query_width < 1
-        or anchor_span < 1
-        or source.block_span < 1
-        or anchor_span % source.block_span
-    ):
+    if n < 1 or window_size < 1 or query_width < 1 or anchor_span < 1 or anchor_span % source.block_span:
         raise ValueError("Invalid dense Draft read geometry")
     if upper_cpu.device.type != "cpu" or upper_cpu.shape != (n,) or upper_cpu.dtype not in (torch.int32, torch.int64):
         raise ValueError("Missing current preparation allocation upper bounds")
     available = torch.tensor(source.valid_columns, dtype=torch.int64, device="cpu") * source.block_span
-    if source.table.ndim != 2 or any(count < 1 or count > source.table.shape[1] for count in source.valid_columns):
-        raise ValueError("Invalid initialized canonical column extent")
-    if any(row < 0 or row >= source.table.shape[0] for row in source.request_rows):
-        raise ValueError("Invalid canonical request row")
     if bool(((upper_cpu <= 0) | (upper_cpu > available)).any()):
         raise ValueError("Allocation upper exceeds initialized canonical columns")
     if exact_device.ndim != 1 or exact_device.numel() < n or row_indices.shape != (n,):

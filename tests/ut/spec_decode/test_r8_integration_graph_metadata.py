@@ -25,12 +25,10 @@ SOURCE = SOURCE_ROOT / "vllm_ascend/worker/v2/spec_decode/draft_window_eager.py"
 def graph_source_initialization(request, monkeypatch):
     """Exercise actual owner initialization without loading a device model."""
     method = request.param
-    from vllm_ascend.worker.v2.spec_decode import draft_window_graph_runtime
     from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowGraphInputMixin
 
     source, provider = object(), object()
     build_source, build_provider = Mock(return_value=source), Mock(return_value=provider)
-    monkeypatch.setattr(draft_window_graph_runtime, "build_parallel_graph_source", build_source)
     if method == "eagle3":
         from vllm_ascend.worker.v2.spec_decode import draft_window_eagle3_adapter, draft_window_eagle3_capture
 
@@ -41,6 +39,7 @@ def graph_source_initialization(request, monkeypatch):
         from vllm_ascend.worker.v2.spec_decode import draft_window_eager
 
         initialize = DraftWindowGraphInputMixin._initialize_draft_window_source_capability
+        monkeypatch.setattr(draft_window_eager, "_build_draft_window_source_capability_for_context", build_source)
         monkeypatch.setattr(draft_window_eager, "DraftWindowGraphBindingProvider", build_provider)
     owner = SimpleNamespace(
         _draft_window_policy=object(),
@@ -143,7 +142,7 @@ def bridge():
     device = torch.tensor([17, 1025, 0, 0], dtype=torch.int32)
     exact = device.clone()
     table = torch.arange(8).reshape(4, 2)
-    read = DraftReadView(table, device, exact, exact, None, 1025, num_reqs=4)
+    read = DraftReadView(table, device, exact, exact, 1025, num_reqs=4)
     common = SimpleNamespace(num_reqs=4, slot_mapping=object(), positions=object())
     read.apply(common)
     return SimpleNamespace(read=read, common=common)
@@ -195,7 +194,7 @@ def test_private_full_uses_one_fresh_builder_and_only_binds_its_device_lengths(m
     slots, query, state = object(), object(), object()
     fresh = SimpleNamespace(
         block_tables=read.window_block_table,
-        seq_lens=read.cpu_window_exact,
+        seq_lens=read.device_window_exact,
         seq_lens_cpu=read.cpu_window_exact,
         seq_lens_gpu=read.device_window_exact,
         seq_lens_list=read.cpu_window_exact.tolist(),
@@ -228,12 +227,12 @@ def test_private_full_uses_one_fresh_builder_and_only_binds_its_device_lengths(m
     assert calls[0]["num_reqs"] == calls[0]["num_reqs_padded"] == padded
     assert calls[0]["num_tokens_padded"] == padded * 8
     assert result["draft.layer.a"] is result["draft.layer.b"] is fresh
-    assert fresh.seq_lens is read.device_window_exact
+    assert fresh.seq_lens.data_ptr() == read.device_window_exact.data_ptr()
+    assert fresh.seq_lens.shape == read.device_window_exact.shape
     assert fresh.seq_lens_cpu is read.cpu_window_exact
     assert fresh.slot_mapping is slots and fresh.query_start_loc is query
     assert fresh.attn_state is state and fresh.num_actual_tokens == padded * 8 and fresh.causal is False
     assert fresh.actual_seq_lengths_q == [(i + 1) * 8 for i in range(padded)]
-    runtime.DraftWindowGraphBindingProvider._validate_metadata_uses_read_carrier(result, read)
 
 
 @pytest.mark.parametrize(
@@ -250,10 +249,31 @@ def test_static_capture_check_precedes_replay_and_successful_update_marks_banks(
     validate = next(
         node for node in calls if isinstance(node.func, ast.Attribute) and node.func.attr == "validate_graph"
     )
-    replay = next(node for node in calls if isinstance(node.func, ast.Attribute) and node.func.attr == "run_fullgraph")
-    update = next(node for node in calls if isinstance(node.func, ast.Attribute) and node.func.attr == "update")
     finish = next(node for node in calls if isinstance(node.func, ast.Attribute) and node.func.attr == "finish_update")
-    assert validate.lineno < replay.lineno < update.lineno < finish.lineno
+    if relative.startswith("target_dependent_ar"):
+        replay = next(
+            node
+            for node in calls
+            if isinstance(node.func, ast.Attribute) and node.func.attr == "_updatable_graph_replay"
+        )
+        assert validate.lineno < replay.lineno < finish.lineno
+        shared = next(
+            n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_updatable_graph_replay"
+        )
+        shared_calls = [node for node in ast.walk(shared) if isinstance(node, ast.Call)]
+        replay = next(
+            node for node in shared_calls if isinstance(node.func, ast.Attribute) and node.func.attr == "run_fullgraph"
+        )
+        update = next(
+            node for node in shared_calls if isinstance(node.func, ast.Attribute) and node.func.attr == "update"
+        )
+        assert replay.lineno < update.lineno
+    else:
+        replay = next(
+            node for node in calls if isinstance(node.func, ast.Attribute) and node.func.attr == "run_fullgraph"
+        )
+        update = next(node for node in calls if isinstance(node.func, ast.Attribute) and node.func.attr == "update")
+        assert validate.lineno < replay.lineno < update.lineno < finish.lineno
     assert all(not (isinstance(node.func, ast.Attribute) and node.func.attr == "validate_update") for node in calls)
 
 
@@ -294,7 +314,8 @@ def test_actual_dispatch_keeps_only_the_framework_descriptor(monkeypatch, active
     monkeypatch.setattr(DFlashCudaGraphManager, "dispatch", lambda *args: descriptor)
     manager = object.__new__(DFlashAclGraphManager)
     manager.speculator = SimpleNamespace(
-        _draft_window_epoch_source=SimpleNamespace(_active=object() if active else None)
+        _draft_window_graph_binding_provider=object(),
+        _draft_window_proposal=object() if active else None,
     )
     assert manager.dispatch(1, 8, 8, 0) is descriptor
     assert manager.speculator._draft_window_selected_metadata is (descriptor if active else None)
@@ -312,13 +333,12 @@ def full_metadata_dispatch():
     from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphBindingProvider
     from vllm_ascend.worker.v2.spec_decode.draft_window_graph_runtime import prepare_parallel_graph
 
-    proposal = SimpleNamespace(mapping_epoch=7, ordered_request_ids=("req-a", "req-b"))
-    identity: Any = SimpleNamespace(proposal=proposal, padded_request_count=2)
+    proposal = SimpleNamespace(ordered_request_ids=("req-a", "req-b"))
     provider: Any = object.__new__(DraftWindowGraphBindingProvider)
-    provider._quarantined_identity = None
+    provider._quarantined = False
     provider._source = SimpleNamespace(policy=SimpleNamespace(normalized_method="dflash"))
-    bank: Any = SimpleNamespace(assert_bound=lambda expected: expected is identity or pytest.fail("stale bank"))
-    inputs = DraftMetadataInputs(identity, bank, provider)
+    bank: Any = object()
+    inputs = DraftMetadataInputs(proposal, 2, 0, bank, provider)
     provider._active_inputs = inputs
     descriptor = BatchExecutionDescriptor(CUDAGraphMode.FULL, num_tokens=16, num_reqs=2, uniform_token_count=8)
     capture = SimpleNamespace(descriptor=descriptor)
@@ -326,9 +346,8 @@ def full_metadata_dispatch():
     carrier = object()
     provider.bind_read_carrier = Mock(return_value=carrier)
     owner = SimpleNamespace(
-        _draft_window_epoch_source=SimpleNamespace(_active=proposal),
+        _draft_window_proposal=proposal,
         _draft_window_graph_binding_provider=provider,
-        _draft_window_graph_session=provider,
         _draft_window_selected_metadata=descriptor,
         model_state=SimpleNamespace(attn_metadata={"target.layer": object()}),
     )
@@ -355,15 +374,15 @@ def test_actual_replay_uses_the_current_provider_bank_without_a_second_generatio
 def test_actual_replay_rejects_stale_rows_bucket_or_already_published_generation(full_metadata_dispatch, damage):
     c = full_metadata_dispatch
     if damage == "proposal":
-        c.owner._draft_window_epoch_source._active = object()
+        c.owner._draft_window_proposal = object()
     elif damage == "padded_rows":
-        c.inputs.identity.padded_request_count = 4
+        object.__setattr__(c.inputs, "padded_request_count", 4)
     elif damage == "descriptor":
         c.owner._draft_window_selected_metadata = object()
     elif damage == "published":
         object.__setattr__(c.inputs, "metadata", {"old": object()})
     else:
         c.provider._active_inputs = None
-    with pytest.raises(RuntimeError, match="proposal|bucket|unconsumed|generation"):
+    with pytest.raises(RuntimeError, match="proposal|bucket|unconsumed|generation|retired"):
         c.prepare(c.owner, c.descriptor)
     c.provider.bind_read_carrier.assert_not_called()

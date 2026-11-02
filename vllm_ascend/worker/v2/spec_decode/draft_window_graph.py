@@ -20,10 +20,8 @@ from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 
 from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftMetadataInputs,
-    DraftWindowGenerationIdentity,
-    DraftWindowSourceCapability,
+    DraftWindowGraphSource,
     DraftWindowWorkspace,
-    _validate_idx_mapping,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_plan import DraftWindowPlan
 
@@ -40,46 +38,15 @@ class DraftWindowGraphRoute(Enum):
     DSPARK = "dspark"
 
 
-class DraftWindowGraphCarrierState(Enum):
-    """Lifecycle of one persistent per-consumer carrier backing."""
-
-    EMPTY = "empty"
-    BOUND = "bound"
-    SUBMITTED = "submitted"
-    UPDATED = "updated"
-
-
-@dataclass(frozen=True, slots=True)
-class DraftWindowGraphTensorIdentity:
-    """Address/geometry fingerprint; deliberately not a freshness token."""
-
-    storage_data_ptr: int
-    data_ptr: int
-    storage_offset: int
-    shape: tuple[int, ...]
-    stride: tuple[int, ...]
-    dtype: str
-    device: str
-
-
-@dataclass(frozen=True, slots=True)
-class DraftWindowGraphCaptureIdentity:
-    """One real manager descriptor and its method-specific consumer."""
+@dataclass(frozen=True, slots=True, eq=False)
+class DraftWindowGraphBucket:
+    """One real descriptor/consumer and its immutable-address read bank."""
 
     route: DraftWindowGraphRoute
     descriptor: BatchExecutionDescriptor
     consumer_ordinal: int
-
-
-@dataclass(slots=True)
-class DraftWindowGraphReadCarrier:
-    """One persistent capture operand rebound to explicit runtime metadata."""
-
-    capture_identity: DraftWindowGraphCaptureIdentity
     workspace: DraftWindowWorkspace
-    backing_snapshot: tuple[DraftWindowGraphTensorIdentity, ...]
     inputs: DraftMetadataInputs | None = None
-    state: DraftWindowGraphCarrierState = DraftWindowGraphCarrierState.EMPTY
 
 
 _ROUTE_METHODS = {
@@ -90,187 +57,84 @@ _ROUTE_METHODS = {
 }
 
 
-def _tensor_identity(tensor: torch.Tensor) -> DraftWindowGraphTensorIdentity:
-    try:
-        storage_data_ptr = tensor.untyped_storage().data_ptr()
-    except (AttributeError, RuntimeError):
-        storage_data_ptr = tensor.data_ptr()
-    return DraftWindowGraphTensorIdentity(
-        storage_data_ptr=storage_data_ptr,
-        data_ptr=tensor.data_ptr(),
-        storage_offset=tensor.storage_offset(),
-        shape=tuple(tensor.shape),
-        stride=tuple(tensor.stride()),
-        dtype=str(tensor.dtype),
-        device=str(tensor.device),
-    )
-
-
-def _bank_snapshot(backing: Any) -> tuple[DraftWindowGraphTensorIdentity, ...]:
-    """Check the stable Graph operands, including offset/stride."""
-    return tuple(
-        _tensor_identity(getattr(backing, name))
-        for name in (
-            "window_block_table",
-            "device_window_exact",
-            "cpu_window_exact",
-        )
-    )
-
-
-def _validate_route(
-    route: DraftWindowGraphRoute,
-    generation: DraftWindowGenerationIdentity,
-    method: str,
-) -> None:
-    if not isinstance(route, DraftWindowGraphRoute):
-        raise TypeError("graph route must be a DraftWindowGraphRoute")
-    if method != _ROUTE_METHODS[route]:
-        raise ValueError(f"graph route method mismatch: route={route.value} method={method}")
-    if route is DraftWindowGraphRoute.EAGLE3_AR_STEP:
-        if generation.step <= 0:
-            raise ValueError(f"graph route {route.value} requires an autoregressive step")
-    elif generation.step != 0:
-        raise ValueError(f"graph route {route.value} requires proposal step 0")
-
-
 class DraftWindowGraphBindingProvider:
     """Own stable capture banks and bind each current runtime generation."""
 
-    def __init__(self, *, source: DraftWindowSourceCapability) -> None:
-        if not isinstance(source, DraftWindowSourceCapability):
-            raise TypeError("Graph binding provider requires its actual Draft source")
+    def __init__(self, *, source: DraftWindowGraphSource) -> None:
         self._source = source
-        group = source.group
-        source.full_source.validate_owner_bindings()
-        source_table = source.full_source._input_block_tables[group.gid]
-        persistent_counts = source.full_source._block_tables_owner.num_blocks.gpu[group.gid]
-        if source_table.dtype != torch.int32 or persistent_counts.dtype != torch.int32:
-            raise TypeError("Draft Graph source tables and valid counts must use int32")
-        if source_table.device != persistent_counts.device:
-            raise ValueError("Draft Graph source table and valid counts must share a device")
-        table_capacity_columns = (
-            source.capacity_columns if source.workspace_capacity_columns is None else source.workspace_capacity_columns
-        )
-        if table_capacity_columns < source.capacity_columns:
-            raise ValueError("configured workspace capacity is smaller than the provider capacity")
-        if table_capacity_columns > source_table.shape[1]:
-            raise ValueError("configured workspace capacity exceeds the canonical source row width")
         self._active_inputs: DraftMetadataInputs | None = None
-        self._last_mapping_epoch = -1
-        self._last_retired_identity: DraftWindowGenerationIdentity | None = None
-        self._quarantined_identity: DraftWindowGenerationIdentity | None = None
-        self._carriers: dict[DraftWindowGraphCaptureIdentity, DraftWindowGraphReadCarrier] = {}
-        self._submitted_carriers: tuple[DraftWindowGraphReadCarrier, ...] = ()
-        self._bound_carriers: dict[DraftWindowGraphRoute, dict[int, DraftWindowGraphReadCarrier]] = {}
+        self._quarantined = False
+        self._carriers: dict[tuple[DraftWindowGraphRoute, BatchExecutionDescriptor, int], DraftWindowGraphBucket] = {}
+        self._pending: list[DraftWindowGraphBucket] = []
+        self._updating = False
         self._validated_graphs: dict[Any, DraftWindowGraphRoute] = {}
 
     @property
-    def source(self) -> DraftWindowSourceCapability:
+    def source(self) -> DraftWindowGraphSource:
         return self._source
 
     @property
-    def quarantined_identity(self) -> DraftWindowGenerationIdentity | None:
-        return self._quarantined_identity
+    def quarantined(self) -> bool:
+        return self._quarantined
 
-    def quarantine_generation(self, expected_identity: DraftWindowGenerationIdentity) -> None:
-        """Keep possibly submitted Draft backing intact until process isolation.
-
-        Unknown native partial submission cannot justify another device write
-        or a completion claim. The live input handle intentionally blocks reuse.
-        """
-        inputs = self._active_inputs
-        if inputs is None:
-            raise RuntimeError("cannot quarantine a generation without live inputs")
-        inputs.validate_for(expected_identity)
-        self._quarantined_identity = expected_identity
+    def quarantine_generation(self, inputs: DraftMetadataInputs) -> None:
+        """Retain possibly submitted backing; uncertain native work is not reusable."""
+        inputs.validate()
+        self._quarantined = True
 
     def materialize(
         self,
         *,
         proposal: DraftWindowProposalContext,
-        idx_mapping: torch.Tensor,
         cpu_full_exact: torch.Tensor,
         cpu_valid_num_blocks: torch.Tensor,
         num_reqs_padded: int,
         step: int,
-        previous_identity: DraftWindowGenerationIdentity | None = None,
         output_workspace: DraftWindowWorkspace,
         frozen_row_plans: tuple[DraftWindowPlan, ...] | None = None,
     ) -> DraftMetadataInputs:
         """Populate a new proposal or the next retired Eagle consumer's bank."""
-        if self._quarantined_identity is not None:
+        if self.quarantined:
             raise RuntimeError("draft-window backing is quarantined after uncertain Graph submission")
         if self._active_inputs is not None:
             raise RuntimeError("Draft Graph provider still owns an active read bank")
-        _validate_idx_mapping(idx_mapping)
-        if previous_identity is None:
-            if proposal.mapping_epoch <= self._last_mapping_epoch:
-                raise ValueError(
-                    f"mapping epoch must strictly increase: current={proposal.mapping_epoch} "
-                    f"previous={self._last_mapping_epoch}"
-                )
-        else:
-            if self._last_retired_identity is not previous_identity:
-                raise RuntimeError("serialized step does not continue the most recently retired generation")
-            if proposal is not previous_identity.proposal or proposal.mapping_epoch != self._last_mapping_epoch:
-                raise RuntimeError("serialized step proposal or request mapping changed")
-            if self.source.policy.normalized_method != "eagle3":
-                raise RuntimeError("serialized per-step continuation is supported only for Eagle3")
-            if step != previous_identity.step + 1:
-                raise RuntimeError(
-                    "serialized Draft Window steps must strictly advance by one: "
-                    f"previous={previous_identity.step} current={step}"
-                )
-            if idx_mapping.data_ptr() != previous_identity.idx_mapping_ptr:
-                raise RuntimeError("serialized step request mapping changed within one proposal")
+        if (
+            type(step) is not int
+            or step < 0
+            or type(num_reqs_padded) is not int
+            or num_reqs_padded < len(proposal.ordered_request_ids)
+        ):
+            raise ValueError("Draft Window consumer step or active/padded geometry is invalid")
         if frozen_row_plans is not None and self.method != "eagle3":
             raise ValueError("proposal-frozen Window anchors belong only to Eagle3")
-        identity = DraftWindowGenerationIdentity(
-            proposal=proposal,
-            padded_request_count=num_reqs_padded,
-            idx_mapping_ptr=idx_mapping.data_ptr(),
-            step=step,
-        )
-        workspace = output_workspace
-        self._last_mapping_epoch = max(self._last_mapping_epoch, identity.proposal.mapping_epoch)
+        inputs = DraftMetadataInputs(proposal, num_reqs_padded, step, output_workspace, self)
+        self._active_inputs = inputs
         try:
-            workspace.materialize(
-                identity=identity,
+            output_workspace.materialize(
+                inputs=inputs,
                 source=self.source,
                 cpu_full_exact=cpu_full_exact,
                 frozen_row_plans=frozen_row_plans,
                 cpu_valid_num_blocks=cpu_valid_num_blocks,
             )
-            self._last_retired_identity = None
-            inputs = DraftMetadataInputs(identity=identity, workspace=workspace, _owner=self)
-            self._active_inputs = inputs
             return inputs
         except BaseException:
-            # The bank is capture-owned and may have queued writes even when
-            # native preparation raises. Never clear it or continue the worker.
-            self._quarantined_identity = identity
+            # Preparation may have queued writes. Keep the current bank and
+            # refuse reuse, without clearing or inspecting device work.
+            self._quarantined = True
             raise
 
-    def retire_generation(self, expected_identity: DraftWindowGenerationIdentity) -> None:
-        if self._quarantined_identity is not None:
-            raise RuntimeError("cannot retire quarantined draft-window backing")
-        inputs = self._active_inputs
-        if inputs is None:
-            raise RuntimeError("cannot use retired Draft inputs")
-        inputs.validate_for(expected_identity)
-        self._finish_generation(expected_identity)
-        self._last_retired_identity = expected_identity
-
-    def _finish_generation(self, identity: DraftWindowGenerationIdentity) -> None:
-        # Graph bank lifetime belongs to capture, not this Host generation.
-        # Clear only at the next same-stream prepare, after the existing tail
-        # dependency.
-        inputs = self._active_inputs
-        assert inputs is not None
-        workspace = inputs.workspace
-        workspace.reset(identity)
+    def retire_generation(self, inputs: DraftMetadataInputs) -> None:
+        inputs.validate()
+        # Host retirement does not imply device completion. Capture owns the
+        # banks; the established tail dependency orders their next overwrite.
         self._active_inputs = None
+
+    def finish_proposal(self) -> None:
+        """All staged consumers must have reached the real Graph UPDATE seam."""
+        self.require_reusable()
+        if self._active_inputs is not None or self._pending:
+            raise RuntimeError("Draft Window proposal has unfinished Graph consumers")
 
     def capture_identity_for(
         self,
@@ -278,21 +142,21 @@ class DraftWindowGraphBindingProvider:
         route: DraftWindowGraphRoute,
         descriptor: BatchExecutionDescriptor,
         consumer_ordinal: int = 0,
-    ) -> DraftWindowGraphCaptureIdentity:
+    ) -> DraftWindowGraphBucket:
         """Select the bank using the actual manager's complete descriptor."""
-        key = DraftWindowGraphCaptureIdentity(route, descriptor, consumer_ordinal)
+        key = route, descriptor, consumer_ordinal
         try:
-            return self._carriers[key].capture_identity
+            return self._carriers[key]
         except KeyError as error:
             raise RuntimeError(f"runtime descriptor does not resolve a captured consumer: {descriptor!r}") from error
 
     def startup_capture_workspace(
         self,
-        capture_identity: DraftWindowGraphCaptureIdentity,
+        capture_identity: DraftWindowGraphBucket,
     ) -> DraftWindowWorkspace:
         """Return the real persistent bank before any business generation."""
         carrier = self._require_registered_capture(capture_identity)
-        if carrier.state in (DraftWindowGraphCarrierState.BOUND, DraftWindowGraphCarrierState.SUBMITTED):
+        if carrier in self._pending:
             raise RuntimeError("startup capture carrier is already bound to a runtime generation")
         return carrier.workspace
 
@@ -307,7 +171,7 @@ class DraftWindowGraphBindingProvider:
         route: DraftWindowGraphRoute,
         descriptor: BatchExecutionDescriptor,
         consumer_ordinal: int = 0,
-    ) -> DraftWindowGraphCaptureIdentity:
+    ) -> DraftWindowGraphBucket:
         """Bind the manager's exact frozen descriptor to one persistent bank."""
         if not isinstance(route, DraftWindowGraphRoute) or _ROUTE_METHODS[route] != self.method:
             raise ValueError("capture route does not match the actual Draft method")
@@ -327,44 +191,38 @@ class DraftWindowGraphBindingProvider:
             raise ValueError("capture query width differs from the actual descriptor")
         if route is DraftWindowGraphRoute.EAGLE3_AR_STEP and query_width != 1:
             raise ValueError("Eagle3 AR capture requires query width 1")
-        identity = DraftWindowGraphCaptureIdentity(route, descriptor, consumer_ordinal)
-        if identity in self._carriers:
+        key = route, descriptor, consumer_ordinal
+        if key in self._carriers:
             raise RuntimeError("capture consumer identity is already registered")
-        source = self.source.full_source
-        if num_reqs > source._input_block_tables[self.source.group.gid].shape[0]:
+        source = self.source
+        if num_reqs > source.table.shape[0]:
             raise RuntimeError("capture request bucket exceeds source capacity")
         backing = DraftWindowWorkspace(
             max_num_reqs=num_reqs,
-            table_capacity_columns=self.source.workspace_capacity_columns or self.source.capacity_columns,
-            table_template=source._input_block_tables[self.source.group.gid],
+            table_capacity_columns=source.table.shape[1],
+            table_template=source.table,
         )
-        backing._needs_clear = True
-        self._carriers[identity] = DraftWindowGraphReadCarrier(
-            capture_identity=identity,
-            workspace=backing,
-            backing_snapshot=_bank_snapshot(backing),
-        )
-        return identity
+        bucket = DraftWindowGraphBucket(route, descriptor, consumer_ordinal, backing)
+        self._carriers[key] = bucket
+        return bucket
 
-    def prepare_workspace(self, capture_identity: DraftWindowGraphCaptureIdentity) -> DraftWindowWorkspace:
+    def prepare_workspace(self, capture_identity: DraftWindowGraphBucket) -> DraftWindowWorkspace:
         """Select the final capture bank before any canonical read is written.
 
         The existing Graph tail-notify/current-stream dependency orders reuse.
-        UPDATED is only Host submission attribution, never device completion.
+        A successful Host UPDATE is not device completion.
         """
         carrier = self._require_registered_capture(capture_identity)
-        if carrier.state in (DraftWindowGraphCarrierState.BOUND, DraftWindowGraphCarrierState.SUBMITTED):
-            raise RuntimeError("cannot overwrite an active Draft Window graph read carrier")
         self.require_reusable()
-        if _bank_snapshot(carrier.workspace) != carrier.backing_snapshot:
-            raise RuntimeError("Graph capture bank address or tensor geometry changed")
+        if carrier in self._pending:
+            raise RuntimeError("cannot overwrite an active Draft Window graph read carrier")
         return carrier.workspace
 
     def require_reusable(self) -> None:
         """Keep every proposal on its established completion stream."""
-        if self.quarantined_identity is not None:
+        if self.quarantined:
             raise RuntimeError("Draft Window bank is quarantined after uncertain submission")
-        source = self.source.full_source._input_block_tables[self.source.group.gid]
+        source = self.source.table
         if source.device.type != "cpu":
             stream = int(torch.npu.current_stream().npu_stream)
             previous = getattr(self, "_owner_stream", stream)
@@ -375,53 +233,41 @@ class DraftWindowGraphBindingProvider:
     def bind_read_carrier(
         self,
         *,
-        capture_identity: DraftWindowGraphCaptureIdentity,
+        capture_identity: DraftWindowGraphBucket,
         inputs: DraftMetadataInputs,
         metadata_builder: Callable[
             [DraftWindowWorkspace],
             Mapping[str, Any],
         ],
-        target_metadata: Any,
-    ) -> DraftWindowGraphReadCarrier:
+    ) -> DraftWindowGraphBucket:
         """Publish this generation against its selected persistent Graph bank."""
-        if not isinstance(capture_identity, DraftWindowGraphCaptureIdentity):
-            raise TypeError("graph read carrier requires a capture identity")
         carrier = self._require_registered_capture(capture_identity)
-        if carrier.state in (
-            DraftWindowGraphCarrierState.BOUND,
-            DraftWindowGraphCarrierState.SUBMITTED,
-        ):
+        if carrier in self._pending:
             raise RuntimeError("cannot overwrite an active Draft Window graph read carrier")
-        if not callable(metadata_builder):
-            raise TypeError("graph metadata builder must be callable")
-        generation = inputs.identity
-        inputs.validate_for(generation)
+        inputs.validate()
         if inputs._owner is not self:
             raise RuntimeError("graph carrier inputs do not belong to the provider runtime")
-        _validate_route(capture_identity.route, generation, self.method)
-        if generation.padded_request_count != capture_identity.descriptor.num_reqs:
+        route = capture_identity.route
+        if (route is DraftWindowGraphRoute.EAGLE3_AR_STEP) != (inputs.step > 0):
+            raise RuntimeError("Graph route does not match the actual consumer step")
+        if inputs.padded_request_count != capture_identity.descriptor.num_reqs:
             raise RuntimeError("capture/runtime padded request count mismatch")
-        self.source.full_source.validate_owner_bindings()
         if inputs.workspace is not carrier.workspace:
             raise RuntimeError("Graph generation was not materialized into its exact capture bank")
+        ordinal = capture_identity.consumer_ordinal
+        if self._updating or ordinal != len(self._pending):
+            raise RuntimeError("Graph Window consumers must bind in their actual serial ordinal order")
+        if self._pending:
+            previous = self._pending[0]
+            assert previous.inputs is not None
+            if previous.route is not route or previous.inputs.proposal is not inputs.proposal:
+                raise RuntimeError("graph read carriers do not belong to the same actual proposal/route")
         metadata = metadata_builder(carrier.workspace)
         if not isinstance(metadata, Mapping) or not metadata:
             raise RuntimeError("explicit Draft Window graph carrier produced no Draft metadata")
-        self._validate_metadata_uses_read_carrier(metadata, carrier.workspace)
-        inputs.publish(metadata, target_metadata=target_metadata)
-
-        bound = self._bound_carriers.setdefault(capture_identity.route, {})
-        ordinal = capture_identity.consumer_ordinal
-        if ordinal in bound:
-            raise RuntimeError("graph read carrier consumer ordinal is already bound")
-        if bound:
-            previous = next(iter(bound.values())).inputs
-            if previous is None or previous.identity.proposal is not generation.proposal:
-                raise RuntimeError("graph read carriers do not belong to the same actual proposal")
-        bound[ordinal] = carrier
-        carrier.inputs = inputs
-        carrier.state = DraftWindowGraphCarrierState.BOUND
-        self._submitted_carriers = ()
+        inputs.publish(metadata)
+        object.__setattr__(carrier, "inputs", inputs)
+        self._pending.append(carrier)
         return carrier
 
     def consume_metadata(
@@ -431,24 +277,18 @@ class DraftWindowGraphBindingProvider:
         expected_consumer_count: int,
     ) -> tuple[Mapping[str, Any], ...]:
         """Submit exactly one explicit carrier set; baseline metadata is forbidden."""
-        if not isinstance(route, DraftWindowGraphRoute):
-            raise TypeError("graph metadata consumption requires a DraftWindowGraphRoute")
-        if not isinstance(expected_consumer_count, int) or expected_consumer_count <= 0:
-            raise ValueError("expected graph consumer count must be positive")
-        bound = self._bound_carriers.get(route, {})
-        if len(bound) != expected_consumer_count or set(bound) != set(range(expected_consumer_count)):
-            raise RuntimeError("graph Window provider requires one explicit read carrier for every consumer")
-        carriers = tuple(bound[index] for index in range(expected_consumer_count))
+        if (
+            expected_consumer_count <= 0
+            or len(self._pending) != expected_consumer_count
+            or self._pending[0].route is not route
+            or self._updating
+        ):
+            raise RuntimeError("Graph Window requires its complete unconsumed consumer batch")
         metadata = []
-        for carrier in carriers:
-            if carrier.state is not DraftWindowGraphCarrierState.BOUND or carrier.inputs is None:
-                raise RuntimeError("graph read carrier has no bound runtime generation")
-            if carrier.inputs.metadata is None:
-                raise RuntimeError("graph read carrier has no Draft-private metadata")
+        for carrier in self._pending:
+            assert carrier.inputs is not None and carrier.inputs.metadata is not None
             metadata.append(carrier.inputs.metadata)
-            carrier.state = DraftWindowGraphCarrierState.SUBMITTED
-        del self._bound_carriers[route]
-        self._submitted_carriers = carriers
+        self._updating = True
         return tuple(metadata)
 
     def validate_graph(self, graph: Any, *, route: DraftWindowGraphRoute) -> None:
@@ -480,63 +320,21 @@ class DraftWindowGraphBindingProvider:
 
     def finish_update(self, *, route: DraftWindowGraphRoute) -> None:
         """Mark successful Host UPDATE; stream/event order still owns reuse."""
-        for carrier in self._require_submitted_route(route):
-            carrier.state = DraftWindowGraphCarrierState.UPDATED
-        self._submitted_carriers = ()
+        if not self._updating or self._pending[0].route is not route:
+            raise RuntimeError("no current Draft Window Graph UPDATE for this route")
+        self._pending.clear()
+        self._updating = False
 
     def _require_registered_capture(
         self,
-        capture_identity: DraftWindowGraphCaptureIdentity,
-    ) -> DraftWindowGraphReadCarrier:
-        carrier = self._carriers.get(capture_identity)
-        if carrier is None or carrier.capture_identity is not capture_identity:
+        capture_identity: DraftWindowGraphBucket,
+    ) -> DraftWindowGraphBucket:
+        carrier = self._carriers.get(
+            (capture_identity.route, capture_identity.descriptor, capture_identity.consumer_ordinal)
+        )
+        if carrier is not capture_identity:
             raise RuntimeError("capture identity/bucket is not registered by this Draft provider")
-        if carrier.workspace.max_num_reqs != capture_identity.descriptor.num_reqs:
-            raise RuntimeError("Graph capture bank request geometry changed")
         return carrier
-
-    @staticmethod
-    def _validate_metadata_uses_read_carrier(
-        metadata: Mapping[str, Any],
-        workspace: DraftWindowWorkspace,
-    ) -> None:
-        """Validate only Draft-private read carriers, never full write state."""
-        identity = _tensor_identity
-        expected_table_storage = identity(workspace.window_block_table).storage_data_ptr
-        expected_device_storage = identity(workspace.device_window_exact).storage_data_ptr
-        expected_cpu_storage = identity(workspace.cpu_window_exact).storage_data_ptr
-        expected_lengths = workspace.cpu_window_exact.tolist()
-        for layer_name, layer_metadata in metadata.items():
-            if layer_metadata is None:
-                continue
-            block_tables = getattr(layer_metadata, "block_tables", None)
-            seq_lens = getattr(layer_metadata, "seq_lens", None)
-            seq_lens_cpu = getattr(layer_metadata, "seq_lens_cpu", None)
-            seq_lens_list = getattr(layer_metadata, "seq_lens_list", None)
-            if not isinstance(block_tables, torch.Tensor) or (
-                identity(block_tables).storage_data_ptr != expected_table_storage
-            ):
-                raise RuntimeError(f"Draft graph metadata {layer_name!r} does not use carrier block tables")
-            if not isinstance(seq_lens, torch.Tensor) or (
-                identity(seq_lens).storage_data_ptr != expected_device_storage
-            ):
-                raise RuntimeError(f"Draft graph metadata {layer_name!r} does not use carrier device lengths")
-            if not isinstance(seq_lens_cpu, torch.Tensor) or (
-                identity(seq_lens_cpu).storage_data_ptr != expected_cpu_storage
-            ):
-                raise RuntimeError(f"Draft graph metadata {layer_name!r} does not use carrier CPU lengths")
-            if not isinstance(seq_lens_list, list) or seq_lens_list[: len(expected_lengths)] != expected_lengths:
-                raise RuntimeError(f"Draft graph metadata {layer_name!r} does not use carrier exact length values")
-
-    def _require_submitted_route(
-        self,
-        route: DraftWindowGraphRoute,
-    ) -> tuple[DraftWindowGraphReadCarrier, ...]:
-        if not self._submitted_carriers:
-            raise RuntimeError("no explicit Draft Window graph read carrier batch was submitted")
-        if any(carrier.capture_identity.route is not route for carrier in self._submitted_carriers):
-            raise RuntimeError("submitted graph read carrier route mismatch")
-        return self._submitted_carriers
 
 
 def resolve_parallel_draft_window_graph_route(

@@ -5,6 +5,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch
 
 import numpy as np
@@ -12,6 +13,7 @@ import torch
 
 from vllm_ascend.worker.v2.spec_decode.draft_window_read import (
     DirectPrefixSource,
+    NativeSWASource,
     materialize_direct_prefix,
 )
 
@@ -25,6 +27,7 @@ class TestCanonicalRead(unittest.TestCase):
             kernel_block_sizes=[4],
         )
         self.mapping = np.array([2, 0])
+        self.retained: list[torch.Tensor] = []
 
     def read(self, ends=(21, 11), starts=(12, 4), upper=(24, 15)):
         exact = torch.tensor(ends, dtype=torch.int32)
@@ -35,7 +38,29 @@ class TestCanonicalRead(unittest.TestCase):
             upper_cpu=torch.tensor(upper),
             starts_cpu=torch.tensor(starts),
             padded_rows=3,
+            row_indices=torch.from_numpy(self.mapping).to(torch.int64),
+            retain=lambda *values: self.retained.extend(values),
         )
+
+    def test_source_construction_checks_static_geometry_for_both_layouts(self):
+        for source_type in (DirectPrefixSource, NativeSWASource):
+            native: dict[str, Any] = {"native_window": 4096} if source_type is NativeSWASource else {}
+            arguments: dict[str, Any] = dict(table=self.table, request_rows=(2, 0), valid_columns=(8, 8), block_span=4)
+            source_type(**arguments, **native)
+            for field, invalid in (
+                ("table", self.table.flatten()),
+                ("table", self.table.float()),
+                ("block_span", 0),
+                ("request_rows", (-1, 0)),
+                ("request_rows", (3, 0)),
+                ("valid_columns", (8,)),
+                ("valid_columns", (9, 8)),
+                ("valid_columns", (-1, 8)),
+            ):
+                with self.subTest(source=source_type, field=field), self.assertRaises(ValueError):
+                    source_type(**dict(arguments, **{field: invalid}), **native)
+        with self.assertRaisesRegex(ValueError, "positive window"):
+            NativeSWASource(self.table, (2, 0), (8, 8), 4, 0)
 
     def test_canonical_projection_preserves_upper_and_padding(self):
         view = self.read()
@@ -67,6 +92,7 @@ class TestCanonicalRead(unittest.TestCase):
                 starts_cpu=torch.tensor([12, 4], dtype=torch.int32),
                 padded_rows=3,
                 retain=lambda *values: retained.extend(values),
+                row_indices=torch.from_numpy(self.mapping).to(torch.int64),
             )
         self.assertEqual(len(copied), 1)
         self.assertEqual(copied[0][0].dtype, torch.int64)
@@ -93,6 +119,7 @@ class TestCanonicalRead(unittest.TestCase):
                     starts_cpu=torch.tensor([12, 4], dtype=torch.int32),
                     padded_rows=3,
                     retain=retain,
+                    row_indices=torch.from_numpy(self.mapping).to(torch.int64),
                 )
             copy.assert_not_called()
 
@@ -130,6 +157,7 @@ class TestCanonicalRead(unittest.TestCase):
                     starts_cpu=torch.tensor([12, 4]),
                     padded_rows=3,
                     row_indices=torch.tensor([2, 0]),
+                    retain=lambda *values: self.retained.extend(values),
                 )
                 expected = torch.stack(
                     (
@@ -155,6 +183,7 @@ class TestCanonicalRead(unittest.TestCase):
                     starts_cpu=torch.tensor([12, 4]),
                     padded_rows=3,
                     row_indices=rows,
+                    retain=lambda *values: self.retained.extend(values),
                 )
 
     def test_typed_application_preserves_query_and_write_identity(self):
@@ -178,7 +207,7 @@ class TestCanonicalRead(unittest.TestCase):
                 self.read(**kwargs)
 
     def test_graph_read_view_preserves_its_bound_request_count(self):
-        view = replace(self.read(), starts_cpu=None, num_reqs=3)
+        view = replace(self.read(), num_reqs=3)
         common = SimpleNamespace(num_reqs=3)
         view.apply(common)
         self.assertIs(view.exact_cpu_for(common), view.seq_lens_cpu)

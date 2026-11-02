@@ -201,6 +201,8 @@ def test_native_source_does_not_acquire_full_residency_by_duck_typing():
             upper_cpu=lengths,
             starts_cpu=torch.tensor([0, 128]),
             padded_rows=2,
+            row_indices=torch.tensor([3, 1]),
+            retain=lambda *values: None,
         )
     with pytest.raises(ValueError, match="cover every native query"):
         materialize_native_swa_intersection(
@@ -211,6 +213,8 @@ def test_native_source_does_not_acquire_full_residency_by_duck_typing():
             starts_cpu=lengths,
             padded_rows=2,
             query_width=8,
+            row_indices=torch.tensor([3, 1]),
+            retain=lambda *values: None,
         )
 
 

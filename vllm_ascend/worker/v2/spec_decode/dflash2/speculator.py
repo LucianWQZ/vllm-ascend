@@ -153,7 +153,6 @@ class AscendDFlash2Speculator(DFlash2Speculator, AscendDFlashSpeculator):
             super().init_cudagraph_manager(CUDAGraphMode.NONE)
             return
         from vllm_ascend import envs
-        from vllm_ascend.worker.v2.spec_decode.draft_window_dflash2_graph import validate_dflash2_graph_config
 
         # Window OFF bypasses the Window factory. It must retain the same
         # explicit experimental gate before any DFlash2 Graph is captured.
@@ -163,7 +162,6 @@ class AscendDFlash2Speculator(DFlash2Speculator, AscendDFlashSpeculator):
             raise NotImplementedError(
                 "DFlash2 Graph first admits FULL/FULL_DECODE_ONLY only; no implicit eager fallback"
             )
-        validate_dflash2_graph_config(self.vllm_config)
         if cudagraph_mode.decode_mode() is CUDAGraphMode.FULL:
             import vllm.v1.worker.gpu.spec_decode.dflash2.speculator as upstream_dflash2
 
@@ -176,22 +174,9 @@ class AscendDFlash2Speculator(DFlash2Speculator, AscendDFlashSpeculator):
             contract = getattr(self, "_dflash2_graph_contract", None)
             if contract is None:
                 self._dflash2_graph_contract = validate_dflash2_graph_source(self)
-            else:
-                contract.validate_owner(self)
         super().init_cudagraph_manager(cudagraph_mode)
         if (
             cudagraph_mode.decode_mode() is CUDAGraphMode.FULL
             and self.query_cudagraph_manager.cudagraph_mode.decode_mode() is not CUDAGraphMode.FULL
         ):
             raise NotImplementedError("DFlash2 Graph backend did not admit FULL capture; no eager fallback is selected")
-
-    def capture(self) -> None:
-        contract = getattr(self, "_dflash2_graph_contract", None)
-        if contract is not None:
-            contract.validate_owner(self)
-        # The parent captures prepare_graph_forward and the virtual DFlash2
-        # _generate_draft, including its NPU conv/TopK/selector/cache kernels.
-        # Python request control, prepare inputs and metadata stay outside it.
-        super().capture()
-        if contract is not None:
-            contract.validate_owner(self)

@@ -145,13 +145,13 @@ def _draft_window_context_kv_scope(owner, input_batch):
     contract for these writes; captured Window banks and generations stay idle.
     """
     runtime = owner._draft_window_graph_binding_provider
-    if runtime.quarantined_identity is not None or getattr(owner, "_draft_window_graph_submission_uncertain", False):
+    if runtime.quarantined or getattr(owner, "_draft_window_graph_submission_uncertain", False):
         raise RuntimeError("Draft Window backing is quarantined before a context-only KV write")
     from vllm_ascend.worker.v2.spec_decode.draft_window_lifetime import DraftWindowOwnerPool
     from vllm_ascend.worker.v2.spec_decode.draft_window_runtime import _NPUCompletion
 
     if (
-        owner._draft_window_epoch_source._active is not None
+        owner._draft_window_proposal is not None
         or getattr(owner, "_draft_window_bypass_active", False)
         or getattr(owner, "_draft_window_context_kv_active", False)
     ):
@@ -176,12 +176,6 @@ def _draft_window_context_kv_scope(owner, input_batch):
 
 def _draft_window_owner_scope(owner, input_batch, dummy_run=False, is_profile=False, *, num_speculative_tokens=None):
     """Choose exactly one existing proposal owner at the Ascend boundary."""
-    dflash2_contract = getattr(owner, "_dflash2_graph_contract", None)
-    if dflash2_contract is not None:
-        # These captured sampler/selector addresses are separate from the
-        # Window bank. Check their Host descriptors before replacing state;
-        # no tensor value read or device synchronization is introduced here.
-        dflash2_contract.validate_owner(owner)
     runtime = getattr(owner, "_draft_window_runtime", None)
     graph_runtime = getattr(owner, "_draft_window_graph_binding_provider", None)
     limit = getattr(owner, "_draft_graph_review_limit", None)

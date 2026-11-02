@@ -441,7 +441,7 @@ class DraftGraphSupportTest(unittest.TestCase):
         owner = NS(
             _draft_graph_review_limit=scope,
             max_model_len=scope.max_model_len,
-            _eagle3_window_epoch_source=NS(_active=NS(phase_plan=NS(baseline_only_rows=(0,)))),
+            _eagle3_window_proposal=NS(phase_plan=NS(baseline_only_rows=(0,))),
         )
         batch = self.batch()
         batch.num_computed_prefill_tokens_np = [512]
@@ -655,9 +655,9 @@ class ActualGraphDescriptorControls(unittest.TestCase):
             self.run_actual(manager, N(num_reqs=4, num_tokens=4))
         self.assertEqual(seen, [])
         for first, step, ordinal, tokens in ((True, 0, 0, 4), (False, 1, 0, 1), (False, 2, 1, 1)):
-            inputs = N(identity=N(proposal=N(ordered_request_ids=("request-0",)), padded_request_count=1, step=step))
+            inputs = N(proposal=N(ordered_request_ids=("request-0",)), padded_request_count=1, step=step)
             M.validate_eagle_single_request_graph_stage(owner, inputs, first=first, n=1, tokens=tokens, ordinal=ordinal)
-            inputs.identity.step = 7
+            inputs.step = 7
             with self.assertRaises(NotImplementedError):
                 M.validate_eagle_single_request_graph_stage(
                     owner, inputs, first=first, n=1, tokens=tokens, ordinal=ordinal
@@ -746,7 +746,7 @@ class EagleMixedRequestControls(unittest.TestCase):
         self.assertEqual(cpu_lengths, [1280, 513])
         batch.num_computed_prefill_tokens_np = [1152, 384]
         batch.num_scheduled_tokens = [128, 129]
-        owner._eagle3_window_epoch_source = NS(_active=NS(phase_plan=NS(baseline_only_rows=(0,))))
+        owner._eagle3_window_proposal = NS(phase_plan=NS(baseline_only_rows=(0,)))
         for step in (0, 1, 2):
             M.validate_eagle_single_request_review_exact(
                 owner, batch, Vector([1280 + step, 513 + step]), num_reqs=2, padded=2, step=step
@@ -757,12 +757,12 @@ class EagleMixedRequestControls(unittest.TestCase):
                         owner, batch, Vector(values), num_reqs=2, padded=2, step=step
                     )
         # Absent/changed phase cannot relabel a terminal/decode row as continuing.
-        owner._eagle3_window_epoch_source = NS(_active=NS(phase_plan=NS(baseline_only_rows=())))
+        owner._eagle3_window_proposal = NS(phase_plan=NS(baseline_only_rows=()))
         with self.assertRaises(NotImplementedError):
             M.validate_eagle_single_request_review_exact(
                 owner, batch, Vector(cpu_lengths), num_reqs=2, padded=2, step=0
             )
-        owner._eagle3_window_epoch_source = NS(_active=NS(phase_plan=NS(baseline_only_rows=(1,))))
+        owner._eagle3_window_proposal = NS(phase_plan=NS(baseline_only_rows=(1,)))
         with self.assertRaises(RuntimeError):
             M.validate_eagle_single_request_review_exact(
                 owner, batch, Vector([1537, 513]), num_reqs=2, padded=2, step=0
@@ -783,13 +783,13 @@ class EagleMixedRequestControls(unittest.TestCase):
             owner, batch = _pair_owner_batch()
             batch.num_computed_prefill_tokens_np = [1152, 384]
             batch.num_scheduled_tokens = [128, 129]
-            owner._eagle3_window_epoch_source = NS(_active=NS(phase_plan=NS(baseline_only_rows=(0,))))
+            owner._eagle3_window_proposal = NS(phase_plan=NS(baseline_only_rows=(0,)))
             if damage == "wrong-id":
                 batch.req_ids[0] = "different-request"
             elif damage == "bad-index":
                 batch.idx_mapping_np[0] = 6
             elif damage == "capacity":
-                owner.max_model_len = 2048
+                batch.draft_graph_request_bounds = ((1537, 4096), (513, 545))
             elif damage == "preempted":
                 owner._draft_graph_review_preempted_request_ids = {batch.req_ids[0]}
             elif damage == "missing":
@@ -829,7 +829,7 @@ def idle_owner():
         update_stream=object(),
         _eagle3_graph_session=session,
         _eagle3_window_bypass_active=True,
-        _eagle3_window_epoch_source=NS(_active=None),
+        _eagle3_window_proposal=None,
         _eagle3_window_continuing_prefill=False,
         _draft_window_graph_binding_provider=provider,
     )
@@ -862,7 +862,7 @@ class EagleIdleOwnershipControls(unittest.TestCase):
                 self.assertTrue(IDLE["validate_eagle_dp_dummy_replay"](owner, manager, descriptor, [{}] * count))
                 with self.assertRaises(RuntimeError):
                     IDLE["validate_eagle_dp_dummy_replay"](owner, manager, descriptor, [{}] * (count + 1))
-            self.assertIsNone(owner._eagle3_window_epoch_source._active)
+            self.assertIsNone(owner._eagle3_window_proposal)
         self.assertFalse(owner._eagle3_graph_dp_dummy_active)
         self.assertFalse(getattr(owner, "_draft_window_graph_submission_uncertain", False))
         # K0 business first-only is a genuine request, never dummy/idle.
@@ -880,7 +880,7 @@ class EagleIdleOwnershipControls(unittest.TestCase):
         self.assertTrue(owner._draft_window_graph_submission_uncertain)
         self.assertFalse(owner._eagle3_graph_dp_dummy_active)
         owner, batch, session = idle_owner()
-        owner._eagle3_window_epoch_source._active = object()
+        owner._eagle3_window_proposal = object()
         with (
             self.assertRaises(RuntimeError),
             IDLE["eagle3_dp_dummy_scope"](owner, batch, dummy_run=True, is_profile=False),

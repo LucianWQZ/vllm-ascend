@@ -133,6 +133,34 @@ def test_dflash2_reference_full_allocation_keeps_native_read_provider(types, par
     assert reference.native_window == 2048
 
 
+@pytest.mark.parametrize("native", [None, 2048])
+def test_dflash2_full_retention_keeps_full_and_native_consumers(types, parallel_config, native):
+    spec = FullSpec()
+    spec.sliding_window = native
+    (route,) = inventory(types, parallel_config, specs=[spec], full_retention_dflash2=True)
+    expected = (
+        DraftWindowProviderStatus.DIRECT_DENSE if native is None else DraftWindowProviderStatus.NATIVE_SWA_CANDIDATE
+    )
+    assert route.status is expected
+    assert route.native_window == native
+
+
+@pytest.mark.parametrize("storage", ["sliding", "chunked", "wrapped_chunked"])
+def test_dflash2_reference_cannot_admit_recycling_or_chunked_storage(types, parallel_config, storage):
+    spec = SlidingSpec() if storage == "sliding" else FullSpec()
+    spec.sliding_window = 2048
+    if storage != "sliding":
+        spec.attention_chunk_size = 256
+    actual = UniformSpec({"draft.layers.0": spec}) if storage == "wrapped_chunked" else spec
+    with pytest.raises(NotImplementedError, match="Full-retention FullAttentionSpec"):
+        inventory(
+            replace(types, sliding_window_spec=SlidingSpec),
+            parallel_config,
+            specs=[actual],
+            full_retention_dflash2=True,
+        )
+
+
 def test_consumer_gid_must_match_its_canonical_source(types, parallel_config):
     with pytest.raises(ValueError, match="consumer and canonical source geometry"):
         inventory(types, parallel_config, group_ids=[1])

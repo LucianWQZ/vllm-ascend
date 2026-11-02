@@ -315,17 +315,18 @@ class AutoRegressiveAclGraphManager(SpeculatorCudaGraphManager):
             )
         return ret
 
-    def _updatable_graph_replay(self, desc, draft_attn_metadatas):
+    def _updatable_graph_replay(self, desc, draft_attn_metadatas, *, fia_params=None):
         from vllm_ascend.worker.v2.spec_decode.draft_window_eagle3_dp import validate_eagle_dp_dummy_replay
 
         dp_dummy = validate_eagle_dp_dummy_replay(self.speculator, self, desc, draft_attn_metadatas)
         graph = self.graphs[desc]
         assert isinstance(graph, UpdatableGraph)
-        fia_params = self.speculator.build_fia_params(
-            desc.num_reqs,
-            draft_attn_metadatas[0],
-            self.is_draft_model_prefill,
-        )
+        if fia_params is None:
+            fia_params = self.speculator.build_fia_params(
+                desc.num_reqs,
+                draft_attn_metadatas[0],
+                self.is_draft_model_prefill,
+            )
         resolved_tasks = graph.resolve_tasks(SharedSource(fia_params))
         self.update_stream.wait_stream(torch.npu.current_stream())
         ret = super().run_fullgraph(desc)
@@ -360,13 +361,6 @@ class AutoRegressiveAclGraphManager(SpeculatorCudaGraphManager):
         owner = self.speculator
         try:
             session.require_reusable()
-            if self.update_stream is None:
-                raise RuntimeError("Eagle3 Graph has no UPDATE stream")
-            stream = int(self.update_stream.npu_stream)
-            if not hasattr(session, "_update_stream_identity"):
-                session._update_stream_identity = stream
-            if stream != session._update_stream_identity:
-                raise RuntimeError("Eagle3 UPDATE stream changed across proposals")
             if self.is_draft_model_prefill:
                 bank = session.provider.prepare_workspace(
                     session.resolve(first=True, n=desc.num_reqs, tokens=desc.num_tokens, ordinal=0)
@@ -389,12 +383,7 @@ class AutoRegressiveAclGraphManager(SpeculatorCudaGraphManager):
                 else DraftWindowGraphRoute.EAGLE3_AR_STEP
             )
             graph = self.graphs[desc]
-            if not isinstance(graph, UpdatableGraph):
-                raise RuntimeError("Eagle3 Window requires the inventoried typed FIA Graph")
             session.provider.validate_graph(graph, route=route)
-            expected = 1 if self.is_draft_model_prefill else owner.num_speculative_steps - 1
-            if len(metadata_batch) != expected:
-                raise RuntimeError("Eagle3 Graph omitted a real first-pass/AR consumer")
             # SharedSource filters by layer. Each layer's provider_index is the
             # consumer ordinal, so AR1 and AR2 retain their own table/length bank.
             params = [
@@ -408,10 +397,7 @@ class AutoRegressiveAclGraphManager(SpeculatorCudaGraphManager):
                 for name, metadata in consumer.items()
                 if metadata is not None
             ]
-            resolved = graph.resolve_tasks(SharedSource(params))
-            self.update_stream.wait_stream(torch.npu.current_stream())
-            ret = super().run_fullgraph(desc)
-            graph.update(self.update_stream, resolved)
+            ret = self._updatable_graph_replay(desc, metadata_batch, fia_params=params)
             session.provider.finish_update(route=route)
             return ret
         except BaseException:

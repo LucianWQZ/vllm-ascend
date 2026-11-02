@@ -246,8 +246,6 @@ def _validate_qualified_graph_config(vllm_config, profile):
         or (additional.get("draft_window_size") is not None and type(additional["draft_window_size"]) is not int)
         or additional.get("enable_dsa_cp", False) is not False
         or type(additional.get("enable_flashcomm1", False)) is not bool
-        or type(scheduler.async_scheduling) is not bool
-        or type(vllm_config.cache_config.enable_prefix_caching) is not bool
         or not captures
         or any(type(size) is not int or size <= 0 for size in captures)
         or not {query * count for count in range(1, rows + 1)}.issubset(captures)
@@ -344,7 +342,7 @@ def validate_eagle_single_request_review_exact(owner, input_batch, exact, *, num
         or str(exact.dtype) != "torch.int32"
     ):
         raise RuntimeError("Eagle review lost its exact admitted-row CPU consumer input")
-    context = getattr(getattr(owner, "_eagle3_window_epoch_source", None), "_active", None)
+    context = getattr(owner, "_eagle3_window_proposal", None)
     continuing_rows = context.phase_plan.baseline_only_rows if context is not None else ()
     for position, (prompt, maximum) in enumerate(rows):
         value = exact[position].item()
@@ -402,11 +400,11 @@ def validate_eagle_single_request_graph_stage(owner, inputs, *, first, n, tokens
         return
     validate_eagle_single_request_graph_descriptor(owner, first=first, n=n, tokens=tokens)
     if (
-        len(inputs.identity.proposal.ordered_request_ids) != n
-        or inputs.identity.padded_request_count != n
+        len(inputs.proposal.ordered_request_ids) != n
+        or inputs.padded_request_count != n
         or type(ordinal) is not int
         or ordinal not in ((0,) if first else (0, 1))
-        or inputs.identity.step != (0 if first else ordinal + 1)
+        or inputs.step != (0 if first else ordinal + 1)
     ):
         raise NotImplementedError("Eagle review Graph must use first Q4 and exactly two AR Q1 consumers per request")
 
@@ -455,16 +453,8 @@ def validate_draft_graph_review_requests(
     scope = getattr(owner, "_draft_graph_review_limit", None)
     if scope is None or dummy_run or is_profile or getattr(input_batch, "is_dummy", False):
         return
-    if not isinstance(scope, DraftGraphSupport):
-        raise RuntimeError("unknown Draft Graph support contract")
     if scope.method == "dflash" and type(input_batch.num_reqs) is int and input_batch.num_reqs == 0:
         return
-    if scope.method == "dflash" and (
-        getattr(owner, "num_query_per_req", None) != scope.query_tokens
-        or getattr(getattr(getattr(owner, "vllm_config", None), "model_config", None), "max_model_len", None)
-        != scope.max_model_len
-    ):
-        raise RuntimeError("DFlash Graph owner lost its configured query/model capacity")
     rows = _request_bounds(input_batch)
     active, padded = input_batch.num_reqs, input_batch.num_reqs_after_padding
     if (
@@ -477,7 +467,6 @@ def validate_draft_graph_review_requests(
         or len(input_batch.idx_mapping_np) < active
         or len(set(input_batch.idx_mapping_np[:active])) != active
         or len(input_batch.prefill_len_np) < active
-        or owner.max_model_len != scope.max_model_len
     ):
         raise NotImplementedError("Draft Graph requires admitted actual rows and their corresponding padded bank")
     blocked = getattr(owner, "_draft_graph_review_preempted_request_ids", ())
