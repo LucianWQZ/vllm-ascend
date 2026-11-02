@@ -112,7 +112,6 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentA
                 self._eagle3_window_expected_steps == 1
                 or batch_desc.cg_mode != CUDAGraphMode.FULL
                 or skip_attn
-                or seq_lens_cpu_upper_bound is None
                 or num_speculative_steps not in (None, self.num_speculative_steps)
             ):
                 raise RuntimeError("Eagle3 Window requires its actual static-K FULL AR descriptor; no eager fallback")
@@ -127,7 +126,6 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentA
                         step=step,
                         num_reqs=num_reqs,
                         num_reqs_padded=padded,
-                        seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
                         output_workspace=bank,
                     )
                     session.stage(inputs, first=False, n=padded, tokens=batch_desc.num_tokens, ordinal=step - 1)

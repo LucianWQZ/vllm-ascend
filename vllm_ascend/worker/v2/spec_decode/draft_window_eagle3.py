@@ -205,8 +205,7 @@ class Eagle3DraftWindowMixin:
         step: int,
         num_reqs: int,
         num_reqs_padded: int,
-        seq_lens_cpu_upper_bound: torch.Tensor | None = None,
-        output_workspace: Any = None,
+        output_workspace: Any,
     ) -> DraftMetadataInputs:
         """Freeze the first anchor, then project each AR end into its own bank."""
         if (
@@ -240,10 +239,9 @@ class Eagle3DraftWindowMixin:
                 )
                 for value in exact[:num_reqs]
             )
-            seq_lens_cpu_upper_bound = batch.seq_lens_cpu_upper_bound
         else:
             step_one_exact = self._eagle3_window_decode_step_one_exact
-            if proposal is None or previous is None or step_one_exact is None or seq_lens_cpu_upper_bound is None:
+            if proposal is None or previous is None or step_one_exact is None:
                 raise RuntimeError("Eagle3 decode step is missing proposal-owned state")
             if len(proposal) != num_reqs:
                 raise RuntimeError("Eagle3 request geometry changed within one proposal")
@@ -257,13 +255,6 @@ class Eagle3DraftWindowMixin:
         validate_eagle_single_request_review_exact(
             self, batch, exact, num_reqs=num_reqs, padded=num_reqs_padded, step=step
         )
-        upper = _copy_padded_cpu_upper(
-            seq_lens_cpu_upper_bound,
-            actual_request_count=num_reqs,
-            padded_request_count=num_reqs_padded,
-            increment=step,
-            max_model_len=self.max_model_len,
-        )
         valid = gather_valid_num_blocks_cpu(
             provider.source.full_source,
             global_group_id=provider.source.group.gid,
@@ -275,7 +266,6 @@ class Eagle3DraftWindowMixin:
             source=provider.source,
             frozen_row_plans=proposal,
             cpu_full_exact=exact,
-            cpu_apply_time_full_upper=upper,
             cpu_valid_num_blocks=valid,
             phase_plan=context.phase_plan,
             actual_request_count=num_reqs,
@@ -288,7 +278,6 @@ class Eagle3DraftWindowMixin:
             idx_mapping=batch.idx_mapping,
             read_descriptors=plan.read_descriptors,
             cpu_window_exact=plan.cpu_window_exact,
-            cpu_window_upper=plan.cpu_window_upper,
             cpu_valid_num_blocks=plan.cpu_valid_num_blocks,
             num_reqs_padded=num_reqs_padded,
             step=step,
@@ -336,29 +325,4 @@ def _copy_padded_cpu_exact(
     result = torch.zeros(padded_request_count, dtype=torch.int32, device="cpu")
     if actual_request_count:
         result[:actual_request_count].copy_(torch.from_numpy(active.copy()).to(torch.int32))
-    return result
-
-
-def _copy_padded_cpu_upper(
-    values: torch.Tensor,
-    *,
-    actual_request_count: int,
-    padded_request_count: int,
-    increment: int,
-    max_model_len: int,
-) -> torch.Tensor:
-    if values.device.type != "cpu":
-        raise ValueError("Eagle3 CPU upper lengths must live on CPU")
-    if values.dtype != torch.int32:
-        raise TypeError("Eagle3 CPU upper lengths must use int32")
-    if values.ndim != 1 or values.shape[0] < actual_request_count:
-        raise ValueError("Eagle3 CPU upper lengths do not cover active requests")
-    result = torch.zeros(padded_request_count, dtype=torch.int32, device="cpu")
-    if actual_request_count:
-        torch.add(
-            values[:actual_request_count],
-            increment,
-            out=result[:actual_request_count],
-        )
-        result[:actual_request_count].clamp_(max=max_model_len)
     return result

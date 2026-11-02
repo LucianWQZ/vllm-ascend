@@ -151,13 +151,11 @@ def test_shared_row_projection_keeps_eagle_anchor_and_full_prefill(full_source, 
         padded_request_count=3,
         phase_plan=phases,
         cpu_full_exact=torch.tensor([end, 2 + step, 0], dtype=torch.int32),
-        cpu_apply_time_full_upper=torch.tensor([16, 6, 0], dtype=torch.int32),
         cpu_valid_num_blocks=torch.tensor([4, 3, 0], dtype=torch.int32),
     )
     assert frozen[0].window_start == 8
     assert result.read_descriptors[0].source_start_column == 2
     assert result.cpu_window_exact.tolist() == [end - 8, 2 + step, 0]
-    assert result.cpu_window_upper.tolist() == [8, 6, 0]
     assert result.read_descriptors[1].source_start_column == 0
     assert result.read_descriptors[1].required_columns == 3
     assert full_source.input_block_table_row_width(0) == 4

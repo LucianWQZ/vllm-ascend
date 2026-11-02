@@ -302,7 +302,6 @@ def test_first_and_ar_share_one_materialization_path_without_moving_the_anchor(p
         return SimpleNamespace(
             read_descriptors=(),
             cpu_window_exact=kwargs["cpu_full_exact"],
-            cpu_window_upper=kwargs["cpu_apply_time_full_upper"],
             cpu_valid_num_blocks=kwargs["cpu_valid_num_blocks"],
         )
 
@@ -325,7 +324,7 @@ def test_first_and_ar_share_one_materialization_path_without_moving_the_anchor(p
                 step=step,
                 num_reqs=1,
                 num_reqs_padded=first_padding if step == 0 else 1,
-                seq_lens_cpu_upper_bound=batch.seq_lens_cpu_upper_bound,
+                output_workspace=object(),
             )
             frozen = frozen or owner._eagle3_window_proposal_plan
             assert owner._eagle3_window_proposal_plan is frozen
@@ -333,11 +332,6 @@ def test_first_and_ar_share_one_materialization_path_without_moving_the_anchor(p
             session.stage(current, first=step == 0, n=1, tokens=4 if step == 0 else 1, ordinal=max(0, step - 1))
             session._carriers[-1].state = DraftWindowGraphCarrierState.UPDATED
     assert [call["cpu_full_exact"].tolist() for call in calls] == [[10] + [0] * (first_padding - 1), [8], [9]]
-    assert [call["cpu_apply_time_full_upper"].tolist() for call in calls] == [
-        [12] + [0] * (first_padding - 1),
-        [13],
-        [14],
-    ]
     assert all(call["frozen_row_plans"] is frozen for call in calls)
 
 
