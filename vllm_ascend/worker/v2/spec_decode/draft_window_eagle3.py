@@ -41,7 +41,6 @@ class Eagle3DraftWindowMixin:
 
     _draft_window_graph_binding_provider: DraftWindowGraphBindingProvider
     _eagle3_window_epoch_source: DraftWindowProposalEpochSource
-    _eagle3_window_proposal_context: DraftWindowProposalContext | None
     _eagle3_window_proposal_plan: tuple[DraftWindowPlan, ...] | None
     _eagle3_window_decode_step_one_exact: torch.Tensor | None
     _eagle3_window_bypass_active: bool
@@ -71,7 +70,6 @@ class Eagle3DraftWindowMixin:
             raise RuntimeError("configured Eagle3 K does not match the P2 provider")
 
         self._eagle3_window_epoch_source = DraftWindowProposalEpochSource()
-        self._eagle3_window_proposal_context = None
         self._eagle3_window_proposal_plan = None
         self._eagle3_window_decode_step_one_exact = None
         self._eagle3_window_bypass_active = False
@@ -109,7 +107,7 @@ class Eagle3DraftWindowMixin:
         if not dummy_run and not is_profile:
             bypass_for_prefill = _requires_prefill_baseline_bypass(input_batch)
         if dummy_run or is_profile or bool(getattr(input_batch, "is_dummy", False)) or bypass_for_prefill:
-            if self._eagle3_window_bypass_active or self._eagle3_window_proposal_context is not None:
+            if self._eagle3_window_bypass_active or self._eagle3_window_epoch_source._active is not None:
                 raise RuntimeError("an Eagle3 Draft Window proposal scope is already active")
             self._eagle3_window_bypass_active = True
             self._eagle3_window_continuing_prefill = bypass_for_prefill
@@ -126,7 +124,6 @@ class Eagle3DraftWindowMixin:
         if graph_session is None:
             raise RuntimeError("Eagle3 Draft Window business proposals require their installed Graph manager")
         context = epoch_source.begin(input_batch)
-        self._eagle3_window_proposal_context = context
         self._eagle3_window_proposal_plan = None
         self._eagle3_window_decode_step_one_exact = None
         self._eagle3_window_next_step = 0
@@ -146,7 +143,6 @@ class Eagle3DraftWindowMixin:
             self._quarantine_eagle3_window()
             raise
         finally:
-            self._eagle3_window_proposal_context = None
             self._eagle3_window_proposal_plan = None
             self._eagle3_window_decode_step_one_exact = None
             self._eagle3_window_next_step = 0
@@ -157,7 +153,7 @@ class Eagle3DraftWindowMixin:
         return (
             hasattr(self, "_draft_window_graph_binding_provider")
             and not getattr(self, "_eagle3_window_bypass_active", False)
-            and getattr(self, "_eagle3_window_proposal_context", None) is not None
+            and self._eagle3_window_epoch_source._active is not None
         )
 
     def _snapshot_eagle3_decode_step_one(
@@ -273,7 +269,7 @@ class Eagle3DraftWindowMixin:
             runtime.quarantine_generation(runtime._active_inputs.identity)
 
     def _require_eagle3_window_context(self) -> DraftWindowProposalContext:
-        context = self._eagle3_window_proposal_context
+        context = self._eagle3_window_epoch_source._active
         if context is None:
             raise RuntimeError("Eagle3 Draft Window operation has no active proposal epoch")
         return context

@@ -115,8 +115,6 @@ def _materialize(full_source, batch, exact, counts, frozen=None):
         group=group,
         full_source=full_source,
         expected_future_offset=3,
-        parallel_config=SimpleNamespace(tensor_parallel_size=1),
-        tensor_parallel_rank=0,
     )
     bank = DraftWindowWorkspace(
         max_num_reqs=len(exact), table_capacity_columns=4, table_template=full_source._input_block_tables[0]

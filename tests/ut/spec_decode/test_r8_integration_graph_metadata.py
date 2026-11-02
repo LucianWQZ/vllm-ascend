@@ -102,56 +102,38 @@ def test_window_off_without_graph_policy_does_not_construct_source(graph_source_
     assert not hasattr(c.owner, "_draft_window_graph_binding_provider")
 
 
-@pytest.fixture
-def source_contract():
-    from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphBindingProvider
-
-    parallel = SimpleNamespace(tensor_parallel_size=16)
-    capability = SimpleNamespace(parallel_config=parallel, tensor_parallel_rank=7)
-    owner: Any = object.__new__(DraftWindowGraphBindingProvider)
-    owner._source = capability
-    owner._tp_identity = (16, 7)
-    return owner, DraftWindowGraphBindingProvider
-
-
 @pytest.mark.parametrize(
-    "field,value",
-    [
-        (None, None),
-        ("parallel_config", None),
-        ("tensor_parallel_size", 0),
-        ("tensor_parallel_size", True),
-        ("tensor_parallel_rank", None),
-        ("tensor_parallel_rank", True),
-        ("tensor_parallel_rank", -1),
-        ("tensor_parallel_rank", 16),
-    ],
+    "field",
+    [None, "pipeline_parallel_size", "prefill_context_parallel_size", "decode_context_parallel_size", "cp_size"],
 )
-def test_graph_capture_requires_real_explicit_world_and_rank(source_contract, field, value):
-    owner, methods = source_contract
-    if field == "parallel_config":
-        owner._source.parallel_config = value
-    elif field == "tensor_parallel_size":
-        owner._source.parallel_config.tensor_parallel_size = value
+def test_graph_initialization_validates_actual_unsharded_context_once(monkeypatch, field):
+    from vllm_ascend.worker.v2.spec_decode import draft_window_graph_runtime as runtime
+
+    monkeypatch.setattr(runtime, "draft_window_graph_enabled", lambda: True)
+    monkeypatch.setattr(
+        runtime,
+        "get_current_hardware_profile",
+        lambda: SimpleNamespace(attention_backend_family=runtime.AttentionBackendFamily.STANDARD),
+    )
+    config = SimpleNamespace(
+        compilation_config=SimpleNamespace(cudagraph_mode=SimpleNamespace(name="FULL_DECODE_ONLY")),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=16,
+            pipeline_parallel_size=1,
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=1,
+        ),
+    )
+    tables = SimpleNamespace(cp_size=1)
+    if field == "cp_size":
+        tables.cp_size = 2
     elif field is not None:
-        owner._source.tensor_parallel_rank = value
+        setattr(config.parallel_config, field, 2)
     if field is None:
-        assert methods._capture_topology(owner) == (16, 7)
+        runtime.validate_graph_context(config, tables)
     else:
-        with pytest.raises(RuntimeError, match="parallel configuration|world/rank"):
-            methods._capture_topology(owner)
-
-
-@pytest.mark.parametrize("replacement", [None, "rank-drift"])
-def test_graph_source_guard_keeps_actual_capability_parallel_object_and_rank(source_contract, replacement):
-    owner, methods = source_contract
-    if replacement == "rank-drift":
-        owner._source.tensor_parallel_rank = 8
-    if replacement is None:
-        methods._validate_source_contract(owner)
-    else:
-        with pytest.raises(RuntimeError, match="parallel configuration or TP rank changed"):
-            methods._validate_source_contract(owner)
+        with pytest.raises(RuntimeError, match="PP=PCP=DCP=1"):
+            runtime.validate_graph_context(config, tables)
 
 
 @pytest.fixture
@@ -304,92 +286,84 @@ def test_window_off_update_keeps_the_original_two_argument_call():
         )
 
 
+@pytest.mark.parametrize("active", [False, True])
+def test_actual_dispatch_keeps_only_the_framework_descriptor(monkeypatch, active):
+    from vllm_ascend.worker.v2.spec_decode.dflash.aclgraph import DFlashAclGraphManager, DFlashCudaGraphManager
+
+    descriptor = SimpleNamespace()
+    monkeypatch.setattr(DFlashCudaGraphManager, "dispatch", lambda *args: descriptor)
+    manager = object.__new__(DFlashAclGraphManager)
+    manager.speculator = SimpleNamespace(
+        _draft_window_epoch_source=SimpleNamespace(_active=object() if active else None)
+    )
+    assert manager.dispatch(1, 8, 8, 0) is descriptor
+    assert manager.speculator._draft_window_selected_metadata is (descriptor if active else None)
+    manager.speculator = SimpleNamespace()
+    assert manager.dispatch(1, 8, 8, 0) is descriptor
+    assert not hasattr(manager.speculator, "_draft_window_selected_metadata")
+
+
 @pytest.fixture
 def full_metadata_dispatch():
-    """Exercise the actual FULL-selection functions and provider type guard."""
+    from vllm.config.compilation import CUDAGraphMode
+    from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
+
+    from vllm_ascend.worker.v2.spec_decode.draft_window import DraftMetadataInputs
     from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphBindingProvider
-    from vllm_ascend.worker.v2.spec_decode.draft_window_graph_metadata import (
-        defer_parallel_graph_metadata,
-        select_parallel_graph_metadata,
-        validate_deferred_parallel_graph_metadata,
-    )
+    from vllm_ascend.worker.v2.spec_decode.draft_window_graph_runtime import prepare_parallel_graph
 
     proposal = SimpleNamespace(mapping_epoch=7, ordered_request_ids=("req-a", "req-b"))
-    identity = SimpleNamespace(proposal=proposal, padded_request_count=2)
-    inputs = SimpleNamespace(identity=identity, metadata=None)
-    inputs.validate_for = lambda expected: None if expected is identity else (_ for _ in ()).throw(ValueError("stale"))
+    identity: Any = SimpleNamespace(proposal=proposal, padded_request_count=2)
     provider: Any = object.__new__(DraftWindowGraphBindingProvider)
-    provider._active_inputs = inputs
+    provider._quarantined_identity = None
     provider._source = SimpleNamespace(policy=SimpleNamespace(normalized_method="dflash"))
+    bank: Any = SimpleNamespace(assert_bound=lambda expected: expected is identity or pytest.fail("stale bank"))
+    inputs = DraftMetadataInputs(identity, bank, provider)
+    provider._active_inputs = inputs
+    descriptor = BatchExecutionDescriptor(CUDAGraphMode.FULL, num_tokens=16, num_reqs=2, uniform_token_count=8)
+    capture = SimpleNamespace(descriptor=descriptor)
+    provider.capture_identity_for = Mock(return_value=capture)
+    carrier = object()
+    provider.bind_read_carrier = Mock(return_value=carrier)
     owner = SimpleNamespace(
-        _draft_window_proposal_context=proposal,
+        _draft_window_epoch_source=SimpleNamespace(_active=proposal),
         _draft_window_graph_binding_provider=provider,
-        num_query_per_req=8,
-        _draft_window_live_inputs=inputs,
-        _draft_window_deferred_metadata=None,
+        _draft_window_graph_session=provider,
+        _draft_window_selected_metadata=descriptor,
+        model_state=SimpleNamespace(attn_metadata={"target.layer": object()}),
     )
-    descriptor = SimpleNamespace(cg_mode=SimpleNamespace(name="FULL"), num_reqs=2, num_tokens=16)
     return SimpleNamespace(
         owner=owner,
         inputs=inputs,
         descriptor=descriptor,
-        select_parallel_graph_metadata=select_parallel_graph_metadata,
-        defer_parallel_graph_metadata=defer_parallel_graph_metadata,
-        validate_deferred_parallel_graph_metadata=validate_deferred_parallel_graph_metadata,
+        provider=provider,
+        carrier=carrier,
+        prepare=prepare_parallel_graph,
     )
 
 
-def test_full_metadata_dispatch_defers_once_for_current_generation(full_metadata_dispatch):
+def test_actual_replay_uses_the_current_provider_bank_without_a_second_generation_ledger(full_metadata_dispatch):
     c = full_metadata_dispatch
-    c.select_parallel_graph_metadata(c.owner, c.descriptor)
-    selected = c.owner._draft_window_selected_metadata
-    assert selected.descriptor is c.descriptor
-    assert selected.proposal is c.inputs.identity.proposal
-    assert selected.descriptor.num_reqs == 2 and selected.descriptor.num_tokens == 16
-    assert c.defer_parallel_graph_metadata(c.owner, c.inputs, padded_requests=2, padded_tokens=16)
-    c.validate_deferred_parallel_graph_metadata(c.owner, c.inputs, c.descriptor)
-    assert c.owner._draft_window_deferred_metadata is c.inputs.identity
-    with pytest.raises(RuntimeError, match="existing publication"):
-        c.defer_parallel_graph_metadata(c.owner, c.inputs, padded_requests=2, padded_tokens=16)
+    assert c.prepare(c.owner, c.descriptor) is c.carrier
+    c.provider.bind_read_carrier.assert_called_once()
+    assert c.provider.bind_read_carrier.call_args.kwargs["inputs"] is c.inputs
+    assert not hasattr(c.owner, "_draft_window_live_inputs")
+    assert not hasattr(c.owner, "_draft_window_deferred_metadata")
 
 
-@pytest.mark.parametrize(
-    "field,value",
-    [
-        ("proposal", SimpleNamespace(mapping_epoch=8, ordered_request_ids=("req-a", "req-b"))),
-        ("proposal", SimpleNamespace(mapping_epoch=7, ordered_request_ids=("req-b", "req-a"))),
-        ("proposal", SimpleNamespace(mapping_epoch=7, ordered_request_ids=("req-a", "req-b"))),
-        ("padded_request_count", 4),
-    ],
-)
-def test_full_metadata_dispatch_rejects_stale_generation_or_rows(full_metadata_dispatch, field, value):
+@pytest.mark.parametrize("damage", ["proposal", "padded_rows", "descriptor", "published", "retired"])
+def test_actual_replay_rejects_stale_rows_bucket_or_already_published_generation(full_metadata_dispatch, damage):
     c = full_metadata_dispatch
-    c.select_parallel_graph_metadata(c.owner, c.descriptor)
-    setattr(c.inputs.identity, field, value)
-    with pytest.raises(RuntimeError, match="stale or wrong-bucket"):
-        c.defer_parallel_graph_metadata(c.owner, c.inputs, padded_requests=2, padded_tokens=16)
-    assert c.owner._draft_window_deferred_metadata is None
-
-
-@pytest.mark.parametrize("tokens,requests", [(8, 2), (16, 4)])
-def test_full_metadata_dispatch_rejects_wrong_actual_bucket(full_metadata_dispatch, tokens, requests):
-    c = full_metadata_dispatch
-    c.select_parallel_graph_metadata(c.owner, c.descriptor)
-    with pytest.raises(RuntimeError, match="stale or wrong-bucket"):
-        c.defer_parallel_graph_metadata(c.owner, c.inputs, padded_requests=requests, padded_tokens=tokens)
-
-
-def test_eager_dispatch_keeps_ordinary_metadata_build(full_metadata_dispatch):
-    c = full_metadata_dispatch
-    c.descriptor.cg_mode.name = "NONE"
-    c.select_parallel_graph_metadata(c.owner, c.descriptor)
-    assert c.owner._draft_window_selected_metadata is None
-    assert not c.defer_parallel_graph_metadata(c.owner, c.inputs, padded_requests=2, padded_tokens=16)
-
-
-def test_full_metadata_dispatch_does_not_replace_published_metadata(full_metadata_dispatch):
-    c = full_metadata_dispatch
-    c.select_parallel_graph_metadata(c.owner, c.descriptor)
-    c.inputs.metadata = object()
-    with pytest.raises(RuntimeError, match="existing publication"):
-        c.defer_parallel_graph_metadata(c.owner, c.inputs, padded_requests=2, padded_tokens=16)
+    if damage == "proposal":
+        c.owner._draft_window_epoch_source._active = object()
+    elif damage == "padded_rows":
+        c.inputs.identity.padded_request_count = 4
+    elif damage == "descriptor":
+        c.owner._draft_window_selected_metadata = object()
+    elif damage == "published":
+        object.__setattr__(c.inputs, "metadata", {"old": object()})
+    else:
+        c.provider._active_inputs = None
+    with pytest.raises(RuntimeError, match="proposal|bucket|unconsumed|generation"):
+        c.prepare(c.owner, c.descriptor)
+    c.provider.bind_read_carrier.assert_not_called()

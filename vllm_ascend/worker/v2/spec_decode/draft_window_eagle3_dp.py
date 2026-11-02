@@ -25,7 +25,7 @@ def _validate_eagle_dp_dummy(owner, session):
         or owner.input_batch.is_dummy is not True
         or getattr(owner, "_eagle3_window_bypass_active", False) is not True
         or getattr(owner, "_eagle3_window_continuing_prefill", False) is not False
-        or getattr(owner, "_eagle3_window_proposal_context", None) is not None
+        or getattr(getattr(owner, "_eagle3_window_epoch_source", None), "_active", None) is not None
         or provider is None
         or getattr(provider, "_active_inputs", None) is not None
         or getattr(owner, "_draft_window_graph_submission_uncertain", False) is not False

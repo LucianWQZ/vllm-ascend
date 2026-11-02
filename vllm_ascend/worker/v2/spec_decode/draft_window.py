@@ -95,8 +95,6 @@ class DraftWindowSourceCapability:
     group: DraftWindowGroupRoute
     full_source: FullDraftKVSource
     expected_future_offset: int
-    parallel_config: Any
-    tensor_parallel_rank: int
     workspace_capacity_columns: int | None = None
     capacity_columns: int = field(init=False)
     window_size: int = field(init=False)
@@ -274,31 +272,6 @@ def _validate_source_geometry(
         )
 
 
-def _get_tensor_parallel_rank(parallel_config: Any) -> int:
-    """Resolve process-local TP identity without inventing a rank.
-
-    Unit/config-only callers may provide an explicit rank.  A live TP route
-    must have an initialized vLLM TP group; failure to resolve it is a hard
-    source/configuration error rather than a rank-zero fallback.
-    """
-    world_size = int(parallel_config.tensor_parallel_size)
-    configured_rank = getattr(parallel_config, "tensor_parallel_rank", None)
-    if configured_rank is not None:
-        rank = int(configured_rank)
-    elif world_size == 1:
-        rank = 0
-    else:
-        try:
-            from vllm.distributed import get_tp_group
-
-            rank = int(get_tp_group().rank_in_group)
-        except (AssertionError, AttributeError, RuntimeError) as error:
-            raise RuntimeError("TP Draft Window route requires an initialized TP group rank") from error
-    if rank < 0 or rank >= world_size:
-        raise ValueError(f"TP rank {rank} is outside [0, {world_size})")
-    return rank
-
-
 def _build_draft_window_source_capability_for_context(
     *,
     policy: DraftWindowPolicyDecision,
@@ -364,8 +337,6 @@ def _build_draft_window_source_capability_for_context(
             configured_k=int(vllm_config.speculative_config.num_speculative_tokens),
             uses_dynamic_k=uses_dynamic_k,
         ),
-        parallel_config=vllm_config.parallel_config,
-        tensor_parallel_rank=_get_tensor_parallel_rank(vllm_config.parallel_config),
         # Mixed/chunked rows may retain a full-resident row beside windowed
         # decode rows in the same stable read bank.
         workspace_capacity_columns=full_source.input_block_table_row_width(group.gid),

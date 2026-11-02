@@ -1,21 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Bind one metadata build to the parallel Draft FULL dispatch.
-
-The fixed MRV2 proposal requests metadata before invoking its Graph manager.
-That temporary result is not consumed by FULL replay: build once against the
-selected persistent bank instead, after checking the proposal and bucket.
-Non-FULL and prefill bypasses retain their original metadata path.
-"""
+"""Isolate mutable Draft metadata and identify the real idle-DP scope."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from copy import copy
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
-
-if TYPE_CHECKING:
-    from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowProposalContext
+from typing import Any
 
 
 def copy_draft_attention_metadata(metadata: Mapping[str, Any]) -> dict[str, Any]:
@@ -86,12 +76,6 @@ def validate_draft_metadata_isolation(metadata: Mapping[str, Any], *, target_met
         raise ValueError("Draft metadata mutable fields alias Target metadata")
 
 
-@dataclass(frozen=True, slots=True)
-class ParallelGraphMetadataSelection:
-    proposal: DraftWindowProposalContext
-    descriptor: Any
-
-
 def is_parallel_graph_dp_dummy(owner: Any) -> bool:
     """Require the explicit no-generation scope before using baseline operands.
 
@@ -112,65 +96,10 @@ def is_parallel_graph_dp_dummy(owner: Any) -> bool:
         or dp_size <= 1
         or getattr(owner, "_draft_window_bypass_active", False) is not True
         or getattr(owner, "_draft_window_prefill_bypass_active", False) is not False
-        or getattr(owner, "_draft_window_proposal_context", None) is not None
-        or getattr(owner, "_draft_window_live_inputs", None) is not None
+        or owner._draft_window_epoch_source._active is not None
         or not isinstance(provider, DraftWindowGraphBindingProvider)
+        or provider._active_inputs is not None
         or provider.method not in ("dflash", "dspark")
     ):
         raise RuntimeError("DP dummy Graph requires its explicit full-read scope without a live Window generation")
     return True
-
-
-def select_parallel_graph_metadata(owner: Any, descriptor: Any) -> None:
-    from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphBindingProvider
-
-    context = getattr(owner, "_draft_window_proposal_context", None)
-    owner._draft_window_selected_metadata = None
-    if context is None or getattr(descriptor.cg_mode, "name", None) != "FULL":
-        return
-    provider = getattr(owner, "_draft_window_graph_binding_provider", None)
-    if not isinstance(provider, DraftWindowGraphBindingProvider) or provider.method not in (
-        "dspark",
-        "dflash",
-    ):
-        raise RuntimeError("FULL metadata selection requires the real parallel Graph provider")
-    n, tokens = descriptor.num_reqs, descriptor.num_tokens
-    if type(n) is not int or n < len(context.ordered_request_ids) or tokens != n * owner.num_query_per_req:
-        raise RuntimeError("single-metadata selection does not match actual FULL dispatch geometry")
-    owner._draft_window_selected_metadata = ParallelGraphMetadataSelection(context, descriptor)
-
-
-def defer_parallel_graph_metadata(owner: Any, inputs: Any, *, padded_requests: int, padded_tokens: int) -> bool:
-    selected = getattr(owner, "_draft_window_selected_metadata", None)
-    if selected is None:
-        return False  # Eager/phase bypass retains its actual metadata build.
-    identity = inputs.identity
-    inputs.validate_for(identity)
-    if (
-        selected.proposal is not identity.proposal
-        or selected.descriptor.num_reqs != padded_requests
-        or selected.descriptor.num_reqs != identity.padded_request_count
-        or selected.descriptor.num_tokens != padded_tokens
-    ):
-        raise RuntimeError("stale or wrong-bucket deferred Graph metadata selection")
-    provider = owner._draft_window_graph_binding_provider
-    if provider._active_inputs is not inputs or owner._draft_window_live_inputs is not inputs:
-        raise RuntimeError("deferred Graph metadata does not own current P3 materialization")
-    if inputs.metadata is not None or getattr(owner, "_draft_window_deferred_metadata", None) is not None:
-        raise RuntimeError("deferred Graph metadata cannot replace an existing publication")
-    owner._draft_window_deferred_metadata = identity
-    return True
-
-
-def validate_deferred_parallel_graph_metadata(owner: Any, inputs: Any, descriptor: Any) -> None:
-    selected = getattr(owner, "_draft_window_selected_metadata", None)
-    if selected is None:
-        raise RuntimeError("single-build FULL replay has no actual dispatch selection")
-    if (
-        getattr(descriptor.cg_mode, "name", None) != "FULL"
-        or descriptor.num_reqs != selected.descriptor.num_reqs
-        or descriptor.num_tokens != selected.descriptor.num_tokens
-        or getattr(owner, "_draft_window_deferred_metadata", None) != inputs.identity
-        or inputs.metadata is not None
-    ):
-        raise RuntimeError("deferred FULL replay does not match the current unconsumed generation")

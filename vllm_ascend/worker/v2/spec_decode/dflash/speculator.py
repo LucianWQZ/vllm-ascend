@@ -151,7 +151,7 @@ def _draft_window_context_kv_scope(owner, input_batch):
     from vllm_ascend.worker.v2.spec_decode.draft_window_runtime import _NPUCompletion
 
     if (
-        getattr(owner, "_draft_window_proposal_context", None) is not None
+        owner._draft_window_epoch_source._active is not None
         or getattr(owner, "_draft_window_bypass_active", False)
         or getattr(owner, "_draft_window_context_kv_active", False)
     ):

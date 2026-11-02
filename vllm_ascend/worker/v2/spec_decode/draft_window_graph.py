@@ -156,12 +156,6 @@ class DraftWindowGraphBindingProvider:
             raise ValueError("configured workspace capacity is smaller than the provider capacity")
         if table_capacity_columns > source_table.shape[1]:
             raise ValueError("configured workspace capacity exceeds the canonical source row width")
-        self._tp_identity = self._capture_topology()
-        if any(
-            getattr(source.parallel_config, name) != 1
-            for name in ("pipeline_parallel_size", "prefill_context_parallel_size", "decode_context_parallel_size")
-        ):
-            raise ValueError("Draft Graph read banks require replicated reads and PP=PCP=DCP=1")
         self._active_inputs: DraftMetadataInputs | None = None
         self._last_mapping_epoch = -1
         self._last_retired_identity: DraftWindowGenerationIdentity | None = None
@@ -333,7 +327,6 @@ class DraftWindowGraphBindingProvider:
             raise ValueError("capture query width differs from the actual descriptor")
         if route is DraftWindowGraphRoute.EAGLE3_AR_STEP and query_width != 1:
             raise ValueError("Eagle3 AR capture requires query width 1")
-        self._validate_source_contract()
         identity = DraftWindowGraphCaptureIdentity(route, descriptor, consumer_ordinal)
         if identity in self._carriers:
             raise RuntimeError("capture consumer identity is already registered")
@@ -406,7 +399,6 @@ class DraftWindowGraphBindingProvider:
         if inputs._owner is not self:
             raise RuntimeError("graph carrier inputs do not belong to the provider runtime")
         _validate_route(capture_identity.route, generation, self.method)
-        self._validate_source_contract()
         if generation.padded_request_count != capture_identity.descriptor.num_reqs:
             raise RuntimeError("capture/runtime padded request count mismatch")
         self.source.full_source.validate_owner_bindings()
@@ -502,19 +494,6 @@ class DraftWindowGraphBindingProvider:
         if carrier.workspace.max_num_reqs != capture_identity.descriptor.num_reqs:
             raise RuntimeError("Graph capture bank request geometry changed")
         return carrier
-
-    def _capture_topology(self) -> tuple[int, int]:
-        parallel = self.source.parallel_config
-        if parallel is None:
-            raise RuntimeError("Graph read banks require their actual parallel configuration")
-        world, rank = parallel.tensor_parallel_size, self.source.tensor_parallel_rank
-        if type(world) is not int or world < 1 or type(rank) is not int or not 0 <= rank < world:
-            raise RuntimeError("Graph TP world/rank must be explicit integers within range")
-        return world, rank
-
-    def _validate_source_contract(self) -> None:
-        if self._capture_topology() != self._tp_identity:
-            raise RuntimeError("Draft Graph parallel configuration or TP rank changed after capture")
 
     @staticmethod
     def _validate_metadata_uses_read_carrier(

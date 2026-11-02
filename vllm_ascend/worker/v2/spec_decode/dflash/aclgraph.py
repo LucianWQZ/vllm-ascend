@@ -92,9 +92,9 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
         descriptor = super().dispatch(
             num_reqs, num_tokens, uniform_token_count, num_active_loras, max_query_len, num_ubatches
         )
-        from vllm_ascend.worker.v2.spec_decode.draft_window_graph_metadata import select_parallel_graph_metadata
-
-        select_parallel_graph_metadata(self.speculator, descriptor)
+        epoch = getattr(self.speculator, "_draft_window_epoch_source", None)
+        if epoch is not None:
+            self.speculator._draft_window_selected_metadata = descriptor if epoch._active is not None else None
         return descriptor
 
     def capture(

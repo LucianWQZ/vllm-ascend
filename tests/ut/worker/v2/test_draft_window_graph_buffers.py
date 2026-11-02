@@ -66,20 +66,12 @@ def graph_buffers():
         table_column_span=4,
         status=DraftWindowProviderStatus.DIRECT_DENSE,
     )
-    parallel = SimpleNamespace(
-        tensor_parallel_size=1,
-        pipeline_parallel_size=1,
-        prefill_context_parallel_size=1,
-        decode_context_parallel_size=1,
-    )
     projection = DraftWindowSourceCapability(
         policy=resolve_draft_window_policy(requested_window_size=4, method="dflash", target_model_type="qwen3"),
         runtime_route="dflash",
         group=group,
         full_source=source,
         expected_future_offset=0,
-        parallel_config=parallel,
-        tensor_parallel_rank=0,
     )
     provider = DraftWindowGraphBindingProvider(source=projection)
     descriptor = BatchExecutionDescriptor(CUDAGraphMode.FULL, num_tokens=2, num_reqs=2, uniform_token_count=1)

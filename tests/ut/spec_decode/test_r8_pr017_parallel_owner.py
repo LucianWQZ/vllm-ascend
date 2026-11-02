@@ -98,9 +98,8 @@ class ParallelOwnerTests(unittest.TestCase):
         self.batch = SimpleNamespace(is_dummy=False)
         self.owner = SimpleNamespace(
             _draft_window_graph_binding_provider=SimpleNamespace(quarantined_identity=None),
-            _draft_window_epoch_source=object(),
+            _draft_window_epoch_source=SimpleNamespace(_active=None),
             _draft_window_bypass_active=False,
-            _draft_window_proposal_context=None,
             vllm_config=SimpleNamespace(max_concurrent_batches=2),
             num_speculative_steps=8,
         )
@@ -124,7 +123,7 @@ class ParallelOwnerTests(unittest.TestCase):
         self.assertEqual(self.normal, [])
         self.assertFalse(self.owner._draft_window_context_kv_pool._poisoned)
         self.assertFalse(hasattr(self.owner, "_draft_window_runtime"))
-        self.assertIsNone(self.owner._draft_window_proposal_context)
+        self.assertIsNone(self.owner._draft_window_epoch_source._active)
 
     def test_zero_original_error_quarantines_and_actual_normal_scope_rejects(self):
         first = RuntimeError("native context write stand-in")
@@ -181,7 +180,7 @@ class ParallelOwnerTests(unittest.TestCase):
                 self.scope(8)
             with self.assertRaisesRegex(RuntimeError, "already active"):
                 self.scope(0)
-        self.owner._draft_window_proposal_context = object()
+        self.owner._draft_window_epoch_source._active = object()
         with (
             self.assertRaisesRegex(RuntimeError, "already active"),
             self.scope(0),
@@ -271,10 +270,10 @@ class ParallelOwnerTests(unittest.TestCase):
             function = propose[0]
             self.assertIn("dp_sync_state", [arg.arg for arg in function.args.args])
             self.assertIn("num_speculative_tokens", [arg.arg for arg in function.args.args])
-            assignment = function.body[0]
-            assert isinstance(assignment, ast.Assign) and isinstance(assignment.value, ast.Call)
-            assert isinstance(assignment.value.func, ast.Name)
-            self.assertEqual(assignment.value.func.id, "_draft_window_owner_scope")
+            first = function.body[0]
+            assert isinstance(first, ast.Assign) and isinstance(first.value, ast.Call)
+            assert isinstance(first.value.func, ast.Name)
+            self.assertEqual(first.value.func.id, "_draft_window_owner_scope")
             forwarded = [
                 node
                 for node in ast.walk(function)

@@ -155,11 +155,11 @@ def prepare_parallel_graph(
         raise TypeError("invalid instance-owned Draft Window Graph provider")
     if descriptor.cg_mode is not CUDAGraphMode.FULL:
         raise RuntimeError("runtime Draft Window Graph requires a FULL replay descriptor")
-    inputs = getattr(owner, "_draft_window_live_inputs", None)
+    inputs = provider._active_inputs
     if not isinstance(inputs, DraftMetadataInputs):
         raise RuntimeError("Draft Window Graph replay has no real P3 proposal generation")
     inputs.validate_for(inputs.identity)
-    proposal_context = getattr(owner, "_draft_window_proposal_context", None)
+    proposal_context = owner._draft_window_epoch_source._active
     if proposal_context is not inputs.identity.proposal:
         raise RuntimeError("Draft Window Graph proposal identity is stale")
     route = resolve_parallel_draft_window_graph_route(owner)
@@ -171,11 +171,8 @@ def prepare_parallel_graph(
     if not isinstance(target_metadata, Mapping) or not target_metadata:
         raise RuntimeError("Draft Window Graph requires real non-empty Target metadata")
 
-    from vllm_ascend.worker.v2.spec_decode.draft_window_graph_metadata import (
-        validate_deferred_parallel_graph_metadata,
-    )
-
-    validate_deferred_parallel_graph_metadata(owner, inputs, descriptor)
+    if owner._draft_window_selected_metadata != descriptor or inputs.metadata is not None:
+        raise RuntimeError("Draft Window replay does not own the selected unconsumed FULL dispatch")
 
     # FULL dispatch deferred its unused temporary metadata. Build and publish
     # exactly this generation once, backed by the persistent Graph read bank.

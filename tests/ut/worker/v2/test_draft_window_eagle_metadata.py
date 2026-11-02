@@ -266,7 +266,7 @@ def test_business_window_proposal_requires_the_real_installed_graph_manager(prop
         owner._eagle3_draft_window_proposal_scope(batch, dummy_run=False, is_profile=False),
     ):
         pytest.fail("a business request reached the old private eager owner")
-    assert owner._eagle3_window_proposal_context is None
+    assert owner._eagle3_window_epoch_source._active is None
     assert runtime._active_inputs is None
 
 
@@ -292,7 +292,7 @@ def test_real_proposal_rejects_unconsumed_or_misattributed_reader(proposal, dama
             current = inputs(1 if damage == "wrong_step" else 0, **changes)
             session.stage(current, first=True, n=1, tokens=4, ordinal=1 if damage == "wrong_ordinal" else 0)
     assert owner._draft_window_graph_submission_uncertain
-    assert owner._eagle3_window_proposal_context is None
+    assert owner._eagle3_window_epoch_source._active is None
     if damage in ("wrong_request", "cloned_proposal", "wrong_step", "wrong_ordinal"):
         assert runtime.quarantined_identity is current.identity
 
@@ -365,8 +365,7 @@ def test_eagle_capture_lookup_keeps_each_real_shape_and_consumer(first, tokens, 
 
 
 @pytest.fixture
-def parallel_hook(monkeypatch):
-    from vllm_ascend.worker.v2.spec_decode import draft_window_graph_metadata
+def parallel_hook():
     from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowGraphInputMixin
 
     class Baseline:
@@ -379,7 +378,6 @@ def parallel_hook(monkeypatch):
     owner: Any = Owner()
     owner._draft_window_graph_binding_provider = object()
     owner._draft_window_bypass_active = False
-    owner._draft_window_selected_metadata = object()
     owner.draft_attn_layer_names, owner.num_query_per_req = {"draft.layer"}, 8
     owner.block_tables = SimpleNamespace(slot_mappings=torch.arange(32, dtype=torch.int64).reshape(1, 32))
     inputs, calls = object(), []
@@ -389,8 +387,8 @@ def parallel_hook(monkeypatch):
         return inputs
 
     owner._materialize_draft_window_read_inputs = materialize
-    monkeypatch.setattr(draft_window_graph_metadata, "defer_parallel_graph_metadata", lambda *args, **kwargs: True)
     desc = SimpleNamespace(cg_mode=SimpleNamespace(name="FULL"), num_reqs=2, num_tokens=16)
+    owner._draft_window_selected_metadata = desc
     return owner, desc, inputs, calls
 
 
@@ -418,7 +416,7 @@ def test_parallel_metadata_hook_prepares_one_bank_without_a_temporary_metadata_b
         8,
         slot_mappings=owner.block_tables.slot_mappings[:, :16],
     )
-    assert result is None and owner._draft_window_live_inputs is inputs
+    assert result is None and not hasattr(owner, "_draft_window_live_inputs")
     assert calls == [{"num_reqs": 1, "num_reqs_padded": 2}]
 
 
