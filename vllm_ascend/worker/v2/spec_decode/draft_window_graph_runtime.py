@@ -11,7 +11,6 @@ output snapshot, artifact writer, or oracle participates in this path.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
 from typing import Any
 
 from vllm.config.compilation import CUDAGraphMode
@@ -37,26 +36,6 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
     DraftWindowGraphRoute,
     resolve_parallel_draft_window_graph_route,
 )
-
-
-@dataclass(slots=True)
-class DraftWindowGraphSession:
-    owner: Any
-    provider: DraftWindowGraphBindingProvider
-    route: DraftWindowGraphRoute
-
-    def resolve_capture_identity(
-        self,
-        descriptor: BatchExecutionDescriptor,
-    ) -> DraftWindowGraphCaptureIdentity:
-        matches = tuple(
-            identity
-            for identity in self.provider.registered_capture_identities(route=self.route)
-            if identity.descriptor == descriptor
-        )
-        if len(matches) != 1:
-            raise RuntimeError(f"runtime descriptor does not resolve one captured consumer: {descriptor!r}")
-        return matches[0]
 
 
 def draft_window_graph_enabled() -> bool:
@@ -119,7 +98,7 @@ def build_parallel_graph_source(
     return capability
 
 
-def install_parallel_graph(owner: Any) -> DraftWindowGraphSession:
+def install_parallel_graph(owner: Any) -> DraftWindowGraphBindingProvider:
     """Install one provider and register every real startup capture bucket."""
     if hasattr(owner, "_draft_window_graph_session"):
         raise RuntimeError("Draft Window Graph is already installed on this speculator")
@@ -134,11 +113,6 @@ def install_parallel_graph(owner: Any) -> DraftWindowGraphSession:
     route = resolve_parallel_draft_window_graph_route(owner)
     if route not in (DraftWindowGraphRoute.DFLASH, DraftWindowGraphRoute.DSPARK):
         raise RuntimeError("Draft Window Graph has no parallel Draft route")
-    session = DraftWindowGraphSession(
-        owner=owner,
-        provider=provider,
-        route=route,
-    )
     descriptors = tuple(
         descriptor
         for mode_descriptors in capture_descs.values()
@@ -165,8 +139,8 @@ def install_parallel_graph(owner: Any) -> DraftWindowGraphSession:
             route=route,
             descriptor=descriptor,
         )
-    owner._draft_window_graph_session = session
-    return session
+    owner._draft_window_graph_session = provider
+    return provider
 
 
 def prepare_parallel_graph(
@@ -174,11 +148,11 @@ def prepare_parallel_graph(
     descriptor: BatchExecutionDescriptor,
 ) -> DraftWindowGraphReadCarrier | None:
     """Bind the real P3 proposal generation before Graph metadata consumption."""
-    session = getattr(owner, "_draft_window_graph_session", None)
-    if session is None:
+    provider = getattr(owner, "_draft_window_graph_session", None)
+    if provider is None:
         return None
-    if not isinstance(session, DraftWindowGraphSession) or session.owner is not owner:
-        raise TypeError("invalid instance-owned Draft Window Graph session")
+    if provider is not owner._draft_window_graph_binding_provider:
+        raise TypeError("invalid instance-owned Draft Window Graph provider")
     if descriptor.cg_mode is not CUDAGraphMode.FULL:
         raise RuntimeError("runtime Draft Window Graph requires a FULL replay descriptor")
     inputs = getattr(owner, "_draft_window_live_inputs", None)
@@ -188,7 +162,9 @@ def prepare_parallel_graph(
     proposal_context = getattr(owner, "_draft_window_proposal_context", None)
     if proposal_context is not inputs.identity.proposal:
         raise RuntimeError("Draft Window Graph proposal identity is stale")
-    capture_identity = session.resolve_capture_identity(descriptor)
+    route = resolve_parallel_draft_window_graph_route(owner)
+    assert route is not None
+    capture_identity = provider.capture_identity_for(route=route, descriptor=descriptor)
     if inputs.identity.padded_request_count != capture_identity.descriptor.num_reqs:
         raise RuntimeError("Draft Window Graph generation does not match the capture request bucket")
     target_metadata = owner.model_state.attn_metadata
@@ -203,7 +179,7 @@ def prepare_parallel_graph(
 
     # FULL dispatch deferred its unused temporary metadata. Build and publish
     # exactly this generation once, backed by the persistent Graph read bank.
-    carrier = session.provider.bind_read_carrier(
+    carrier = provider.bind_read_carrier(
         capture_identity=capture_identity,
         inputs=inputs,
         metadata_builder=lambda workspace: _build_private_graph_metadata(

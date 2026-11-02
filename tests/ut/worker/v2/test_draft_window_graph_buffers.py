@@ -381,36 +381,13 @@ def test_eagle_serialized_steps_own_distinct_banks_and_preserve_previous_consume
     ],
 )
 def test_runtime_capture_resolves_all_actual_descriptor_fields(graph_buffers, field, value):
-    import ast
-    from pathlib import Path
-
-    source = Path(__file__).resolve().parents[4] / "vllm_ascend/worker/v2/spec_decode/draft_window_graph_runtime.py"
-    cls = next(
-        n
-        for n in ast.parse(source.read_text()).body
-        if isinstance(n, ast.ClassDef) and n.name == "DraftWindowGraphSession"
-    )
-    method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "resolve_capture_identity")
-    ns: dict[str, Any] = {}
-    exec(
-        compile(
-            ast.fix_missing_locations(
-                ast.Module(
-                    body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), method],
-                    type_ignores=[],
-                )
-            ),
-            str(source),
-            "exec",
-        ),
-        ns,
-    )
-    session = SimpleNamespace(provider=graph_buffers.provider, route=DraftWindowGraphRoute.DFLASH)
+    provider = graph_buffers.provider
     descriptor = graph_buffers.capture.descriptor
+    route = DraftWindowGraphRoute.DFLASH
     assert hash(descriptor) == hash(replace(descriptor))
-    assert ns[method.name](session, replace(descriptor)) is graph_buffers.capture
+    assert provider.capture_identity_for(route=route, descriptor=replace(descriptor)) is graph_buffers.capture
     with pytest.raises(RuntimeError, match="descriptor does not resolve"):
-        ns[method.name](session, replace(descriptor, **{field: value}))
+        provider.capture_identity_for(route=route, descriptor=replace(descriptor, **{field: value}))
 
 
 @pytest.mark.parametrize("field,value", [("num_active_loras", 1), ("num_ubatches", 2)])
@@ -486,8 +463,44 @@ def test_parallel_capture_uses_exact_manager_descriptor_and_preserves_full_table
     assert read.device_window_exact.tolist() == [7, 7]
     assert torch.equal(full, before)
     assert torch.equal(read.window_block_table, full[:, :2])
-    with pytest.raises(RuntimeError, match="does not resolve exactly one"):
+    with pytest.raises(RuntimeError, match="descriptor does not resolve"):
         _build_capture_context(owner, buffers, {CUDAGraphMode.FULL: [replace(desc, max_query_len=1)]})
+
+
+def test_window_capture_delegates_original_dummy_preparation_then_only_rebinds_reads(graph_buffers, monkeypatch):
+    from vllm.v1.worker.gpu.cudagraph_utils import AttentionState
+
+    from vllm_ascend.worker.v2.spec_decode.dflash import capture
+
+    case = graph_buffers
+    buffers = object.__new__(InputBuffers)
+    buffers.query_start_loc = torch.tensor([0, 1, 2], dtype=torch.int32)
+    owner = SimpleNamespace(input_buffers=buffers, _draft_window_graph_binding_provider=case.provider)
+    ctx = capture._build_capture_context(owner, buffers, {CUDAGraphMode.FULL: [case.capture.descriptor]})
+    setattr(buffers, capture._CAPTURE_CONTEXT_ATTRIBUTE, ctx)
+    slots, state_marker = object(), object()
+    layer = SimpleNamespace(slot_mapping=slots, actual_seq_lengths_q=[1, 2], attn_state=state_marker, causal=False)
+    state = AttentionState({"draft.layer": layer}, {"draft.layer": slots})
+    calls = []
+
+    def upstream(*args):
+        calls.append(args)
+        return state
+
+    monkeypatch.setattr(capture, "_ORIGINAL_PREPARE_DFLASH_INPUTS_TO_CAPTURE", upstream)
+    full = case.owner.input_block_tables[0].clone()
+    result = capture.ascend_prepare_dflash_inputs_to_capture(2, 2, buffers, case.owner, [], object(), 16, False, False)
+    assert result is state and len(calls) == 1
+    bank = case.provider.startup_capture_workspace(case.capture)
+    assert layer.block_tables is bank.window_block_table
+    assert layer.seq_lens is layer.seq_lens_gpu is bank.device_window_exact
+    assert layer.seq_lens_cpu is bank.cpu_window_exact
+    assert layer.seq_lens_list == [7, 7] and layer.max_seq_len == 7
+    assert layer.query_start_loc.data_ptr() == buffers.query_start_loc.data_ptr()
+    assert layer.slot_mapping is slots and layer.actual_seq_lengths_q == [1, 2]
+    assert layer.attn_state is state_marker and layer.causal is False
+    assert result.slot_mappings["draft.layer"] is slots
+    assert torch.equal(case.owner.input_block_tables[0], full)
 
 
 def test_context_only_capture_preserves_upstream_preparation_without_a_read_bank(graph_buffers, monkeypatch):
@@ -535,7 +548,7 @@ def test_workspace_rejects_invalid_native_table_dtype_at_its_creation_boundary()
 
 
 def test_nonfull_scratch_narrows_the_actual_bank_only_at_the_ascend_read_seam(graph_buffers):
-    from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowGraphInputMixin
+    from vllm_ascend.worker.v2.spec_decode.draft_window_eager import draft_window_read_inputs
 
     case = graph_buffers
     plan = compute_draft_window_plan(full_exact_end=11, future_offset=0, window_size=4, block_span_tokens=4)
@@ -550,8 +563,14 @@ def test_nonfull_scratch_narrows_the_actual_bank_only_at_the_ascend_read_seam(gr
         step=0,
     )
     assert inputs.workspace.window_block_table.shape[0] == 2
-    owner: Any = SimpleNamespace(block_tables=SimpleNamespace(input_block_tables=[case.source._input_block_tables[0]]))
-    read = DraftWindowGraphInputMixin._validated_draft_attention_read_inputs(owner, inputs, inputs.identity)
+    inputs.validate_for(inputs.identity)
+    read = draft_window_read_inputs(
+        inputs.workspace,
+        actual_request_count=1,
+        padded_request_count=1,
+        block_tables=[case.source._input_block_tables[0]],
+        global_group_id=case.projection.group.gid,
+    )
     assert read.block_tables[0].shape == (1, 2)
     assert read.seq_lens.shape == read.seq_lens_cpu_exact.shape == read.seq_lens_cpu_upper_bound.shape == (1,)
     assert read.block_tables[0].data_ptr() == inputs.workspace.window_block_table.data_ptr()
@@ -559,7 +578,7 @@ def test_nonfull_scratch_narrows_the_actual_bank_only_at_the_ascend_read_seam(gr
     assert read.seq_lens_cpu_upper_bound.item() == read.seq_lens_cpu_exact.item() + 1
     case.provider.retire_generation(inputs.identity)
     with pytest.raises(RuntimeError, match="retired Draft inputs"):
-        DraftWindowGraphInputMixin._validated_draft_attention_read_inputs(owner, inputs, inputs.identity)
+        inputs.validate_for(inputs.identity)
 
 
 def test_equal_dynamic_fields_cannot_forge_an_actual_generation(graph_buffers):

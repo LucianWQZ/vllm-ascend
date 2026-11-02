@@ -57,6 +57,7 @@ def assembly(monkeypatch):
         ),
         input_batch=SimpleNamespace(is_prefilling_np=np.array([False] * 4)),
         vllm_config=SimpleNamespace(parallel_config=object()),
+        attn_vllm_config=SimpleNamespace(parallel_config=object()),
         model_state=SimpleNamespace(attn_metadata={"target": SimpleNamespace(attn_state="decode")}),
         kv_cache_config=object(),
     )
@@ -102,7 +103,8 @@ def test_shared_assembler_preserves_uniform_full_capture_and_nonuniform_queries(
     result = owner.assembly_calls[0]
     assert result["positions"].data_ptr() == owner.input_buffers.positions.data_ptr()
     assert result["attn_state"] == "decode"
-    assert result["parallel_config"] is owner.vllm_config.parallel_config
+    assert result["parallel_config"] is owner.attn_vllm_config.parallel_config
+    assert result["parallel_config"] is not owner.vllm_config.parallel_config
     assert result["query_start_loc_cpu"].tolist() == expected
     assert result["max_query_len"] == max_query
     assert result["draft_window_read_inputs"] is read

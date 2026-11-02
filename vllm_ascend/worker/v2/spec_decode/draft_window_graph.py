@@ -337,27 +337,19 @@ class DraftWindowGraphBindingProvider:
     def submitted_carriers(self) -> tuple[DraftWindowGraphReadCarrier, ...]:
         return self._submitted_carriers
 
-    def registered_capture_identities(
+    def capture_identity_for(
         self,
         *,
         route: DraftWindowGraphRoute,
-    ) -> tuple[DraftWindowGraphCaptureIdentity, ...]:
-        """Return immutable startup identities for one explicitly typed route."""
-        if not isinstance(route, DraftWindowGraphRoute):
-            raise TypeError("capture identity lookup requires a graph route")
-        return tuple(
-            sorted(
-                (
-                    carrier.capture_identity
-                    for carrier in self._carriers.values()
-                    if carrier.capture_identity.route is route
-                ),
-                key=lambda identity: (
-                    identity.consumer_ordinal,
-                    (identity.descriptor.num_reqs, identity.descriptor.num_tokens),
-                ),
-            )
-        )
+        descriptor: BatchExecutionDescriptor,
+        consumer_ordinal: int = 0,
+    ) -> DraftWindowGraphCaptureIdentity:
+        """Select the bank using the actual manager's complete descriptor."""
+        key = DraftWindowGraphCaptureIdentity(route, descriptor, consumer_ordinal)
+        try:
+            return self._carriers[key].capture_identity
+        except KeyError as error:
+            raise RuntimeError(f"runtime descriptor does not resolve a captured consumer: {descriptor!r}") from error
 
     def startup_capture_workspace(
         self,

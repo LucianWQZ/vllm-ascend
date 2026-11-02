@@ -19,20 +19,17 @@ from typing import Any
 import torch
 from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.kv_cache_interface import KVCacheConfig
-from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
-from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu.cudagraph_utils import (
     AttentionState,
     BatchExecutionDescriptor,
 )
-from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+from vllm.v1.worker.gpu.input_batch import InputBuffers
 from vllm.v1.worker.gpu.spec_decode.dflash.cudagraph import (
     _prepare_dflash_inputs_to_capture as _ORIGINAL_PREPARE_DFLASH_INPUTS_TO_CAPTURE,
 )
 from vllm.v1.worker.utils import AttentionGroup
 
-from vllm_ascend.worker.v2.attn_utils import build_attn_metadata
 from vllm_ascend.worker.v2.spec_decode.draft_window import DraftWindowWorkspace
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
     DraftWindowGraphBindingProvider,
@@ -51,6 +48,7 @@ class DraftWindowDFlashCaptureContext:
     provider: DraftWindowGraphBindingProvider
     route: DraftWindowGraphRoute
     input_buffers: InputBuffers
+    captures: dict[tuple[int, int], DraftWindowGraphCaptureIdentity]
     active: bool = True
 
     def validate_for_provider(self, provider: DraftWindowGraphBindingProvider) -> None:
@@ -61,19 +59,10 @@ class DraftWindowDFlashCaptureContext:
 
     def resolve(self, num_reqs: int, num_tokens: int) -> tuple[DraftWindowGraphCaptureIdentity, DraftWindowWorkspace]:
         self.validate_for_provider(self.provider)
-        matches = tuple(
-            identity
-            for identity in self.provider.registered_capture_identities(route=self.route)
-            if identity.descriptor.num_reqs == num_reqs
-            and identity.descriptor.num_tokens == num_tokens
-            and identity.descriptor.cg_mode is CUDAGraphMode.FULL
-        )
-        if len(matches) != 1:
-            raise RuntimeError(
-                "Draft Window capture bucket does not resolve exactly one persistent "
-                f"carrier: requests={num_reqs} tokens={num_tokens} mode=FULL matches={len(matches)}"
-            )
-        identity = matches[0]
+        try:
+            identity = self.captures[num_reqs, num_tokens]
+        except KeyError as error:
+            raise RuntimeError("Draft Window capture has no exact persistent bank") from error
         return identity, self.provider.startup_capture_workspace(identity)
 
 
@@ -100,22 +89,17 @@ def _build_capture_context(
         for descriptor in entries
         if descriptor.cg_mode is CUDAGraphMode.FULL
     )
-    identities = provider.registered_capture_identities(route=route)
-    if not descriptors or len(descriptors) != len(identities):
-        raise RuntimeError("Draft Window capture descriptor/carrier cardinality mismatch")
-    # The upstream helper receives only these three coordinates. Require that
-    # they select exactly one of the provider's real, fully qualified keys.
-    keys = set()
+    captures = {}
     for descriptor in descriptors:
-        num_reqs = descriptor.num_reqs
-        matches = [identity for identity in identities if identity.descriptor == descriptor]
-        if len(matches) != 1:
-            raise RuntimeError("Draft Window capture descriptor does not resolve exactly one registered carrier")
-        key = (num_reqs, descriptor.num_tokens, descriptor.cg_mode)
-        if key in keys:
+        if descriptor.num_reqs is None:
+            raise RuntimeError("FULL Draft Window capture requires a request count")
+        key = descriptor.num_reqs, descriptor.num_tokens
+        if key in captures:
             raise RuntimeError("Draft Window capture descriptor mapping is ambiguous")
-        keys.add(key)
-    return DraftWindowDFlashCaptureContext(provider, route, input_buffers)
+        captures[key] = provider.capture_identity_for(route=route, descriptor=descriptor)
+    if not captures:
+        raise RuntimeError("Draft Window capture has no FULL descriptor")
+    return DraftWindowDFlashCaptureContext(provider, route, input_buffers, captures)
 
 
 @contextmanager
@@ -213,57 +197,32 @@ def ascend_prepare_dflash_inputs_to_capture(
         raise RuntimeError("Draft Window capture context owner mismatch")
     identity, workspace = context.resolve(num_reqs, num_tokens)
 
-    input_batch = InputBatch.make_dummy(num_reqs, num_tokens, input_buffers)
-    input_block_tables = block_tables.get_dummy_block_tables(num_reqs)
-    slot_mappings = block_tables.get_dummy_slot_mappings(num_tokens)
-    slot_mappings_by_layer = build_slot_mappings_by_layer(
-        slot_mappings,
+    # Keep dummy InputBatch, Full slots, query geometry and model-specific
+    # metadata construction in the fixed MRV2 helper. Only replace the actual
+    # Window read operands before any capture forward is submitted.
+    state = _ORIGINAL_PREPARE_DFLASH_INPUTS_TO_CAPTURE(
+        num_reqs,
+        num_tokens,
+        input_buffers,
+        block_tables,
+        attn_groups,
         kv_cache_config,
+        max_model_len,
+        skip_attn,
+        causal,
     )
-    max_seq_len = _seed_capture_workspace(
-        identity, workspace, input_block_tables, max_model_len=max_model_len, provider=context.provider
+    if not state.attn_metadata:
+        raise RuntimeError("Draft Window capture builder produced no attention metadata")
+    tables = tuple(table[:num_reqs] for table in block_tables.input_block_tables)
+    capacity = _seed_capture_workspace(
+        identity, workspace, tables, max_model_len=max_model_len, provider=context.provider
     )
-    query_start_loc_cpu = torch.from_numpy(input_batch.query_start_loc_np)
-    dcp_local_seq_lens = None
-    if block_tables.cp_size > 1:
-        dcp_local_seq_lens = prepare_dcp_local_seq_lens(
-            input_buffers.dcp_local_seq_lens,
-            workspace.device_window_exact,
-            input_batch.num_reqs,
-            block_tables.cp_size,
-            block_tables.cp_rank,
-            block_tables.cp_interleave,
-            num_reqs_padded=input_batch.num_reqs_after_padding,
-        )
-    read_block_tables = list(input_block_tables)
-    read_block_tables[context.provider.source.group.gid] = workspace.window_block_table
-    from vllm_ascend.worker.v2.spec_decode.draft_window_eager import AscendDraftAttentionReadInputs
-
-    graph_read_inputs = AscendDraftAttentionReadInputs(
-        block_tables=tuple(read_block_tables),
-        seq_lens=workspace.device_window_exact,
-        seq_lens_cpu_exact=workspace.cpu_window_exact,
-        seq_lens_cpu_upper_bound=workspace.cpu_window_upper,
-        max_seq_len=max_seq_len,
-        dcp_local_seq_lens=dcp_local_seq_lens,
-    )
-    attn_metadata = build_attn_metadata(
-        attn_groups=attn_groups,
-        num_reqs=num_reqs,
-        num_tokens=num_tokens,
-        query_start_loc_gpu=input_batch.query_start_loc,
-        query_start_loc_cpu=query_start_loc_cpu,
-        max_query_len=num_tokens // num_reqs,
-        seq_lens=workspace.device_window_exact,
-        seq_lens_cpu=workspace.cpu_window_exact,
-        seq_lens_cpu_upper_bound=workspace.cpu_window_upper,
-        draft_window_read_inputs=graph_read_inputs,
-        dcp_local_seq_lens=dcp_local_seq_lens,
-        max_seq_len=max_seq_len,
-        block_tables=tuple(read_block_tables),
-        slot_mappings=slot_mappings,
-        kv_cache_config=kv_cache_config,
-        for_cudagraph_capture=True,
-        causal=causal,
-    )
-    return AttentionState(attn_metadata, slot_mappings_by_layer)
+    for name in context.provider.source.group.layers:
+        layer = state.attn_metadata[name]
+        layer.block_tables = workspace.window_block_table
+        layer.seq_lens = layer.seq_lens_gpu = workspace.device_window_exact
+        layer.seq_lens_cpu = workspace.cpu_window_exact
+        layer.seq_lens_list = workspace.cpu_window_exact.tolist()
+        layer.max_seq_len = capacity
+        layer.query_start_loc = input_buffers.query_start_loc[: num_reqs + 1]
+    return state

@@ -20,7 +20,6 @@ from vllm.v1.worker.gpu.input_batch import InputBatch
 
 from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftMetadataInputs,
-    DraftWindowGenerationIdentity,
     gather_valid_num_blocks_cpu,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphBindingProvider
@@ -208,6 +207,7 @@ def build_draft_window_attn_metadata(
     dcp_local_seq_lens: torch.Tensor | None,
     attn_groups: Any = None,
     attn_state: Any = None,
+    parallel_config: Any = None,
 ) -> dict[str, Any]:
     """Assemble canonical query/write fields with one explicit Window read view.
 
@@ -249,6 +249,8 @@ def build_draft_window_attn_metadata(
 
     if attn_state is None:
         attn_state = next(layer.attn_state for layer in owner.model_state.attn_metadata.values() if layer is not None)
+    if parallel_config is None:
+        parallel_config = owner.attn_vllm_config.parallel_config
     metadata = build_attn_metadata(
         draft_window_read_inputs=read_inputs,
         attn_groups=owner.attn_groups if attn_groups is None else attn_groups,
@@ -268,7 +270,7 @@ def build_draft_window_attn_metadata(
         seq_lens_cpu_upper_bound=read_inputs.seq_lens_cpu_upper_bound,
         positions=owner.input_buffers.positions[:num_tokens_padded],
         is_prefilling=torch.from_numpy(owner.input_batch.is_prefilling_np),
-        parallel_config=owner.vllm_config.parallel_config,
+        parallel_config=parallel_config,
         attn_state=attn_state,
     )
     # The generic builder also makes a temporary GPU query-layout copy.
@@ -464,9 +466,13 @@ class DraftWindowGraphInputMixin:
         selected = getattr(self, "_draft_window_selected_metadata", None)
         output_workspace = None
         if selected is not None:
-            session = self._draft_window_graph_session
-            capture_identity = session.resolve_capture_identity(selected.descriptor)
-            output_workspace = session.provider.prepare_workspace(capture_identity)
+            from vllm_ascend.worker.v2.spec_decode.draft_window_graph import resolve_parallel_draft_window_graph_route
+
+            provider = self._draft_window_graph_binding_provider
+            route = resolve_parallel_draft_window_graph_route(self)
+            assert route is not None
+            capture_identity = provider.capture_identity_for(route=route, descriptor=selected.descriptor)
+            output_workspace = provider.prepare_workspace(capture_identity)
 
         cpu_full_exact = self._snapshot_prepared_draft_seq_lens(num_reqs_padded)
         cpu_apply_time_full_upper = torch.zeros(
@@ -513,21 +519,6 @@ class DraftWindowGraphInputMixin:
         )
         return inputs
 
-    def _validated_draft_attention_read_inputs(
-        self,
-        inputs: DraftMetadataInputs,
-        expected_identity: DraftWindowGenerationIdentity,
-    ) -> AscendDraftAttentionReadInputs:
-        """The single formal P4a validation and transport-narrowing boundary."""
-        inputs.validate_for(expected_identity)
-        return draft_window_read_inputs(
-            inputs.workspace,
-            actual_request_count=len(expected_identity.proposal.ordered_request_ids),
-            padded_request_count=expected_identity.padded_request_count,
-            block_tables=self.block_tables.input_block_tables,
-            global_group_id=inputs._owner.source.group.gid,
-        )
-
     def _build_attn_metadata(
         self,
         num_reqs: int,
@@ -569,7 +560,6 @@ class DraftWindowGraphInputMixin:
             validate_full8_single_request_graph_stage,
         )
         from vllm_ascend.worker.v2.spec_decode.draft_window_graph_metadata import defer_parallel_graph_metadata
-
 
         validate_full8_single_request_graph_stage(self, actual=num_reqs, padded=padded, tokens=tokens)
         full_slots = self.block_tables.slot_mappings[:, :tokens]
