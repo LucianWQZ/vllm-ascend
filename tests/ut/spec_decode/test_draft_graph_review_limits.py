@@ -441,7 +441,7 @@ class DraftGraphSupportTest(unittest.TestCase):
         owner = NS(
             _draft_graph_review_limit=scope,
             max_model_len=scope.max_model_len,
-            _eagle3_window_proposal_context=NS(phase_plan=NS(baseline_only_rows=(0,))),
+            _eagle3_window_epoch_source=NS(_active=NS(phase_plan=NS(baseline_only_rows=(0,)))),
         )
         batch = self.batch()
         batch.num_computed_prefill_tokens_np = [512]
@@ -746,7 +746,7 @@ class EagleMixedRequestControls(unittest.TestCase):
         self.assertEqual(cpu_lengths, [1280, 513])
         batch.num_computed_prefill_tokens_np = [1152, 384]
         batch.num_scheduled_tokens = [128, 129]
-        owner._eagle3_window_proposal_context = NS(phase_plan=NS(baseline_only_rows=(0,)))
+        owner._eagle3_window_epoch_source = NS(_active=NS(phase_plan=NS(baseline_only_rows=(0,))))
         for step in (0, 1, 2):
             M.validate_eagle_single_request_review_exact(
                 owner, batch, Vector([1280 + step, 513 + step]), num_reqs=2, padded=2, step=step
@@ -757,12 +757,12 @@ class EagleMixedRequestControls(unittest.TestCase):
                         owner, batch, Vector(values), num_reqs=2, padded=2, step=step
                     )
         # Absent/changed phase cannot relabel a terminal/decode row as continuing.
-        owner._eagle3_window_proposal_context = NS(phase_plan=NS(baseline_only_rows=()))
+        owner._eagle3_window_epoch_source = NS(_active=NS(phase_plan=NS(baseline_only_rows=())))
         with self.assertRaises(NotImplementedError):
             M.validate_eagle_single_request_review_exact(
                 owner, batch, Vector(cpu_lengths), num_reqs=2, padded=2, step=0
             )
-        owner._eagle3_window_proposal_context = NS(phase_plan=NS(baseline_only_rows=(1,)))
+        owner._eagle3_window_epoch_source = NS(_active=NS(phase_plan=NS(baseline_only_rows=(1,))))
         with self.assertRaises(RuntimeError):
             M.validate_eagle_single_request_review_exact(
                 owner, batch, Vector([1537, 513]), num_reqs=2, padded=2, step=0
@@ -783,7 +783,7 @@ class EagleMixedRequestControls(unittest.TestCase):
             owner, batch = _pair_owner_batch()
             batch.num_computed_prefill_tokens_np = [1152, 384]
             batch.num_scheduled_tokens = [128, 129]
-            owner._eagle3_window_proposal_context = NS(phase_plan=NS(baseline_only_rows=(0,)))
+            owner._eagle3_window_epoch_source = NS(_active=NS(phase_plan=NS(baseline_only_rows=(0,))))
             if damage == "wrong-id":
                 batch.req_ids[0] = "different-request"
             elif damage == "bad-index":
@@ -829,6 +829,7 @@ def idle_owner():
         update_stream=object(),
         _eagle3_graph_session=session,
         _eagle3_window_bypass_active=True,
+        _eagle3_window_epoch_source=NS(_active=None),
         _eagle3_window_continuing_prefill=False,
         _draft_window_graph_binding_provider=provider,
     )
@@ -861,7 +862,7 @@ class EagleIdleOwnershipControls(unittest.TestCase):
                 self.assertTrue(IDLE["validate_eagle_dp_dummy_replay"](owner, manager, descriptor, [{}] * count))
                 with self.assertRaises(RuntimeError):
                     IDLE["validate_eagle_dp_dummy_replay"](owner, manager, descriptor, [{}] * (count + 1))
-            self.assertIsNone(getattr(owner, "_eagle3_window_proposal_context", None))
+            self.assertIsNone(owner._eagle3_window_epoch_source._active)
         self.assertFalse(owner._eagle3_graph_dp_dummy_active)
         self.assertFalse(getattr(owner, "_draft_window_graph_submission_uncertain", False))
         # K0 business first-only is a genuine request, never dummy/idle.
@@ -878,15 +879,14 @@ class EagleIdleOwnershipControls(unittest.TestCase):
             raise RuntimeError("injected submission uncertainty")
         self.assertTrue(owner._draft_window_graph_submission_uncertain)
         self.assertFalse(owner._eagle3_graph_dp_dummy_active)
-        for field in ("_eagle3_window_proposal_context",):
-            owner, batch, session = idle_owner()
-            setattr(owner, field, object())
-            with (
-                self.assertRaises(RuntimeError),
-                IDLE["eagle3_dp_dummy_scope"](owner, batch, dummy_run=True, is_profile=False),
-            ):
-                self.fail("live business generation entered dummy replay")
-            self.assertTrue(owner._draft_window_graph_submission_uncertain)
+        owner, batch, session = idle_owner()
+        owner._eagle3_window_epoch_source._active = object()
+        with (
+            self.assertRaises(RuntimeError),
+            IDLE["eagle3_dp_dummy_scope"](owner, batch, dummy_run=True, is_profile=False),
+        ):
+            self.fail("live business generation entered dummy replay")
+        self.assertTrue(owner._draft_window_graph_submission_uncertain)
         owner, batch, session = idle_owner()
         owner._draft_window_graph_binding_provider._active_inputs = object()
         with (

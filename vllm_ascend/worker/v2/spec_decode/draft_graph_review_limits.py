@@ -344,7 +344,7 @@ def validate_eagle_single_request_review_exact(owner, input_batch, exact, *, num
         or str(exact.dtype) != "torch.int32"
     ):
         raise RuntimeError("Eagle review lost its exact admitted-row CPU consumer input")
-    context = getattr(owner, "_eagle3_window_proposal_context", None)
+    context = getattr(getattr(owner, "_eagle3_window_epoch_source", None), "_active", None)
     continuing_rows = context.phase_plan.baseline_only_rows if context is not None else ()
     for position, (prompt, maximum) in enumerate(rows):
         value = exact[position].item()
