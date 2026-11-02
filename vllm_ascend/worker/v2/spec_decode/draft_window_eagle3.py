@@ -11,7 +11,6 @@ import torch
 
 from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftMetadataInputs,
-    DraftWindowGenerationIdentity,
     gather_valid_num_blocks_cpu,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_eager import (
@@ -47,8 +46,6 @@ class Eagle3DraftWindowMixin:
     _eagle3_window_epoch_source: DraftWindowProposalEpochSource
     _eagle3_window_proposal_context: DraftWindowProposalContext | None
     _eagle3_window_proposal_plan: tuple[DraftWindowPlan, ...] | None
-    _eagle3_window_live_inputs: DraftMetadataInputs | None
-    _eagle3_window_last_identity: DraftWindowGenerationIdentity | None
     _eagle3_window_decode_step_one_exact: torch.Tensor | None
     _eagle3_window_bypass_active: bool
     _eagle3_window_next_step: int
@@ -79,8 +76,6 @@ class Eagle3DraftWindowMixin:
         self._eagle3_window_epoch_source = DraftWindowProposalEpochSource()
         self._eagle3_window_proposal_context = None
         self._eagle3_window_proposal_plan = None
-        self._eagle3_window_live_inputs = None
-        self._eagle3_window_last_identity = None
         self._eagle3_window_decode_step_one_exact = None
         self._eagle3_window_bypass_active = False
         self._eagle3_window_continuing_prefill = False
@@ -134,14 +129,12 @@ class Eagle3DraftWindowMixin:
         context = epoch_source.begin(input_batch)
         self._eagle3_window_proposal_context = context
         self._eagle3_window_proposal_plan = None
-        self._eagle3_window_live_inputs = None
-        self._eagle3_window_last_identity = None
         self._eagle3_window_decode_step_one_exact = None
         self._eagle3_window_next_step = 0
         self._eagle3_window_expected_steps = expected_steps
         try:
             yield
-            if self._eagle3_window_live_inputs is not None:
+            if self._draft_window_graph_binding_provider._active_inputs is not None:
                 raise RuntimeError("Eagle3 proposal returned with an active Draft Window reader")
             if self._eagle3_window_next_step != expected_steps:
                 raise RuntimeError(
@@ -156,7 +149,7 @@ class Eagle3DraftWindowMixin:
                 self._quarantine_eagle3_window()
             raise
         finally:
-            live_inputs = self._eagle3_window_live_inputs
+            live_inputs = self._draft_window_graph_binding_provider._active_inputs
             try:
                 if (
                     live_inputs is not None
@@ -167,8 +160,6 @@ class Eagle3DraftWindowMixin:
             finally:
                 self._eagle3_window_proposal_context = None
                 self._eagle3_window_proposal_plan = None
-                self._eagle3_window_live_inputs = None
-                self._eagle3_window_last_identity = None
                 self._eagle3_window_decode_step_one_exact = None
                 self._eagle3_window_next_step = 0
                 self._eagle3_window_expected_steps = self.num_speculative_steps
@@ -222,16 +213,15 @@ class Eagle3DraftWindowMixin:
             type(step) is not int
             or not 0 <= step < self._eagle3_window_expected_steps
             or step != self._eagle3_window_next_step
-            or self._eagle3_window_live_inputs is not None
+            or self._draft_window_graph_binding_provider._active_inputs is not None
         ):
             raise RuntimeError("Eagle3 Window step is stale or its previous reader remains active")
         context = self._require_eagle3_window_context()
         batch = self.input_batch
-        self._eagle3_window_epoch_source.validate(context, batch)
         self._validate_request_counts(num_reqs, num_reqs_padded)
         provider = self._draft_window_graph_binding_provider
         proposal = self._eagle3_window_proposal_plan
-        previous = self._eagle3_window_last_identity
+        previous = provider._last_retired_identity if step else None
         if step == 0:
             if proposal is not None:
                 raise RuntimeError("Eagle3 first-pass Window state is already materialized")
@@ -306,12 +296,6 @@ class Eagle3DraftWindowMixin:
             output_workspace=output_workspace,
         )
         self._eagle3_window_proposal_plan = proposal
-        self._eagle3_window_live_inputs = inputs
-        try:
-            self._eagle3_window_epoch_source.validate(context, batch)
-        except BaseException:
-            self._quarantine_eagle3_window()
-            raise
         return inputs
 
     def _quarantine_eagle3_window(self) -> None:

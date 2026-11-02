@@ -229,9 +229,7 @@ class Eagle3GraphSession:
             self.require_reusable()
             self.provider.retire_generation(current)
             self._carriers.append(carrier)
-            owner._eagle3_window_last_identity = current
             owner._eagle3_window_next_step = current.step + 1
-            owner._eagle3_window_live_inputs = None
         except BaseException:
             owner._quarantine_eagle3_window()
             raise

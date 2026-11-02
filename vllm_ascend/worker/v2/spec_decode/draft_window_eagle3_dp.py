@@ -12,7 +12,6 @@ from contextlib import contextmanager
 def _validate_eagle_dp_dummy(owner, session):
     session.require_reusable()
     provider = getattr(owner, "_draft_window_graph_binding_provider", None)
-    runtime = getattr(owner, "_draft_window_graph_binding_provider", None)
     support = getattr(owner, "_draft_graph_review_limit", None)
     if (
         getattr(owner, "method", None) != "eagle3"
@@ -27,9 +26,8 @@ def _validate_eagle_dp_dummy(owner, session):
         or getattr(owner, "_eagle3_window_bypass_active", False) is not True
         or getattr(owner, "_eagle3_window_continuing_prefill", False) is not False
         or getattr(owner, "_eagle3_window_proposal_context", None) is not None
-        or getattr(owner, "_eagle3_window_live_inputs", None) is not None
-        or runtime is None
-        or getattr(runtime, "_active_inputs", None) is not None
+        or provider is None
+        or getattr(provider, "_active_inputs", None) is not None
         or getattr(owner, "_draft_window_graph_submission_uncertain", False) is not False
         or session._capture_call is not None
         or provider is not session.provider

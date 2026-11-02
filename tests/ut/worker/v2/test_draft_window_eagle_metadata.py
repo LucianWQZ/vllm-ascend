@@ -219,7 +219,7 @@ def proposal():
         identity = SimpleNamespace(**values)
         current = SimpleNamespace(identity=identity, retired=False)
         current.validate_for = lambda actual: actual is identity or pytest.fail("replaced identity")
-        runtime._active_inputs = owner._eagle3_window_live_inputs = current
+        runtime._active_inputs = current
         return current
 
     return owner, batch, session, runtime, inputs
@@ -245,7 +245,7 @@ def test_real_proposal_keeps_each_submitted_consumer_until_update(proposal):
             session.stage(current, first=step == 0, n=1, tokens=4 if step == 0 else 1, ordinal=max(0, step - 1))
             assert owner._eagle3_window_next_step == step + 1
             assert runtime._last_retired_identity is current.identity
-            assert owner._eagle3_window_live_inputs is None
+            assert runtime._active_inputs is None
             assert len(session._carriers) == step + 1
             session._carriers[-1].state = DraftWindowGraphCarrierState.UPDATED
     assert not session._carriers
