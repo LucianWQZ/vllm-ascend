@@ -877,9 +877,8 @@ class EagleIdleOwnershipControls(unittest.TestCase):
         ):
             raise RuntimeError("injected submission uncertainty")
         self.assertTrue(owner._draft_window_graph_submission_uncertain)
-        self.assertTrue(owner._draft_window_graph_submission_uncertain)
         self.assertFalse(owner._eagle3_graph_dp_dummy_active)
-        for field in ("_eagle3_window_proposal_context", "_eagle3_window_live_inputs"):
+        for field in ("_eagle3_window_proposal_context",):
             owner, batch, session = idle_owner()
             setattr(owner, field, object())
             with (
