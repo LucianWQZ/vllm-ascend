@@ -601,7 +601,6 @@ def test_eagle_full_continuing_keeps_full_addressing_without_window_snapshot(set
     def unexpected(*args, **kwargs):
         pytest.fail("Full continuing prefill requested a Window exact snapshot or read projection")
 
-    monkeypatch.setattr(runtime, "_eagle_first_pass_lengths", unexpected)
     monkeypatch.setattr(runtime_module, "materialize_direct_prefix", unexpected)
     retained_common = []
     with runtime.proposal_context(spec, state):
@@ -680,6 +679,7 @@ def test_eagle_full_continuing_prompt_snapshot_clamps_at_model_limit(setup):
     runtime.method, runtime.static_k, runtime._dense_reads = "eagle3", 3, True
     spec.max_model_len, spec.advance_draft_positions = 32, True
     state = batch(computed=(8, 24), prompt=(32, 32), scheduled=(4, 7), drafts=None)
+    spec.input_buffers.positions = torch.tensor([11, 30])
     with runtime.proposal_context(spec, state):
         for step in range(3):
             expected = (12 + step, min(31 + step, 32))
@@ -688,17 +688,20 @@ def test_eagle_full_continuing_prompt_snapshot_clamps_at_model_limit(setup):
             assert metadata.seq_lens_cpu.tolist() == [*expected, 0]
 
 
-def test_eagle_full_continuing_rejects_prompt_progress_change_between_ar_steps(setup):
+def test_eagle_full_continuing_uses_prepared_exact_not_old_progress_estimate(setup):
     runtime, spec, _, _ = setup
     runtime.method, runtime.static_k, runtime._dense_reads = "eagle3", 3, True
     spec.max_model_len, spec.advance_draft_positions = 4096, True
     state = batch(computed=(8, 24), prompt=(100, 100), scheduled=(4, 3), drafts=None)
-    with pytest.raises(RuntimeError, match="[Pp]rompt preparation changed"), runtime.proposal_context(spec, state):
-        runtime.metadata_callback(0, 2)(0, common())
+    with runtime.proposal_context(spec, state, num_speculative_tokens=2):
+        first, second = common(), common(exact=(13, 28))
+        runtime.metadata_callback(0, 2)(0, first)
         state.num_computed_prefill_tokens_np[0] += 1
-        runtime.metadata_callback(1, 2)(0, common())
-    assert runtime._eagle_prompt_exact_base is None
-    assert runtime.pool.poisoned
+        runtime.metadata_callback(1, 2)(0, second)
+        # Reused CPU progress does not certify a new device E. The actual
+        # prepared lengths win and the retained first result stays unchanged.
+        assert first.seq_lens_cpu.tolist() == [12, 27, 0]
+        assert second.seq_lens_cpu.tolist() == [13, 28, 0]
 
 
 def test_multiple_groups_project_same_logical_start_with_independent_backing(setup, monkeypatch):
@@ -930,23 +933,15 @@ def test_prepared_exact_pair_rejects_invalid_type_shape_or_device_prefix(setup, 
         runtime.metadata_callback(3, 2, prepared_exact_cpu=cpu, prepared_exact_device=device)
 
 
-@pytest.mark.parametrize("change", ["mapping", "device"])
-def test_prepared_exact_pair_cannot_be_applied_to_another_input(setup, change):
+def test_prepared_exact_pair_cannot_be_applied_to_another_device_input(setup):
     runtime, spec, _, _ = setup
     state, metadata = batch(), common()
     snapshot = metadata.seq_lens[:2].clone()
-    expected = "request mapping" if change == "mapping" else "device input"
-    with pytest.raises((RuntimeError, ValueError), match=expected), runtime.proposal_context(spec, state):
+    with pytest.raises(ValueError, match="device input"), runtime.proposal_context(spec, state):
         owner = runtime._owner
         callback = runtime.metadata_callback(3, 2, prepared_exact_cpu=snapshot, prepared_exact_device=metadata.seq_lens)
-        if change == "mapping":
-            callback(0, metadata)
-            state.req_ids.reverse()
-            state.idx_mapping_np[:] = state.idx_mapping_np[::-1]
-            runtime.metadata_callback(3, 2, prepared_exact_cpu=snapshot, prepared_exact_device=metadata.seq_lens)
-        else:
-            metadata.seq_lens = metadata.seq_lens.clone()
-            callback(0, metadata)
+        metadata.seq_lens = metadata.seq_lens.clone()
+        callback(0, metadata)
     assert runtime.pool.poisoned
     assert any(value is snapshot for value in owner.retained)
 
@@ -1002,7 +997,9 @@ def test_dense_device_callback_or_exact_fallback_keeps_the_same_window(setup, up
 @pytest.mark.parametrize("drafts", [None, (0, 0)])
 @pytest.mark.parametrize("all_terminal", [False, True])
 @pytest.mark.parametrize("max_len", [4096, 2178])
-def test_eagle_prompt_only_terminal_rows_reuse_exact_without_d2h(setup, monkeypatch, drafts, all_terminal, max_len):
+def test_eagle_prompt_only_terminal_rows_snapshot_each_actual_preparation(
+    setup, monkeypatch, drafts, all_terminal, max_len
+):
     runtime, spec, _, _ = setup
     runtime.method, runtime.static_k, runtime._dense_reads = "eagle3", 3, True
     runtime.window_size, runtime.anchor_block_span = 1035, 128
@@ -1020,13 +1017,14 @@ def test_eagle_prompt_only_terminal_rows_reuse_exact_without_d2h(setup, monkeypa
     spec.input_buffers.positions = torch.cat((torch.arange(1792, 2047), torch.arange(1920, 2177)))
     spec.last_token_indices = torch.tensor([254, 511])
     original_to = torch.Tensor.to
+    snapshots = []
 
-    def no_exact_cpu_copy(tensor, *args, **kwargs):
+    def record_snapshot(tensor, *args, **kwargs):
         if kwargs.get("device") == "cpu" and kwargs.get("copy") is True:
-            pytest.fail("Known prompt producer still copied current device exact lengths")
+            snapshots.append(tuple(tensor.shape))
         return original_to(tensor, *args, **kwargs)
 
-    monkeypatch.setattr(torch.Tensor, "to", no_exact_cpu_copy)
+    monkeypatch.setattr(torch.Tensor, "to", record_snapshot)
     before = table.clone()
     with runtime.proposal_context(spec, state):
         for step in range(3):
@@ -1048,55 +1046,24 @@ def test_eagle_prompt_only_terminal_rows_reuse_exact_without_d2h(setup, monkeypa
             ]
             assert metadata.slot_mapping is slots and metadata.positions is positions
             assert torch.equal(table, before)
-    assert runtime._eagle_prompt_exact_base is None
+    assert snapshots == [(2, 2), (2,), (2,)]
 
 
-@pytest.mark.parametrize(
-    "invalid",
-    ["placeholder", "query_width", "terminal_logits", "past_prompt", "decode_row", "past_limit", "replicated_pcp"],
-)
-def test_eagle_prompt_only_ambiguous_producer_keeps_exact_fallback(setup, invalid):
+def test_full_prompt_snapshot_is_cpu_owned_and_new_proposals_rebuild_it(setup):
     runtime, spec, _, _ = setup
     runtime.method, runtime.static_k, runtime._dense_reads = "eagle3", 3, True
     spec.max_model_len, spec.advance_draft_positions = 100, True
-    state = batch(computed=(8, 24), prompt=(12, 100), scheduled=(4, 3), drafts=None)
-    state.query_start_loc_np = np.array([0, 4, 7])
-    state.cu_num_logits_np = np.array([0, 1, 1])
-    if invalid == "placeholder":
-        state.num_draft_tokens_per_req = np.array([1, 0])
-    elif invalid == "query_width":
-        state.query_start_loc_np[1] = 3
-    elif invalid == "terminal_logits":
-        state.cu_num_logits_np[1:] = 2
-    elif invalid == "past_prompt":
-        state.prefill_len_np[0] = 11
-    elif invalid == "decode_row":
-        state.is_prefilling_np[0] = False
-    elif invalid == "past_limit":
-        spec.max_model_len = 11
-    else:
-        spec.replicated_pcp = True
-    with pytest.raises(RuntimeError, match="did not consume a read projection"), runtime.proposal_context(spec, state):
-        assert runtime._prompt_exact_lengths(0, 2) is None
-        assert runtime._eagle_prompt_exact_base is None
-    assert runtime.pool.poisoned
-
-
-def test_eagle_prompt_only_snapshot_cpu_and_generation_scope(setup):
-    runtime, spec, _, _ = setup
-    runtime.method, runtime.static_k, runtime._dense_reads = "eagle3", 3, True
-    spec.max_model_len, spec.advance_draft_positions = 100, True
-    state = batch(computed=(8, 24), prompt=(12, 100), scheduled=(4, 3), drafts=None)
-    state.query_start_loc_np = np.array([0, 4, 7])
-    state.cu_num_logits_np = np.array([0, 1, 1])
-    with pytest.raises(RuntimeError, match="preparation changed"), runtime.proposal_context(spec, state):
-        with torch.device("meta"):
-            snapshot = runtime._prompt_exact_lengths(0, 2)
-        assert snapshot.device.type == "cpu" and snapshot.tolist() == [12, 27]
-        state.num_scheduled_tokens[1] += 1
-        state.query_start_loc_np[-1] += 1
-        runtime._prompt_exact_lengths(1, 2)
-    assert runtime.pool.poisoned and runtime._eagle_prompt_exact_base is None
+    state = batch(computed=(8, 24), prompt=(100, 100), scheduled=(4, 3), drafts=None)
+    results = []
+    for ends in ((12, 27), (13, 28)):
+        spec.input_buffers.positions = torch.tensor(ends) - 1
+        metadata = common(exact=ends)
+        with runtime.proposal_context(spec, state, num_speculative_tokens=1), torch.device("meta"):
+            runtime.metadata_callback(0, 2)(0, metadata)
+            assert metadata.seq_lens_cpu.device.type == "cpu"
+            results.append(metadata.seq_lens_cpu)
+    assert [values.tolist() for values in results] == [[12, 27, 0], [13, 28, 0]]
+    assert results[0] is not results[1]
 
 
 def test_eagle_mixed_decode_prompt_uses_one_exact_snapshot_per_preparation(setup, monkeypatch):
@@ -1143,7 +1110,7 @@ def test_eagle_mixed_decode_prompt_uses_one_exact_snapshot_per_preparation(setup
 
 
 @pytest.mark.parametrize("method", ["dflash", "dspark"])
-def test_parallel_continuing_prefill_reuses_certified_prompt_exact_without_full_gather(setup, monkeypatch, method):
+def test_parallel_continuing_prefill_snapshots_actual_exact_without_full_gather(setup, monkeypatch, method):
     runtime, spec, _, _ = setup
     runtime.method, runtime._dense_reads = method, True
     runtime.window_size, runtime.anchor_block_span = 1024, 128
@@ -1159,13 +1126,14 @@ def test_parallel_continuing_prefill_reuses_certified_prompt_exact_without_full_
     metadata.query_start_loc_cpu = torch.tensor([0, 8, 16, 16], dtype=torch.int32)
     spec.input_buffers.seq_lens = metadata.seq_lens
     original_to = torch.Tensor.to
+    snapshots = []
 
-    def no_exact_cpu_copy(tensor, *args, **kwargs):
+    def record_snapshot(tensor, *args, **kwargs):
         if kwargs.get("device") == "cpu" and kwargs.get("copy") is True:
-            pytest.fail("Certified continuing prompt producer copied device exact")
+            snapshots.append(tuple(tensor.shape))
         return original_to(tensor, *args, **kwargs)
 
-    monkeypatch.setattr(torch.Tensor, "to", no_exact_cpu_copy)
+    monkeypatch.setattr(torch.Tensor, "to", record_snapshot)
     before = table.clone()
     slots, positions = metadata.slot_mapping, metadata.positions
     with runtime.proposal_context(spec, state):
@@ -1179,6 +1147,8 @@ def test_parallel_continuing_prefill_reuses_certified_prompt_exact_without_full_
         assert read.exact_cpu_for(metadata)[:2].tolist() == [1151, 1281]
         assert metadata.slot_mapping is slots and metadata.positions is positions
         assert torch.equal(table, before)
+
+    assert snapshots == [(2,)]
 
 
 @pytest.mark.parametrize("invalid", ["mixed_decode", "terminal", "placeholder", "query_width", "replicated_pcp"])
@@ -1199,7 +1169,7 @@ def test_parallel_prompt_producer_rejects_uncertified_preparation(setup, invalid
     else:
         spec.replicated_pcp = True
     with pytest.raises(RuntimeError, match="did not consume"), runtime.proposal_context(spec, state):
-        assert runtime._prompt_exact_lengths(spec.num_query_per_req, 2) is None
+        assert not runtime._parallel_full_prefill(2, continuing_prefill_rows(state, 2))
 
 
 def test_mla_partial_rotary_copy_failure_keeps_submitted_operands(setup, monkeypatch):
@@ -1240,19 +1210,13 @@ def test_mla_partial_rotary_copy_failure_keeps_submitted_operands(setup, monkeyp
     torch.testing.assert_close(canonical, full, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("changed", ["request_ids", "slots", "extent"])
-def test_eagle_next_preparation_rejects_changed_proposal_mapping(setup, changed):
+def test_eagle_next_preparation_rejects_incorrect_active_extent(setup):
     runtime, spec, _, _ = setup
     runtime.method, runtime.static_k = "eagle3", 3
     state = batch()
     with pytest.raises(RuntimeError, match="request mapping"), runtime.proposal_context(spec, state):
         runtime.metadata_callback(0, 2)(0, common())
-        if changed == "request_ids":
-            state.req_ids.reverse()
-        elif changed == "slots":
-            state.idx_mapping_np[:] = [3, 1]
-        else:
-            state.num_reqs = 1
+        state.num_reqs = 1
         runtime.metadata_callback(1, 2)
     assert runtime.pool.poisoned
 

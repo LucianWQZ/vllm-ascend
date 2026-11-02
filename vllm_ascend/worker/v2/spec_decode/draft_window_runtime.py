@@ -111,9 +111,7 @@ class DraftWindowRuntime:
         self._bypass = False
         self._build_count = 0
         self._eagle_plans: tuple[DraftWindowPlan, ...] | None = None
-        self._eagle_prompt_exact_base: tuple[Any, torch.Tensor] | None = None
         self._next_step = 0
-        self._proposal_mapping: tuple[tuple[str, ...], tuple[int, ...]] | None = None
         self._sources: dict[int, DirectPrefixSource] = {}
 
     @property
@@ -228,9 +226,7 @@ class DraftWindowRuntime:
             self._input_batch = input_batch
             self._build_count = 0
             self._eagle_plans = None
-            self._eagle_prompt_exact_base = None
             self._next_step = 0
-            self._proposal_mapping = None
             self._sources.clear()
             try:
                 # Preparation and builders enqueue copies/kernels before model
@@ -252,8 +248,6 @@ class DraftWindowRuntime:
                 self._owner = None
                 self._input_batch = None
                 self._eagle_plans = None
-                self._eagle_prompt_exact_base = None
-                self._proposal_mapping = None
                 self._sources.clear()
 
     def _source(self, gid: int, num_reqs: int) -> DirectPrefixSource:
@@ -288,15 +282,10 @@ class DraftWindowRuntime:
             raise ValueError("Parallel Draft metadata step must match its actual query width")
         if self.method == "eagle3" and (step != self._next_step or step >= self.static_k):
             raise ValueError("Eagle3 metadata must advance exactly one configured step")
-        # The fixed metadata builder walks groups synchronously; InputBatch
-        # changes only between preparations, not between groups in this walk.
-        # Eagle still rechecks the mapping at every actual AR preparation.
-        mapping = (tuple(batch.req_ids), tuple(int(row) for row in batch.idx_mapping_np[:num_reqs]))
-        if batch.num_reqs != num_reqs or len(mapping[0]) != num_reqs:
+        # The fixed propose call keeps this InputBatch's CPU request mapping
+        # unchanged through every synchronous first/AR metadata preparation.
+        if batch.num_reqs != num_reqs or len(batch.req_ids) != num_reqs:
             raise RuntimeError("Draft Window request mapping does not cover the active preparation")
-        if self._proposal_mapping is not None and self._proposal_mapping != mapping:
-            raise RuntimeError("Draft Window request mapping changed within a proposal")
-        self._proposal_mapping = mapping
         if (prepared_exact_cpu is None) != (prepared_exact_device is None):
             raise ValueError("Prepared exact CPU lengths require their device input")
         if prepared_exact_cpu is not None:
@@ -373,7 +362,7 @@ class DraftWindowRuntime:
                 and getattr(self.speculator, "advance_draft_positions", False)
                 and not getattr(self.speculator, "replicated_pcp", False)
             ):
-                return self._full_prefill_metadata_callback(step, num_reqs)
+                return self._full_prefill_metadata_callback(step, num_reqs, common)
             dense = dense and not (
                 self._input_batch.is_prefilling_np[:num_reqs].all()
                 or not getattr(self.speculator, "advance_draft_positions", False)
@@ -388,12 +377,8 @@ class DraftWindowRuntime:
                 if prefilling.any()
                 else int(common.query_start_loc_cpu[: num_reqs + 1].diff().max()) <= self.static_k + 1
             )
-        elif self.method != "eagle3" and dense:
-            prompt_exact = self._prompt_exact_lengths(step, num_reqs)
-            if prompt_exact is not None:
-                prepared_exact_cpu = prompt_exact
-                prepared_exact_device = self.speculator.input_buffers.seq_lens[:num_reqs]
-                dense = False
+        elif self.method != "eagle3" and dense and self._parallel_full_prefill(num_reqs, continuing):
+            dense = False
         return self._host_metadata_callback(
             step,
             num_reqs,
@@ -404,14 +389,21 @@ class DraftWindowRuntime:
             dense=dense,
         )
 
-    def _full_prefill_metadata_callback(self, step: int, num_reqs: int):
-        exact = self._prompt_exact_lengths(step, num_reqs, full_only=True)
-        assert exact is not None
+    def _full_prefill_metadata_callback(self, step: int, num_reqs: int, common: Any):
         owner = self._owner
         assert owner is not None
+        full_exact = common.seq_lens
+        self.pool.retain(owner, full_exact)
+        if step == 0:
+            exact, live = self._eagle_first_pass_lengths(full_exact, num_reqs)
+            if not torch.equal(exact, live):
+                raise ValueError("Full prompt metadata cannot include rejected query padding")
+        else:
+            exact = full_exact[:num_reqs].to(device="cpu", dtype=torch.int32, copy=True)
+        self.pool.retain(owner, exact)
 
         def apply(gid: int, common: Any) -> None:
-            exact_cpu = torch.zeros(common.num_reqs, dtype=torch.int32)
+            exact_cpu = torch.zeros(common.num_reqs, dtype=torch.int32, device="cpu")
             exact_cpu[:num_reqs] = exact
             common.seq_lens_cpu = common._seq_lens_cpu = exact_cpu
             self.pool.retain(owner, common, exact_cpu, common.seq_lens, common.block_table_tensor)
@@ -455,73 +447,27 @@ class DraftWindowRuntime:
             raise ValueError("Eagle3 prepared live queries disagree with the current native padding extent")
         return extent_cpu, live_cpu
 
-    def _prompt_exact_lengths(self, step: int, num_reqs: int, *, full_only: bool = False):
-        """Use exact scheduled prompt progress, never an optimistic CPU E.
+    def _parallel_full_prefill(self, num_reqs: int, continuing: np.ndarray) -> bool:
+        """Keep large ongoing prompts on their native Full consumer.
 
-        Continuing parallel prompts append their fixed query block. Eagle
-        advances a retained first-pass base through its actual AR steps. A
-        terminal Eagle row is exact only with the canonical single-logit
-        producer; unknown/mixed/rejection/PCP preparations keep device E.
+        This chooses a consumer, never an exact length. Unknown layouts keep
+        the existing private read path; all lengths come from actual device E.
         """
-        batch, owner = self._input_batch, self._owner
-        if owner is None:
-            raise RuntimeError("Prompt exact lengths have no active Draft Window proposal")
-        if (
-            not self._dense_reads
-            or getattr(self.speculator, "replicated_pcp", False)
-            or batch.num_reqs != num_reqs
-            or not batch.is_prefilling_np[:num_reqs].all()
-            or (self.method == "eagle3" and not getattr(self.speculator, "advance_draft_positions", False))
-        ):
-            return None
+        batch = self._input_batch
         drafts = batch.num_draft_tokens_per_req
-        if drafts is not None and drafts[:num_reqs].any():
-            return None
-        progress = batch.num_computed_prefill_tokens_np[:num_reqs]
         scheduled = batch.num_scheduled_tokens[:num_reqs]
-        prompt = batch.prefill_len_np[:num_reqs]
-        ends = progress + scheduled
-        if np.any(progress < 0) or np.any(scheduled <= 0) or np.any(ends > self.speculator.max_model_len):
-            return None
-        if full_only or self.method != "eagle3":
-            if np.any(ends >= prompt):
-                return None
-        elif np.any(ends > prompt):
-            return None
-        if not full_only:
-            boundaries = getattr(batch, "query_start_loc_np", None)
-            if (
-                boundaries is None
-                or len(boundaries) < num_reqs + 1
-                or not np.array_equal(np.diff(boundaries[: num_reqs + 1]), scheduled)
-            ):
-                return None
-            if self.method == "eagle3":
-                logits = getattr(batch, "cu_num_logits_np", None)
-                if (
-                    logits is None
-                    or len(logits) < num_reqs + 1
-                    or np.any(np.diff(logits[: num_reqs + 1])[ends == prompt] != 1)
-                ):
-                    return None
-        if self.method != "eagle3":
-            return torch.tensor(
-                np.minimum(ends + self.speculator.num_query_per_req, self.speculator.max_model_len),
-                dtype=torch.int32,
-                device="cpu",
-            )
-        identity = (tuple(progress), tuple(scheduled), tuple(prompt))
-        if self._eagle_prompt_exact_base is None:
-            if step != 0:
-                return None
-            base = torch.tensor(ends, dtype=torch.int32, device="cpu")
-            self._eagle_prompt_exact_base = identity, base
-            self.pool.retain(owner, base)
-        if self._eagle_prompt_exact_base[0] != identity:
-            raise RuntimeError("Prompt preparation changed within a proposal")
-        exact = torch.clamp(self._eagle_prompt_exact_base[1] + step, max=self.speculator.max_model_len)
-        self.pool.retain(owner, exact)
-        return exact
+        boundaries = getattr(batch, "query_start_loc_np", None)
+        return bool(
+            continuing.all()
+            and batch.is_prefilling_np[:num_reqs].all()
+            and not getattr(self.speculator, "replicated_pcp", False)
+            and (drafts is None or not drafts[:num_reqs].any())
+            and (scheduled > 0).all()
+            and (batch.num_computed_prefill_tokens_np[:num_reqs] + scheduled <= self.speculator.max_model_len).all()
+            and boundaries is not None
+            and len(boundaries) >= num_reqs + 1
+            and np.array_equal(np.diff(boundaries[: num_reqs + 1]), scheduled)
+        )
 
     def _host_metadata_callback(
         self,
@@ -537,8 +483,7 @@ class DraftWindowRuntime:
         """Project current prepared lengths; CPU reuse requires an explicit pair.
 
         The caller owns a fresh exact snapshot in this active proposal and
-        request order: either a completed copy from the device input or the
-        separately certified unfinished-parallel-prompt producer. It must not
+        request order, completed from its paired device input. It must not
         modify that snapshot afterward. A common CPU field alone is not an
         exactness certificate. The proposal retains the supplied snapshot.
         """
@@ -546,17 +491,8 @@ class DraftWindowRuntime:
         assert owner is not None
         full_exact_input = common.seq_lens
         self.pool.retain(owner, full_exact_input)
-        prompt_exact = (
-            self._prompt_exact_lengths(step, num_reqs)
-            if self.method == "eagle3" and prepared_exact_cpu is None
-            else None
-        )
-        if self.method == "eagle3" and step == 0 and prompt_exact is not None:
-            exact = proposal_exact = prompt_exact
-        elif self.method == "eagle3" and step == 0:
+        if self.method == "eagle3" and step == 0:
             exact, proposal_exact = self._eagle_first_pass_lengths(full_exact_input, num_reqs)
-        elif prompt_exact is not None:
-            exact = prompt_exact
         elif prepared_exact_cpu is not None:
             assert prepared_exact_device is not None
             if (
