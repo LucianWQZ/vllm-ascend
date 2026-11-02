@@ -16,6 +16,7 @@ import unittest
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from types import MethodType, SimpleNamespace
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[3]
 SPEC = ROOT / "vllm_ascend/worker/v2/spec_decode/dflash/speculator.py"
@@ -26,6 +27,7 @@ LIFETIME = ROOT / "vllm_ascend/worker/v2/spec_decode/draft_window_lifetime.py"
 def load_lifetime():
     name = "_r8_pr017_parallel_owner_lifetime"
     spec = importlib.util.spec_from_file_location(name, LIFETIME)
+    assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
     spec.loader.exec_module(module)
@@ -52,6 +54,7 @@ def load_seam(completion):
     spec = importlib.util.spec_from_file_location(
         name, ROOT / "vllm_ascend/worker/v2/spec_decode/draft_graph_review_limits.py"
     )
+    assert spec is not None and spec.loader is not None
     guard_module = importlib.util.module_from_spec(spec)
     sys.modules[name] = guard_module
     spec.loader.exec_module(guard_module)
@@ -94,14 +97,14 @@ class ParallelOwnerTests(unittest.TestCase):
         self.seam = load_seam(Completion)
         self.batch = SimpleNamespace(is_dummy=False)
         self.owner = SimpleNamespace(
-            _draft_window_runtime_state=SimpleNamespace(quarantined_identity=None),
+            _draft_window_graph_binding_provider=SimpleNamespace(quarantined_identity=None),
             _draft_window_epoch_source=object(),
             _draft_window_bypass_active=False,
             _draft_window_proposal_context=None,
             vllm_config=SimpleNamespace(max_concurrent_batches=2),
             num_speculative_steps=8,
         )
-        self.normal = []
+        self.normal: list[tuple[Any, dict[str, Any]]] = []
 
         @contextmanager
         def normal_scope(batch, **kwargs):
@@ -145,7 +148,7 @@ class ParallelOwnerTests(unittest.TestCase):
     def test_normal_uncertain_or_quarantined_refuses_zero_before_native(self):
         for identity, uncertain in [(object(), False), (None, True)]:
             with self.subTest(uncertain=uncertain):
-                self.owner._draft_window_runtime_state.quarantined_identity = identity
+                self.owner._draft_window_graph_binding_provider.quarantined_identity = identity
                 self.owner._draft_window_graph_submission_uncertain = uncertain
                 with (
                     self.assertRaisesRegex(RuntimeError, "quarantined"),
@@ -198,15 +201,15 @@ class ParallelOwnerTests(unittest.TestCase):
         self.assertEqual(len(self.normal), 5)
         self.assertTrue(self.normal[-1][1]["dummy_run"])
         self.assertFalse(hasattr(self.owner, "_draft_window_context_kv_pool"))
-        for tokens in (1, 7, 9, False, 0.0):
+        for invalid_tokens in (1, 7, 9, False, 0.0):
             with (
-                self.subTest(tokens=tokens),
+                self.subTest(tokens=invalid_tokens),
                 self.assertRaisesRegex(RuntimeError, "static K"),
             ):
-                self.scope(tokens)
+                self.scope(invalid_tokens)
 
     def test_public_typed_eager_keeps_context_only_flag_and_off_is_idle(self):
-        del self.owner._draft_window_runtime_state
+        del self.owner._draft_window_graph_binding_provider
         calls = []
 
         def proposal_context(*args, **kwargs):
@@ -236,7 +239,7 @@ class ParallelOwnerTests(unittest.TestCase):
         self.batch.req_ids = ["a"]
         self.batch.idx_mapping_np = [0]
         self.batch.prefill_len_np = [33025]
-        self.batch.draft_graph_review_request_rows = (("a", 0, 33025, 33089, 33025),)
+        self.batch.draft_graph_request_bounds = ((33025, 33089),)
         with self.scope(0):
             pass
         self.assertEqual(self.normal, [])
@@ -268,8 +271,10 @@ class ParallelOwnerTests(unittest.TestCase):
             function = propose[0]
             self.assertIn("dp_sync_state", [arg.arg for arg in function.args.args])
             self.assertIn("num_speculative_tokens", [arg.arg for arg in function.args.args])
-            self.assertIsInstance(function.body[0], ast.Assign)
-            self.assertEqual(function.body[0].value.func.id, "_draft_window_owner_scope")
+            assignment = function.body[0]
+            assert isinstance(assignment, ast.Assign) and isinstance(assignment.value, ast.Call)
+            assert isinstance(assignment.value.func, ast.Name)
+            self.assertEqual(assignment.value.func.id, "_draft_window_owner_scope")
             forwarded = [
                 node
                 for node in ast.walk(function)
@@ -278,6 +283,7 @@ class ParallelOwnerTests(unittest.TestCase):
             self.assertEqual(len(forwarded), 1)
             count = [kw.value for kw in forwarded[0].keywords if kw.arg == "num_speculative_tokens"]
             self.assertEqual(len(count), 1)
+            assert isinstance(count[0], ast.Name)
             self.assertEqual(count[0].id, "num_speculative_tokens")
 
     def test_capture_keeps_544_callback_and_graph_scope(self):

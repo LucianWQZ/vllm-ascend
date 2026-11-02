@@ -299,84 +299,30 @@ def note_eagle_single_request_review_lifecycle(owner, scheduler_output):
     blocked.difference_update(finished)
 
 
-def eagle_single_request_review_rows(owner, req_states, req_ids, idx_mapping_np):
-    """Snapshot authoritative CPU limits for the qualified Eagle and DFlash entries."""
-    limit = getattr(owner, "_draft_graph_review_limit", None)
-    if not _is_eagle_support(limit) and full8_graph_review_max_requests(limit) is None:
+def draft_graph_request_bounds(owner, req_states, req_ids, idx_mapping_np):
+    """Borrow the runner's row order; copy only CPU limits absent from InputBatch."""
+    if getattr(owner, "_draft_graph_review_limit", None) is None:
         return None
-    method = "Eagle" if _is_eagle_support(limit) else "Full8"
-    rows = []
-    for req_id, raw_index in zip(req_ids, idx_mapping_np):
-        if req_id in getattr(owner, "_draft_graph_review_preempted_request_ids", ()):
-            raise NotImplementedError(f"{method} Graph support does not qualify resumption after preemption")
-        index = int(raw_index)
-        if req_states.req_id_to_index.get(req_id) != index:
-            raise RuntimeError(f"{method} review request mapping changed during input preparation")
-        rows.append(
-            (
-                req_id,
-                index,
-                int(req_states.prompt_len.np[index]),
-                int(req_states.max_seq_len[index]),
-                int(req_states.prefill_len.np[index]),
-            )
-        )
-    if len(rows) != len(req_ids):
-        raise RuntimeError(f"{method} review lacks complete authoritative request rows")
-    return tuple(rows)
-
-
-def _request_rows(owner, input_batch, *, check_padding=True):
-    """Check one authoritative row snapshot for either qualified consumer."""
-    scope = owner._draft_graph_review_limit
-    rows = getattr(input_batch, "draft_graph_review_request_rows", None)
-    active = input_batch.num_reqs
-    padded = input_batch.num_reqs_after_padding
-    if (
-        type(active) is not int
-        or not 1 <= active <= scope.max_requests
-        or (check_padding and (type(padded) is not int or padded != active))
-        or not isinstance(rows, tuple)
-        or len(rows) != active
-        or len(input_batch.req_ids) != active
-        or len(set(input_batch.req_ids)) != active
-        or len(input_batch.idx_mapping_np) < active
-        or len(input_batch.prefill_len_np) < active
-    ):
-        raise NotImplementedError("Draft Graph requires admitted actual rows and their corresponding padded bank")
-    indices = []
-    for position, row in enumerate(rows):
-        if (
-            not isinstance(row, tuple)
-            or len(row) != 5
-            or not isinstance(row[0], str)
-            or not row[0]
-            or any(type(value) is not int for value in row[1:])
-            or row[0] != input_batch.req_ids[position]
-            or row[1] < 0
-            or row[1] != int(input_batch.idx_mapping_np[position])
-            or row[4] != int(input_batch.prefill_len_np[position])
-        ):
-            raise RuntimeError("Draft Graph request identity/source row differs")
-        if row[0] in getattr(owner, "_draft_graph_review_preempted_request_ids", ()):
+    bounds = []
+    blocked = getattr(owner, "_draft_graph_review_preempted_request_ids", ())
+    for req_id, raw_index in zip(req_ids, idx_mapping_np, strict=True):
+        if req_id in blocked:
             raise NotImplementedError("Draft Graph does not qualify resumption after preemption")
-        _, index, prompt, maximum, prefill = row
-        lookahead = scope.static_k if scope.method == "eagle3" else scope.query_tokens
-        if (
-            type(getattr(owner, "max_model_len", None)) is not int
-            or owner.max_model_len != scope.max_model_len
-            or not 0 < prompt < maximum
-            or maximum + lookahead > scope.max_model_len
-            or prefill != prompt
-        ):
-            raise NotImplementedError(
-                "Draft Graph requires the original prompt/output budget and static query lookahead "
-                "within the allocated model capacity; resumed requests are not qualified"
-            )
-        indices.append(index)
-    if len(set(indices)) != active:
-        raise RuntimeError("Draft Graph request rows alias the same authoritative request index")
-    return rows
+        row = int(raw_index)
+        if req_states.req_id_to_index.get(req_id) != row:
+            raise RuntimeError("Draft Graph request mapping changed during input preparation")
+        prompt = int(req_states.prompt_len.np[row])
+        if int(req_states.prefill_len.np[row]) != prompt:
+            raise NotImplementedError("Draft Graph does not qualify resumed request history")
+        bounds.append((prompt, int(req_states.max_seq_len[row])))
+    return tuple(bounds)
+
+
+def _request_bounds(input_batch):
+    bounds = input_batch.draft_graph_request_bounds
+    if bounds is None:
+        raise RuntimeError("Draft Graph lacks authoritative CPU request bounds")
+    return bounds
 
 
 def validate_eagle_single_request_review_exact(owner, input_batch, exact, *, num_reqs, padded, step):
@@ -384,7 +330,7 @@ def validate_eagle_single_request_review_exact(owner, input_batch, exact, *, num
     scope = getattr(owner, "_draft_graph_review_limit", None)
     if not _is_eagle_support(scope):
         return
-    rows = _request_rows(owner, input_batch)
+    rows = _request_bounds(input_batch)
     if (
         type(num_reqs) is not int
         or num_reqs != len(rows)
@@ -400,7 +346,7 @@ def validate_eagle_single_request_review_exact(owner, input_batch, exact, *, num
         raise RuntimeError("Eagle review lost its exact admitted-row CPU consumer input")
     context = getattr(owner, "_eagle3_window_proposal_context", None)
     continuing_rows = context.phase_plan.baseline_only_rows if context is not None else ()
-    for position, (request_id, _, prompt, maximum, _) in enumerate(rows):
+    for position, (prompt, maximum) in enumerate(rows):
         value = exact[position].item()
         lower = prompt
         upper = min(maximum + scope.static_k, scope.max_model_len)
@@ -425,7 +371,7 @@ def validate_eagle_single_request_review_exact(owner, input_batch, exact, *, num
         if type(value) is not int or not lower <= value <= upper:
             raise NotImplementedError(
                 "Eagle consumer exact length is outside its request and model capacity: "
-                f"row={position}, request={request_id!r}, step={step}, exact={value!r}, expected=[{lower}, {upper}]"
+                f"row={position}, step={step}, exact={value!r}, expected=[{lower}, {upper}]"
             )
 
 
@@ -434,10 +380,17 @@ def validate_eagle_single_request_graph_descriptor(owner, *, first, n, tokens):
     scope = getattr(owner, "_draft_graph_review_limit", None)
     if not _is_eagle_support(scope):
         return
-    rows = _request_rows(owner, owner.input_batch)
+    batch = owner.input_batch
+    rows = _request_bounds(batch)
     if type(first) is not bool or type(n) is not int or type(tokens) is not int:
         raise TypeError("Eagle review requires exact Graph descriptor types")
-    if n != len(rows) or tokens != n * (scope.static_k + 1 if first else 1):
+    if (
+        not 1 <= n <= scope.max_requests
+        or n != batch.num_reqs
+        or n != batch.num_reqs_after_padding
+        or n != len(rows)
+        or tokens != n * (scope.static_k + 1 if first else 1)
+    ):
         raise NotImplementedError(
             "Eagle review Graph requires padded1 or explicitly admitted padded2, first Q4 or AR Q1 before replay"
         )
@@ -512,4 +465,32 @@ def validate_draft_graph_review_requests(
         != scope.max_model_len
     ):
         raise RuntimeError("DFlash Graph owner lost its configured query/model capacity")
-    _request_rows(owner, input_batch, check_padding=not context_kv_only)
+    rows = _request_bounds(input_batch)
+    active, padded = input_batch.num_reqs, input_batch.num_reqs_after_padding
+    if (
+        type(active) is not int
+        or not 1 <= active <= scope.max_requests
+        or (not context_kv_only and (type(padded) is not int or padded != active))
+        or len(rows) != active
+        or len(input_batch.req_ids) != active
+        or len(set(input_batch.req_ids)) != active
+        or len(input_batch.idx_mapping_np) < active
+        or len(set(input_batch.idx_mapping_np[:active])) != active
+        or len(input_batch.prefill_len_np) < active
+        or owner.max_model_len != scope.max_model_len
+    ):
+        raise NotImplementedError("Draft Graph requires admitted actual rows and their corresponding padded bank")
+    blocked = getattr(owner, "_draft_graph_review_preempted_request_ids", ())
+    lookahead = scope.static_k if scope.method == "eagle3" else scope.query_tokens
+    for position, (prompt, maximum) in enumerate(rows):
+        if input_batch.req_ids[position] in blocked:
+            raise NotImplementedError("Draft Graph does not qualify resumption after preemption")
+        if (
+            not 0 < prompt < maximum
+            or maximum + lookahead > scope.max_model_len
+            or input_batch.prefill_len_np[position] != prompt
+        ):
+            raise NotImplementedError(
+                "Draft Graph requires the original prompt/output budget and static query lookahead "
+                "within allocated capacity; resumed requests are not qualified"
+            )

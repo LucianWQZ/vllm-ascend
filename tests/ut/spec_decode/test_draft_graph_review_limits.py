@@ -367,7 +367,7 @@ class DraftGraphSupportTest(unittest.TestCase):
             req_ids=[r[0] for r in records],
             idx_mapping_np=list(range(rows)),
             prefill_len_np=[1021] * rows,
-            draft_graph_review_request_rows=records,
+            draft_graph_request_bounds=tuple((r[2], r[3]) for r in records),
         )
 
     def test_actual_rows_and_request_identity_not_client_concurrency(self):
@@ -396,6 +396,29 @@ class DraftGraphSupportTest(unittest.TestCase):
             owner, NS(finished_req_ids={"request-0"}, preempted_req_ids=set())
         )
         GUARD.validate_draft_graph_review_requests(owner, batch)
+
+    def test_bounds_use_runner_order_and_reject_changed_or_resumed_requests(self):
+        import numpy as np
+
+        scope = self.resolve(self.config(rows=2))
+        owner = NS(_draft_graph_review_limit=scope)
+        state = NS(
+            req_id_to_index={"a": 2, "b": 0},
+            prompt_len=NS(np=np.array([513, 0, 1537])),
+            prefill_len=NS(np=np.array([513, 0, 1537])),
+            max_seq_len=np.array([545, 0, 1569]),
+        )
+        self.assertEqual(GUARD.draft_graph_request_bounds(owner, state, ["a", "b"], [2, 0]), ((1537, 1569), (513, 545)))
+        for ids, indices in ((["a", "b"], [0, 2]), (["other", "b"], [2, 0])):
+            with self.subTest(ids=ids, indices=indices), self.assertRaises(RuntimeError):
+                GUARD.draft_graph_request_bounds(owner, state, ids, indices)
+        state.prefill_len.np[2] += 1
+        with self.assertRaises(NotImplementedError):
+            GUARD.draft_graph_request_bounds(owner, state, ["a", "b"], [2, 0])
+        state.prefill_len.np[2] -= 1
+        owner._draft_graph_review_preempted_request_ids = {"b"}
+        with self.assertRaises(NotImplementedError):
+            GUARD.draft_graph_request_bounds(owner, state, ["a", "b"], [2, 0])
 
     def test_changed_normalized_head_dimension_stays_blocked(self):
         config = self.config()
@@ -447,7 +470,7 @@ class DraftGraphSupportTest(unittest.TestCase):
         )
         batch = self.batch()
         GUARD.validate_draft_graph_review_requests(owner, batch)
-        batch.draft_graph_review_request_rows = (("request-0", 0, 1021, 40960, 1021),)
+        batch.draft_graph_request_bounds = ((1021, 40960),)
         with self.assertRaises(NotImplementedError):
             GUARD.validate_draft_graph_review_requests(owner, batch)
 
@@ -496,7 +519,9 @@ class DraftGraphSupportTest(unittest.TestCase):
                 entry(owner, batch, num_speculative_tokens=7)
             batch.req_ids[0] = "wrong-original-request"
             with self.assertRaises(RuntimeError):
-                entry(owner, batch, num_speculative_tokens=0)
+                GUARD.draft_graph_request_bounds(
+                    owner, NS(req_id_to_index={"request-0": 0}), batch.req_ids, batch.idx_mapping_np
+                )
         self.assertFalse(hasattr(owner, "_draft_window_runtime"))
 
     def test_actual_propose_rejects_bad_rows_before_replacing_owner(self):
@@ -540,7 +565,7 @@ def _single_owner_batch(prompt=257, output=32, capacity=4096):
         req_ids=["actual-A"],
         idx_mapping_np=[7],
         prefill_len_np=[prompt],
-        draft_graph_review_request_rows=(("actual-A", 7, prompt, prompt + output, prompt),),
+        draft_graph_request_bounds=((prompt, prompt + output),),
     )
     owner.input_batch = batch
     return owner, batch
@@ -554,7 +579,7 @@ def _pair_owner_batch():
         req_ids=["request-A", "request-B"],
         idx_mapping_np=[7, 3],
         prefill_len_np=[1537, 513],
-        draft_graph_review_request_rows=(("request-A", 7, 1537, 1569, 1537), ("request-B", 3, 513, 545, 513)),
+        draft_graph_request_bounds=((1537, 1569), (513, 545)),
     )
     owner.input_batch = batch
     return owner, batch
@@ -778,6 +803,12 @@ class EagleMixedRequestControls(unittest.TestCase):
             else:
                 batch.num_scheduled_tokens[0] = 0
             with self.subTest(damage=damage), self.assertRaises((RuntimeError, NotImplementedError)):
+                if damage in ("wrong-id", "bad-index"):
+                    # Identity is established when the actual runner builds the
+                    # batch, not repeatedly reconstructed by each AR reader.
+                    state = NS(req_id_to_index={"request-A": 7, "request-B": 3})
+                    M.draft_graph_request_bounds(owner, state, batch.req_ids, batch.idx_mapping_np)
+                M.validate_draft_graph_review_requests(owner, batch)
                 M.validate_eagle_single_request_review_exact(
                     owner, batch, Vector([1280, 513]), num_reqs=2, padded=2, step=0
                 )

@@ -1088,9 +1088,9 @@ class NPUModelRunner(GPUModelRunner):
         # prefill_len may include generated tokens after preemption and is not
         # an original prompt-length substitute. This reads existing CPU state.
         if getattr(self.speculator, "_draft_graph_review_limit", None) is not None:
-            from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import eagle_single_request_review_rows
+            from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import draft_graph_request_bounds
 
-            input_batch.draft_graph_review_request_rows = eagle_single_request_review_rows(
+            input_batch.draft_graph_request_bounds = draft_graph_request_bounds(
                 self.speculator,
                 self.req_states,
                 req_ids,
