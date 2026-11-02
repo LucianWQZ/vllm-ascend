@@ -17,6 +17,7 @@ from vllm.v1.worker.gpu.input_batch import InputBuffers
 from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftWindowGraphSource,
     DraftWindowWorkspace,
+    gather_valid_num_blocks_cpu,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_backends import (
     DraftWindowGroupRoute,
@@ -97,6 +98,32 @@ def _bank_tensors(bank):
 
 def _bind(case, inputs):
     return case.provider.bind_read_carrier(capture_identity=case.capture, inputs=inputs)
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_parallel_exact_snapshot_is_an_independent_cpu_int32_allocation(dtype):
+    from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowGraphInputMixin
+
+    owner = object.__new__(DraftWindowGraphInputMixin)
+    source = torch.tensor([11, 14, 0, 0, 99], dtype=dtype)
+    owner.input_buffers = SimpleNamespace(seq_lens=source)
+    snapshot = owner._snapshot_prepared_draft_seq_lens(4)
+    assert snapshot.device.type == "cpu" and snapshot.dtype == torch.int32
+    assert snapshot.shape == (4,) and snapshot.tolist() == [11, 14, 0, 0]
+    snapshot.fill_(7)
+    assert source.tolist() == [11, 14, 0, 0, 99]
+
+
+def test_canonical_count_gather_owns_cpu_int32_storage_and_inert_padding(graph_buffers):
+    case = graph_buffers
+    case.owner.num_blocks.cpu[0].copy_(torch.tensor([3, 4], dtype=torch.int32))
+    counts = gather_valid_num_blocks_cpu(case.source, idx_mapping_np=np.array([1, 0]), num_reqs=2, num_reqs_padded=4)
+    assert counts.device.type == "cpu" and counts.dtype == torch.int32
+    assert counts.shape == (4,) and counts.tolist() == [4, 3, 0, 0]
+    case.owner.num_blocks.cpu.fill_(9)
+    assert counts.tolist() == [4, 3, 0, 0]
+    counts.zero_()
+    assert case.owner.num_blocks.cpu.tolist() == [[9, 9]]
 
 
 def test_direct_capture_bank_never_allocates_scratch_or_mutates_full_source(graph_buffers):
@@ -356,8 +383,11 @@ def test_startup_capture_exposes_the_real_bank_without_fake_generation(graph_buf
         bank.max_num_reqs += 1
 
 
-def test_parallel_capture_uses_exact_manager_descriptor_and_preserves_full_tables(graph_buffers):
-    from vllm_ascend.worker.v2.spec_decode.dflash.capture import _build_capture_context, _seed_capture_workspace
+def test_parallel_capture_uses_registered_geometry_and_preserves_full_tables(graph_buffers):
+    from vllm_ascend.worker.v2.spec_decode.dflash.capture import (
+        _seed_capture_workspace,
+        draft_window_dflash_capture_scope,
+    )
 
     case = graph_buffers
     buffers = object.__new__(InputBuffers)
@@ -366,21 +396,20 @@ def test_parallel_capture_uses_exact_manager_descriptor_and_preserves_full_table
         _draft_window_graph_binding_provider=case.provider,
         model_state=SimpleNamespace(attn_metadata=case.target_metadata),
     )
-    desc = case.capture.descriptor
-    ctx = _build_capture_context(owner, buffers, {CUDAGraphMode.FULL: [desc]})
-    assert ctx is not None
-    identity = ctx.capture_banks_for(route=case.capture.route, num_reqs=2, num_tokens=2)[0]
-    read = ctx.startup_capture_workspace(identity)
-    assert identity is case.capture
-    full = case.source.table
-    before = full.clone()
-    maximum = _seed_capture_workspace(read, max_model_len=16, provider=case.provider)
-    assert maximum == 7 and read.cpu_window_exact.tolist() == [7, 7]
-    assert read.device_window_exact.tolist() == [7, 7]
-    assert torch.equal(full, before)
-    assert torch.equal(read.window_block_table[:, :2], full[:, :2])
-    with pytest.raises(RuntimeError, match="descriptor does not resolve"):
-        _build_capture_context(owner, buffers, {CUDAGraphMode.FULL: [replace(desc, max_query_len=1)]})
+    with draft_window_dflash_capture_scope(owner, buffers) as context:
+        assert context is not None
+        identity = context.capture_banks_for(route=case.capture.route, num_reqs=2, num_tokens=2)[0]
+        read = context.startup_capture_workspace(identity)
+        assert identity is case.capture
+        full = case.source.table
+        before = full.clone()
+        maximum = _seed_capture_workspace(read, max_model_len=16, provider=case.provider)
+        assert maximum == 7 and read.cpu_window_exact.tolist() == [7, 7]
+        assert read.device_window_exact.tolist() == [7, 7]
+        assert torch.equal(full, before)
+        assert torch.equal(read.window_block_table[:, :2], full[:, :2])
+        with pytest.raises(RuntimeError, match="no captured consumer for this geometry"):
+            context.capture_banks_for(route=case.capture.route, num_reqs=1, num_tokens=2)
 
 
 @pytest.mark.parametrize("capture_fails", [False, True])
@@ -390,11 +419,10 @@ def test_parallel_capture_scope_owns_its_attachment_until_normal_or_error_exit(g
     case = graph_buffers
     buffers = case.input_buffers
     owner = SimpleNamespace(input_buffers=buffers, _draft_window_graph_binding_provider=case.provider)
-    descriptors = {CUDAGraphMode.FULL: [case.capture.descriptor]}
     full_before = case.owner.input_block_tables[0].clone()
     slots_before = case.owner.slot_mappings.clone()
     try:
-        with capture.draft_window_dflash_capture_scope(owner, buffers, descriptors) as context:
+        with capture.draft_window_dflash_capture_scope(owner, buffers) as context:
             assert getattr(buffers, capture._CAPTURE_CONTEXT_ATTRIBUTE) is context
             assert context is not None
             bucket = context.capture_banks_for(route=case.capture.route, num_reqs=2, num_tokens=2)[0]
@@ -402,7 +430,7 @@ def test_parallel_capture_scope_owns_its_attachment_until_normal_or_error_exit(g
             assert bucket is case.capture and bank is case.capture.workspace
             with (
                 pytest.raises(RuntimeError, match="already attached"),
-                capture.draft_window_dflash_capture_scope(owner, buffers, descriptors),
+                capture.draft_window_dflash_capture_scope(owner, buffers),
             ):
                 pytest.fail("nested capture must not start")
             if capture_fails:
@@ -423,8 +451,6 @@ def test_window_capture_delegates_original_dummy_preparation_then_only_rebinds_r
     buffers = object.__new__(InputBuffers)
     buffers.query_start_loc = torch.tensor([0, 1, 2], dtype=torch.int32)
     owner = SimpleNamespace(input_buffers=buffers, _draft_window_graph_binding_provider=case.provider)
-    ctx = capture._build_capture_context(owner, buffers, {CUDAGraphMode.FULL: [case.capture.descriptor]})
-    setattr(buffers, capture._CAPTURE_CONTEXT_ATTRIBUTE, ctx)
     slots, state_marker = object(), object()
     layer = SimpleNamespace(slot_mapping=slots, actual_seq_lengths_q=[1, 2], attn_state=state_marker, causal=False)
     state = AttentionState({"draft.layer": layer}, {"draft.layer": slots})
@@ -436,7 +462,10 @@ def test_window_capture_delegates_original_dummy_preparation_then_only_rebinds_r
 
     monkeypatch.setattr(capture, "_ORIGINAL_PREPARE_DFLASH_INPUTS_TO_CAPTURE", upstream)
     full = case.owner.input_block_tables[0].clone()
-    result = capture.ascend_prepare_dflash_inputs_to_capture(2, 2, buffers, case.owner, [], object(), 16, False, False)
+    with capture.draft_window_dflash_capture_scope(owner, buffers):
+        result = capture.ascend_prepare_dflash_inputs_to_capture(
+            2, 2, buffers, case.owner, [], object(), 16, False, False
+        )
     assert result is state and len(calls) == 1
     bank = case.provider.startup_capture_workspace(case.capture)
     assert layer.block_tables is bank.window_block_table
@@ -793,7 +822,7 @@ def test_eagle_first_bank_retains_full_table_capacity_for_a_mixed_prefill(graph_
 
 
 @pytest.mark.parametrize("failure", [None, "update", "republish", "prepare"])
-def test_actual_proposal_scope_owns_fresh_inputs_and_preserves_failed_submission(graph_buffers, failure):
+def test_actual_proposal_scope_owns_fresh_inputs_and_preserves_failed_submission(graph_buffers, failure, monkeypatch):
     from contextlib import nullcontext
 
     from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowGraphInputMixin
@@ -817,10 +846,20 @@ def test_actual_proposal_scope_owns_fresh_inputs_and_preserves_failed_submission
     errors = {
         "update": (RuntimeError, "native UPDATE failed"),
         "republish": (RuntimeError, "overwrite active draft metadata"),
-        "prepare": (TypeError, "CPU Full exact must use int32"),
+        "prepare": (RuntimeError, "native Window copy failed"),
     }
     expected = pytest.raises(errors[failure][0], match=errors[failure][1]) if failure else nullcontext()
     preparation_error = None
+    if failure == "prepare":
+        original_copy = torch.Tensor.copy_
+        bank_storage = case.capture.workspace.window_block_table.untyped_storage().data_ptr()
+
+        def failed_copy(destination, *args, **kwargs):
+            if destination.untyped_storage().data_ptr() == bank_storage:
+                raise RuntimeError("native Window copy failed")
+            return original_copy(destination, *args, **kwargs)
+
+        monkeypatch.setattr(torch.Tensor, "copy_", failed_copy)
     with expected as caught, owner._draft_window_proposal_scope(batch, dummy_run=False, is_profile=False):
         context = owner._draft_window_proposal
         assert context is not None and context.input_batch is batch
@@ -833,13 +872,13 @@ def test_actual_proposal_scope_owns_fresh_inputs_and_preserves_failed_submission
         try:
             inputs = case.provider.materialize(
                 proposal=context,
-                cpu_full_exact=torch.tensor([11, 14], dtype=torch.float32 if failure == "prepare" else torch.int32),
+                cpu_full_exact=torch.tensor([11, 14], dtype=torch.int32),
                 cpu_valid_num_blocks=torch.tensor([4, 4], dtype=torch.int32),
                 num_reqs_padded=2,
                 step=0,
                 output_workspace=case.provider.prepare_workspace(case.capture),
             )
-        except TypeError as error:
+        except RuntimeError as error:
             preparation_error = error
             raise
         _bind(case, inputs)

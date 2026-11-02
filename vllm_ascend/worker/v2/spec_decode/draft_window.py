@@ -89,16 +89,6 @@ def gather_valid_num_blocks_cpu(
     return out
 
 
-def _shares_storage(left: torch.Tensor, right: torch.Tensor) -> bool:
-    """Conservatively reject output views into any borrowed source storage."""
-    if left.device != right.device:
-        return False
-    try:
-        return left.untyped_storage().data_ptr() == right.untyped_storage().data_ptr()
-    except (AttributeError, RuntimeError):
-        return left.data_ptr() == right.data_ptr()
-
-
 def _build_draft_window_source_capability_for_context(
     *,
     policy: DraftWindowPolicyDecision,
@@ -201,37 +191,12 @@ class DraftWindowWorkspace:
         padded = inputs.padded_request_count
         if padded > self.max_num_reqs:
             raise RuntimeError(f"draft-window request capacity exceeded: padded={padded} capacity={self.max_num_reqs}")
-        _validate_window_length_input(
-            cpu_full_exact,
-            name="CPU Full exact",
-            padded_request_count=padded,
-            expected_device=torch.device("cpu"),
-        )
-        _validate_window_length_input(
-            cpu_valid_num_blocks,
-            name="CPU valid block counts",
-            padded_request_count=padded,
-            expected_device=torch.device("cpu"),
-        )
-        workspace_tensors = (
-            self.window_block_table,
-            self.device_window_exact,
-            self.cpu_window_exact,
-        )
-        if any(
-            _shares_storage(supplied, backing)
-            for supplied in (cpu_full_exact, cpu_valid_num_blocks)
-            for backing in workspace_tensors
-        ):
-            raise ValueError("Window length inputs must not alias workspace backing")
         if actual and bool(torch.any(cpu_full_exact[:actual] < 0)):
             raise ValueError("Full exact lengths must be greater than or equal to 0")
         if frozen_row_plans is not None and len(frozen_row_plans) != actual:
             raise ValueError("frozen Window anchors must match active request rows")
 
         source_table = source.table
-        if source_table.device != self.window_block_table.device or source_table.dtype != self.window_block_table.dtype:
-            raise ValueError("canonical source table and Window bank must share a dtype and device")
         self.window_block_table.zero_()
         self.cpu_window_exact.zero_()
         span = source.group.table_column_span
@@ -288,20 +253,3 @@ class DraftMetadataInputs:
             raise RuntimeError("cannot use retired Draft inputs")
         if self._owner.quarantined:
             raise RuntimeError("cannot use quarantined Draft inputs")
-
-
-def _validate_window_length_input(
-    tensor: torch.Tensor,
-    *,
-    name: str,
-    padded_request_count: int,
-    expected_device: torch.device,
-) -> None:
-    if tensor.ndim != 1:
-        raise ValueError(f"{name} must be one-dimensional")
-    if tensor.shape[0] < padded_request_count:
-        raise ValueError(f"{name} is too small for the padded request count")
-    if tensor.dtype != torch.int32:
-        raise TypeError(f"{name} must use int32")
-    if tensor.device != expected_device:
-        raise ValueError(f"{name} must live on {expected_device}")

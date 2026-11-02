@@ -11,17 +11,13 @@ mappings and query/write carriers remain owned by canonical ``BlockTables``.
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from typing import Any
 
-from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.block_table import BlockTables
-from vllm.v1.worker.gpu.cudagraph_utils import (
-    AttentionState,
-    BatchExecutionDescriptor,
-)
+from vllm.v1.worker.gpu.cudagraph_utils import AttentionState
 from vllm.v1.worker.gpu.input_batch import InputBuffers
 from vllm.v1.worker.gpu.spec_decode.dflash.cudagraph import (
     _prepare_dflash_inputs_to_capture as _ORIGINAL_PREPARE_DFLASH_INPUTS_TO_CAPTURE,
@@ -32,68 +28,38 @@ from vllm_ascend.worker.v2.spec_decode.draft_window import DraftWindowWorkspace
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
     DraftWindowGraphBindingProvider,
     DraftWindowGraphRoute,
-    resolve_parallel_draft_window_graph_route,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph_metadata import bind_draft_window_read
 
 _CAPTURE_CONTEXT_ATTRIBUTE = "_ascend_draft_window_capture_context"
 
 
-def _build_capture_context(
-    owner: Any,
-    input_buffers: InputBuffers,
-    capture_descs: Mapping[CUDAGraphMode, Sequence[BatchExecutionDescriptor]],
-) -> DraftWindowGraphBindingProvider | None:
+@contextmanager
+def draft_window_dflash_capture_scope(
+    owner: Any, input_buffers: InputBuffers
+) -> Iterator[DraftWindowGraphBindingProvider | None]:
+    """Attach the admitted provider at the actual Draft capture boundary.
+
+    Startup registration already validates the manager's full descriptors.
+    The fixed callback resolves each actual geometry before a capture forward.
+    """
     provider = getattr(owner, "_draft_window_graph_binding_provider", None)
     if provider is None:
-        return None
+        yield None
+        return
     if not isinstance(provider, DraftWindowGraphBindingProvider):
         raise TypeError("invalid instance-owned Draft Window graph binding provider")
-    if not isinstance(input_buffers, InputBuffers) or getattr(owner, "input_buffers", None) is not input_buffers:
+    if not isinstance(input_buffers, InputBuffers) or owner.input_buffers is not input_buffers:
         raise RuntimeError("capture must use the speculator-owned Draft input buffers")
     if getattr(owner, "target_input_buffers", None) is input_buffers:
         raise RuntimeError("Draft Window capture context cannot use Target input buffers")
-    route = resolve_parallel_draft_window_graph_route(owner)
-    if route is None:
-        raise RuntimeError("Draft Window graph provider has no parallel capture route")
-    descriptors = tuple(
-        descriptor
-        for entries in capture_descs.values()
-        for descriptor in entries
-        if descriptor.cg_mode is CUDAGraphMode.FULL
-    )
-    for descriptor in descriptors:
-        if descriptor.num_reqs is None:
-            raise RuntimeError("FULL Draft Window capture requires a request count")
-        provider.capture_identity_for(route=route, descriptor=descriptor)
-    if not descriptors:
-        raise RuntimeError("Draft Window capture has no FULL descriptor")
-    return provider
-
-
-@contextmanager
-def draft_window_dflash_capture_scope(
-    owner: Any,
-    input_buffers: InputBuffers,
-    capture_descs: Mapping[CUDAGraphMode, Sequence[BatchExecutionDescriptor]],
-) -> Iterator[DraftWindowGraphBindingProvider | None]:
-    """Attach a capture context to one Draft-private input owner and clean it."""
     if hasattr(input_buffers, _CAPTURE_CONTEXT_ATTRIBUTE):
         raise RuntimeError("Draft Window capture context is already attached")
-    context = _build_capture_context(
-        owner,
-        input_buffers,
-        capture_descs,
-    )
-    if context is None:
-        yield None
-        return
-    setattr(input_buffers, _CAPTURE_CONTEXT_ATTRIBUTE, context)
+    setattr(input_buffers, _CAPTURE_CONTEXT_ATTRIBUTE, provider)
     try:
-        yield context
+        yield provider
     finally:
-        if hasattr(input_buffers, _CAPTURE_CONTEXT_ATTRIBUTE):
-            delattr(input_buffers, _CAPTURE_CONTEXT_ATTRIBUTE)
+        delattr(input_buffers, _CAPTURE_CONTEXT_ATTRIBUTE)
 
 
 def _seed_capture_workspace(
