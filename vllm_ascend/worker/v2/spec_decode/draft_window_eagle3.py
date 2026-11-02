@@ -223,6 +223,16 @@ class Eagle3DraftWindowMixin:
                 )
                 for value in exact[:num_reqs]
             )
+            if batch.has_prefill:
+                widths = np.diff(batch.query_start_loc_np[: num_reqs + 1])
+                if any(
+                    not context.phase_plan.full_read_rows[row] and query > plan.window_visible_length
+                    for row, (query, plan) in enumerate(zip(widths, proposal))
+                ):
+                    raise NotImplementedError(
+                        "Eagle3 Window terminal prefill query begins before its frozen read window; "
+                        "use a smaller chunked-prefill budget"
+                    )
         else:
             step_one_exact = self._eagle3_window_decode_step_one_exact
             if proposal is None or previous is None or step_one_exact is None:

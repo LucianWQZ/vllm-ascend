@@ -628,3 +628,57 @@ def test_official_nonuniform_prefill_uses_window_first_bank_without_an_eager_own
     assert not hasattr(owner, "_draft_window_runtime")
     assert target_layer.slot_mapping is slots and target_layer.query_start_loc is query
     torch.testing.assert_close(absolute, torch.arange(7) + 70)
+
+
+def test_terminal_prefill_rejects_a_query_outside_the_frozen_window_before_writing_bank(proposal, monkeypatch):
+    from vllm_ascend.worker.v2.spec_decode import draft_window_eagle3
+
+    owner, batch, session, runtime, _ = proposal
+    owner.input_batch, owner.max_model_len = batch, 32
+    batch.num_computed_prefill_tokens_np = np.array([0])
+    batch.prefill_len_np = batch.num_scheduled_tokens = batch.seq_lens_np = np.array([10])
+    batch.is_prefilling_np, batch.has_prefill = np.array([True]), True
+    batch.query_start_loc_np = np.array([0, 10], dtype=np.int32)
+    runtime.source.window_size = 4
+    runtime.source.group = SimpleNamespace(gid=0, table_column_span=4)
+    runtime.source.full_source = object()
+    monkeypatch.setattr(
+        draft_window_eagle3,
+        "gather_valid_num_blocks_cpu",
+        lambda *args, **kwargs: pytest.fail("unsupported query reached bank materialization"),
+    )
+    with (
+        pytest.raises(NotImplementedError, match="query begins before its frozen read window"),
+        owner._eagle3_draft_window_proposal_scope(batch, dummy_run=False, is_profile=False),
+    ):
+        owner._materialize_eagle3_step(step=0, num_reqs=1, num_reqs_padded=1, output_workspace=object())
+    assert runtime._active_inputs is None
+
+
+def test_mixed_prefill_query_guard_keeps_full_rows_and_checks_only_actual_window_rows(proposal, monkeypatch):
+    from vllm_ascend.worker.v2.spec_decode import draft_window_eagle3
+
+    owner, batch, session, runtime, _ = proposal
+    owner.input_batch, owner.max_model_len = batch, 32
+    batch.num_reqs, batch.req_ids = 2, ["continuing", "terminal"]
+    batch.idx_mapping_np, batch.idx_mapping = np.array([0, 1]), torch.tensor([0, 1])
+    batch.num_computed_prefill_tokens_np = np.array([10, 8])
+    batch.prefill_len_np, batch.num_scheduled_tokens = np.array([100, 10]), np.array([10, 2])
+    batch.seq_lens_np, batch.query_start_loc_np = np.array([20, 10]), np.array([0, 10, 12], dtype=np.int32)
+    batch.is_prefilling_np, batch.has_prefill = np.array([True, True]), True
+    runtime.source.window_size = 4
+    runtime.source.group = SimpleNamespace(gid=0, table_column_span=4)
+    runtime.source.full_source = object()
+    monkeypatch.setattr(
+        draft_window_eagle3, "gather_valid_num_blocks_cpu", lambda *args, **kwargs: torch.tensor([5, 3, 0, 0])
+    )
+    calls = []
+    runtime.materialize = lambda **kwargs: calls.append(kwargs) or SimpleNamespace()
+    context = owner._eagle3_window_epoch_source.begin(batch)
+    try:
+        owner._materialize_eagle3_step(step=0, num_reqs=2, num_reqs_padded=4, output_workspace=object())
+    finally:
+        owner._eagle3_window_epoch_source.finish(context)
+    assert context.phase_plan.full_read_rows == (True, False)
+    assert len(calls) == 1 and calls[0]["cpu_full_exact"].tolist() == [20, 10, 0, 0]
+    assert [plan.window_visible_length for plan in calls[0]["frozen_row_plans"]] == [4, 2]
