@@ -494,8 +494,9 @@ def test_eagle_graph_builder_uses_the_draft_parallel_config_and_actual_phase(mon
 @pytest.mark.parametrize("mode", [CUDAGraphMode.NONE, CUDAGraphMode.PIECEWISE])
 @pytest.mark.parametrize("skip_sample", [False, True])
 @pytest.mark.parametrize("fail", [False, True])
+@pytest.mark.parametrize("padding", ["none", "tensor", "extra_request"])
 def test_official_nonuniform_prefill_uses_window_first_bank_without_an_eager_owner(
-    monkeypatch, mode, skip_sample, fail
+    monkeypatch, mode, skip_sample, fail, padding
 ):
     from vllm_ascend.attention.attention_v1 import AscendAttentionState
     from vllm_ascend.worker.v2.spec_decode.draft_window_graph_metadata import validate_draft_metadata_isolation
@@ -520,6 +521,7 @@ def test_official_nonuniform_prefill_uses_window_first_bank_without_an_eager_own
         positions=absolute,
         slot_mapping=slots,
         qfa_metadata_cache={},
+        num_actual_tokens=7,
         attn_state=AscendAttentionState.PrefillNoCache,
     )
     target = {"draft": target_layer}
@@ -565,7 +567,12 @@ def test_official_nonuniform_prefill_uses_window_first_bank_without_an_eager_own
     owner._draft_window_graph_binding_provider = provider
     owner._eagle3_graph_session = SimpleNamespace(_capture_call=None, resolve=resolve)
     owner._eagle3_window_next_step, owner.num_speculative_steps = 0, 3
-    owner.input_batch = SimpleNamespace(num_reqs=2, has_prefill=True, idx_mapping=torch.tensor([1, 0]))
+    owner.input_batch = SimpleNamespace(
+        num_reqs=2,
+        has_prefill=True,
+        idx_mapping=torch.tensor([1, 0]),
+        query_start_loc_np=np.array([0, 3, 7], dtype=np.int32),
+    )
 
     def gather(mapping, *, num_reqs_padded):
         assert mapping is owner.input_batch.idx_mapping and num_reqs_padded == 2
@@ -577,16 +584,21 @@ def test_official_nonuniform_prefill_uses_window_first_bank_without_an_eager_own
     owner._quarantine_eagle3_window = lambda: events.append("quarantine")
     owner._prepare_replicated_prefill_attn = lambda metadata, mappings, *args, **kwargs: (metadata, mappings)
     owner.draft_attn_layer_names, owner.pcp_manager = {"draft"}, None
-    owner.input_buffers = SimpleNamespace(positions=absolute.clone())
+    model_tokens = 8 if padding == "tensor" else 7
+    positions = torch.cat((absolute, torch.zeros(1, dtype=absolute.dtype))) if padding == "tensor" else absolute.clone()
+    owner.input_buffers = SimpleNamespace(positions=positions)
+    if padding == "extra_request":
+        target_layer.actual_seq_lengths_q.append(8)
+        target_layer.seq_lens_list.append(1)
     owner.last_token_indices, owner.idx_mapping = torch.tensor([2, 6]), torch.tensor([1, 0])
     owner.draft_tokens = torch.zeros((2, 3), dtype=torch.int64)
     owner.hidden_states = torch.zeros((2, 8))
     owner.sample_src_positions = torch.zeros(2, dtype=torch.int64)
     owner.temperature = owner.seeds = owner.current_draft_step = owner.draft_logits = object()
-    output = torch.arange(56, dtype=torch.float32).reshape(7, 8)
+    output = torch.arange(model_tokens * 8, dtype=torch.float32).reshape(model_tokens, 8)
 
     def forward(current, num_tokens, metadata, mappings, across, actual_mode, mm_inputs):
-        assert current is owner and num_tokens == 7 and actual_mode is mode and mappings is slot_map
+        assert current is owner and num_tokens == model_tokens and actual_mode is mode and mappings is slot_map
         assert provider._active_inputs is pending
         layer = metadata["draft"]
         assert metadata is not target and layer is not target_layer
@@ -610,14 +622,20 @@ def test_official_nonuniform_prefill_uses_window_first_bank_without_an_eager_own
 
     owner.sample_draft = sample
     monkeypatch.setattr(AscendTargetDependentARSpeculator, "_run_model", forward)
+    if padding == "extra_request":
+        with pytest.raises(NotImplementedError, match="additional padding requests"):
+            owner._prefill(2, model_tokens, target, slot_map, None, mode, skip_sample=skip_sample)
+        assert events == [] and provider._active_inputs is None and not sampled
+        assert target_layer.actual_seq_lengths_q == [3, 7, 8]
+        return
     if fail:
         with pytest.raises(ValueError, match="native prefill failed"):
-            owner._prefill(2, 7, target, slot_map, None, mode, skip_sample=skip_sample)
+            owner._prefill(2, model_tokens, target, slot_map, None, mode, skip_sample=skip_sample)
         assert events == ["prepare", "gather_full", "materialize", "publish", "native", "quarantine"]
         assert provider._active_inputs is pending and owner._eagle3_window_next_step == 0
         assert not sampled
     else:
-        owner._prefill(2, 7, target, slot_map, None, mode, skip_sample=skip_sample)
+        owner._prefill(2, model_tokens, target, slot_map, None, mode, skip_sample=skip_sample)
         assert events == ["prepare", "gather_full", "materialize", "publish", "native", "retire"]
         assert provider._active_inputs is None and owner._eagle3_window_next_step == 1
         if skip_sample:
@@ -673,7 +691,12 @@ def test_mixed_prefill_query_guard_keeps_full_rows_and_checks_only_actual_window
         draft_window_eagle3, "gather_valid_num_blocks_cpu", lambda *args, **kwargs: torch.tensor([5, 3, 0, 0])
     )
     calls = []
-    runtime.materialize = lambda **kwargs: calls.append(kwargs) or SimpleNamespace()
+
+    def materialize(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace()
+
+    runtime.materialize = materialize
     context = owner._eagle3_window_epoch_source.begin(batch)
     try:
         owner._materialize_eagle3_step(step=0, num_reqs=2, num_reqs_padded=4, output_workspace=object())

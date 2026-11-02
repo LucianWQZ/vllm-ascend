@@ -101,6 +101,22 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentA
             # outside FULL graphs. Reuse its prepared query/write metadata and
             # the same persistent first-reader bank, not a second eager owner.
             n = self.input_batch.num_reqs
+            queries = self.input_batch.query_start_loc_np[1 : n + 1].tolist()
+            if any(
+                layer is not None
+                and (
+                    layer.actual_seq_lengths_q != queries
+                    or layer.num_actual_tokens != queries[-1]
+                    or queries[-1] > num_tokens
+                    or layer.block_tables.shape[0] < n
+                    or len(layer.seq_lens_list) < n
+                )
+                for layer in attn_metadata.values()
+            ):
+                raise NotImplementedError(
+                    "Eagle3 Window native prefill requires canonical effective query rows; "
+                    "additional padding requests are not qualified for this read bank"
+                )
             capture = session.resolve(first=True, n=n, tokens=n * (self.num_speculative_steps + 1), ordinal=0)
             provider = self._draft_window_graph_binding_provider
             bank = provider.prepare_workspace(capture)

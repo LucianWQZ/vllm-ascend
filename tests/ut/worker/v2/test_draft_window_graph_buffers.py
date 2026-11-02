@@ -715,29 +715,17 @@ def test_publication_rejects_a_builder_that_lost_the_actual_read_bank(graph_buff
         _bind(case, inputs)
 
 
-def test_eagle_first_bank_retains_full_table_capacity_for_a_mixed_prefill(graph_buffers, monkeypatch):
-    from vllm_ascend.worker.v2.spec_decode import draft_window_eagle3_capture as capture_module
-
+def test_eagle_first_bank_retains_full_table_capacity_for_a_mixed_prefill(graph_buffers):
     case = graph_buffers
-    source = replace(
+    # The shared production factory already retains the canonical Full table
+    # width, including rows that continue prefill in an otherwise Window batch.
+    bounded = replace(
         case.projection,
         policy=resolve_draft_window_policy(requested_window_size=4, method="eagle3", target_model_type="qwen3"),
         runtime_route="eagle3",
         expected_future_offset=3,
+        workspace_capacity_columns=case.source.input_block_table_row_width(0),
     )
-    monkeypatch.setattr(capture_module, "draft_window_graph_enabled", lambda: True)
-    monkeypatch.setattr(capture_module, "validate_graph_context", lambda *args: None)
-    monkeypatch.setattr(capture_module, "_build_draft_window_source_capability_for_context", lambda **kwargs: source)
-    owner = SimpleNamespace(
-        method="eagle3",
-        speculative_config=SimpleNamespace(uses_dynamic_speculative_decoding=lambda: False),
-        vllm_config=object(),
-        block_tables=case.owner,
-        _draft_window_policy=source.policy,
-        attn_groups=object(),
-        kv_cache_config=object(),
-    )
-    bounded = capture_module.build_eagle3_graph_source(owner)
     assert bounded.capacity_columns == 2 and bounded.workspace_capacity_columns == 4
     provider = DraftWindowGraphBindingProvider(source=bounded)
     capture = provider.register_capture_identity(
