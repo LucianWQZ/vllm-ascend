@@ -11,7 +11,7 @@ import pytest
 import torch
 
 from tests.ut.worker.v2.draft_window_cpu import cpu_dense_planning as cpu_dense_planning
-from vllm_ascend.worker.v2.spec_decode.draft_window_lifetime import DraftWindowOwner, DraftWindowOwnerState
+from vllm_ascend.worker.v2.spec_decode.draft_window_lifetime import DraftWindowOwner
 from vllm_ascend.worker.v2.spec_decode.draft_window_policy import resolve_draft_window_policy
 from vllm_ascend.worker.v2.spec_decode.draft_window_runtime import DraftWindowRuntime, continuing_prefill_rows
 
@@ -354,7 +354,7 @@ def test_failed_native_proposal_poison_keeps_read_metadata(setup):
         runtime.metadata_callback(3, 2)(0, metadata)
         owner = runtime._owner
         raise RuntimeError("after model enqueue")
-    assert owner.state is DraftWindowOwnerState.QUARANTINED
+    assert runtime.pool.poisoned
     assert metadata in owner.retained
     assert not completions
     with pytest.raises(RuntimeError, match="quarantined"), runtime.proposal_context(spec, batch()):
@@ -371,7 +371,7 @@ def test_event_failure_after_successful_build_poison_keeps_read_metadata(setup, 
     with pytest.raises(RuntimeError, match="record failed"), runtime.proposal_context(spec, batch()):
         runtime.metadata_callback(3, 2)(0, common())
         owner = runtime._owner
-    assert owner.state is DraftWindowOwnerState.QUARANTINED
+    assert runtime.pool.poisoned
     assert owner.retained
 
 
@@ -465,7 +465,7 @@ def test_eagle_scheduled_prefill_and_steps_keep_static_window_geometry(setup, re
             runtime.metadata_callback(step, 2)(0, metadata)
             outputs.append(metadata)
         owner = runtime._owner
-    assert owner is not None and owner.state is DraftWindowOwnerState.SUBMITTED
+    assert owner is not None and owner.completion is not None
     assert runtime.static_k == 3
     assert len(completions) == 1 and runtime._next_step == consumed
     # The configured three-step horizon still freezes S=20. A scheduled
@@ -776,16 +776,16 @@ def test_context_only_kv_write_keeps_completion_without_inventing_attention(setu
     payload = torch.ones(8)
     with runtime.proposal_context(spec, batch(), context_kv_only=True):
         owner = runtime._owner
-        assert owner is not None and owner.state is DraftWindowOwnerState.ACTIVE
+        assert owner is not None and owner.completion is None
         runtime.pool.retain(owner, payload)
-    assert owner.state is DraftWindowOwnerState.SUBMITTED
+    assert owner.completion is not None
     assert owner.completion is completions[-1]
     assert any(value is payload for value in owner.retained)
     assert runtime.pool.reclaim_completed() == 0
     torch.testing.assert_close(canonical, before, rtol=0, atol=0)
     completions[-1].complete = True
     assert runtime.pool.reclaim_completed() == 1
-    assert owner.state is DraftWindowOwnerState.RELEASED
+    assert not owner.retained and owner.completion is None
 
 
 def test_context_only_scope_cannot_hide_an_actual_draft_read(setup):
@@ -927,7 +927,7 @@ def test_dsa_builder_callback_retains_every_step_and_quarantines_error(setup):
         later = runtime.metadata_builder_callback(0)(0, original, ["draft"])
         assert later is not first
         raise RuntimeError("after native")
-    assert quarantined.state is DraftWindowOwnerState.QUARANTINED
+    assert runtime.pool.poisoned
     assert any(value is later for value in quarantined.retained)
 
 
@@ -990,12 +990,12 @@ def test_prepared_exact_pair_is_explicit_and_retained_until_completion(setup, mo
     if with_prepared_exact:
         assert any(value is snapshot for value in owner.retained)
         assert snapshot.tolist() == [12, 27]
-    assert owner.state is DraftWindowOwnerState.SUBMITTED
+    assert owner.completion is not None
     runtime.pool.reclaim_completed()
-    assert owner.state is DraftWindowOwnerState.SUBMITTED
+    assert owner.completion is not None
     completions[0].complete = True
     runtime.pool.reclaim_completed()
-    assert owner.state is DraftWindowOwnerState.RELEASED
+    assert not owner.retained and owner.completion is None
     assert owner.retained == []
 
 
@@ -1046,7 +1046,7 @@ def test_prepared_exact_pair_cannot_be_applied_to_another_input(setup, change):
         else:
             metadata.seq_lens = metadata.seq_lens.clone()
         callback(0, metadata)
-    assert owner.state is DraftWindowOwnerState.QUARANTINED
+    assert runtime.pool.poisoned
     assert any(value is snapshot for value in owner.retained)
 
 
@@ -1326,7 +1326,8 @@ def test_mla_partial_rotary_copy_failure_keeps_submitted_operands(setup, monkeyp
     with pytest.raises(RuntimeError, match="MLA second RoPE copy failed"), runtime.proposal_context(spec, batch()):
         owner = runtime._owner
         runtime.retain_metadata(metadata)
-    assert owner.state is DraftWindowOwnerState.QUARANTINED
+    assert runtime.pool.poisoned
+    assert owner is not None
     first_copy = metadata["draft"].decode.cos
     assert first_copy is not cos
     assert any(value is first_copy for value in owner.retained)

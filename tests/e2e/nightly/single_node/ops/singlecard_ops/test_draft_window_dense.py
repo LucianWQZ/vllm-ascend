@@ -299,3 +299,62 @@ def test_small_causal_window_empty_rows_are_zero():
     expected[-1] = 7
     actual = dense_draft_attention(read, query, keys, values, 1 / math.sqrt(dim))
     torch.testing.assert_close(actual.cpu(), expected, atol=0, rtol=0)
+
+
+def test_same_stream_prepared_inputs_are_consumed_before_reuse():
+    """Plan/pack owns its outputs, not copies of the next step's input bank."""
+    block, dim, heads, width = 128, 128, 2, 4
+    generator = torch.Generator().manual_seed(4317)
+    table_cpu = torch.arange(24, dtype=torch.int32).reshape(2, 12)
+    keys_cpu = (torch.randn(24, block, heads, dim, generator=generator) * 0.2).bfloat16()
+    values_cpu = (torch.randn(24, block, heads, dim, generator=generator) * 0.2).bfloat16()
+    query_cpu = (torch.randn(7, 4, dim, generator=generator) * 0.2).bfloat16()
+    keys, values, query = keys_cpu.npu(), values_cpu.npu(), query_cpu.npu()
+    source = DirectPrefixSource(table_cpu.npu(), (0, 1), (12, 12), block)
+    exact = torch.empty(2, dtype=torch.int32, device="npu")
+    query_ends = torch.empty_like(exact)
+    offsets = torch.empty(3, dtype=torch.int32, device="npu")
+    offsets_cpu = torch.tensor([0, 3, 7], dtype=torch.int32)
+    rows = torch.tensor([0, 1], dtype=torch.int64, device="npu")
+    retained, results, references = [], [], []
+    for ends in ((1151, 1281), (1152, 1279), (1149, 1280)):
+        ends_cpu = torch.tensor(ends, dtype=torch.int32)
+        exact.copy_(ends_cpu)
+        query_ends.copy_(ends_cpu + 1)
+        offsets.copy_(offsets_cpu)
+        read = prepare_dense_draft_read(
+            source,
+            exact_device=exact,
+            query_ends=query_ends,
+            row_indices=rows,
+            upper_cpu=ends_cpu + 1,
+            window_size=1024,
+            anchor_span=block,
+            query_width=width,
+            causal=True,
+            query_start_loc_cpu=offsets_cpu,
+            query_start_loc_device=offsets,
+            retain=lambda *items: retained.extend(items),
+        )
+        # Enqueued after plan/pack on the same stream, before attention. Neither
+        # later attention nor output restoration may consult these inputs again.
+        exact.zero_()
+        query_ends.zero_()
+        offsets.zero_()
+        results.append(dense_draft_attention(read, query, keys, values, 1 / math.sqrt(dim)))
+        expected = []
+        for row, (end, begin, count) in enumerate(zip(ends, (0, 3), (3, 4))):
+            start = max(end - 1024, 0) // block * block
+            key = keys_cpu[row * 12 : (row + 1) * 12].flatten(0, 1)[start:end].float().repeat_interleave(2, dim=1)
+            value = values_cpu[row * 12 : (row + 1) * 12].flatten(0, 1)[start:end].float().repeat_interleave(2, dim=1)
+            q = query_cpu[begin : begin + count].float()
+            scores = torch.einsum("qhd,khd->hqk", q, key) / math.sqrt(dim)
+            positions = torch.arange(end + 1 - count, end + 1)
+            scores.masked_fill_(torch.arange(start, end)[None, :] > positions[:, None], -torch.inf)
+            expected.append(torch.einsum("hqk,khd->qhd", scores.softmax(-1), value))
+        references.append(torch.cat(expected))
+    for actual, expected in zip(results, references):
+        torch.testing.assert_close(actual.cpu().float(), expected, atol=2**-7, rtol=2**-6)
+    torch.testing.assert_close(keys.cpu(), keys_cpu, atol=0, rtol=0)
+    torch.testing.assert_close(values.cpu(), values_cpu, atol=0, rtol=0)
+    torch.testing.assert_close(source.table.cpu(), table_cpu, atol=0, rtol=0)

@@ -280,7 +280,6 @@ class DraftWindowRuntime:
                 # forward. Even a later host error must retain this proposal.
                 if self.native_swa_intersections:
                     self._native_swa_built.clear()
-                self.pool.begin_native(owner)
                 yield
                 # DFlash/DSpark keep context KV current when the scheduler
                 # requests zero drafts. That upstream branch writes KV but
@@ -444,6 +443,7 @@ class DraftWindowRuntime:
         exact = self._prompt_exact_lengths(step, num_reqs, full_only=True)
         assert exact is not None
         owner = self._owner
+        assert owner is not None
 
         def apply(gid: int, common: Any) -> None:
             exact_cpu = torch.zeros(common.num_reqs, dtype=torch.int32)
@@ -457,6 +457,7 @@ class DraftWindowRuntime:
         from vllm_ascend.worker.v2.spec_decode.draft_window_dense import prepare_dense_draft_read
 
         owner, batch = self._owner, self._input_batch
+        assert owner is not None
         query_width = 1 if eagle_step is not None else self.speculator.num_query_per_req
         packed_query_cpu = packed_query_device = None
         rows = batch.idx_mapping_np[:num_reqs]
@@ -692,6 +693,7 @@ class DraftWindowRuntime:
         exactness certificate. The proposal retains the supplied snapshot.
         """
         owner, speculator = self._owner, self.speculator
+        assert owner is not None
         # All direct-prefix groups use the same logical exact lengths and S.
         # The callback runs once per fresh common object, before each builder.
         exact = starts = rows = full_exact_input = proposal_exact = None

@@ -3,12 +3,13 @@
 
 import gc
 import weakref
+from typing import cast
 
 import pytest
 
 from vllm_ascend.worker.v2.spec_decode.draft_window_lifetime import (
+    DraftWindowCompletion,
     DraftWindowOwnerPool,
-    DraftWindowOwnerState,
 )
 
 
@@ -42,34 +43,29 @@ class Payload:
 
 
 def submit(pool, completion, *payloads):
-    owner = pool.acquire()
-    pool.retain(owner, *payloads)
-    pool.begin_native(owner)
-    pool.submit(owner, lambda: completion)
+    with pool.operation(lambda: completion) as owner:
+        pool.retain(owner, *payloads)
     return owner
 
 
-def test_pre_native_failure_releases_without_creating_an_event():
+def test_entered_proposal_failure_never_infers_that_no_work_was_submitted():
     pool = DraftWindowOwnerPool(1)
-
-    def unused_event():
-        pytest.fail("no native operation requires no event")
-
-    with pytest.raises(ValueError, match="invalid input"), pool.operation(unused_event) as owner:
+    with pytest.raises(ValueError, match="invalid input"), pool.operation(lambda: Completion()) as owner:
         pool.retain(owner, Payload())
         raise ValueError("invalid input")
-    assert owner.state is DraftWindowOwnerState.RELEASED
-    assert not owner.retained
-    assert not pool.poisoned
-    assert pool.acquire().lane == owner.lane
+    assert owner.retained and owner.completion is None and pool.poisoned
+    with pytest.raises(RuntimeError, match="quarantined"):
+        pool.acquire()
 
 
-def test_no_native_operation_needs_no_event():
-    pool = DraftWindowOwnerPool(1)
-    with pool.operation(lambda: pytest.fail("unused event")) as owner:
-        pool.retain(owner, Payload())
-    assert owner.state is DraftWindowOwnerState.RELEASED
-    assert not pool.poisoned
+def test_empty_entered_proposal_still_records_a_completion():
+    pool, completion = DraftWindowOwnerPool(1), Completion()
+    with pool.operation(lambda: completion) as owner:
+        pass
+    assert owner.completion is completion and not pool.poisoned
+    assert pool.reclaim_completed() == 0
+    completion.complete = True
+    assert pool.reclaim_completed() == 1
 
 
 def test_partial_native_submission_then_host_error_retains_and_blocks_reuse():
@@ -81,19 +77,17 @@ def test_partial_native_submission_then_host_error_retains_and_blocks_reuse():
         pool.operation(lambda: pytest.fail("success event must not be recorded")) as owner,
     ):
         pool.retain(owner, payload)
-        pool.begin_native(owner)
         del payload
         # This models entry into a possibly submitted region, not an NPU
         # operation. Host failure does not supply a completion boundary.
         raise RuntimeError("host failed after enqueue")
     gc.collect()
     assert reader_view() is not None
-    assert owner.state is DraftWindowOwnerState.QUARANTINED
+    assert pool.poisoned
     assert pool.poisoned
     # Even a free lane must not resume a context whose completion is unknown.
     with pytest.raises(RuntimeError, match="quarantined"):
         pool.acquire()
-    pool.abort(owner)
     assert reader_view() is not None
 
 
@@ -107,8 +101,7 @@ def test_completion_creation_recording_and_bookkeeping_errors_quarantine(failure
 
     with pytest.raises(RuntimeError, match=failure), pool.operation(failed_completion) as owner:
         pool.retain(owner, payload)
-        pool.begin_native(owner)
-    assert owner.state is DraftWindowOwnerState.QUARANTINED
+    assert pool.poisoned
     assert owner.retained == [payload]
     assert pool.poisoned
     with pytest.raises(RuntimeError, match="quarantined"):
@@ -118,9 +111,11 @@ def test_completion_creation_recording_and_bookkeeping_errors_quarantine(failure
 def test_invalid_completion_cannot_release_already_submitted_work():
     pool = DraftWindowOwnerPool(1)
     invalid = object()
-    with pytest.raises(TypeError, match="completion must implement"), pool.operation(lambda: invalid) as owner:
+    with (
+        pytest.raises(TypeError, match="completion must implement"),
+        pool.operation(lambda: cast(DraftWindowCompletion, invalid)) as owner,
+    ):
         pool.retain(owner, Payload())
-        pool.begin_native(owner)
     assert owner.completion is invalid
     assert owner.retained
     assert pool.poisoned
@@ -134,8 +129,11 @@ def test_completion_protocol_validation_failure_retains_the_token():
 
     pool = DraftWindowOwnerPool(1)
     invalid = InvalidCompletion()
-    with pytest.raises(RuntimeError, match="bookkeeping property failed"), pool.operation(lambda: invalid) as owner:
-        pool.begin_native(owner)
+    with (
+        pytest.raises(RuntimeError, match="bookkeeping property failed"),
+        pool.operation(lambda: cast(DraftWindowCompletion, invalid)) as owner,
+    ):
+        pool.retain(owner, Payload())
     assert owner.completion is invalid
     assert pool.poisoned
 
@@ -189,7 +187,7 @@ def test_completion_failure_never_releases_the_backing(failure):
         pool.acquire()
     assert owner.retained == [payload]
     assert owner.completion is completion
-    assert owner.state is DraftWindowOwnerState.QUARANTINED
+    assert pool.poisoned
     assert pool.poisoned
     completion.query_error = completion.wait_error = False
     completion.complete = True
@@ -207,7 +205,6 @@ def test_all_eagle_steps_and_nested_derived_state_live_until_proposal_completion
             read_views.append(weakref.ref(reads))
             derived_views.append(weakref.ref(derived))
             pool.retain(owner, reads, {"builder": {"local_and_index": derived}})
-            pool.begin_native(owner)
             del reads, derived
     assert len(owner.retained) == 8
     gc.collect()
@@ -220,18 +217,17 @@ def test_all_eagle_steps_and_nested_derived_state_live_until_proposal_completion
     assert all(ref() is None for ref in read_views + derived_views)
 
 
-def test_abort_after_record_keeps_real_completion_authoritative():
+def test_recorded_reader_keeps_completion_authoritative_until_it_finishes():
     pool = DraftWindowOwnerPool(1)
     completion = Completion()
     owner = submit(pool, completion, Payload())
-    pool.abort(owner)
     assert owner.retained
-    assert owner.state is DraftWindowOwnerState.SUBMITTED
+    assert owner.completion is completion
     assert not pool.poisoned
     assert pool.reclaim_completed() == 0
     completion.complete = True
     assert pool.reclaim_completed() == 1
-    assert owner.state is DraftWindowOwnerState.RELEASED
+    assert not owner.retained and owner.completion is None
 
 
 def test_late_reader_requires_all_reader_completion_not_primary_only():
@@ -258,10 +254,11 @@ def test_late_reader_requires_all_reader_completion_not_primary_only():
 def test_stale_or_cross_pool_owner_cannot_mutate_another_generation():
     pool = DraftWindowOwnerPool(1)
     other = DraftWindowOwnerPool(1)
-    owner = pool.acquire()
+    completion = Completion(complete=True)
+    owner = submit(pool, completion)
     with pytest.raises(RuntimeError, match="stale or belongs"):
-        other.begin_native(owner)
-    pool.abort(owner)
+        other.retain(owner, Payload())
+    assert pool.reclaim_completed() == 1
     replacement = pool.acquire()
     assert replacement.lane == owner.lane
     with pytest.raises(RuntimeError, match="stale or belongs"):
@@ -276,7 +273,7 @@ def test_unsubmitted_pool_pressure_never_waits_or_discards():
     with pytest.raises(RuntimeError, match="unsubmitted proposal"):
         pool.acquire()
     assert owner.retained
-    assert owner.state is DraftWindowOwnerState.PREPARING
+    assert owner.completion is None
 
 
 @pytest.mark.parametrize("capacity", [0, -1, True, 1.5])

@@ -717,7 +717,7 @@ def test_dspark_mla_reuses_prepared_exact_cpu_without_another_transfer(contract,
     assert len(window_cpu_copies) == 0  # The feature adds no second exact copy.
     prepared = prepared_cpu_copies[0]
     assert any(isinstance(value, torch.Tensor) and value.data_ptr() == prepared.data_ptr() for value in owner.retained)
-    assert owner.state is modules["lifetime"].DraftWindowOwnerState.SUBMITTED
+    assert owner.completion is not None
     assert owner.completion is completion
     common = result["draft.a"]
     assert common.seq_lens_cpu.tolist() == [9] + [0] * (padded_rows - 1)

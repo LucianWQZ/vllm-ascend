@@ -7,6 +7,7 @@ enqueue, completion and mixed engine regression need separate device tests.
 """
 
 from types import SimpleNamespace
+from typing import NoReturn
 
 import pytest
 import torch
@@ -17,7 +18,11 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_lifetime import DraftWindowO
 from vllm_ascend.worker.v2.spec_decode.draft_window_read import DirectPrefixSource
 
 
-@pytest.mark.parametrize("stage", ["exact", "phase", "cohort"])
+def unrecorded_completion() -> NoReturn:
+    raise AssertionError("failed preparation must not record a success event")
+
+
+@pytest.mark.parametrize("stage", ["phase", "cohort"])
 def test_copy_failure_keeps_actual_input_and_output_owned(monkeypatch, stage):
     table = torch.arange(32, dtype=torch.int32).reshape(2, 16)
     source = DirectPrefixSource(table, (1, 0), (16, 16), 128)
@@ -27,8 +32,6 @@ def test_copy_failure_keeps_actual_input_and_output_owned(monkeypatch, stage):
     originals = {name: getattr(torch.Tensor, name) for name in ("clone", "to", "copy_")}
 
     def selected(tensor):
-        if stage == "exact":
-            return tensor.data_ptr() == exact.data_ptr()
         return tensor.dtype == (torch.bool if stage == "phase" else torch.int64)
 
     def after_copy(input_tensor, output_tensor):
@@ -39,8 +42,6 @@ def test_copy_failure_keeps_actual_input_and_output_owned(monkeypatch, stage):
 
     def clone(tensor, *args, **kwargs):
         output = originals["clone"](tensor, *args, **kwargs)
-        if stage == "exact" and selected(tensor):
-            after_copy(tensor, output)
         return output
 
     def to(tensor, *args, **kwargs):
@@ -58,9 +59,8 @@ def test_copy_failure_keeps_actual_input_and_output_owned(monkeypatch, stage):
     monkeypatch.setattr(torch.Tensor, "clone", clone)
     monkeypatch.setattr(torch.Tensor, "to", to)
     monkeypatch.setattr(torch.Tensor, "copy_", copy)
-    full_rows = None if stage == "exact" else torch.tensor([True, True] if stage == "phase" else [False, True])
-    with pytest.raises(RuntimeError, match="deliberate error"), pool.operation(lambda: None) as owner:
-        pool.begin_native(owner)
+    full_rows = torch.tensor([True, True] if stage == "phase" else [False, True])
+    with pytest.raises(RuntimeError, match="deliberate error"), pool.operation(unrecorded_completion) as owner:
         prepare_dense_draft_read(
             source,
             exact_device=exact,
@@ -74,10 +74,40 @@ def test_copy_failure_keeps_actual_input_and_output_owned(monkeypatch, stage):
             retain=lambda *items: pool.retain(owner, *items),
         )
     assert len(submitted) == 1
-    assert pool.poisoned and owner.state.name == "QUARANTINED"
+    assert pool.poisoned
     assert all(any(item is tensor for item in owner.retained) for tensor in submitted[0])
     with pytest.raises(RuntimeError, match="quarantined"):
         pool.acquire()
+
+
+def test_planning_failure_keeps_prepared_device_input_owned(monkeypatch):
+    from vllm_ascend.ops.triton.v2.spec_decode import draft_window
+
+    source = DirectPrefixSource(torch.arange(16, dtype=torch.int32)[None], (0,), (16,), 128)
+    exact = torch.tensor([1151], dtype=torch.int32)
+    pool = DraftWindowOwnerPool(1)
+
+    def failed_plan(table, rows, prepared_exact, *args, **kwargs):
+        assert prepared_exact.data_ptr() == exact.data_ptr()
+        assert any(item is prepared_exact for item in owner.retained)
+        raise RuntimeError("deliberate error during planning submission")
+
+    monkeypatch.setattr(draft_window, "plan_draft_window", failed_plan)
+    with pytest.raises(RuntimeError, match="planning submission"), pool.operation(unrecorded_completion) as owner:
+        prepare_dense_draft_read(
+            source,
+            exact_device=exact,
+            row_indices=torch.tensor([0]),
+            upper_cpu=exact + 1,
+            window_size=1024,
+            anchor_span=128,
+            query_width=4,
+            causal=False,
+            retain=lambda *items: pool.retain(owner, *items),
+        )
+    assert pool.poisoned and any(
+        isinstance(item, torch.Tensor) and item.data_ptr() == exact.data_ptr() for item in owner.retained
+    )
 
 
 def test_metadata_length_copy_is_owned_before_partial_fill(monkeypatch):
@@ -103,10 +133,9 @@ def test_metadata_length_copy_is_owned_before_partial_fill(monkeypatch):
         return result
 
     monkeypatch.setattr(torch.Tensor, "__setitem__", filled)
-    with pytest.raises(RuntimeError, match="after metadata fill"), pool.operation(lambda: None) as owner:
-        pool.begin_native(owner)
+    with pytest.raises(RuntimeError, match="after metadata fill"), pool.operation(unrecorded_completion) as owner:
         pool.retain(owner, read)
         read.apply(SimpleNamespace(num_reqs=3))
     assert len(submitted) == 1
-    assert pool.poisoned and owner.state.name == "QUARANTINED"
+    assert pool.poisoned
     assert any(item is submitted[0] for item in owner.retained)

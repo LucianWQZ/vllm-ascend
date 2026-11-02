@@ -14,7 +14,6 @@ import torch
 
 from vllm_ascend.worker.v2.spec_decode.draft_window_lifetime import (
     DraftWindowOwnerPool,
-    DraftWindowOwnerState,
 )
 
 CALLBACK_NAMES = ("common_metadata_callback", "metadata_builder_callback")
@@ -323,14 +322,12 @@ def test_factory_error_restores_module_but_quarantines_active_owner(factory_cont
     callbacks = {} if stage == "backend" else {stage: fail}
     with pytest.raises(RuntimeError, match="partial-submit host error"), pool.operation(completion) as owner:
         pool.retain(owner, payload)
-        # Real owner state transition, but no native operation is claimed.
-        pool.begin_native(owner)
+        # Entered proposal lifetime; no native operation is claimed here.
         with contract.wrapper(), contract.factory([0], 1, False, **callbacks):
             contract.module.build_attn_metadata()
     assert contract.module.build_attn_metadata is contract.original
-    assert owner.state is DraftWindowOwnerState.QUARANTINED
-    assert owner.retained == [payload]
     assert pool.poisoned
+    assert owner.retained == [payload]
     completion.assert_not_called()
     with pytest.raises(RuntimeError, match="quarantined"):
         pool.acquire()
