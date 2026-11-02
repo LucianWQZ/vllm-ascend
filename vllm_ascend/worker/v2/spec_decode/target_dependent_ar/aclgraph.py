@@ -51,7 +51,7 @@ def _eagle_ar_capture_config(vllm_config: VllmConfig, cudagraph_mode: CUDAGraphM
     Ascend filters the shared Target capture sizes to multiples of TP. K3
     first passes use Q4, so their valid request buckets survive that filter;
     the same sizes cannot represent Q1 AR for those requests. Only this
-    default-off TP4 Eagle review gets an independent compilation descriptor.
+    explicitly enabled TP4 Eagle Graph route gets an independent descriptor.
     Target/first-pass configs, topology and computation remain unchanged.
     """
     speculative = vllm_config.speculative_config
@@ -242,7 +242,7 @@ class AutoRegressiveAclGraphManager(SpeculatorCudaGraphManager):
         if session is not None and self.speculator._eagle3_window_is_active():
             return self._run_eagle_window_fullgraph(desc, session)
         # Without a Window session the ordinary graph still needs the finite
-        # review's real consumer shape. Target input padding alone does not
+        # admitted consumer shape. Target input padding alone does not
         # constrain the AR graph bucket selected by the fixed core dispatcher.
         # Source-created dummy/profile batches retain their original behavior.
         if getattr(getattr(self.speculator, "input_batch", None), "is_dummy", False) is not True:

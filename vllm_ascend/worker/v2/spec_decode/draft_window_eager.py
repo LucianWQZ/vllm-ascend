@@ -224,7 +224,7 @@ class DraftWindowGraphInputMixin:
     max_model_len: int
 
     def _initialize_draft_window_source_capability(self) -> None:
-        """Atomically bind eligible P2 source and P3 ownership state."""
+        """Bind the eligible Source and its Graph input owner atomically."""
         policy = getattr(self, "_draft_window_policy", None)
         if policy is None:
             return
@@ -249,9 +249,9 @@ class DraftWindowGraphInputMixin:
 
     def _initialize_draft_window_graph_inputs(self) -> None:
         if not hasattr(self, "_draft_window_graph_binding_provider"):
-            raise RuntimeError("P4a eager state requires initialized P3 runtime state")
+            raise RuntimeError("Draft Window Graph inputs require an initialized Source owner")
         if hasattr(self, "_draft_window_epoch_source"):
-            raise RuntimeError("P4a eager state is already initialized")
+            raise RuntimeError("Draft Window Graph inputs are already initialized")
         self._draft_window_epoch_source = DraftWindowProposalEpochSource()
         self._draft_window_bypass_active = False
         self._draft_window_prefill_bypass_active = False

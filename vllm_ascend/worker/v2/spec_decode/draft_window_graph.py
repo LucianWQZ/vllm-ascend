@@ -298,7 +298,7 @@ class DraftWindowGraphBindingProvider:
 
     @property
     def method(self) -> str:
-        """Return the P2-normalized method owned by this provider."""
+        """Return the policy-normalized method owned by this provider."""
         return self.source.policy.normalized_method
 
     def register_capture_identity(

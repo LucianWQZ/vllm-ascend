@@ -2,7 +2,7 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 """Parallel Draft Graph installation and persistent read-metadata binding.
 
-One session owns the captured read banks. Runtime preparation binds the
+One provider owns the captured read banks. Runtime preparation binds the
 current proposal to those banks while preserving canonical Full write slots,
 absolute query positions, and independent Target metadata. No recorder,
 output snapshot, artifact writer, or oracle participates in this path.
@@ -72,7 +72,7 @@ def build_parallel_graph_source(
     vllm_config: Any,
     dflash2_graph_contract: Any = None,
 ) -> DraftWindowSourceCapability:
-    """Build P2/P3 source state only after the real Graph route is gated."""
+    """Build Source ownership only after the real Graph route is gated."""
     if not draft_window_graph_enabled():
         raise RuntimeError("internal Draft Window Graph flag is not enabled")
     validate_graph_context(vllm_config, block_tables)
@@ -147,7 +147,7 @@ def prepare_parallel_graph(
     owner: Any,
     descriptor: BatchExecutionDescriptor,
 ) -> DraftWindowGraphReadCarrier | None:
-    """Bind the real P3 proposal generation before Graph metadata consumption."""
+    """Bind the current proposal inputs before Graph metadata consumption."""
     provider = getattr(owner, "_draft_window_graph_session", None)
     if provider is None:
         return None
@@ -157,7 +157,7 @@ def prepare_parallel_graph(
         raise RuntimeError("runtime Draft Window Graph requires a FULL replay descriptor")
     inputs = provider._active_inputs
     if not isinstance(inputs, DraftMetadataInputs):
-        raise RuntimeError("Draft Window Graph replay has no real P3 proposal generation")
+        raise RuntimeError("Draft Window Graph replay has no current proposal inputs")
     inputs.validate_for(inputs.identity)
     proposal_context = owner._draft_window_epoch_source._active
     if proposal_context is not inputs.identity.proposal:

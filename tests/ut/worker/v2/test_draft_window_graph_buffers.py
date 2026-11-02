@@ -183,7 +183,8 @@ def test_retirement_preserves_bank_until_next_generation_then_clears_tail(graph_
     snapshots = [tensor.clone() for tensor in _bank_tensors(bank)]
     pointers = [tensor.data_ptr() for tensor in _bank_tensors(bank)]
     case.provider.retire_generation(first.identity)
-    assert bank.bound_identity is None
+    with pytest.raises(RuntimeError, match="generation identity"):
+        bank.assert_bound(first.identity)
     assert all(torch.equal(tensor, old) for tensor, old in zip(_bank_tensors(bank), snapshots))
     second = _materialize(case, epoch=1, ends=(4,))
     assert [tensor.data_ptr() for tensor in _bank_tensors(bank)] == pointers
@@ -249,7 +250,7 @@ def test_failed_metadata_isolation_quarantines_bank_without_clearing(graph_buffe
     assert case.provider.quarantined_identity == inputs.identity
     assert case.provider._active_inputs.workspace is inputs.workspace
     assert case.provider._active_inputs is inputs
-    assert inputs.workspace.bound_identity == inputs.identity
+    inputs.workspace.assert_bound(inputs.identity)
     assert all(torch.equal(tensor, old) for tensor, old in zip(_bank_tensors(inputs.workspace), before))
     with pytest.raises(RuntimeError, match="quarantined"):
         case.provider.prepare_workspace(case.capture)
@@ -270,8 +271,10 @@ def test_cpu_valid_counts_are_required_before_any_bank_materialization(graph_buf
             step=0,
             output_workspace=bank,
         )
-    assert bank.bound_identity is None
     assert all(torch.equal(tensor, old) for tensor, old in zip(_bank_tensors(bank), before))
+    # A missing argument must leave the actual bank available for a real bind.
+    inputs = _materialize(case)
+    bank.assert_bound(inputs.identity)
 
 
 def test_eagle_serialized_steps_own_distinct_banks_and_preserve_previous_consumers(graph_buffers):
@@ -322,7 +325,8 @@ def test_eagle_serialized_steps_own_distinct_banks_and_preserve_previous_consume
                 with pytest.raises(RuntimeError, match="proposal or request mapping changed"):
                     provider.materialize(previous_identity=previous, **{**kwargs, "proposal": replace(proposal)})
                 assert provider._last_retired_identity is previous
-                assert bank.bound_identity is None
+                with pytest.raises(RuntimeError, match="generation identity"):
+                    bank.assert_bound(previous)
             inputs = provider.materialize(previous_identity=previous, **kwargs)
         current = SimpleNamespace(**{**vars(case), "provider": provider, "capture": capture})
         carrier = _bind(current, inputs)
@@ -406,8 +410,11 @@ def test_startup_capture_exposes_the_real_bank_without_fake_generation(graph_buf
     case = graph_buffers
     carrier = case.provider._carriers[case.capture]
     bank = case.provider.startup_capture_workspace(case.capture)
-    assert bank is carrier.workspace and bank.bound_identity is None
+    assert bank is carrier.workspace
     assert bank.max_num_reqs == case.capture.descriptor.num_reqs
+    # A startup placeholder must not bind an invented business generation.
+    inputs = _materialize(case)
+    bank.assert_bound(inputs.identity)
     bank.max_num_reqs += 1
     with pytest.raises(RuntimeError, match="request geometry changed"):
         case.provider.startup_capture_workspace(case.capture)

@@ -62,7 +62,7 @@ class FullDraftKVSource:
         return self._input_block_tables[global_group_id].shape[1]
 
     def validate_owner_bindings(self) -> None:
-        """Reject replacement of a canonical owner tensor after P2 binding."""
+        """Reject replacement of a canonical owner tensor after Source binding."""
         current_tables = tuple(self._block_tables_owner.input_block_tables)
         if len(current_tables) != len(self._input_block_tables):
             raise RuntimeError("canonical input block table group count changed")
@@ -201,7 +201,7 @@ def gather_valid_num_blocks_cpu(
     """Gather valid counts from the canonical CPU owner in batch order.
 
     The accelerator view of ``UvaBackedTensor`` is a rotating transport and is
-    not a stable freshness identity. P4 eager planning is host-side, so using
+    not a stable freshness identity. Length preparation is host-side, so using
     the source-of-truth CPU owner avoids a device-to-host synchronization.
     """
     full_source.validate_owner_bindings()
@@ -398,10 +398,6 @@ class DraftWindowWorkspace:
         self.cpu_window_exact = torch.zeros(max_num_reqs, dtype=torch.int32)
         self._bound_identity: DraftWindowGenerationIdentity | None = None
         self._needs_clear = False
-
-    @property
-    def bound_identity(self) -> DraftWindowGenerationIdentity | None:
-        return self._bound_identity
 
     def materialize(
         self,

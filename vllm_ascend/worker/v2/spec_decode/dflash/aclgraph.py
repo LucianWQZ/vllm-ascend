@@ -112,9 +112,8 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
     ) -> None:
         """Capture ACL graphs for DFlash.
 
-        vLLM #60692 renamed ``precompute_context_kv(num_reqs)`` to
-        ``prepare_forward(num_reqs, attn_metadata)``; accept both and forward the
-        one the installed vLLM expects.
+        Forward the fixed vLLM preparation callback with its actual request
+        count and attention metadata.
         """
         prepare_kwargs: dict[str, Any] = {"prepare_forward": prepare_forward}
         with draft_window_dflash_capture_scope(
