@@ -6,7 +6,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tests.ut.worker.v2.draft_window_cpu import cpu_dense_planning as cpu_dense_planning
 from vllm_ascend.worker.v2.spec_decode.draft_window_dense import (
     DenseDraftRead,
     gather_dense_draft_kv,
@@ -161,10 +160,10 @@ def test_apply_keeps_full_write_and_absolute_query_operands():
 
 def test_allocation_upper_cannot_authorize_uninitialized_columns():
     source = DirectPrefixSource(torch.tensor([[1]], dtype=torch.int32), (0,), (1,), 128)
-    with pytest.raises(ValueError, match="Allocation upper"):
+    with pytest.raises(ValueError, match="exact lengths exceed"):
         prepare_dense_draft_read(
             source,
-            exact_device=torch.tensor([127]),
+            exact_device=torch.tensor([129]),
             row_indices=torch.tensor([0]),
             upper_cpu=torch.tensor([129]),
             window_size=128,
@@ -211,8 +210,8 @@ def test_short_context_large_window_does_not_gather_window_sized_padding():
         retain=lambda *objects: None,
     )
     assert isinstance(read, DenseDraftRead)
-    assert read.capacity == 64
+    assert read.capacity == 32
     assert (31 - read.seq_lens).tolist() == [0] and read.seq_lens.tolist() == [31]
     assert read.slots[0, :31].tolist() == list(range(128, 159))
-    assert read.slots[0, 31:].tolist() == [158] * 33
+    assert read.slots[0, 31:].tolist() == [158]
     assert not read.mask[..., :31].any() and read.mask[..., 31:].all()

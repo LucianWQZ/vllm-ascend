@@ -35,7 +35,7 @@ class NativeCompletion:
         self.event.synchronize()
 
 
-@pytest.mark.parametrize("operation", ["plan", "gather", "pack"])
+@pytest.mark.parametrize("operation", ["gather"])
 def test_private_kernel_outputs_survive_exception_after_real_enqueue(monkeypatch, operation):
     from vllm_ascend.ops.triton.v2.spec_decode import draft_window
 
@@ -44,9 +44,7 @@ def test_private_kernel_outputs_survive_exception_after_real_enqueue(monkeypatch
     held_outputs: list[torch.Tensor] = []
     diagnostic_events: list[Any] = []
     kernel_name = {
-        "plan": "_plan_draft_window",
         "gather": "_gather_draft_kv_fp32",
-        "pack": "_pack_draft_query_indices",
     }[operation]
     original = getattr(draft_window, kernel_name)
 
@@ -55,7 +53,7 @@ def test_private_kernel_outputs_survive_exception_after_real_enqueue(monkeypatch
             launcher = original[grid]
 
             def launch(*args):
-                outputs = args[7:10] if operation == "plan" else args[3:5] if operation == "gather" else args[1:3]
+                outputs = args[3:5]
                 assert all(any(value is output for value in owner.retained) for output in outputs)
                 held_outputs.extend(outputs)
                 launcher(*args)
@@ -76,30 +74,12 @@ def test_private_kernel_outputs_survive_exception_after_real_enqueue(monkeypatch
         pool.operation(lambda: NativeCompletion(stream)) as owner,
     ):
         retain = lambda *objects: pool.retain(owner, *objects)
-        if operation == "plan":
-            draft_window.plan_draft_window(
-                torch.arange(8, dtype=torch.int32, device="npu").reshape(1, 8),
-                torch.tensor([0], dtype=torch.int64, device="npu"),
-                torch.tensor([17], dtype=torch.int32, device="npu"),
-                None,
-                block_span=4,
-                anchor_span=4,
-                window=8,
-                capacity=12,
-                query_width=3,
-                causal=True,
-                retain=retain,
-            )
-        elif operation == "gather":
+        if operation == "gather":
             draft_window.gather_draft_kv_fp32(
                 torch.tensor([[1, 2, 3]], dtype=torch.int64, device="npu"),
                 torch.arange(64, dtype=torch.bfloat16, device="npu").reshape(2, 4, 1, 8),
                 torch.ones((2, 4, 1, 8), dtype=torch.bfloat16, device="npu"),
                 retain=retain,
-            )
-        else:
-            draft_window.pack_draft_query_indices(
-                torch.tensor([0, 2, 5], dtype=torch.int32, device="npu"), 5, 3, retain=retain
             )
     assert diagnostic_events and held_outputs
     assert pool.poisoned
@@ -107,15 +87,9 @@ def test_private_kernel_outputs_survive_exception_after_real_enqueue(monkeypatch
     with pytest.raises(RuntimeError, match="quarantined"):
         pool.acquire()
     diagnostic_events[0].synchronize()
-    if operation == "plan":
-        assert held_outputs[0][0, 0].cpu().item() == 8
-        assert held_outputs[1].cpu().tolist() == [9]
-    elif operation == "gather":
+    if operation == "gather":
         torch.testing.assert_close(held_outputs[0].cpu().flatten(), torch.arange(8, 32, dtype=torch.float32))
         assert held_outputs[1].eq(1).all()
-    else:
-        assert held_outputs[0].cpu().tolist() == [[0, 0, 1], [2, 3, 4]]
-        assert held_outputs[1].cpu().tolist() == [1, 2, 3, 4, 5]
     # Even an external diagnostic wait does not make production's unknown
     # completion contract safe to reuse.
     with pytest.raises(RuntimeError, match="quarantined"):

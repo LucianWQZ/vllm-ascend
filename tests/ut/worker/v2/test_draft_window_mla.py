@@ -35,8 +35,7 @@ def metadata_for_decode(positions, cos, sin):
     )
 
 
-@pytest.mark.parametrize("owned_submission", [False, True])
-def test_later_real_rope_build_cannot_overwrite_inflight_window_metadata(monkeypatch, owned_submission):
+def test_later_real_rope_build_cannot_overwrite_inflight_window_metadata(monkeypatch):
     cos_cache = torch.arange(64, dtype=torch.float32).view(16, 4)
     sin_cache = -cos_cache
     for name, value in {
@@ -59,11 +58,10 @@ def test_later_real_rope_build_cannot_overwrite_inflight_window_metadata(monkeyp
     layers = {"draft.a": metadata, "draft.b": metadata}
     submitted = []
     retain = lambda *objects: submitted.extend(objects)
-    retained = freeze_mla_read_metadata(layers, tuple(layers), retain=retain if owned_submission else None)
-    if owned_submission:
-        assert any(value is cos for value in submitted)
-        assert any(value is sin for value in submitted)
-        assert all(any(value is output for value in submitted) for output in retained)
+    retained = freeze_mla_read_metadata(layers, tuple(layers), retain=retain)
+    assert any(value is cos for value in submitted)
+    assert any(value is sin for value in submitted)
+    assert all(any(value is output for value in submitted) for output in retained)
     rotary_embedding.get_cos_and_sin_mla(torch.tensor([2, 3]), use_cache=True)
     # The original producer is demonstrably mutable; the Window read isn't.
     assert not torch.equal(cos, expected_cos)
@@ -80,13 +78,13 @@ def test_later_real_rope_build_cannot_overwrite_inflight_window_metadata(monkeyp
 
 def test_nope_and_prefill_do_not_copy_full_query_or_metadata():
     metadata = metadata_for_decode(torch.tensor([9, 10]), None, None)
-    assert freeze_mla_read_metadata({"draft": metadata}, ["draft"]) == ()
+    assert freeze_mla_read_metadata({"draft": metadata}, ["draft"], retain=lambda *items: None) == ()
     metadata.decode = None
-    assert freeze_mla_read_metadata({"draft": metadata}, ["draft"]) == ()
+    assert freeze_mla_read_metadata({"draft": metadata}, ["draft"], retain=lambda *items: None) == ()
 
 
 def test_flashmla_is_not_silently_treated_as_fia():
     metadata = metadata_for_decode(torch.tensor([9, 10]), None, None)
     metadata.external_flashmla = object()
     with pytest.raises(NotImplementedError, match="FlashMLA"):
-        freeze_mla_read_metadata({"draft": metadata}, ["draft"])
+        freeze_mla_read_metadata({"draft": metadata}, ["draft"], retain=lambda *items: None)

@@ -22,7 +22,7 @@ TOLERANCES = {torch.bfloat16: (2**-7, 2**-6), torch.float16: (2**-10, 2**-9)}
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("dim,kv_heads", [(192, 4), (128, 1)])
-@pytest.mark.parametrize("case", ["parallel", "eagle", "interleaved_eagle"])
+@pytest.mark.parametrize("case", ["parallel", "eagle", "interleaved_eagle", "decode_ragged"])
 def test_native_ragged_exact_read_with_full_continuation(dtype, dim, kv_heads, case):
     eagle = case != "parallel"
     block, window, heads = 128, 1035 if eagle else 1024, 4
@@ -34,6 +34,9 @@ def test_native_ragged_exact_read_with_full_continuation(dtype, dim, kv_heads, c
     if case == "interleaved_eagle":
         ends, widths, starts = (1151, 2177, 1795, 1535), (4, 33, 4, 33), (0, 0, 640, 0)
         native_ends, frozen = (1152, 2177, 1796, 1535), (0, 1024, 640, 512)
+    if case == "decode_ragged":
+        ends, widths, starts = (1159, 1291), (1, 4), (0, 256)
+        native_ends, frozen = (1160, 1291), (0, 256)
     generator = torch.Generator().manual_seed(4337 + dim)
     canonical = (torch.randperm(128, generator=generator) + 1).reshape(4, 32).to(torch.int32)
     rows = (3, 1, 0, 2)[: len(ends)]
@@ -68,7 +71,9 @@ def test_native_ragged_exact_read_with_full_continuation(dtype, dim, kv_heads, c
         query_width=max(widths),
         causal=eagle,
         frozen_starts=torch.tensor(frozen, dtype=torch.int32, device="npu") if eagle else None,
-        full_rows_cpu=torch.tensor([False, True] * (len(rows) // 2)),
+        full_rows_cpu=torch.tensor(
+            [False] * len(rows) if case == "decode_ragged" else [False, True] * (len(rows) // 2)
+        ),
         query_start_loc_cpu=offsets,
         query_start_loc_device=offsets.npu(),
         retain=lambda *objects: retained.extend(objects),

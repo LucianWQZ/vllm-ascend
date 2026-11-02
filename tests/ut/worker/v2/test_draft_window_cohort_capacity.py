@@ -5,7 +5,6 @@
 import pytest
 import torch
 
-from tests.ut.worker.v2.draft_window_cpu import cpu_dense_planning as cpu_dense_planning
 from vllm_ascend.worker.v2.spec_decode.draft_window_dense import (
     DenseDraftRead,
     prepare_dense_draft_read,
@@ -50,7 +49,7 @@ def test_different_full_row_bounds_do_not_multiply_largest_workspace(order):
             assert torch.equal(private.slots[local, : absolute.numel()], expected_slots)
             assert not private.mask[local, ..., : absolute.numel()].any()
     actual_tokens = sum(len(indices) * private.capacity for indices, private in parts)
-    row_bounds = torch.where(full, upper, torch.minimum(upper, torch.tensor(1024 + 128 - 1)))
+    row_bounds = exact - expected_starts
     expected_tokens = int(((row_bounds + 31) // 32 * 32).sum())
     assert actual_tokens == expected_tokens, "short Full rows inherited another request's largest capacity"
 

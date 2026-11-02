@@ -43,28 +43,14 @@ def operators(monkeypatch):
 
 
 def invoke(operators, operation, retain):
-    if operation == "plan":
-        return operators.plan_draft_window(
-            torch.arange(8, dtype=torch.int32).reshape(1, 8),
-            torch.tensor([0]),
-            torch.tensor([17], dtype=torch.int32),
-            None,
-            block_span=4,
-            anchor_span=4,
-            window=8,
-            capacity=12,
-            query_width=3,
-            causal=True,
-            retain=retain,
-        )
     if operation == "gather":
         return operators.gather_draft_kv_fp32(
             torch.tensor([[1, 2, 3]]), torch.empty(2, 4, 1, 8), torch.empty(2, 4, 1, 8), retain=retain
         )
-    return operators.pack_draft_query_indices(torch.tensor([0, 2, 5]), 5, 3, retain=retain)
+    raise AssertionError(f"Unknown read operation: {operation}")
 
 
-@pytest.mark.parametrize("operation,outputs", [("plan", 3), ("gather", 2), ("pack", 2)])
+@pytest.mark.parametrize("operation,outputs", [("gather", 2)])
 def test_outputs_are_retained_before_dispatch_can_raise(monkeypatch, operators, operation, outputs):
     held: list[torch.Tensor] = []
 
@@ -74,20 +60,20 @@ def test_outputs_are_retained_before_dispatch_can_raise(monkeypatch, operators, 
                 assert len(held) >= outputs
                 # The output arguments belong to this real call, rather than
                 # a previously retained allocation with an equal shape.
-                expected = args[7:10] if operation == "plan" else args[3:5] if operation == "gather" else args[1:3]
+                expected = args[3:5]
                 assert all(any(value is output for value in held) for output in expected)
                 raise DispatchFailure("submission can fail after enqueue")
 
             return launch
 
-    kernel = {"plan": "_plan_draft_window", "gather": "_gather_draft_kv_fp32", "pack": "_pack_draft_query_indices"}
+    kernel = {"gather": "_gather_draft_kv_fp32"}
     monkeypatch.setattr(operators, kernel[operation], PartialDispatch())
     with pytest.raises(DispatchFailure):
         invoke(operators, operation, lambda *values: held.extend(values))
     assert len([value for value in held if isinstance(value, torch.Tensor)]) >= outputs
 
 
-@pytest.mark.parametrize("operation", ["plan", "gather", "pack"])
+@pytest.mark.parametrize("operation", ["gather"])
 def test_retention_failure_prevents_dispatch(monkeypatch, operators, operation):
     calls = []
 
@@ -99,7 +85,7 @@ def test_retention_failure_prevents_dispatch(monkeypatch, operators, operation):
     def retain(*values):
         raise RetentionFailure("owner cannot accept new storage")
 
-    kernel = {"plan": "_plan_draft_window", "gather": "_gather_draft_kv_fp32", "pack": "_pack_draft_query_indices"}
+    kernel = {"gather": "_gather_draft_kv_fp32"}
     monkeypatch.setattr(operators, kernel[operation], Dispatch())
     with pytest.raises(RetentionFailure):
         invoke(operators, operation, retain)

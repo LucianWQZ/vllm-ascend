@@ -12,7 +12,6 @@ from typing import NoReturn
 import pytest
 import torch
 
-from tests.ut.worker.v2.draft_window_cpu import cpu_dense_planning as cpu_dense_planning
 from vllm_ascend.worker.v2.spec_decode.draft_window_dense import DenseDraftRead, prepare_dense_draft_read
 from vllm_ascend.worker.v2.spec_decode.draft_window_lifetime import DraftWindowOwnerPool
 from vllm_ascend.worker.v2.spec_decode.draft_window_read import DirectPrefixSource
@@ -68,20 +67,21 @@ def test_copy_failure_keeps_actual_input_and_output_owned(monkeypatch, stage):
         pool.acquire()
 
 
-def test_planning_failure_keeps_prepared_device_input_owned(monkeypatch):
-    from vllm_ascend.ops.triton.v2.spec_decode import draft_window
-
+def test_planning_copy_failure_keeps_prepared_input_owned(monkeypatch):
     source = DirectPrefixSource(torch.arange(16, dtype=torch.int32)[None], (0,), (16,), 128)
     exact = torch.tensor([1151], dtype=torch.int32)
     pool = DraftWindowOwnerPool(1)
+    original_copy = torch.Tensor.copy_
 
-    def failed_plan(table, rows, prepared_exact, *args, **kwargs):
-        assert prepared_exact.data_ptr() == exact.data_ptr()
-        assert any(item is prepared_exact for item in owner.retained)
-        raise RuntimeError("deliberate error during planning submission")
+    def failed_copy(destination, value, *args, **kwargs):
+        assert any(item is exact for item in owner.retained)
+        assert any(item is value for item in owner.retained)
+        assert any(item is destination for item in owner.retained)
+        original_copy(destination, value, *args, **kwargs)
+        raise RuntimeError("deliberate error during planning copy")
 
-    monkeypatch.setattr(draft_window, "plan_draft_window", failed_plan)
-    with pytest.raises(RuntimeError, match="planning submission"), pool.operation(unrecorded_completion) as owner:
+    monkeypatch.setattr(torch.Tensor, "copy_", failed_copy)
+    with pytest.raises(RuntimeError, match="planning copy"), pool.operation(unrecorded_completion) as owner:
         prepare_dense_draft_read(
             source,
             exact_device=exact,
@@ -93,9 +93,7 @@ def test_planning_failure_keeps_prepared_device_input_owned(monkeypatch):
             causal=False,
             retain=lambda *items: pool.retain(owner, *items),
         )
-    assert pool.poisoned and any(
-        isinstance(item, torch.Tensor) and item.data_ptr() == exact.data_ptr() for item in owner.retained
-    )
+    assert pool.poisoned and any(item is exact for item in owner.retained)
 
 
 def test_metadata_length_copy_is_owned_before_partial_fill(monkeypatch):

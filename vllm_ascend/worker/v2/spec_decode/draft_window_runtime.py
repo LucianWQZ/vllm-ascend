@@ -98,7 +98,7 @@ class DraftWindowRuntime:
         self.mla_layer_names: tuple[str, ...] = ()
         self.native_swa_intersections: dict[int, int] = {}
         self.native_swa_causal: dict[int, bool] = {}
-        self._dense_device_reads = False
+        self._dense_reads = False
         self.gids = self._validate_route(speculator)
         read_groups = self.gids or tuple(self.native_swa_intersections)
         if not read_groups:
@@ -111,8 +111,6 @@ class DraftWindowRuntime:
         self._bypass = False
         self._build_count = 0
         self._eagle_plans: tuple[DraftWindowPlan, ...] | None = None
-        self._eagle_frozen_starts: torch.Tensor | None = None
-        self._eagle_first_pass_pair: torch.Tensor | None = None
         self._eagle_prompt_exact_base: tuple[Any, torch.Tensor] | None = None
         self._next_step = 0
         self._proposal_mapping: tuple[tuple[str, ...], tuple[int, ...]] | None = None
@@ -175,7 +173,7 @@ class DraftWindowRuntime:
             specs = [item for spec in specs for item in getattr(spec, "kv_cache_specs", {"": spec}).values()]
             context = config.compilation_config.static_forward_context
             implementations = [getattr(context.get(name), "impl", None) for route in routes for name in route.layers]
-            self._dense_device_reads = all(spec.dtype in (torch.float16, torch.bfloat16) for spec in specs) and all(
+            self._dense_reads = all(spec.dtype in (torch.float16, torch.bfloat16) for spec in specs) and all(
                 type(impl) is AscendAttentionBackendImpl
                 and not impl.use_bnsd_kv_cache
                 and impl.sinks is None
@@ -230,8 +228,6 @@ class DraftWindowRuntime:
             self._input_batch = input_batch
             self._build_count = 0
             self._eagle_plans = None
-            self._eagle_frozen_starts = None
-            self._eagle_first_pass_pair = None
             self._eagle_prompt_exact_base = None
             self._next_step = 0
             self._proposal_mapping = None
@@ -256,8 +252,6 @@ class DraftWindowRuntime:
                 self._owner = None
                 self._input_batch = None
                 self._eagle_plans = None
-                self._eagle_frozen_starts = None
-                self._eagle_first_pass_pair = None
                 self._eagle_prompt_exact_base = None
                 self._proposal_mapping = None
                 self._sources.clear()
@@ -294,7 +288,15 @@ class DraftWindowRuntime:
             raise ValueError("Parallel Draft metadata step must match its actual query width")
         if self.method == "eagle3" and (step != self._next_step or step >= self.static_k):
             raise ValueError("Eagle3 metadata must advance exactly one configured step")
+        # The fixed metadata builder walks groups synchronously; InputBatch
+        # changes only between preparations, not between groups in this walk.
+        # Eagle still rechecks the mapping at every actual AR preparation.
         mapping = (tuple(batch.req_ids), tuple(int(row) for row in batch.idx_mapping_np[:num_reqs]))
+        if batch.num_reqs != num_reqs or len(mapping[0]) != num_reqs:
+            raise RuntimeError("Draft Window request mapping does not cover the active preparation")
+        if self._proposal_mapping is not None and self._proposal_mapping != mapping:
+            raise RuntimeError("Draft Window request mapping changed within a proposal")
+        self._proposal_mapping = mapping
         if (prepared_exact_cpu is None) != (prepared_exact_device is None):
             raise ValueError("Prepared exact CPU lengths require their device input")
         if prepared_exact_cpu is not None:
@@ -326,11 +328,6 @@ class DraftWindowRuntime:
                 raise RuntimeError(
                     "Draft Window callback belongs to a stale proposal or its group was already projected"
                 )
-            current = (tuple(batch.req_ids), tuple(int(row) for row in batch.idx_mapping_np[:num_reqs]))
-            if batch.num_reqs != num_reqs or len(current[0]) != num_reqs or current != mapping:
-                raise RuntimeError("Draft Window request mapping changed during metadata preparation")
-            if self._proposal_mapping is not None and self._proposal_mapping != mapping:
-                raise RuntimeError("Draft Window request mapping changed within a proposal")
             if common.num_reqs < num_reqs or common.seq_lens.ndim != 1 or common.seq_lens.numel() < num_reqs:
                 raise ValueError("Draft Window metadata does not cover the active requests")
             if full_exact is None:
@@ -339,7 +336,6 @@ class DraftWindowRuntime:
                 raise ValueError("Draft Window groups must share current preparation lengths")
             if hasattr(common, "_draft_window_read") or hasattr(common, "_draft_window_device_read"):
                 raise ValueError("Draft Window requires fresh, unprojected common metadata")
-            self._proposal_mapping = mapping
             if project is None:
                 project = self._select_projection(
                     step,
@@ -366,43 +362,38 @@ class DraftWindowRuntime:
         prepared_exact_cpu: torch.Tensor | None,
         prepared_exact_device: torch.Tensor | None,
     ):
-        dense = self._dense_device_reads
+        dense = self._dense_reads
         continuing = continuing_prefill_rows(self._input_batch, num_reqs)
-        if self.method == "eagle3":
-            if continuing.any():
-                drafts = self._input_batch.num_draft_tokens_per_req
-                if (
-                    dense
-                    and continuing.all()
-                    and (drafts is None or not drafts[:num_reqs].any())
-                    and getattr(self.speculator, "advance_draft_positions", False)
-                    and not getattr(self.speculator, "replicated_pcp", False)
-                ):
-                    # Original Full backend: exact prompt progress, no table
-                    # projection, private FP32 KV gather, or device E snapshot.
-                    return self._full_prefill_metadata_callback(step, num_reqs)
-                dense = dense and not (
-                    self._input_batch.is_prefilling_np[:num_reqs].all()
-                    or not getattr(self.speculator, "advance_draft_positions", False)
-                    or getattr(self.speculator, "replicated_pcp", False)
-                )
-            if dense and step > 0 and self._eagle_frozen_starts is None:
-                raise RuntimeError("Eagle3 AR read has no current proposal anchor")
-        elif dense:
+        if self.method == "eagle3" and continuing.any():
+            drafts = self._input_batch.num_draft_tokens_per_req
+            if (
+                dense
+                and continuing.all()
+                and (drafts is None or not drafts[:num_reqs].any())
+                and getattr(self.speculator, "advance_draft_positions", False)
+                and not getattr(self.speculator, "replicated_pcp", False)
+            ):
+                return self._full_prefill_metadata_callback(step, num_reqs)
+            dense = dense and not (
+                self._input_batch.is_prefilling_np[:num_reqs].all()
+                or not getattr(self.speculator, "advance_draft_positions", False)
+                or getattr(self.speculator, "replicated_pcp", False)
+            )
+        if self.method == "eagle3" and step == 0:
+            prefilling = self._input_batch.is_prefilling_np[:num_reqs]
+            dense = dense and (
+                not prefilling.all()
+                and bool(getattr(self.speculator, "advance_draft_positions", False))
+                and not getattr(self.speculator, "replicated_pcp", False)
+                if prefilling.any()
+                else int(common.query_start_loc_cpu[: num_reqs + 1].diff().max()) <= self.static_k + 1
+            )
+        elif self.method != "eagle3" and dense:
             prompt_exact = self._prompt_exact_lengths(step, num_reqs)
             if prompt_exact is not None:
                 prepared_exact_cpu = prompt_exact
                 prepared_exact_device = self.speculator.input_buffers.seq_lens[:num_reqs]
                 dense = False
-        if dense:
-            project = self._dense_metadata_callback(
-                num_reqs,
-                common,
-                continuing,
-                eagle_step=step if self.method == "eagle3" else None,
-            )
-            if project is not None:
-                return project
         return self._host_metadata_callback(
             step,
             num_reqs,
@@ -410,6 +401,7 @@ class DraftWindowRuntime:
             continuing,
             prepared_exact_cpu=prepared_exact_cpu,
             prepared_exact_device=prepared_exact_device,
+            dense=dense,
         )
 
     def _full_prefill_metadata_callback(self, step: int, num_reqs: int):
@@ -426,97 +418,12 @@ class DraftWindowRuntime:
 
         return apply
 
-    def _dense_metadata_callback(
-        self, num_reqs: int, common: Any, continuing: np.ndarray, *, eagle_step: int | None = None
-    ):
-        from vllm_ascend.worker.v2.spec_decode.draft_window_dense import prepare_dense_draft_read
+    def _eagle_first_pass_lengths(self, native_extent: torch.Tensor, num_reqs: int):
+        """Snapshot native Q extent and initialized live KV end together.
 
-        owner, batch = self._owner, self._input_batch
-        assert owner is not None
-        query_width = 1 if eagle_step is not None else self.speculator.num_query_per_req
-        packed_query_cpu = packed_query_device = None
-        sources = {group: self._source(group, num_reqs) for group in self.gids}
-        upper = common.seq_lens_cpu_upper_bound[:num_reqs]
-        widths = common.query_start_loc_cpu[: num_reqs + 1].diff()
-        if eagle_step == 0:
-            query_width = int(widths.max())
-        full_rows = continuing | (batch.is_prefilling_np[:num_reqs] if eagle_step == 0 else False)
-        full_rows_cpu = torch.tensor(full_rows, dtype=torch.bool, device="cpu")
-        # Keep the existing exact path when scheduling bounds do not
-        # prove allocated address capacity. Parallel methods preserve
-        # their fixed native query width; Eagle may right-align its
-        # current ragged queries in private attention scratch.
-        use_device = (
-            bool((widths > 0).all())
-            and (eagle_step == 0 or bool((widths == query_width).all()))
-            and all(
-                all(0 < int(bound) <= count * source.block_span for bound, count in zip(upper, source.valid_columns))
-                for source in sources.values()
-            )
-        )
-        if eagle_step == 0:
-            assert self.static_k is not None
-            prefilling = batch.is_prefilling_np[:num_reqs]
-            if prefilling.any():
-                # Entire prompt-only batches already have the cheaper
-                # certified CPU producer. Only mixed decode/prompt
-                # batches need a Full-capacity device read here.
-                use_device = (
-                    use_device
-                    and not prefilling.all()
-                    and bool(
-                        getattr(self.speculator, "advance_draft_positions", False)
-                        and not getattr(self.speculator, "replicated_pcp", False)
-                    )
-                )
-            else:
-                use_device = use_device and query_width <= self.static_k + 1
-            if use_device:
-                self._eagle_first_pass_device_lengths(common.seq_lens, num_reqs)
-        if use_device and not bool((widths == query_width).all()):
-            packed_query_cpu = common.query_start_loc_cpu[: num_reqs + 1].clone()
-            packed_query_device = common.query_start_loc[: num_reqs + 1]
-        if not use_device:
-            return None
-
-        def apply(gid: int, common: Any) -> None:
-            if packed_query_cpu is not None:
-                assert packed_query_device is not None
-                if (
-                    not torch.equal(common.query_start_loc_cpu[: num_reqs + 1], packed_query_cpu)
-                    or common.query_start_loc.data_ptr() != packed_query_device.data_ptr()
-                ):
-                    raise ValueError("Dense Draft groups must share current packed query boundaries")
-            retain = lambda *objects: self.pool.retain(owner, *objects)
-            first_pass = self._eagle_first_pass_pair if eagle_step == 0 else None
-            read = prepare_dense_draft_read(
-                sources[gid],
-                exact_device=common.seq_lens if first_pass is None else first_pass[1],
-                row_indices=batch.idx_mapping[:num_reqs],
-                upper_cpu=common.seq_lens_cpu_upper_bound[:num_reqs],
-                window_size=self.window_size,
-                anchor_span=self.anchor_block_span,
-                query_width=query_width,
-                causal=common.causal,
-                retain=retain,
-                frozen_starts=self._eagle_frozen_starts if eagle_step is not None else None,
-                query_ends=None if first_pass is None else first_pass[0],
-                full_rows_cpu=full_rows_cpu,
-                query_start_loc_cpu=packed_query_cpu,
-                query_start_loc_device=packed_query_device,
-            )
-            retain(common)
-            read.apply(common)
-
-        return apply
-
-    def _eagle_first_pass_device_lengths(self, native_extent: torch.Tensor, num_reqs: int) -> torch.Tensor:
-        """Freeze current live/native lengths without a Host exact consumer.
-
-        MRV2 keeps rejected query padding in the first-pass native layout.
-        Its last valid query index, rather than that padded extent, identifies
-        the logical proposal end. Native lengths keep the original causal
-        alignment; only the frozen Window anchor uses the live end.
+        Rejected first-pass query padding belongs to Q's causal alignment,
+        not the readable KV interval. The frozen CPU plan uses the last valid
+        query position, while the native extent retains its query coordinates.
         """
         positions = self.speculator.input_buffers.positions
         indices = self.speculator.last_token_indices[:num_reqs]
@@ -531,7 +438,7 @@ class DraftWindowRuntime:
             raise ValueError("Eagle3 Window requires current one-dimensional prepared positions and last query indices")
         owner = self._owner
         if owner is None:
-            raise RuntimeError("Eagle3 length preparation has no active Draft Window proposal")
+            raise RuntimeError("Eagle3 length snapshot has no active Draft Window proposal")
         indices = indices.to(dtype=torch.int64)
         self.pool.retain(owner, indices)
         last_positions = positions.index_select(0, indices)
@@ -539,32 +446,8 @@ class DraftWindowRuntime:
         live_end = last_positions.to(dtype=torch.int32)
         self.pool.retain(owner, live_end)
         live_end.add_(1)
-        if self._dense_device_reads:
-            # Freeze from this preparation's last valid query. Later AR
-            # inputs advance within this horizon;
-            # their device exact lengths must not move this proposal anchor.
-            self._eagle_frozen_starts = (
-                torch.div(
-                    torch.clamp(live_end + self.static_k - self.window_size, min=0),
-                    self.anchor_block_span,
-                    rounding_mode="floor",
-                )
-                * self.anchor_block_span
-            )
-            self.pool.retain(owner, self._eagle_frozen_starts)
         pair = torch.stack((native_extent[:num_reqs], live_end))
         self.pool.retain(owner, pair)
-        self._eagle_first_pass_pair = pair
-        return pair
-
-    def _eagle_first_pass_lengths(self, native_extent: torch.Tensor, num_reqs: int):
-        """Certify first-pass lengths for a legacy consumer or later fallback."""
-        pair = self._eagle_first_pass_pair
-        if pair is None:
-            pair = self._eagle_first_pass_device_lengths(native_extent, num_reqs)
-        owner = self._owner
-        if owner is None:
-            raise RuntimeError("Eagle3 length snapshot has no active Draft Window proposal")
         snapshot = pair.to(device="cpu", dtype=torch.int32, copy=True)
         self.pool.retain(owner, snapshot)
         extent_cpu, live_cpu = snapshot[0], snapshot[1]
@@ -584,7 +467,7 @@ class DraftWindowRuntime:
         if owner is None:
             raise RuntimeError("Prompt exact lengths have no active Draft Window proposal")
         if (
-            not self._dense_device_reads
+            not self._dense_reads
             or getattr(self.speculator, "replicated_pcp", False)
             or batch.num_reqs != num_reqs
             or not batch.is_prefilling_np[:num_reqs].all()
@@ -649,6 +532,7 @@ class DraftWindowRuntime:
         *,
         prepared_exact_cpu: torch.Tensor | None = None,
         prepared_exact_device: torch.Tensor | None = None,
+        dense: bool = False,
     ):
         """Project current prepared lengths; CPU reuse requires an explicit pair.
 
@@ -661,15 +545,13 @@ class DraftWindowRuntime:
         owner, batch = self._owner, self._input_batch
         assert owner is not None
         full_exact_input = common.seq_lens
+        self.pool.retain(owner, full_exact_input)
         prompt_exact = (
             self._prompt_exact_lengths(step, num_reqs)
             if self.method == "eagle3" and prepared_exact_cpu is None
             else None
         )
         if self.method == "eagle3" and step == 0 and prompt_exact is not None:
-            # Retain the real device native/live pair and frozen starts
-            # for a subsequent dense AR reader, without copying it.
-            self._eagle_first_pass_device_lengths(full_exact_input, num_reqs)
             exact = proposal_exact = prompt_exact
         elif self.method == "eagle3" and step == 0:
             exact, proposal_exact = self._eagle_first_pass_lengths(full_exact_input, num_reqs)
@@ -695,12 +577,7 @@ class DraftWindowRuntime:
         if self.method == "eagle3":
             if self._eagle_plans is None:
                 if step > 0:
-                    if self._eagle_first_pass_pair is None:
-                        raise RuntimeError("Eagle3 fallback has no current first-pass snapshot")
-                    # A device first pass retained this generation's
-                    # native/live pair. A later legacy consumer may
-                    # copy that pair, never infer the anchor from E-W.
-                    _, proposal_exact = self._eagle_first_pass_lengths(self._eagle_first_pass_pair[0], num_reqs)
+                    raise RuntimeError("Eagle3 AR metadata has no frozen first-pass plan")
                 assert proposal_exact is not None
                 self._eagle_plans = tuple(
                     freeze_eagle_window_plan(
@@ -733,18 +610,47 @@ class DraftWindowRuntime:
 
         def apply(gid: int, common_metadata: Any) -> None:
             source = self._source(gid, num_reqs)
-            view = materialize_direct_prefix(
-                source,
-                exact_cpu=exact,
-                exact_device=common_metadata.seq_lens,
-                upper_cpu=common_metadata.seq_lens_cpu_upper_bound[:num_reqs],
-                starts_cpu=starts,
-                padded_rows=common_metadata.num_reqs,
-                row_indices=batch.idx_mapping[:num_reqs],
-                retain=lambda *objects: self.pool.retain(owner, *objects),
-            )
-            # Retain before a builder or native reader can receive the view.
-            self.pool.retain(owner, view, common_metadata)
+            retain = lambda *objects: self.pool.retain(owner, *objects)
+            view: Any
+            if dense:
+                from vllm_ascend.worker.v2.spec_decode.draft_window_dense import prepare_dense_draft_read
+
+                first = self.method == "eagle3" and step == 0
+                boundaries = common_metadata.query_start_loc_cpu[: num_reqs + 1]
+                widths = boundaries.diff()
+                query_width = int(widths.max())
+                ragged = not bool((widths == query_width).all())
+                view = prepare_dense_draft_read(
+                    source,
+                    exact_device=common_metadata.seq_lens,
+                    exact_cpu=proposal_exact if first else exact,
+                    query_ends_cpu=exact,
+                    row_indices=batch.idx_mapping[:num_reqs],
+                    upper_cpu=common_metadata.seq_lens_cpu_upper_bound[:num_reqs],
+                    window_size=self.window_size,
+                    anchor_span=self.anchor_block_span,
+                    query_width=query_width,
+                    causal=common_metadata.causal,
+                    frozen_starts=starts,
+                    full_rows_cpu=torch.tensor(
+                        continuing | (batch.is_prefilling_np[:num_reqs] if first else False), device="cpu"
+                    ),
+                    query_start_loc_cpu=boundaries if ragged else None,
+                    query_start_loc_device=common_metadata.query_start_loc[: num_reqs + 1] if ragged else None,
+                    retain=retain,
+                )
+            else:
+                view = materialize_direct_prefix(
+                    source,
+                    exact_cpu=exact,
+                    exact_device=common_metadata.seq_lens,
+                    upper_cpu=common_metadata.seq_lens_cpu_upper_bound[:num_reqs],
+                    starts_cpu=starts,
+                    padded_rows=common_metadata.num_reqs,
+                    row_indices=batch.idx_mapping[:num_reqs],
+                    retain=retain,
+                )
+            retain(view, common_metadata)
             view.apply(common_metadata)
 
         return apply

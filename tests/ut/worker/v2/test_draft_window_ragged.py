@@ -4,7 +4,6 @@
 import pytest
 import torch
 
-from tests.ut.worker.v2.draft_window_cpu import cpu_dense_planning as cpu_dense_planning
 from vllm_ascend.worker.v2.spec_decode.draft_window_dense import (
     DenseDraftReadBatch,
     prepare_dense_draft_read,
@@ -36,11 +35,11 @@ def test_ragged_queries_keep_full_row_and_use_device_exact_at_boundary(causal):
     )
     assert (exact - read.seq_lens).tolist() == [0, 0]
     assert read.seq_lens.tolist() == [1151, 1408]
-    assert read.capacity == 1440  # Full-row U controls allocation only.
+    assert read.capacity == 1408  # Completed exact now bounds the allocation.
     assert read.num_query_tokens == 8
     assert isinstance(read, DenseDraftReadBatch)
     assert [indices.tolist() for indices, _ in read.parts] == [[0, 1, 2], [3, 4, 5, 6, 7]]
-    assert [part.capacity for _, part in read.parts] == [1152, 1440]
+    assert [part.capacity for _, part in read.parts] == [1152, 1408]
     for row, (state_row, end, width) in enumerate(((1, 1151, 3), (0, 1408, 5))):
         expected = [int(before[state_row, pos // 128]) * 128 + pos % 128 for pos in range(end)]
         private = read.parts[row][1]
@@ -107,4 +106,40 @@ def test_uniform_full_read_rows_keep_original_query_layout():
     assert read.num_query_tokens == 16
     assert isinstance(read, DenseDraftReadBatch)
     assert [indices.tolist() for indices, _ in read.parts] == [list(range(8)), list(range(8, 16))]
-    assert all(part.query_indices is None and part.output_indices is None for _, part in read.parts)
+    assert all(part.num_query_tokens == indices.numel() for indices, part in read.parts)
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("full_rows", [None, [False, False, False]])
+def test_decode_ragged_widths_use_same_partition_without_query_padding(causal, full_rows):
+    table = torch.arange(48, dtype=torch.int32).reshape(3, 16)
+    source = DirectPrefixSource(table, (2, 0, 1), (16, 16, 16), 128)
+    offsets = torch.tensor([0, 1, 4, 5], dtype=torch.int32)
+    exact = torch.tensor([1151, 1291, 1408], dtype=torch.int32)
+    read = prepare_dense_draft_read(
+        source,
+        exact_device=exact,
+        row_indices=torch.tensor([2, 0, 1]),
+        upper_cpu=exact + 3,
+        window_size=1024,
+        anchor_span=128,
+        query_width=3,
+        causal=causal,
+        frozen_starts=torch.tensor([0, 256, 384], dtype=torch.int32),
+        full_rows_cpu=None if full_rows is None else torch.tensor(full_rows),
+        query_start_loc_cpu=offsets,
+        query_start_loc_device=offsets.clone(),
+        retain=lambda *items: None,
+    )
+    assert isinstance(read, DenseDraftReadBatch)
+    assert read.num_query_tokens == 5
+    assert [indices.tolist() for indices, _ in read.parts] == [[0, 4], [1, 2, 3]]
+    assert [part.query_width for _, part in read.parts] == [1, 3]
+    assert read.seq_lens.tolist() == [1151, 1035, 1024]
+    for indices, part in read.parts:
+        assert indices.numel() == part.num_query_tokens
+        for row in range(part.num_reqs):
+            visible = int(part.seq_lens[row])
+            allowed = [visible - part.query_width + step + 1 for step in range(part.query_width)]
+            assert (~part.mask[row, 0]).sum(-1).tolist() == (allowed if causal else [visible] * part.query_width)
+            assert part.slots[row, visible:].eq(part.slots[row, visible - 1]).all()

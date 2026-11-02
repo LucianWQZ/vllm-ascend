@@ -12,7 +12,7 @@ def freeze_mla_read_metadata(
     metadata: Mapping[str, Any],
     mla_layer_names: Collection[str],
     *,
-    retain: Callable[..., None] | None = None,
+    retain: Callable[..., None],
 ) -> tuple[Any, ...]:
     """Detach only MLA decode RoPE from the builder's process-wide scratch.
 
@@ -43,14 +43,11 @@ def freeze_mla_read_metadata(
         for field in ("cos", "sin"):
             value = getattr(decode, field)
             if value is not None:
-                if retain is None:
-                    owned = value.clone()
-                else:
-                    # Own both operands before a copy can partially submit and
-                    # raise. A later field failure must not lose this snapshot.
-                    owned = torch.empty_like(value)
-                    retain(value, owned)
-                    owned.copy_(value, non_blocking=True)
+                # Own both operands before a copy can partially submit and
+                # raise. A later field failure must not lose this snapshot.
+                owned = torch.empty_like(value)
+                retain(value, owned)
+                owned.copy_(value, non_blocking=True)
                 setattr(decode, field, owned)
                 retained.append(owned)
     return tuple(retained)
