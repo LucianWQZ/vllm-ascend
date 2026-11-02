@@ -7,7 +7,7 @@ Unknown or incompatible consumers fail before proposal work; successful
 selection describes an addressing contract, not device qualification.
 """
 
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, cast
@@ -17,48 +17,6 @@ class DraftWindowProviderStatus(str, Enum):
     DIRECT_DENSE = "DIRECT_DENSE"
     NATIVE_SWA = "NATIVE_SWA"
     DIRECT_MLA = "DIRECT_MLA"
-
-
-@dataclass(frozen=True)
-class DraftWindowBackendTypes:
-    """Concrete runtime classes; injected explicitly in CPU contract tests."""
-
-    dense_backend: type
-    dense_builder: type
-    full_attention_spec: type
-    uniform_spec: type[Any]
-    storage_block_size: Callable[[Any], int]
-    compression_ratio: Callable[[Any], int]
-    mla_backend: type | None = None
-    mla_builder: type | None = None
-    mla_spec: type | None = None
-    sliding_window_spec: type | None = None
-
-    @classmethod
-    def load(cls) -> "DraftWindowBackendTypes":
-        # Keep device/backend imports out of CONFIG_OFF and policy evaluation.
-        from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec, UniformTypeKVCacheSpecs
-
-        from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionMetadataBuilder
-        from vllm_ascend.attention.mla_v1 import AscendMLABackend, AscendMLAMetadataBuilder
-        from vllm_ascend.core.kv_cache_interface import (
-            AscendMLAAttentionSpec,
-            get_kv_cache_compression_ratio,
-            get_storage_block_size,
-        )
-
-        return cls(
-            AscendAttentionBackend,
-            AscendAttentionMetadataBuilder,
-            FullAttentionSpec,
-            UniformTypeKVCacheSpecs,
-            get_storage_block_size,
-            get_kv_cache_compression_ratio,
-            mla_backend=AscendMLABackend,
-            mla_builder=AscendMLAMetadataBuilder,
-            mla_spec=AscendMLAAttentionSpec,
-            sliding_window_spec=SlidingWindowSpec,
-        )
 
 
 @dataclass(frozen=True)
@@ -75,7 +33,6 @@ def _select_read_provider(
     backend: type,
     builder: Any,
     specs: Sequence[Any],
-    types: DraftWindowBackendTypes,
     *,
     uncompressed: bool,
     native_window: int | None,
@@ -83,24 +40,29 @@ def _select_read_provider(
     full_retention_dflash2: bool,
 ) -> DraftWindowProviderStatus:
     """Match one actual consumer, then apply its layout-specific restrictions."""
+    from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
+
+    from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionMetadataBuilder
+    from vllm_ascend.attention.mla_v1 import AscendMLABackend, AscendMLAMetadataBuilder
+    from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
+
     status = DraftWindowProviderStatus
     selected: DraftWindowProviderStatus | None = None
     if not uncompressed:
         raise NotImplementedError("Compressed or packed cache geometry needs a separate read provider")
 
-    def matches(backend_type: type | None, builder_type: type | None, spec_type: type | None) -> bool:
+    def matches(backend_type: type, builder_type: type, spec_type: type) -> bool:
         return (
             backend is backend_type and type(builder) is builder_type and all(type(item) is spec_type for item in specs)
         )
 
     if full_retention_dflash2 and any(
-        type(item) is not types.full_attention_spec or getattr(item, "attention_chunk_size", None) is not None
-        for item in specs
+        type(item) is not FullAttentionSpec or getattr(item, "attention_chunk_size", None) is not None for item in specs
     ):
         raise NotImplementedError("DFlash2 requires Full-retention FullAttentionSpec without chunked attention")
 
-    native = matches(types.dense_backend, types.dense_builder, types.sliding_window_spec)
-    if matches(types.dense_backend, types.dense_builder, types.full_attention_spec):
+    native = matches(AscendAttentionBackend, AscendAttentionMetadataBuilder, SlidingWindowSpec)
+    if matches(AscendAttentionBackend, AscendAttentionMetadataBuilder, FullAttentionSpec):
         if (
             all(getattr(item, "attention_chunk_size", None) is None for item in specs)
             and uniform_windows
@@ -112,7 +74,7 @@ def _select_read_provider(
         else:
             raise NotImplementedError("Dense chunked or nonuniform native attention needs a separate provider")
     elif not native:
-        if matches(types.mla_backend, types.mla_builder, types.mla_spec):
+        if matches(AscendMLABackend, AscendMLAMetadataBuilder, AscendMLAAttentionSpec):
             if builder.flashmla_state is not None:
                 raise NotImplementedError("FlashMLA persistent derived state needs a separate provider")
             selected = status.DIRECT_MLA
@@ -140,7 +102,6 @@ def inventory_draft_window_groups(
     kv_cache_config: Any,
     block_tables: Any,
     parallel_config: Any,
-    types: DraftWindowBackendTypes | None = None,
     full_retention_dflash2: bool = False,
 ) -> tuple[DraftWindowGroupRoute, ...]:
     """Inventory every actual consumer without inspecting tensor contents.
@@ -150,8 +111,10 @@ def inventory_draft_window_groups(
     table column; compressed physical rows are that span divided by ratio.
     No resident-set guarantee is inferred from capacity or valid counts.
     """
-    if types is None:
-        types = DraftWindowBackendTypes.load()
+    from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
+
+    from vllm_ascend.core.kv_cache_interface import get_kv_cache_compression_ratio, get_storage_block_size
+
     if parallel_config.prefill_context_parallel_size != 1 or parallel_config.decode_context_parallel_size != 1:
         raise NotImplementedError("Context-parallel read coordinates need a separate provider")
     cache_groups = kv_cache_config.kv_cache_groups
@@ -166,11 +129,11 @@ def inventory_draft_window_groups(
             # after filtering by active_layer_names. They have no draft reader.
             continue
         spec = cache_group.kv_cache_spec
-        specs = tuple(spec.kv_cache_specs.values()) if isinstance(spec, types.uniform_spec) else (spec,)
+        specs = tuple(spec.kv_cache_specs.values()) if isinstance(spec, UniformTypeKVCacheSpecs) else (spec,)
         if not specs:
             raise ValueError(f"Draft KV group {gid} has no cache spec")
         geometries = {
-            (int(item.block_size), int(types.compression_ratio(item)), int(types.storage_block_size(item)))
+            (int(item.block_size), int(get_kv_cache_compression_ratio(item)), int(get_storage_block_size(item)))
             for item in specs
         }
         if len(geometries) != 1:
@@ -188,7 +151,7 @@ def inventory_draft_window_groups(
         for group in groups:
             if group.kv_cache_group_id != gid or int(group.kv_cache_spec.block_size) != scheduler_span:
                 raise ValueError(f"Draft KV group {gid} consumer and canonical source geometry disagree")
-            if isinstance(spec, types.uniform_spec):
+            if isinstance(spec, UniformTypeKVCacheSpecs):
                 try:
                     consumer_specs = tuple(spec.kv_cache_specs[name] for name in group.layer_names)
                 except KeyError as error:
@@ -204,7 +167,6 @@ def inventory_draft_window_groups(
                     backend,
                     builder,
                     consumer_specs,
-                    types,
                     uncompressed=ratio == 1 and storage_size == scheduler_span,
                     native_window=native_window,
                     uniform_windows=len(windows) == 1,

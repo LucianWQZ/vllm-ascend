@@ -20,17 +20,9 @@ class TensorHeader:
     def __init__(self, shape, dtype="torch.int64"):
         self.shape, self.dtype, self.device = tuple(shape), dtype, "npu:0"
         self.address = id(self)
-        self.offset = 0
-        self.contiguous = True
 
     def data_ptr(self):
         return self.address
-
-    def untyped_storage(self):
-        return self
-
-    def storage_offset(self):
-        return self.offset
 
     def stride(self):
         result, size = [], 1
@@ -38,9 +30,6 @@ class TensorHeader:
             result.append(size)
             size *= dim
         return tuple(reversed(result))
-
-    def is_contiguous(self):
-        return self.contiguous
 
     def __getattr__(self, name):
         raise AssertionError(f"contract tried a nonmetadata tensor operation: {name}")
@@ -142,15 +131,7 @@ def owner():
         candidate_sampler=SimpleNamespace(
             num_steps=7,
             top_k=2,
-            scores=TensorHeader((4, 7, 2), "torch.float32"),
-            cached_candidate_ids=TensorHeader((4, 7, 2)),
         ),
-        sample_indices=TensorHeader((28,)),
-        sample_pos=TensorHeader((28,)),
-        sample_idx_mapping=TensorHeader((28,)),
-        temperature=TensorHeader((4,), "torch.float32"),
-        seeds=TensorHeader((4,)),
-        draft_tokens=TensorHeader((4, 7)),
         draft_logits=None,
         draft_attn_layer_names={"draft.0"},
     )
@@ -208,8 +189,8 @@ def test_graph_factory_qualifies_the_real_dflash2_owner(monkeypatch, owner):
     )
     source = draft_window._build_draft_window_source_capability_for_context(**kwargs)
     assert source.table is owner.block_tables.input_block_tables[0]
-    owner.candidate_sampler.scores.shape = (4, 7, 3)
-    with pytest.raises(ValueError, match="shape/dtype"):
+    owner.model.model.layers[0].attention_conv.block_size = 7
+    with pytest.raises(ValueError, match="query boundary"):
         draft_window._build_draft_window_source_capability_for_context(**kwargs)
     kwargs["dflash2_graph_owner"] = None
     with pytest.raises(TypeError, match="actual model owner"):
@@ -247,9 +228,6 @@ def test_actual_conditional_full_vocab_logits_allocation(module, owner, sampling
         (lambda x: setattr(x, "_dflash2_full_kv_reference", False), "full-retention loader"),
         (lambda x: setattr(x.speculative_config, "enforce_eager", True), "typed eager owner"),
         (lambda x: setattr(x.model.model.layers[0].attention_conv, "block_size", 3), "query boundary"),
-        (lambda x: setattr(x.candidate_sampler.scores, "shape", (4, 7, 3)), "shape/dtype"),
-        (lambda x: setattr(x.sample_idx_mapping, "dtype", "torch.int32"), "shape/dtype"),
-        (lambda x: setattr(x.seeds, "contiguous", False), "contiguous"),
         (
             lambda x: setattr(x.attn_vllm_config, "compilation_config", SimpleNamespace(static_forward_context={})),
             "static context",

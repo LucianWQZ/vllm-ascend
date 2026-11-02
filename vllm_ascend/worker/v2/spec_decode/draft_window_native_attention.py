@@ -160,15 +160,10 @@ def report_owner_draft_native_attention(owner: Any, logger: Any) -> DraftNativeA
     eager = (
         _get(speculative, "enforce_eager") is True or _get(_get(owner, "draft_model_config"), "enforce_eager") is True
     )
-    managers = (
-        _get(owner, "query_cudagraph_manager"),
-        _get(owner, "prefill_cudagraph_manager"),
-        _get(owner, "decode_cudagraph_manager"),
-    )
-    modes = tuple(_get(_get(manager, "cudagraph_mode"), "name") for manager in managers if manager is not None)
-    # A real initialized manager is authoritative. Before manager creation this
-    # is only the explicit Draft request, never the Target's graph selection.
-    graph_requested = not eager and (any(mode != "NONE" for mode in modes) if modes else True)
+    # All real callers run here from set_attn, before the fixed runner calls
+    # init_cudagraph_manager. Report the Draft request, not Target Graph mode
+    # or a hypothetical already-created manager.
+    graph_requested = not eager
     inventory = inspect_draft_native_attention(owner)
     logger.info_once(
         "Draft native attention=%s; native windows=%s; extra Draft window=%s; "

@@ -19,20 +19,6 @@ def _require(condition: bool, message: str) -> None:
         raise ValueError("DFlash2 Graph: " + message)
 
 
-def _capture_tensor(
-    parent: Any,
-    name: str,
-    shape: tuple[int, ...],
-    dtype: str,
-) -> None:
-    tensor = getattr(parent, name)
-    _require(
-        tuple(tensor.shape) == shape and str(tensor.dtype) == dtype,
-        f"{name} shape/dtype does not match static K/selector capacity",
-    )
-    _require(tensor.is_contiguous() and tensor.data_ptr() != 0, f"{name} must have live contiguous persistent storage")
-
-
 def _attention_impl_type():
     # Worker-only import; CONFIG_OFF/policy evaluation stays host-only.
     from vllm_ascend.attention.attention_v1 import AscendAttentionBackendImpl
@@ -162,26 +148,15 @@ def validate_dflash2_graph_source(owner: Any) -> None:
         and callable(selector),
         "actual selector/sampler contract differs",
     )
-    fields = (
-        ("sample_indices", (capacity * k,), "torch.int64"),
-        ("sample_pos", (capacity * k,), "torch.int64"),
-        ("sample_idx_mapping", (capacity * k,), "torch.int64"),
-        ("temperature", (capacity,), "torch.float32"),
-        ("seeds", (capacity,), "torch.int64"),
-        ("draft_tokens", (capacity, k), "torch.int64"),
-    )
-    _capture_tensor(sampler, "scores", (capacity, k, top_k), "torch.float32")
-    _capture_tensor(sampler, "cached_candidate_ids", (capacity, k, top_k), "torch.int64")
-    for args in fields:
-        _capture_tensor(owner, *args)
+    # Fixed DFlash/DFlash2 constructors own the sampler and per-request input
+    # allocations. Capture retains those original tensors; Window does not
+    # replace them or maintain a second allocation/layout schema.
     _require(config.draft_sample_method in ("greedy", "probabilistic"), "unknown candidate sampling mode")
     probabilistic = config.draft_sample_method == "probabilistic"
     _require(
         (owner.draft_logits is not None) is probabilistic,
         "probabilistic selector requires its existing full-vocab cache; greedy must not add one",
     )
-    if probabilistic:
-        _capture_tensor(owner, "draft_logits", (capacity, k, owner.vocab_size), "torch.float32")
     impl_type = _attention_impl_type()
     context = owner.vllm_config.compilation_config.static_forward_context
     _require(

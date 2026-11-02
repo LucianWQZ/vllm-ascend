@@ -104,19 +104,16 @@ class NativeAttentionTests(unittest.TestCase):
         self.assertEqual(native.inspect_draft_native_attention(loaded(cfg, [None], causal=True)).kind, "FULL")
         self.assertEqual(native.inspect_draft_native_attention(loaded(cfg, [2048], causal=True)).kind, "SWA")
 
-    def test_owner_actual_draft_none_mode_does_not_inherit_target_graph(self):
+    def test_startup_graph_request_uses_draft_flag_not_target_mode(self):
         owner = loaded(config(), [None, None])
-        next(iter(owner.attn_vllm_config.compilation_config.static_forward_context.values())).impl = object()
-        owner.speculative_config = SimpleNamespace(enforce_eager=False)
-        owner.query_cudagraph_manager = SimpleNamespace(cudagraph_mode=SimpleNamespace(name="NONE"))
+        owner.speculative_config = SimpleNamespace(enforce_eager=True)
         owner.attn_vllm_config.compilation_config.cudagraph_mode = SimpleNamespace(name="FULL")
         log = Log()
-        result = native.report_owner_draft_native_attention(owner, log)
-        self.assertEqual(result.kind, "UNKNOWN")
+        native.report_owner_draft_native_attention(owner, log)
         self.assertEqual(log.info[0][0][4], False)
-        owner.query_cudagraph_manager.cudagraph_mode.name = "FULL"
-        with self.assertRaises(NotImplementedError):
-            native.report_owner_draft_native_attention(owner, log)
+        owner.speculative_config.enforce_eager = False
+        native.report_owner_draft_native_attention(owner, log)
+        self.assertEqual(log.info[-1][0][4], True)
 
     def test_startup_inventory_preserves_baseline_off_unknown_graph(self):
         owner = loaded(config(architecture="UnclassifiedMTPDraft"), [None, None])
