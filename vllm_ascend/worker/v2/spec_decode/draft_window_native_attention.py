@@ -67,11 +67,7 @@ class DraftNativeAttention:
         return tuple(sorted({value for value in self.windows if window_size < value}))
 
 
-def inspect_draft_native_attention(
-    speculator: Any,
-    *,
-    provider_routes: Sequence[Any] = (),
-) -> DraftNativeAttention:
+def inspect_draft_native_attention(speculator: Any) -> DraftNativeAttention:
     """Inspect loaded Draft consumers, after the real loader and ``set_attn``.
 
     Normalized architecture/layer count bounds the inventory. Native windows
@@ -121,18 +117,6 @@ def inspect_draft_native_attention(
                         issues.append(f"noncausal Draft consumer {name} has no native-SWA mask binding")
                 except ValueError as error:
                     issues.append(f"Draft consumer {name}: {error}")
-    for route in provider_routes:
-        native = _get(route, "native_window")
-        if native is None:
-            continue
-        try:
-            native = _window(native)
-        except ValueError as error:
-            issues.append(f"Draft provider: {error}")
-            continue
-        for name in _get(route, "layers", _get(route, "layer_names", ())):
-            if name not in layers or layers[name] != native:
-                issues.append(f"Draft provider and actual consumer {name} disagree on native window")
     # The loader already identifies the Draft layer set, including any Target
     # layer offset. Use that registration instead of parsing layer-name strings.
     declared = _get(speculator, "draft_attn_layer_names", ()) or ()
@@ -164,47 +148,6 @@ def require_known_draft_native_attention(
         )
 
 
-def report_draft_native_attention(
-    speculator: Any,
-    *,
-    logger: Any,
-    window_size: int | None,
-    graph_requested: bool = False,
-    provider_routes: Sequence[Any] = (),
-    certified_native_windows: Mapping[int, int] | None = None,
-) -> DraftNativeAttention:
-    """Emit a once-per-loaded-model summary, without installing an owner."""
-    inventory = inspect_draft_native_attention(speculator, provider_routes=provider_routes)
-    logger.info_once(
-        "Draft native attention=%s; native windows=%s; extra Draft window=%s; "
-        "Draft Graph requested=%s; complete actual inventory=%s; issues=%s. "
-        "Full KV retention does not imply Full attention.",
-        inventory.kind,
-        inventory.windows,
-        window_size,
-        graph_requested,
-        inventory.actual_complete,
-        inventory.issues,
-        scope="global",
-    )
-    native_windows = set(inventory.narrowed_windows(window_size))
-    # The existing typed eager provider has already certified these native
-    # consumers. Keep its warning even when a test/older model omits config.
-    if window_size is not None:
-        native_windows.update(value for value in (certified_native_windows or {}).values() if window_size < value)
-    if native_windows:
-        logger.warning_once(
-            "The Draft model contains native SWA layers with windows %s. "
-            "The additional draft_window_size=%s narrows those layers and may reduce "
-            "acceptance or throughput. Prefer the native window by default and "
-            "enable an additional window only after measuring your workload.",
-            tuple(sorted(native_windows)),
-            window_size,
-            scope="global",
-        )
-    return inventory
-
-
 def report_owner_draft_native_attention(owner: Any, logger: Any) -> DraftNativeAttention:
     """Startup-only summary of the actual speculator's loaded attention.
 
@@ -226,18 +169,30 @@ def report_owner_draft_native_attention(owner: Any, logger: Any) -> DraftNativeA
     # A real initialized manager is authoritative. Before manager creation this
     # is only the explicit Draft request, never the Target's graph selection.
     graph_requested = not eager and (any(mode != "NONE" for mode in modes) if modes else True)
-    provider = _get(owner, "_draft_window_graph_binding_provider")
-    group = _get(_get(provider, "source"), "group")
-    routes = () if group is None else (group,)
-    runtime = _get(owner, "_draft_window_runtime")
-    inventory = report_draft_native_attention(
-        owner,
-        logger=logger,
-        window_size=window,
-        graph_requested=graph_requested,
-        provider_routes=routes,
-        certified_native_windows=_get(runtime, "native_swa_intersections"),
+    inventory = inspect_draft_native_attention(owner)
+    logger.info_once(
+        "Draft native attention=%s; native windows=%s; extra Draft window=%s; "
+        "Draft Graph requested=%s; complete actual inventory=%s; issues=%s. "
+        "Full KV retention does not imply Full attention.",
+        inventory.kind,
+        inventory.windows,
+        window,
+        graph_requested,
+        inventory.actual_complete,
+        inventory.issues,
+        scope="global",
     )
+    narrowed = inventory.narrowed_windows(window)
+    if narrowed:
+        logger.warning_once(
+            "The Draft model contains native SWA layers with windows %s. "
+            "The additional draft_window_size=%s narrows those layers and may reduce "
+            "acceptance or throughput. Prefer the native window by default and "
+            "enable an additional window only after measuring your workload.",
+            narrowed,
+            window,
+            scope="global",
+        )
     # Detection must not turn an original Window-OFF Graph route (for example
     # built-in MTP) into a newly rejected configuration. Additional Window
     # owners always need the contract; DFlash2 Graph is itself new admission

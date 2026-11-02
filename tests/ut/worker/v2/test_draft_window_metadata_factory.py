@@ -1,14 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
-"""Factory patch contracts; unchanged source bodies, no NPU execution claim."""
+"""Normal metadata ownership and existing factory contracts; CPU only."""
 
 import ast
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
 import torch
 
@@ -121,14 +122,17 @@ def test_metadata_copy_rejects_invalid_known_host_fields(metadata_isolation):
 
 
 def test_real_builder_constructs_private_window_metadata_without_touching_target(monkeypatch):
-    from copy import copy
+    from vllm.v1.kv_cache_interface import FullAttentionSpec
 
     from vllm_ascend.attention.attention_v1 import (
         AscendAttentionMetadataBuilder,
         AscendAttentionState,
         AscendMetadata,
     )
-    from vllm_ascend.worker.v2.spec_decode.draft_window_eager import draft_window_read_inputs
+    from vllm_ascend.worker.v2.spec_decode.draft_window_eager import (
+        build_draft_window_attn_metadata,
+        draft_window_read_inputs,
+    )
 
     # Only pinning and backend phase/mask dependencies are isolated. The real
     # builder creates both metadata objects and all mutable Host containers.
@@ -173,9 +177,42 @@ def test_real_builder_constructs_private_window_metadata_without_touching_target
         device_window_exact=torch.tensor([7, 6], dtype=torch.int32),
         cpu_window_exact=torch.tensor([7, 6], dtype=torch.int32),
     )
-    draft_common = copy(common)
-    draft_window_read_inputs(bank, actual_request_count=2, padded_request_count=2).apply(draft_common)
-    draft = AscendAttentionMetadataBuilder.build(builder, 0, draft_common)
+    builder.build = MethodType(AscendAttentionMetadataBuilder.build, builder)
+    group = SimpleNamespace(layer_names=["draft"], get_metadata_builder=lambda _: builder)
+    owner = SimpleNamespace(
+        num_query_per_req=1,
+        arange_np=np.arange(3, dtype=np.int32),
+        dcp_size=1,
+        max_model_len=16,
+        draft_max_seq_len=16,
+        draft_is_prefilling=torch.zeros(2, dtype=torch.bool),
+        attn_groups=[[group]],
+        input_buffers=SimpleNamespace(query_start_loc=query, seq_lens=exact, positions=torch.arange(2)),
+        input_batch=SimpleNamespace(
+            is_prefilling_np=np.array([False, False]), attn_state=AscendAttentionState.DecodeOnly
+        ),
+        block_tables=SimpleNamespace(input_block_tables=[table], slot_mappings=slots.unsqueeze(0)),
+        attn_vllm_config=SimpleNamespace(parallel_config=None),
+        kv_cache_config=SimpleNamespace(
+            kv_cache_groups=[
+                SimpleNamespace(
+                    kv_cache_spec=FullAttentionSpec(block_size=4, num_kv_heads=1, head_size=16, dtype=torch.float16)
+                )
+            ]
+        ),
+        _draft_window_graph_binding_provider=SimpleNamespace(
+            source=SimpleNamespace(group=SimpleNamespace(gid=0, layers=("draft",)))
+        ),
+    )
+    draft = build_draft_window_attn_metadata(
+        owner,
+        num_reqs=2,
+        num_reqs_padded=2,
+        num_tokens_padded=2,
+        read_inputs=draft_window_read_inputs(bank, actual_request_count=2, padded_request_count=2),
+        causal=True,
+        query_start_loc_np=None,
+    )["draft"]
     assert draft is not target
     assert draft.block_tables.data_ptr() == bank.window_block_table.data_ptr()
     assert draft.block_tables.shape == bank.window_block_table.shape
@@ -183,7 +220,7 @@ def test_real_builder_constructs_private_window_metadata_without_touching_target
     assert draft.seq_lens_list == [7, 6] and draft.seq_lens_list is not target.seq_lens_list
     assert draft.actual_seq_lengths_q is not target.actual_seq_lengths_q
     assert draft.slot_mapping.data_ptr() == target.slot_mapping.data_ptr() == slots.data_ptr()
-    assert draft.query_start_loc_gpu is target.query_start_loc_gpu is query
+    assert draft.query_start_loc_gpu.data_ptr() == target.query_start_loc_gpu.data_ptr() == query.data_ptr()
     draft.seq_lens_list[0] = 99
     draft.actual_seq_lengths_q.append(3)
     assert target.seq_lens_list == [11, 14] and target.actual_seq_lengths_q == [1, 2]

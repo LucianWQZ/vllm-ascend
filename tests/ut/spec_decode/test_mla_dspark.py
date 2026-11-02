@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from contextlib import contextmanager, nullcontext
+from inspect import signature
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
@@ -24,6 +25,17 @@ from vllm_ascend.worker.v2.spec_decode import init_speculator
 from vllm_ascend.worker.v2.spec_decode.dflash import aclgraph as graph
 from vllm_ascend.worker.v2.spec_decode.dspark import speculator as shared
 from vllm_ascend.worker.v2.spec_decode.dspark.speculator import AscendDSparkSpeculator
+
+_METADATA_SIGNATURE = signature(DSparkSpeculator._build_attn_metadata)
+
+
+@pytest.fixture(autouse=True)
+def normal_nonwindow_features(monkeypatch):
+    monkeypatch.setattr(
+        "vllm_ascend.worker.v2.spec_decode.get_ascend_config", lambda: SimpleNamespace(draft_window_size=None)
+    )
+    monkeypatch.setattr("vllm_ascend.worker.v2.spec_decode.lmhead_tp_utils.lmhead_tp_enable", lambda: False)
+    monkeypatch.setattr(shared, "lmhead_tp_enable", lambda: False)
 
 
 def make_speculator():
@@ -122,7 +134,9 @@ def initialize_attention(monkeypatch, draft_backend, target_backend=AscendMLABac
     monkeypatch.setattr(shared, "prepare_replicated_pcp_config", lambda config: (config, False))
     config = SimpleNamespace(
         attention_config=AttentionConfig(),
-        speculative_config=SimpleNamespace(method="dspark", enforce_eager=None, use_dspark=lambda: True),
+        speculative_config=SimpleNamespace(
+            method="dspark", enforce_eager=None, use_dspark=lambda: True, draft_model_config=SimpleNamespace(model=None)
+        ),
         parallel_config=SimpleNamespace(decode_context_parallel_size=1),
         cache_config=SimpleNamespace(block_size=128),
     )
@@ -312,7 +326,18 @@ def test_propose_uses_draft_decode_flags_for_dcp(monkeypatch, use_dcp):
     monkeypatch.setattr(shared, "build_attn_metadata_wrapper", nullcontext)
 
     @contextmanager
-    def factory(positions, pad, is_prefilling, seq_lens_cpu=None, *, attn_state=None, parallel_config=None):
+    def factory(
+        positions,
+        pad,
+        is_prefilling,
+        seq_lens_cpu=None,
+        *,
+        attn_state=None,
+        parallel_config=None,
+        common_metadata_callback=None,
+        metadata_builder_callback=None,
+    ):
+        assert common_metadata_callback is None and metadata_builder_callback is None
         captured.update(is_prefilling=is_prefilling, seq_lens_cpu=seq_lens_cpu)
         yield
 
@@ -348,7 +373,18 @@ def test_replay_metadata_preserves_architecture_behavior(monkeypatch, architectu
     captured: dict[str, Any] = {}
 
     @contextmanager
-    def factory(positions, pad, is_prefilling, seq_lens_cpu=None, *, attn_state=None, parallel_config=None):
+    def factory(
+        positions,
+        pad,
+        is_prefilling,
+        seq_lens_cpu=None,
+        *,
+        attn_state=None,
+        parallel_config=None,
+        common_metadata_callback=None,
+        metadata_builder_callback=None,
+    ):
+        assert common_metadata_callback is None and metadata_builder_callback is None
         if architecture == "MLA":
             assert seq_lens_cpu.tolist() == [5, 0]
         else:
@@ -371,7 +407,7 @@ def test_replay_metadata_preserves_architecture_behavior(monkeypatch, architectu
     else:
         assert query_metadata.actual_seq_lengths_q == [5, 5]
         update.assert_not_called()
-    kwargs = builder.call_args.kwargs
+    kwargs = _METADATA_SIGNATURE.bind(None, *builder.call_args.args, **builder.call_args.kwargs).arguments
     assert kwargs["num_reqs"] == 1
     assert kwargs["batch_desc"].num_reqs == 2
     assert kwargs["batch_desc"].num_tokens == 10
@@ -434,7 +470,8 @@ def test_query_builder_overrides_and_restores_target_context(monkeypatch, archit
         metadata.attn_state = kwargs["attn_state"]
         return {"draft": metadata}
 
-    def parent(self, **kwargs):
+    def parent(self, *args, **kwargs):
+        _METADATA_SIGNATURE.bind(self, *args, **kwargs)
         return module.build_attn_metadata(attn_state=None)
 
     spec.input_batch = SimpleNamespace(num_reqs=1)

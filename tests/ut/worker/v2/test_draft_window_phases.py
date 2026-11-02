@@ -16,8 +16,9 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_backends import (
     DraftWindowGroupRoute,
     DraftWindowProviderStatus,
 )
-from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowProposalContext
-from vllm_ascend.worker.v2.spec_decode.draft_window_nongraph import (
+from vllm_ascend.worker.v2.spec_decode.draft_window_eager import (
+    DraftWindowProposalContext,
+    _requires_prefill_baseline_bypass,
     classify_draft_window_batch_phase,
 )
 
@@ -46,19 +47,18 @@ def _batch(rows):
 
 
 @pytest.mark.parametrize(
-    "rows,full_rows,baseline,bypass",
+    "rows,full_rows,bypass",
     [
-        ([(0, 8, 2)], (True,), (0,), True),
-        ([(6, 8, 2)], (False,), (), False),
-        ([(0, 8, 2), (8, 8, 1)], (True, False), (0,), False),
-        ([], (), (), False),
+        ([(0, 8, 2)], (True,), True),
+        ([(6, 8, 2)], (False,), False),
+        ([(0, 8, 2), (8, 8, 1)], (True, False), False),
+        ([], (), False),
     ],
 )
-def test_bypass_requires_every_real_row_to_be_continuing(rows, full_rows, baseline, bypass):
-    plan = classify_draft_window_batch_phase(_batch(rows))
-    assert plan.full_read_rows == full_rows
-    assert plan.baseline_only_rows == baseline
-    assert plan.bypass_entire_batch is bypass
+def test_bypass_requires_every_real_row_to_be_continuing(rows, full_rows, bypass):
+    batch = _batch(rows)
+    assert classify_draft_window_batch_phase(batch) == full_rows
+    assert _requires_prefill_baseline_bypass(batch) is bypass
 
 
 @pytest.mark.parametrize("field", ["req_ids", "idx_mapping_np", "num_scheduled_tokens"])

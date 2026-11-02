@@ -177,6 +177,8 @@ class DraftGraphSupportTest(unittest.TestCase):
                 ("rms_norm_eps", 1e-5),
                 ("tie_word_embeddings", True),
                 ("vocab_size", 256000),
+                ("block_size", 32),
+                ("num_target_layers", 2),
             ):
                 setattr(hf, field, value)
                 with self.subTest(method=method, field=field):
@@ -222,9 +224,12 @@ class DraftGraphSupportTest(unittest.TestCase):
         target_hf = NS(model_type="glm_moe_dsa", num_hidden_layers=78)
         speculative.target_model_config = NS(hf_text_config=target_hf, get_hidden_size=lambda: 6144)
         self.assertIsNone(self.resolve(config))
+        # This export count is not consumed by the fixed DFlash model/worker;
+        # the actual Target layer count below still bounds every auxiliary ID.
+        hf.num_target_layers = 40
+        self.assertIsNone(self.resolve(config))
         for field, bad in (
             ("target_hidden_size", 2048),
-            ("num_target_layers", 40),
             ("layer_types", ["sliding_attention"] * 5),
             ("dflash_config", {"target_layer_ids": [1, 78]}),
             ("dflash_config", {"target_layer_ids": [1, 1]}),
@@ -441,7 +446,7 @@ class DraftGraphSupportTest(unittest.TestCase):
         owner = NS(
             _draft_graph_review_limit=scope,
             max_model_len=scope.max_model_len,
-            _eagle3_window_proposal=NS(phase_plan=NS(baseline_only_rows=(0,))),
+            _eagle3_window_proposal=NS(full_read_rows=(True,)),
         )
         batch = self.batch()
         batch.num_computed_prefill_tokens_np = [512]
@@ -746,7 +751,7 @@ class EagleMixedRequestControls(unittest.TestCase):
         self.assertEqual(cpu_lengths, [1280, 513])
         batch.num_computed_prefill_tokens_np = [1152, 384]
         batch.num_scheduled_tokens = [128, 129]
-        owner._eagle3_window_proposal = NS(phase_plan=NS(baseline_only_rows=(0,)))
+        owner._eagle3_window_proposal = NS(full_read_rows=(True, False))
         for step in (0, 1, 2):
             M.validate_eagle_single_request_review_exact(
                 owner, batch, Vector([1280 + step, 513 + step]), num_reqs=2, padded=2, step=step
@@ -757,12 +762,12 @@ class EagleMixedRequestControls(unittest.TestCase):
                         owner, batch, Vector(values), num_reqs=2, padded=2, step=step
                     )
         # Absent/changed phase cannot relabel a terminal/decode row as continuing.
-        owner._eagle3_window_proposal = NS(phase_plan=NS(baseline_only_rows=()))
+        owner._eagle3_window_proposal = NS(full_read_rows=(False, False))
         with self.assertRaises(NotImplementedError):
             M.validate_eagle_single_request_review_exact(
                 owner, batch, Vector(cpu_lengths), num_reqs=2, padded=2, step=0
             )
-        owner._eagle3_window_proposal = NS(phase_plan=NS(baseline_only_rows=(1,)))
+        owner._eagle3_window_proposal = NS(full_read_rows=(False, True))
         with self.assertRaises(RuntimeError):
             M.validate_eagle_single_request_review_exact(
                 owner, batch, Vector([1537, 513]), num_reqs=2, padded=2, step=0
@@ -783,7 +788,7 @@ class EagleMixedRequestControls(unittest.TestCase):
             owner, batch = _pair_owner_batch()
             batch.num_computed_prefill_tokens_np = [1152, 384]
             batch.num_scheduled_tokens = [128, 129]
-            owner._eagle3_window_proposal = NS(phase_plan=NS(baseline_only_rows=(0,)))
+            owner._eagle3_window_proposal = NS(full_read_rows=(True, False))
             if damage == "wrong-id":
                 batch.req_ids[0] = "different-request"
             elif damage == "bad-index":

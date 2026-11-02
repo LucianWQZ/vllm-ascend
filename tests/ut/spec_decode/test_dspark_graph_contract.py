@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from contextlib import contextmanager, nullcontext
+from inspect import signature
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -20,6 +21,8 @@ from vllm_ascend.attention.fa_v1 import AscendFlashAttentionBackend
 from vllm_ascend.compilation.updatable_graph import UpdatableGraph
 from vllm_ascend.worker.v2.spec_decode.dflash.aclgraph import DFlashAclGraphManager
 from vllm_ascend.worker.v2.spec_decode.dspark.speculator import AscendDSparkSpeculator
+
+_METADATA_SIGNATURE = signature(DSparkSpeculator._build_attn_metadata)
 
 
 class _BackendA:
@@ -81,7 +84,18 @@ def test_set_attn_preserves_cache_group_order(monkeypatch):
     speculator = _speculator(vllm_config=vllm_config, draft_attn_layer_names={"draft.2", "draft.0"})
     cache = SimpleNamespace(kv_cache_groups=[SimpleNamespace(layer_names=["draft.2", "target.0", "draft.0"])])
 
+    def summary(actual, logger):
+        assert actual is speculator
+        assert list(actual.attn_backends) == ["draft.2", "draft.0"]
+        assert actual._context_slot_mappings.dtype == torch.int32
+        assert active_context == []
+
+    report = MagicMock(side_effect=summary)
+    monkeypatch.setattr(
+        "vllm_ascend.worker.v2.spec_decode.draft_window_native_attention.report_owner_draft_native_attention", report
+    )
     speculator.set_attn(None, cache, None, None, None)
+    report.assert_called_once_with(speculator, speculator_module.logger)
 
     assert list(speculator.attn_backends) == ["draft.2", "draft.0"]
     assert speculator._context_slot_mappings.dtype == torch.int32
@@ -119,8 +133,9 @@ def test_draft_metadata_matches_full_or_actual_query_shape(monkeypatch, architec
     )
 
     assert result == {"draft.0": layer_metadata}
-    assert parent_build.call_args.kwargs["batch_desc"] is batch_desc
-    np.testing.assert_array_equal(parent_build.call_args.kwargs["query_start_loc_np"], [0, 8, 16, 24])
+    received = _METADATA_SIGNATURE.bind(None, *parent_build.call_args.args, **parent_build.call_args.kwargs).arguments
+    assert received["batch_desc"] is batch_desc
+    np.testing.assert_array_equal(received["query_start_loc_np"], [0, 8, 16, 24])
     assert metadata_factory.call_args.args[1] == (32 if graph_mode == CUDAGraphMode.FULL else 24)
     assert metadata.actual_seq_lengths_q == ([8, 16, 24, 32] if graph_mode == CUDAGraphMode.FULL else [8, 16, 24, 24])
 
@@ -142,7 +157,8 @@ def test_sfa_draft_metadata_passes_through_upstream(monkeypatch):
     )
 
     assert result is metadata
-    assert parent_build.call_args.kwargs["batch_desc"] is batch_desc
+    received = _METADATA_SIGNATURE.bind(None, *parent_build.call_args.args, **parent_build.call_args.kwargs).arguments
+    assert received["batch_desc"] is batch_desc
 
 
 @pytest.mark.parametrize("query_count", [1, 7, 8])

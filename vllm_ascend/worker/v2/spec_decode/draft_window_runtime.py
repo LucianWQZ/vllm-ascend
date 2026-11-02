@@ -14,13 +14,11 @@ from typing import Any
 
 import numpy as np
 import torch
-from vllm.logger import logger
 
 from vllm_ascend.worker.v2.spec_decode.draft_window_lifetime import (
     DraftWindowOwner,
     DraftWindowOwnerPool,
 )
-from vllm_ascend.worker.v2.spec_decode.draft_window_native_attention import report_draft_native_attention
 from vllm_ascend.worker.v2.spec_decode.draft_window_plan import (
     DraftWindowPlan,
     compute_draft_window_plan,
@@ -119,12 +117,6 @@ class DraftWindowRuntime:
         self._next_step = 0
         self._proposal_mapping: tuple[tuple[str, ...], tuple[int, ...]] | None = None
         self._sources: dict[int, DirectPrefixSource] = {}
-        report_draft_native_attention(
-            speculator,
-            logger=logger,
-            window_size=self.window_size,
-            certified_native_windows=self.native_swa_intersections,
-        )
 
     @property
     def reads_active(self) -> bool:

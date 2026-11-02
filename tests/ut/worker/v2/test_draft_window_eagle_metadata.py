@@ -713,15 +713,6 @@ def test_official_nonuniform_prefill_uses_window_first_bank_without_an_eager_own
     pending = SimpleNamespace(workspace=bank)
     provider = SimpleNamespace(_active_inputs=None)
 
-    def publish(metadata):
-        assert metadata is not target and metadata["draft"] is not target_layer
-        assert metadata["draft"].actual_seq_lengths_q == target_layer.actual_seq_lengths_q
-        assert metadata["draft"].actual_seq_lengths_q is not target_layer.actual_seq_lengths_q
-        assert metadata["draft"].seq_lens_list is not target_layer.seq_lens_list
-        events.append("publish")
-
-    pending.publish = publish
-
     def resolve(**kwargs):
         assert kwargs == dict(first=True, n=2, tokens=8, ordinal=0)
         return capture
@@ -787,6 +778,8 @@ def test_official_nonuniform_prefill_uses_window_first_bank_without_an_eager_own
         assert layer.attn_state is AscendAttentionState.ChunkedPrefill
         assert layer.slot_mapping is slots and layer.query_start_loc is query and layer.positions is absolute
         assert layer.actual_seq_lengths_q == [3, 7]
+        assert layer.actual_seq_lengths_q is not target_layer.actual_seq_lengths_q
+        assert layer.seq_lens_list is not target_layer.seq_lens_list
         assert target_layer.seq_lens_list == [77, 88]
         assert target_layer.attn_state is AscendAttentionState.PrefillNoCache
         torch.testing.assert_close(target_layer.block_tables, original_target_table)
@@ -810,12 +803,12 @@ def test_official_nonuniform_prefill_uses_window_first_bank_without_an_eager_own
     if fail:
         with pytest.raises(ValueError, match="native prefill failed"):
             owner._prefill(2, model_tokens, target, slot_map, None, mode, skip_sample=skip_sample)
-        assert events == ["prepare", "gather_full", "materialize", "publish", "native", "quarantine"]
+        assert events == ["prepare", "gather_full", "materialize", "native", "quarantine"]
         assert provider._active_inputs is pending and owner._eagle3_window_next_step == 0
         assert not sampled
     else:
         owner._prefill(2, model_tokens, target, slot_map, None, mode, skip_sample=skip_sample)
-        assert events == ["prepare", "gather_full", "materialize", "publish", "native", "retire"]
+        assert events == ["prepare", "gather_full", "materialize", "native", "retire"]
         assert provider._active_inputs is None and owner._eagle3_window_next_step == 1
         if skip_sample:
             assert not sampled and not bool(owner.draft_tokens.any())
@@ -933,7 +926,7 @@ def test_dp_synchronized_native_first_without_local_prefill(monkeypatch, mode, f
     finally:
         owner._eagle3_window_proposal = None
     assert len(observed) == 1
-    assert observed[0].proposal.phase_plan.full_read_rows == (False,)
+    assert observed[0].proposal.full_read_rows == (False,)
     assert provider._active_inputs is None and not owner._eagle3_window_native_prefill_active
     assert owner._eagle3_window_next_step == 1 and owner.draft_tokens[0, 0] == 23
     assert bank.cpu_window_exact.tolist() == [full_end - start]  # Retirement did not clear live backing.
@@ -994,7 +987,7 @@ def test_mixed_prefill_query_guard_keeps_full_rows_and_checks_only_actual_window
         owner._materialize_eagle3_step(step=0, num_reqs=2, num_reqs_padded=4, output_workspace=object())
     finally:
         owner._eagle3_window_proposal = None
-    assert context.phase_plan.full_read_rows == (True, False)
+    assert context.full_read_rows == (True, False)
     assert len(calls) == 1 and calls[0]["cpu_full_exact"].tolist() == [20, 10, 0, 0]
     assert [plan.window_visible_length for plan in calls[0]["frozen_row_plans"]] == [4, 2]
 

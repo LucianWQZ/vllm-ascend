@@ -35,7 +35,6 @@ _CONSUMER_CONFIGS = {
         **_COMMON_CONSUMER_CONFIG,
         **{
             "architectures": ["DFlashDraftModel"],
-            "block_size": 16,
             "dflash_config": {"mask_token_id": 248070, "target_layer_ids": [1, 10, 19, 28, 37]},
             "head_dim": 128,
             "layer_types": ["full_attention"] * 8,
@@ -43,7 +42,6 @@ _CONSUMER_CONFIGS = {
             "num_attention_heads": 32,
             "num_hidden_layers": 8,
             "num_key_value_heads": 4,
-            "num_target_layers": 40,
             "rope_parameters": {
                 "beta_fast": 32.0,
                 "beta_slow": 1.0,
@@ -109,7 +107,6 @@ def _consumer_profile(speculative):
                 and getattr(hf, "sliding_window", None) is None
                 and getattr(hf, "use_sliding_window", False) is False
                 and getattr(hf, "target_hidden_size", None) == target.get_hidden_size()
-                and getattr(hf, "num_target_layers", None) == target_hf.num_hidden_layers
                 and isinstance(aux, list)
                 and aux
                 and all(type(layer) is int and 0 <= layer < target_hf.num_hidden_layers for layer in aux)
@@ -343,12 +340,12 @@ def validate_eagle_single_request_review_exact(owner, input_batch, exact, *, num
     ):
         raise RuntimeError("Eagle review lost its exact admitted-row CPU consumer input")
     context = getattr(owner, "_eagle3_window_proposal", None)
-    continuing_rows = context.phase_plan.baseline_only_rows if context is not None else ()
+    continuing_rows = context.full_read_rows if context is not None else ()
     for position, (prompt, maximum) in enumerate(rows):
         value = exact[position].item()
         lower = prompt
         upper = min(maximum + scope.static_k, scope.max_model_len)
-        if position in continuing_rows:
+        if continuing_rows and continuing_rows[position]:
             # The proposal epoch already classified and validated this row from
             # canonical InputBatch counters. In a mixed prefill, its first
             # consumer ends before the prompt; later Eagle AR consumers advance

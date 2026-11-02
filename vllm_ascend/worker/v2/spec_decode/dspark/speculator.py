@@ -24,6 +24,7 @@ import torch
 from vllm.config import VllmConfig, get_layers_from_vllm_config, set_current_vllm_config
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed import get_dcp_group
+from vllm.logger import logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
@@ -275,6 +276,9 @@ class AscendDSparkSpeculator(DraftWindowGraphInputMixin, LmheadTPDraftSamplingMi
                 block_tables,
             )
 
+        from vllm_ascend.worker.v2.spec_decode.draft_window_native_attention import report_owner_draft_native_attention
+
+        report_owner_draft_native_attention(self, logger)
         if hasattr(self, "_draft_window_policy"):
             if hasattr(self, "draft_window_policy"):
                 raise RuntimeError("Draft Window cannot initialize both eager and Graph policies")
@@ -368,8 +372,6 @@ class AscendDSparkSpeculator(DraftWindowGraphInputMixin, LmheadTPDraftSamplingMi
     ) -> dict[str, Any] | None:
         """Build Ascend draft metadata through the upstream attention hook."""
         runtime = getattr(self, "_draft_window_runtime", None)
-        # Older vLLM releases do not accept this optional upstream argument.
-        slot_kwargs = {} if slot_mappings is None else {"slot_mappings": slot_mappings}
         if self.attn_architecture not in ("GQA", "MLA"):
             # These consumers keep their existing preparation. Window changes
             # only the fresh common read view and its private builder owner.
@@ -393,7 +395,7 @@ class AscendDSparkSpeculator(DraftWindowGraphInputMixin, LmheadTPDraftSamplingMi
                     step=step,
                     causal=causal,
                     dcp_local_seq_lens=dcp_local_seq_lens,
-                    **slot_kwargs,
+                    slot_mappings=slot_mappings,
                 )
             if runtime is not None:
                 runtime.retain_metadata(metadata)
@@ -440,7 +442,7 @@ class AscendDSparkSpeculator(DraftWindowGraphInputMixin, LmheadTPDraftSamplingMi
                 step=step,
                 causal=causal,
                 dcp_local_seq_lens=dcp_local_seq_lens,
-                **slot_kwargs,
+                slot_mappings=slot_mappings,
             )
         if batch_desc.cg_mode == CUDAGraphMode.FULL and attn_metadata is not None:
             # FULL replay uses the captured padded Q, so FIA needs cumulative

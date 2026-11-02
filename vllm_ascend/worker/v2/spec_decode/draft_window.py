@@ -235,7 +235,7 @@ class DraftWindowWorkspace:
         self.window_block_table.zero_()
         self.cpu_window_exact.zero_()
         span = source.group.table_column_span
-        for row, full_read in enumerate(inputs.proposal.phase_plan.full_read_rows):
+        for row, full_read in enumerate(inputs.proposal.full_read_rows):
             exact = int(cpu_full_exact[row])
             valid = int(cpu_valid_num_blocks[row])
             if not 0 <= valid <= source_table.shape[1]:
@@ -288,18 +288,6 @@ class DraftMetadataInputs:
             raise RuntimeError("cannot use retired Draft inputs")
         if self._owner.quarantined:
             raise RuntimeError("cannot use quarantined Draft inputs")
-
-    def publish(self, metadata: Mapping[str, Any]) -> None:
-        """Publish once on this actual generation, without a second owner store."""
-        try:
-            self.validate()
-            if self.metadata is not None:
-                raise RuntimeError("cannot overwrite active draft metadata")
-            object.__setattr__(self, "metadata", metadata)
-        except BaseException:
-            if self._owner._active_inputs is self and not self._owner.quarantined:
-                self._owner.quarantine_generation(self)
-            raise
 
 
 def _validate_window_length_input(

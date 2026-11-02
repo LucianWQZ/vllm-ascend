@@ -78,7 +78,8 @@ class DraftWindowGraphBindingProvider:
 
     def quarantine_generation(self, inputs: DraftMetadataInputs) -> None:
         """Retain possibly submitted backing; uncertain native work is not reusable."""
-        inputs.validate()
+        if self._active_inputs is not inputs:
+            raise RuntimeError("cannot quarantine retired Draft inputs")
         self._quarantined = True
 
     def materialize(
@@ -238,9 +239,11 @@ class DraftWindowGraphBindingProvider:
     ) -> DraftWindowGraphBucket:
         """Publish this generation against its selected persistent Graph bank."""
         carrier = self._require_registered_capture(capture_identity)
+        inputs.validate()
+        if inputs.metadata is not None:
+            raise RuntimeError("cannot overwrite active draft metadata")
         if carrier in self._pending:
             raise RuntimeError("cannot overwrite an active Draft Window graph read carrier")
-        inputs.validate()
         if inputs._owner is not self:
             raise RuntimeError("graph carrier inputs do not belong to the provider runtime")
         route = capture_identity.route
@@ -260,7 +263,7 @@ class DraftWindowGraphBindingProvider:
                 raise RuntimeError("graph read carriers do not belong to the same actual proposal/route")
         if not isinstance(metadata, Mapping) or not metadata:
             raise RuntimeError("explicit Draft Window graph carrier produced no Draft metadata")
-        inputs.publish(metadata)
+        object.__setattr__(inputs, "metadata", metadata)
         object.__setattr__(carrier, "inputs", inputs)
         self._pending.append(carrier)
         return carrier

@@ -73,8 +73,10 @@ class DraftNativeAttentionLoggingTests(unittest.TestCase):
         self.assertIs(logger.warning_once.__func__, vllm_logging._VllmLogger.warning_once)
         with patch.object(parallel_state, "_WORLD", SimpleNamespace(is_first_rank=True, local_rank=0)):
             owner = loaded(config(kinds=["sliding_attention"] * 2), [2048, 2048])
+            owner.speculative_config = SimpleNamespace(enforce_eager=True)
+            owner.draft_window_policy = SimpleNamespace(effective_window_size=1024)
             for _ in range(2):
-                native.report_draft_native_attention(owner, logger=logger, window_size=1024)
+                native.report_owner_draft_native_attention(owner, logger)
         self.assertEqual(len(records.messages), 2)
         self.assertIn("native attention=SWA", records.messages[0])
         self.assertIn("additional draft_window_size=1024", records.messages[1])
@@ -89,8 +91,10 @@ class DraftNativeAttentionLoggingTests(unittest.TestCase):
                         # Distinct loaded owners share the logger's exact
                         # once-key without a second per-owner deduplication cache.
                         owner = loaded(config(kinds=["sliding_attention"] * 2), [2048, 2048])
-                        native.report_draft_native_attention(owner, logger=logger, window_size=1024)
-                        native.report_draft_native_attention(owner, logger=logger, window_size=1024)
+                        owner.speculative_config = SimpleNamespace(enforce_eager=True)
+                        owner.draft_window_policy = SimpleNamespace(effective_window_size=1024)
+                        native.report_owner_draft_native_attention(owner, logger)
+                        native.report_owner_draft_native_attention(owner, logger)
                 self.assertEqual(len(records.messages), 2 if rank == 0 else 0)
 
 

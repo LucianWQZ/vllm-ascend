@@ -33,8 +33,8 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_graph_metadata import copy_d
 
 def build_eagle3_graph_source(owner: Any):
     """Bind the actual consumer Source after normal Graph configuration."""
-    if owner.method != "eagle3" or owner.speculative_config.uses_dynamic_speculative_decoding():
-        raise NotImplementedError("Eagle3 Graph requires normalized Eagle3 and static K")
+    if owner.method != "eagle3":
+        raise NotImplementedError("Eagle3 Graph requires the normalized Eagle3 method")
     return _build_draft_window_source_capability_for_context(
         policy=owner._draft_window_policy,
         runtime_route="eagle3",

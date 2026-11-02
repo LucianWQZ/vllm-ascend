@@ -80,43 +80,6 @@ def test_effective_draft_eager_preserves_target_graph(setup, method, inherited_e
             DraftWindowRuntime(spec, policy)
 
 
-@pytest.mark.parametrize(
-    "native_windows,window,expected",
-    [
-        ({}, 1024, ()),
-        ({0: 2048}, 1024, (2048,)),
-        ({0: 2048}, 2048, ()),
-        ({0: 2048}, 4096, ()),
-        ({0: 2048, 1: 4096}, 2048, (4096,)),
-        ({0: 4096, 1: 4096}, 1024, (4096,)),
-    ],
-)
-def test_native_swa_warning_uses_only_certified_narrowed_draft_groups(
-    setup, monkeypatch, native_windows, window, expected
-):
-    _, spec, canonical, _ = setup
-    before = canonical.clone()
-    warnings = []
-
-    def validate(runtime, actual_spec):
-        assert actual_spec is spec
-        runtime.native_swa_intersections = native_windows
-        return (0,)
-
-    monkeypatch.setattr(DraftWindowRuntime, "_validate_route", validate)
-    monkeypatch.setattr(runtime_module.logger, "warning_once", lambda *args, **kwargs: warnings.append((args, kwargs)))
-    runtime = DraftWindowRuntime(spec, resolve_draft_window_policy(requested_window_size=window, method="dflash"))
-    assert runtime.window_size == window
-    assert runtime.native_swa_intersections == native_windows
-    assert torch.equal(canonical, before)
-    assert len(warnings) == bool(expected)
-    if expected:
-        args, kwargs = warnings[0]
-        assert args[1:] == (expected, window)
-        assert kwargs == {"scope": "global"}
-        assert "may reduce" in args[0]
-
-
 @pytest.mark.parametrize("current_capability,legacy_flag", [(True, False), (False, True)])
 def test_eagle_window_checks_current_decode_metadata_update_capability(setup, current_capability, legacy_flag):
     _, spec, _, _ = setup
@@ -187,7 +150,7 @@ def test_shared_phase_rejects_invalid_active_row_counters(field, value):
 
 
 def test_graph_phase_uses_the_same_prompt_progress_as_eager():
-    from vllm_ascend.worker.v2.spec_decode.draft_window_nongraph import (
+    from vllm_ascend.worker.v2.spec_decode.draft_window_eager import (
         classify_draft_window_batch_phase,
     )
 
@@ -196,10 +159,10 @@ def test_graph_phase_uses_the_same_prompt_progress_as_eager():
     # Total scheduled tokens cross the prompt boundary, but three are Draft
     # placeholders. The first row must retain Full reads until prompt ends.
     phases = classify_draft_window_batch_phase(state)
-    assert phases.full_read_rows == (True, False)
+    assert phases == (True, False)
     state.num_computed_prefill_tokens_np[0] = 9
     phases = classify_draft_window_batch_phase(state)
-    assert phases.full_read_rows == (False, False)
+    assert phases == (False, False)
     state.is_prefilling_np[0] = False
     with pytest.raises(RuntimeError, match="is_prefilling"):
         classify_draft_window_batch_phase(state)

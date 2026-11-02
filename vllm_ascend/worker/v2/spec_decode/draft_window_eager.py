@@ -22,11 +22,8 @@ from vllm_ascend.worker.v2.spec_decode.draft_window import (
     gather_valid_num_blocks_cpu,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphBindingProvider
-from vllm_ascend.worker.v2.spec_decode.draft_window_nongraph import (
-    DraftWindowBatchPhasePlan,
-    classify_draft_window_batch_phase,
-)
 from vllm_ascend.worker.v2.spec_decode.draft_window_read import DraftReadView
+from vllm_ascend.worker.v2.spec_decode.draft_window_runtime import continuing_prefill_rows
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -36,7 +33,7 @@ class DraftWindowProposalContext:
     input_batch: InputBatch | Any
     ordered_request_ids: tuple[str, ...]
     idx_mapping_fingerprint: tuple[int, ...]
-    phase_plan: DraftWindowBatchPhasePlan
+    full_read_rows: tuple[bool, ...]
 
     @classmethod
     def from_batch(cls, input_batch: InputBatch | Any) -> "DraftWindowProposalContext":
@@ -49,8 +46,27 @@ class DraftWindowProposalContext:
         requests, mapping = _proposal_fingerprint(input_batch)
         if requests != self.ordered_request_ids or mapping != self.idx_mapping_fingerprint:
             raise RuntimeError("proposal request ordering or idx_mapping changed")
-        if classify_draft_window_batch_phase(input_batch) != self.phase_plan:
+        if classify_draft_window_batch_phase(input_batch) != self.full_read_rows:
             raise RuntimeError("proposal row phases changed")
+
+
+def classify_draft_window_batch_phase(input_batch: Any) -> tuple[bool, ...]:
+    """Classify every active row from pinned ``InputBatch`` source fields."""
+    num_reqs = int(input_batch.num_reqs)
+    # The common eager/Graph helper checks each real prompt-progress counter,
+    # including speculative placeholders, once before deriving these rows.
+    continuing = continuing_prefill_rows(input_batch, num_reqs)
+    computed = np.asarray(input_batch.num_computed_prefill_tokens_np)[:num_reqs]
+    prefill_len = np.asarray(input_batch.prefill_len_np)[:num_reqs]
+    declared = np.asarray(input_batch.is_prefilling_np)
+    if declared.ndim != 1 or declared.shape[0] < num_reqs:
+        raise ValueError("is_prefilling does not cover active request rows")
+    actual_prefill = computed < prefill_len
+    if not np.array_equal(actual_prefill, declared[:num_reqs].astype(np.bool_, copy=False)):
+        raise RuntimeError("InputBatch is_prefilling rows disagree with computed/prefill lengths")
+    if bool(getattr(input_batch, "has_prefill", False)) != bool(np.any(actual_prefill)):
+        raise RuntimeError("InputBatch has_prefill disagrees with row phase state")
+    return tuple(bool(value) for value in continuing)
 
 
 def draft_window_read_inputs(
@@ -443,4 +459,5 @@ def _requires_prefill_baseline_bypass(
     existing proposal-scope call sites; the immutable phase plan is bound to
     the proposal epoch before any materialization.
     """
-    return classify_draft_window_batch_phase(input_batch).bypass_entire_batch
+    full_read_rows = classify_draft_window_batch_phase(input_batch)
+    return bool(full_read_rows) and all(full_read_rows)

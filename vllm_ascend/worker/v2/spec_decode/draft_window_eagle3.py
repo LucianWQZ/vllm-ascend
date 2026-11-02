@@ -195,7 +195,7 @@ class Eagle3DraftWindowMixin:
             if batch.has_prefill:
                 widths = np.diff(batch.query_start_loc_np[: num_reqs + 1])
                 if any(
-                    not context.phase_plan.full_read_rows[row] and query > plan.window_visible_length
+                    not context.full_read_rows[row] and query > plan.window_visible_length
                     for row, (query, plan) in enumerate(zip(widths, proposal))
                 ):
                     raise NotImplementedError(

@@ -159,25 +159,6 @@ class NativeAttentionTests(unittest.TestCase):
         next(iter(owner.attn_vllm_config.compilation_config.static_forward_context.values())).impl = object()
         self.assertEqual(native.inspect_draft_native_attention(owner).kind, "UNKNOWN")
 
-    def test_provider_native_window_must_match_actual_consumer(self):
-        owner = loaded(config(kinds=["sliding_attention"] * 2), [2048, 2048])
-        name = owner.attn_groups[0][0].layer_names[0]
-        good = SimpleNamespace(layers=(name,), native_window=2048)
-        bad = SimpleNamespace(layers=(name,), native_window=4096)
-        self.assertEqual(native.inspect_draft_native_attention(owner, provider_routes=[good]).kind, "SWA")
-        self.assertEqual(native.inspect_draft_native_attention(owner, provider_routes=[bad]).kind, "UNKNOWN")
-
-    def test_startup_uses_the_actual_graph_source_group(self):
-        owner = loaded(config(kinds=["sliding_attention"] * 2), [2048, 2048])
-        name = owner.attn_groups[0][0].layer_names[0]
-        owner._draft_window_graph_binding_provider = SimpleNamespace(
-            source=SimpleNamespace(group=SimpleNamespace(layers=(name,), native_window=2048))
-        )
-        self.assertEqual(native.report_owner_draft_native_attention(owner, Log()).kind, "SWA")
-        owner._draft_window_graph_binding_provider.source.group.native_window = 4096
-        with self.assertRaises(NotImplementedError):
-            native.report_owner_draft_native_attention(owner, Log())
-
     def test_off_no_runtime_and_unknown_window_graph_fail_closed(self):
         owner = loaded(config(architecture="UnknownDraft"), [None, None])
         inventory = native.inspect_draft_native_attention(owner)
@@ -189,27 +170,26 @@ class NativeAttentionTests(unittest.TestCase):
         self.assertFalse(hasattr(owner, "_draft_window_runtime_state"))
 
     def test_summary_once_and_only_actual_narrowing_warns(self):
-        for window, warning in ((None, False), (1024, True), (2048, False), (4096, False)):
-            owner = loaded(config(kinds=["sliding_attention"] * 2), [2048, 2048])
+        for windows, window, expected in (
+            ([2048, 2048], None, ()),
+            ([2048, 2048], 1024, (2048,)),
+            ([2048, 2048], 2048, ()),
+            ([2048, 2048], 4096, ()),
+            ([2048, 4096], 2048, (4096,)),
+            ([4096, 4096], 1024, (4096,)),
+        ):
+            owner = loaded(config(kinds=["sliding_attention"] * 2), windows)
+            owner.speculative_config = SimpleNamespace(enforce_eager=True)
+            owner.draft_window_policy = SimpleNamespace(effective_window_size=window)
             log = Log()
             for _ in range(2):
-                result = native.report_draft_native_attention(owner, logger=log, window_size=window)
+                result = native.report_owner_draft_native_attention(owner, log)
             self.assertEqual(result.kind, "SWA")
             self.assertEqual(len(log.info), 1)
-            self.assertEqual(len(log.warnings), int(warning))
-            if warning:
-                self.assertEqual(log.warnings[0][0][1:], ((2048,), 1024))
+            self.assertEqual(len(log.warnings), bool(expected))
+            if expected:
+                self.assertEqual(log.warnings[0][0][1:], (expected, window))
             self.assertFalse(hasattr(owner, "_draft_window_runtime"))
-
-    def test_runtime_existing_certified_provider_warning_is_preserved(self):
-        owner = SimpleNamespace()
-        log = Log()
-        result = native.report_draft_native_attention(
-            owner, logger=log, window_size=1024, certified_native_windows={0: 2048}
-        )
-        self.assertEqual(result.kind, "UNKNOWN")
-        self.assertEqual(len(log.warnings), 1)
-        self.assertFalse(result.actual_complete)
 
 
 if __name__ == "__main__":

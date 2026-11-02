@@ -26,15 +26,12 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
     DraftWindowGraphBindingProvider,
     DraftWindowGraphRoute,
 )
-from vllm_ascend.worker.v2.spec_decode.draft_window_nongraph import DraftWindowBatchPhasePlan
 from vllm_ascend.worker.v2.spec_decode.draft_window_plan import compute_draft_window_plan
 from vllm_ascend.worker.v2.spec_decode.draft_window_policy import resolve_draft_window_policy
 
 
 def _proposal(epoch=0, requests=("request-a",)):
-    return DraftWindowProposalContext(
-        object(), requests, tuple(range(len(requests))), DraftWindowBatchPhasePlan((False,) * len(requests))
-    )
+    return DraftWindowProposalContext(object(), requests, tuple(range(len(requests))), (False,) * len(requests))
 
 
 @pytest.fixture
@@ -209,6 +206,8 @@ def test_old_input_handle_cannot_retire_or_publish_over_new_bank(graph_buffers):
             stale.validate()
         with pytest.raises(RuntimeError, match="retired"):
             case.provider.retire_generation(stale)
+        with pytest.raises(RuntimeError, match="retired"):
+            case.provider.quarantine_generation(stale)
     current.validate()
 
 
@@ -223,22 +222,19 @@ def test_provider_rejects_overwrite_before_bound_consumer_has_finished(graph_buf
         case.provider.prepare_workspace(case.capture)
 
 
-def test_repeated_publication_quarantines_bank_without_clearing(graph_buffers):
+def test_repeated_binding_preserves_the_actual_published_metadata_and_pending_bank(graph_buffers):
     case = graph_buffers
     inputs = _materialize(case)
     before = [tensor.clone() for tensor in _bank_tensors(inputs.workspace)]
-    _bind(case, inputs)
+    bucket = _bind(case, inputs)
+    metadata = inputs.metadata
     with pytest.raises(RuntimeError, match="overwrite active draft metadata"):
-        inputs.publish({})
-    assert case.provider.quarantined
-    assert case.provider._active_inputs.workspace is inputs.workspace
+        _bind(case, inputs)
+    assert inputs.metadata is metadata and bucket.inputs is inputs
     assert case.provider._active_inputs is inputs
-    assert inputs.workspace is case.provider._active_inputs.workspace
     assert all(torch.equal(tensor, old) for tensor, old in zip(_bank_tensors(inputs.workspace), before))
-    with pytest.raises(RuntimeError, match="quarantined"):
+    with pytest.raises(RuntimeError, match="active Draft Window"):
         case.provider.prepare_workspace(case.capture)
-    with pytest.raises(RuntimeError, match="quarantined"):
-        case.provider.retire_generation(inputs)
 
 
 def test_cpu_valid_counts_are_required_before_any_bank_materialization(graph_buffers):
@@ -719,7 +715,7 @@ def test_eagle_first_bank_retains_full_table_capacity_for_a_mixed_prefill(graph_
     )
     bank = provider.prepare_workspace(capture)
     inputs = provider.materialize(
-        proposal=replace(_proposal(0, ("request-a", "request-b")), phase_plan=DraftWindowBatchPhasePlan((True, False))),
+        proposal=replace(_proposal(0, ("request-a", "request-b")), full_read_rows=(True, False)),
         cpu_full_exact=torch.tensor([11, 14], dtype=torch.int32),
         cpu_valid_num_blocks=torch.tensor([4, 4], dtype=torch.int32),
         num_reqs_padded=2,
@@ -741,8 +737,8 @@ def test_eagle_first_bank_retains_full_table_capacity_for_a_mixed_prefill(graph_
     assert case.target_metadata["target.layer"].seq_lens_list == [91, 92]
 
 
-@pytest.mark.parametrize("fail", [False, True])
-def test_actual_proposal_scope_owns_fresh_inputs_and_quarantines_failed_update(graph_buffers, fail):
+@pytest.mark.parametrize("failure", [None, "update", "republish", "prepare"])
+def test_actual_proposal_scope_owns_fresh_inputs_and_preserves_failed_submission(graph_buffers, failure):
     from contextlib import nullcontext
 
     from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowGraphInputMixin
@@ -763,8 +759,14 @@ def test_actual_proposal_scope_owns_fresh_inputs_and_quarantines_failed_update(g
         has_prefill=False,
     )
     owner.input_batch = batch
-    expected = pytest.raises(RuntimeError, match="native UPDATE failed") if fail else nullcontext()
-    with expected, owner._draft_window_proposal_scope(batch, dummy_run=False, is_profile=False):
+    errors = {
+        "update": (RuntimeError, "native UPDATE failed"),
+        "republish": (RuntimeError, "overwrite active draft metadata"),
+        "prepare": (TypeError, "CPU Full exact must use int32"),
+    }
+    expected = pytest.raises(errors[failure][0], match=errors[failure][1]) if failure else nullcontext()
+    preparation_error = None
+    with expected as caught, owner._draft_window_proposal_scope(batch, dummy_run=False, is_profile=False):
         context = owner._draft_window_proposal
         assert context is not None and context.input_batch is batch
         context.validate(batch)
@@ -773,22 +775,33 @@ def test_actual_proposal_scope_owns_fresh_inputs_and_quarantines_failed_update(g
             owner._draft_window_proposal_scope(batch, dummy_run=False, is_profile=False),
         ):
             pytest.fail("a real proposal cannot nest or replace its current context")
-        inputs = case.provider.materialize(
-            proposal=context,
-            cpu_full_exact=torch.tensor([11, 14], dtype=torch.int32),
-            cpu_valid_num_blocks=torch.tensor([4, 4], dtype=torch.int32),
-            num_reqs_padded=2,
-            step=0,
-            output_workspace=case.provider.prepare_workspace(case.capture),
-        )
+        try:
+            inputs = case.provider.materialize(
+                proposal=context,
+                cpu_full_exact=torch.tensor([11, 14], dtype=torch.float32 if failure == "prepare" else torch.int32),
+                cpu_valid_num_blocks=torch.tensor([4, 4], dtype=torch.int32),
+                num_reqs_padded=2,
+                step=0,
+                output_workspace=case.provider.prepare_workspace(case.capture),
+            )
+        except TypeError as error:
+            preparation_error = error
+            raise
         _bind(case, inputs)
+        if failure == "republish":
+            _bind(case, inputs)
         case.provider.consume_metadata(route=case.capture.route, expected_consumer_count=1)
-        if fail:
+        if failure == "update":
             raise RuntimeError("native UPDATE failed")
         case.provider.finish_update(route=case.capture.route)
     assert owner._draft_window_proposal is None
-    if fail:
-        assert case.provider.quarantined and case.provider._active_inputs is inputs
+    if failure:
+        active = case.provider._active_inputs
+        assert case.provider.quarantined and active is not None and active.workspace is case.capture.workspace
+        case.provider.quarantine_generation(active)
+        assert case.provider._active_inputs is active
+        if failure == "prepare":
+            assert caught.value is preparation_error
         with pytest.raises(RuntimeError, match="quarantined"):
             case.provider.prepare_workspace(case.capture)
     else:

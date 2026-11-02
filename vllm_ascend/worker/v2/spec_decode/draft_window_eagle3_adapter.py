@@ -127,7 +127,6 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentA
                     layer.seq_lens_list = bank.cpu_window_exact.tolist()
                     layer.max_seq_len = int(bank.cpu_window_exact.max().item())
                     layer.attn_state = AscendAttentionState.ChunkedPrefill
-            prefill_inputs.publish(attn_metadata)
         try:
             output = super()._run_model(
                 num_tokens,

@@ -639,7 +639,6 @@ class AscendTargetDependentARSpeculator(LmheadTPDraftSamplingMixin, TargetDepend
         """Build Ascend draft metadata for uniform and explicit query layouts."""
         runtime = getattr(self, "_draft_window_runtime", None)
         window_first_pass = runtime is not None and runtime.reads_active and step == 0
-        slot_kwargs = {} if slot_mappings is None else {"slot_mappings": slot_mappings}
         assert self.input_batch is not None
         seq_lens_cpu = None
         is_prefilling = torch.from_numpy(self.input_batch.is_prefilling_np)
@@ -681,7 +680,7 @@ class AscendTargetDependentARSpeculator(LmheadTPDraftSamplingMixin, TargetDepend
                 step,
                 causal,
                 dcp_local_seq_lens,
-                **slot_kwargs,
+                slot_mappings=slot_mappings,
             )
         if attn_metadata is not None:
             for metadata in attn_metadata.values():

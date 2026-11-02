@@ -367,8 +367,6 @@ class AscendDFlashSpeculator(DraftWindowGraphInputMixin, LmheadTPDraftSamplingMi
         slot_mappings: torch.Tensor | None = None,
     ) -> dict[str, Any] | None:
         runtime = getattr(self, "_draft_window_runtime", None)
-        # Older vLLM releases do not accept this optional upstream argument.
-        slot_kwargs = {} if slot_mappings is None else {"slot_mappings": slot_mappings}
         if runtime is None:
             return super()._build_attn_metadata(
                 num_reqs,
@@ -378,7 +376,7 @@ class AscendDFlashSpeculator(DraftWindowGraphInputMixin, LmheadTPDraftSamplingMi
                 step,
                 causal,
                 dcp_local_seq_lens,
-                **slot_kwargs,
+                slot_mappings=slot_mappings,
             )
         with build_attn_metadata_factory(
             self.input_buffers.positions,
@@ -395,7 +393,7 @@ class AscendDFlashSpeculator(DraftWindowGraphInputMixin, LmheadTPDraftSamplingMi
                 step,
                 causal,
                 dcp_local_seq_lens,
-                **slot_kwargs,
+                slot_mappings=slot_mappings,
             )
         runtime.retain_metadata(metadata)
         return metadata
