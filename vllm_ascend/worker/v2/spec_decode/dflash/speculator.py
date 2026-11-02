@@ -164,7 +164,6 @@ def _draft_window_context_kv_scope(owner, input_batch):
     try:
         with pool.operation(_NPUCompletion) as completion_owner:
             pool.retain(completion_owner, owner, input_batch)
-            pool.begin_native(completion_owner)
             yield
     except BaseException:
         # A partial context write or failed completion record also makes the
