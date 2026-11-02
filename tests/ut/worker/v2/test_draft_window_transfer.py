@@ -29,7 +29,7 @@ def test_copy_failure_keeps_actual_input_and_output_owned(monkeypatch, stage):
     exact = torch.tensor([1151, 1408], dtype=torch.int32)
     pool = DraftWindowOwnerPool(1)
     submitted = []
-    originals = {name: getattr(torch.Tensor, name) for name in ("clone", "to", "copy_")}
+    original_copy = torch.Tensor.copy_
 
     def selected(tensor):
         return tensor.dtype == (torch.bool if stage == "phase" else torch.int64)
@@ -40,24 +40,12 @@ def test_copy_failure_keeps_actual_input_and_output_owned(monkeypatch, stage):
         assert any(item is output_tensor for item in owner.retained), "copy destination not owned before submission"
         raise RuntimeError("deliberate error after copy submission")
 
-    def clone(tensor, *args, **kwargs):
-        output = originals["clone"](tensor, *args, **kwargs)
-        return output
-
-    def to(tensor, *args, **kwargs):
-        output = originals["to"](tensor, *args, **kwargs)
-        if kwargs.get("non_blocking") and selected(tensor):
-            after_copy(tensor, output)
-        return output
-
     def copy(destination, tensor, *args, **kwargs):
-        output = originals["copy_"](destination, tensor, *args, **kwargs)
+        output = original_copy(destination, tensor, *args, **kwargs)
         if selected(tensor):
             after_copy(tensor, destination)
         return output
 
-    monkeypatch.setattr(torch.Tensor, "clone", clone)
-    monkeypatch.setattr(torch.Tensor, "to", to)
     monkeypatch.setattr(torch.Tensor, "copy_", copy)
     full_rows = torch.tensor([True, True] if stage == "phase" else [False, True])
     with pytest.raises(RuntimeError, match="deliberate error"), pool.operation(unrecorded_completion) as owner:
@@ -116,7 +104,6 @@ def test_metadata_length_copy_is_owned_before_partial_fill(monkeypatch):
     read = DenseDraftRead(
         torch.zeros(2, 4, dtype=torch.int64),
         torch.tensor([3, 4], dtype=torch.int32),
-        torch.zeros(2, dtype=torch.int32),
         torch.zeros(2, 1, 1, 4, dtype=torch.bool),
         4,
         1,

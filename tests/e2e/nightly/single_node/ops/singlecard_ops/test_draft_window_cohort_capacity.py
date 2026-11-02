@@ -48,7 +48,7 @@ def test_full_row_capacity_cohorts_have_independent_native_operands(decode_exact
     expected = torch.tensor([3, 1, 2], dtype=torch.bfloat16).repeat_interleave(8)[:, None, None]
     torch.testing.assert_close(output.cpu(), expected.expand(24, 8, 192), atol=2**-7, rtol=2**-6)
     starts = torch.where(full, 0, (exact - 1024).clamp(min=0) // 128 * 128)
-    assert torch.equal(read.starts.cpu(), starts)
+    assert torch.equal(exact - read.seq_lens.cpu(), starts)
     assert torch.equal(read.seq_lens.cpu(), exact - starts)
     assert torch.equal(table.cpu(), table_cpu)
     assert not keys.count_nonzero().item()

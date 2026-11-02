@@ -16,7 +16,6 @@ torch_npu = pytest.importorskip("torch_npu")
 
 from vllm_ascend.worker.v2.spec_decode.draft_window_lifetime import (  # noqa: E402
     DraftWindowOwnerPool,
-    DraftWindowOwnerState,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -56,7 +55,7 @@ def test_private_kernel_outputs_survive_exception_after_real_enqueue(monkeypatch
             launcher = original[grid]
 
             def launch(*args):
-                outputs = args[7:11] if operation == "plan" else args[3:5] if operation == "gather" else args[1:3]
+                outputs = args[7:10] if operation == "plan" else args[3:5] if operation == "gather" else args[1:3]
                 assert all(any(value is output for value in owner.retained) for output in outputs)
                 held_outputs.extend(outputs)
                 launcher(*args)
@@ -76,7 +75,6 @@ def test_private_kernel_outputs_survive_exception_after_real_enqueue(monkeypatch
         torch.npu.stream(stream),
         pool.operation(lambda: NativeCompletion(stream)) as owner,
     ):
-        pool.begin_native(owner)
         retain = lambda *objects: pool.retain(owner, *objects)
         if operation == "plan":
             draft_window.plan_draft_window(
@@ -104,14 +102,14 @@ def test_private_kernel_outputs_survive_exception_after_real_enqueue(monkeypatch
                 torch.tensor([0, 2, 5], dtype=torch.int32, device="npu"), 5, 3, retain=retain
             )
     assert diagnostic_events and held_outputs
-    assert owner.state is DraftWindowOwnerState.QUARANTINED
+    assert pool.poisoned
     assert all(any(value is output for value in owner.retained) for output in held_outputs)
     with pytest.raises(RuntimeError, match="quarantined"):
         pool.acquire()
     diagnostic_events[0].synchronize()
     if operation == "plan":
-        assert held_outputs[1].cpu().tolist() == [8]
-        assert held_outputs[2].cpu().tolist() == [9]
+        assert held_outputs[0][0, 0].cpu().item() == 8
+        assert held_outputs[1].cpu().tolist() == [9]
     elif operation == "gather":
         torch.testing.assert_close(held_outputs[0].cpu().flatten(), torch.arange(8, 32, dtype=torch.float32))
         assert held_outputs[1].eq(1).all()
@@ -146,12 +144,11 @@ def test_native_enqueue_failure_quarantines_backing(failure):
 
     with pytest.raises((RuntimeError, TypeError)), torch.npu.stream(stream), pool.operation(completion) as owner:
         pool.retain(owner, payload)
-        pool.begin_native(owner)
         observed = payload.square()
         pool.retain(owner, observed)
         if failure == "host_after_enqueue":
             raise RuntimeError("injected host failure after native enqueue")
-    assert owner.state is DraftWindowOwnerState.QUARANTINED
+    assert pool.poisoned
     assert owner.retained[0] is payload
     with pytest.raises(RuntimeError, match="quarantined"):
         pool.acquire()
@@ -167,7 +164,6 @@ def test_native_completion_covers_an_explicit_late_reader_join():
     pool = DraftWindowOwnerPool(1)
     producer, reader = torch.npu.Stream(), torch.npu.Stream()
     with torch.npu.stream(producer), pool.operation(lambda: NativeCompletion(producer)) as owner:
-        pool.begin_native(owner)
         payload = torch.arange(1024, dtype=torch.float32, device="npu")
         pool.retain(owner, payload)
         reader.wait_stream(producer)
@@ -179,7 +175,7 @@ def test_native_completion_covers_an_explicit_late_reader_join():
         producer.wait_stream(reader)
     replacement = pool.acquire()
     assert replacement.lane == owner.lane
-    assert owner.state is DraftWindowOwnerState.RELEASED
+    assert not owner.retained and owner.completion is None
     torch.testing.assert_close(result.cpu(), torch.arange(1024, dtype=torch.float32) * 3)
 
 
@@ -225,7 +221,6 @@ def pending_native_reader(pool):
     stream = torch.npu.Stream()
     try:
         with torch.npu.stream(stream), pool.operation(lambda: completion) as owner:
-            pool.begin_native(owner)
             payload = torch.arange(1024, dtype=torch.float32, device="npu")
             observed = torch.empty_like(payload)
             left = torch.full((matrix_size, matrix_size), 1 / matrix_size, dtype=torch.bfloat16, device="npu")
@@ -249,18 +244,16 @@ def test_native_pool_pressure_waits_before_overwriting_read_backing():
     with pending_native_reader(pool) as (owner, completion, payload, observed):
         replacement = pool.acquire()
         if completion.waits == 0:
-            pool.abort(replacement)
             pytest.skip("reader completed before pool pressure reached the native wait")
         assert completion.queries[0] is False
         assert completion.queries[-1] is True
         assert completion.waits == 1
-        assert owner.state is DraftWindowOwnerState.RELEASED
+        assert not owner.retained and owner.completion is None
         assert replacement.lane == owner.lane
         # The replacement may now overwrite the exact backing read by the
         # delayed native copy. That copy must have consumed the old values.
         payload.fill_(-1)
         torch.testing.assert_close(observed.cpu(), torch.arange(1024, dtype=torch.float32))
-        pool.abort(replacement)
 
 
 def test_native_reverse_completion_reuses_only_the_completed_lane():
@@ -269,7 +262,6 @@ def test_native_reverse_completion_reuses_only_the_completed_lane():
         fast_stream = torch.npu.Stream()
         try:
             with torch.npu.stream(fast_stream), pool.operation(lambda: NativeCompletion(fast_stream)) as fast_owner:
-                pool.begin_native(fast_owner)
                 fast_payload = torch.ones(1024, device="npu")
                 fast_result = fast_payload + 1
                 pool.retain(fast_owner, fast_payload, fast_result)
@@ -277,16 +269,14 @@ def test_native_reverse_completion_reuses_only_the_completed_lane():
             if slow.event.query():
                 pytest.skip("device did not exhibit reverse completion of the two native readers")
             replacement = pool.acquire()
-            if slow_owner.state is DraftWindowOwnerState.RELEASED:
-                pool.abort(replacement)
+            if not slow_owner.retained and slow_owner.completion is None:
                 pytest.skip("slow reader completed before pool reclamation observed it")
             assert slow.queries[-1] is False
             assert slow.waits == 0
-            assert slow_owner.state is DraftWindowOwnerState.SUBMITTED
+            assert slow_owner.completion is not None
             assert any(value is payload for value in slow_owner.retained)
             assert replacement.lane == fast_owner.lane
-            assert fast_owner.state is DraftWindowOwnerState.RELEASED
-            pool.abort(replacement)
+            assert not fast_owner.retained and fast_owner.completion is None
             slow.wait()
             torch.testing.assert_close(observed.cpu(), torch.arange(1024, dtype=torch.float32))
         finally:
@@ -302,7 +292,7 @@ def test_native_pending_completion_fault_quarantines_the_execution(failure):
             pool.acquire()
         assert completion.queries[0] is False
         assert completion.waits == (1 if failure == "wait" else 0)
-        assert owner.state is DraftWindowOwnerState.QUARANTINED
+        assert pool.poisoned
         assert any(value is payload for value in owner.retained)
         assert owner.completion is completion
         with pytest.raises(RuntimeError, match="quarantined"):

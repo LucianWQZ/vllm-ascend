@@ -43,7 +43,7 @@ def _plan_cpu(
     full_rows: torch.Tensor | None = None,
     query_offsets: torch.Tensor | None = None,
     retain: Callable[..., None] | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     assert exact.device.type == "cpu"
     n = exact.numel()
     starts = (
@@ -74,7 +74,7 @@ def _plan_cpu(
     if query_offsets is not None:
         padding = query_width - query_offsets.diff()
         mask = mask | (torch.arange(query_width)[None, :, None] < padding[:, None, None])
-    return slots, starts, visible, mask[:, None].contiguous()
+    return slots, visible, mask[:, None].contiguous()
 
 
 @pytest.fixture(autouse=True)

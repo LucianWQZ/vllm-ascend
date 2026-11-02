@@ -64,7 +64,7 @@ def invoke(operators, operation, retain):
     return operators.pack_draft_query_indices(torch.tensor([0, 2, 5]), 5, 3, retain=retain)
 
 
-@pytest.mark.parametrize("operation,outputs", [("plan", 4), ("gather", 2), ("pack", 2)])
+@pytest.mark.parametrize("operation,outputs", [("plan", 3), ("gather", 2), ("pack", 2)])
 def test_outputs_are_retained_before_dispatch_can_raise(monkeypatch, operators, operation, outputs):
     held: list[torch.Tensor] = []
 
@@ -74,7 +74,7 @@ def test_outputs_are_retained_before_dispatch_can_raise(monkeypatch, operators, 
                 assert len(held) >= outputs
                 # The output arguments belong to this real call, rather than
                 # a previously retained allocation with an equal shape.
-                expected = args[7:11] if operation == "plan" else args[3:5] if operation == "gather" else args[1:3]
+                expected = args[7:10] if operation == "plan" else args[3:5] if operation == "gather" else args[1:3]
                 assert all(any(value is output for value in held) for output in expected)
                 raise DispatchFailure("submission can fail after enqueue")
 

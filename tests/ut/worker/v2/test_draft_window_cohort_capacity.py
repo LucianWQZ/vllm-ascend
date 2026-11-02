@@ -35,7 +35,7 @@ def test_different_full_row_bounds_do_not_multiply_largest_workspace(order):
         retain=lambda *items: held.extend(items),
     )
     expected_starts = torch.where(full, 0, (exact - 1024).clamp(min=0) // 128 * 128)
-    assert torch.equal(read.starts, expected_starts)
+    assert torch.equal(exact - read.seq_lens, expected_starts)
     assert torch.equal(read.seq_lens, exact - expected_starts)
     assert torch.equal(table, original)
     parts = (
@@ -71,5 +71,5 @@ def test_equal_aligned_full_bounds_keep_one_existing_read():
     )
     assert isinstance(read, DenseDraftRead)
     assert read.capacity == 2080
-    assert read.starts.tolist() == [0, 0]
+    assert (torch.tensor([2055, 2063]) - read.seq_lens).tolist() == [0, 0]
     assert read.seq_lens.tolist() == [2055, 2063]

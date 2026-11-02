@@ -62,9 +62,8 @@ def test_planner_query_tiles_preserve_unaligned_capacity_and_frozen_reads(query_
                 for query in range(query_width)
             ]
         )
-    for slots, starts, lengths, mask in outputs:
+    for slots, lengths, mask in outputs:
         assert torch.equal(slots.cpu(), torch.tensor(slots_reference, dtype=torch.int64))
-        assert torch.equal(starts.cpu(), frozen)
         assert torch.equal(lengths.cpu(), exact - frozen)
         assert torch.equal(mask.cpu(), torch.tensor(mask_reference, dtype=torch.bool)[:, None])
     assert torch.equal(table_device.cpu(), canonical)
@@ -87,7 +86,6 @@ def test_fp32_gather_preserves_distinct_page_strides_and_storage_offsets(dtype, 
     read = DenseDraftRead(
         slots=slots.npu(),
         seq_lens=torch.tensor([4, 4], dtype=torch.int32, device="npu"),
-        starts=torch.zeros(2, dtype=torch.int32, device="npu"),
         mask=torch.zeros((2, 1, 1, 5), dtype=torch.bool, device="npu"),
         capacity=5,
         query_width=1,

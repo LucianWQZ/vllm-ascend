@@ -75,7 +75,7 @@ def test_native_ragged_exact_read_with_full_continuation(dtype, dim, kv_heads, c
     )
     result = dense_draft_attention(read, query_cpu.npu(), keys, values, 1 / math.sqrt(dim))
     torch.npu.synchronize()
-    assert read.starts.cpu().tolist() == list(starts)
+    assert (torch.tensor(ends) - read.seq_lens.cpu()).tolist() == list(starts)
     assert read.seq_lens.cpu().tolist() == [end - start for end, start in zip(ends, starts)]
     references, query_offset = [], 0
     for index, (row, start, end, width) in enumerate(zip(rows, starts, ends, widths)):

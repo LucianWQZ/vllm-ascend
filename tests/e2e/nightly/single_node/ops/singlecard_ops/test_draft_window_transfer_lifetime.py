@@ -16,7 +16,7 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_read import DirectPrefixSour
 pytestmark = pytest.mark.skipif(not torch.npu.is_available(), reason="requires an Ascend NPU")
 
 
-@pytest.mark.parametrize("stage", ["exact", "phase", "cohort"])
+@pytest.mark.parametrize("stage", ["phase", "cohort"])
 def test_real_private_copy_failure_retains_its_actual_operands(monkeypatch, stage):
     table = torch.arange(32, dtype=torch.int32, device="npu").reshape(2, 16)
     before = table.clone()
@@ -25,11 +25,9 @@ def test_real_private_copy_failure_retains_its_actual_operands(monkeypatch, stag
     rows = torch.tensor([1, 0], device="npu")
     pool = DraftWindowOwnerPool(1)
     events, submitted = [], []
-    originals = {name: getattr(torch.Tensor, name) for name in ("clone", "to", "copy_")}
+    original_copy = torch.Tensor.copy_
 
     def selected(tensor):
-        if stage == "exact":
-            return tensor.is_npu and tensor.data_ptr() == exact.data_ptr()
         dtype = torch.bool if stage == "phase" else torch.int64
         return tensor.device.type == "cpu" and tensor.dtype == dtype
 
@@ -43,31 +41,16 @@ def test_real_private_copy_failure_retains_its_actual_operands(monkeypatch, stag
         assert any(item is output_tensor for item in owner.retained), "copy destination missing from active owner"
         raise RuntimeError("deliberate Host failure after real NPU copy")
 
-    def clone(tensor, *args, **kwargs):
-        output = originals["clone"](tensor, *args, **kwargs)
-        if stage == "exact" and selected(tensor):
-            after_copy(tensor, output)
-        return output
-
-    def to(tensor, *args, **kwargs):
-        output = originals["to"](tensor, *args, **kwargs)
-        if kwargs.get("non_blocking") and selected(tensor):
-            after_copy(tensor, output)
-        return output
-
     def copy(destination, tensor, *args, **kwargs):
-        output = originals["copy_"](destination, tensor, *args, **kwargs)
+        output = original_copy(destination, tensor, *args, **kwargs)
         if selected(tensor):
             after_copy(tensor, destination)
         return output
 
-    monkeypatch.setattr(torch.Tensor, "clone", clone)
-    monkeypatch.setattr(torch.Tensor, "to", to)
     monkeypatch.setattr(torch.Tensor, "copy_", copy)
-    full_rows = None if stage == "exact" else torch.tensor([True, True] if stage == "phase" else [False, True])
+    full_rows = torch.tensor([True, True] if stage == "phase" else [False, True])
     try:
         with pytest.raises(RuntimeError, match="after real NPU copy"), pool.operation(lambda: None) as owner:
-            pool.begin_native(owner)
             prepare_dense_draft_read(
                 source,
                 exact_device=exact,
@@ -81,7 +64,7 @@ def test_real_private_copy_failure_retains_its_actual_operands(monkeypatch, stag
                 retain=lambda *items: pool.retain(owner, *items),
             )
         assert len(submitted) == 1
-        assert pool.poisoned and owner.state.name == "QUARANTINED"
+        assert pool.poisoned
         assert all(any(item is tensor for item in owner.retained) for tensor in submitted[0])
         with pytest.raises(RuntimeError, match="quarantined"):
             pool.acquire()
@@ -98,7 +81,6 @@ def test_real_metadata_fill_keeps_destination_quarantined(monkeypatch):
     read = DenseDraftRead(
         torch.zeros(2, 4, dtype=torch.int64, device="npu"),
         torch.tensor([3, 4], dtype=torch.int32, device="npu"),
-        torch.zeros(2, dtype=torch.int32, device="npu"),
         torch.zeros(2, 1, 1, 4, dtype=torch.bool, device="npu"),
         4,
         1,
@@ -121,11 +103,10 @@ def test_real_metadata_fill_keeps_destination_quarantined(monkeypatch):
     monkeypatch.setattr(torch.Tensor, "__setitem__", filled)
     try:
         with pytest.raises(RuntimeError, match="after real metadata fill"), pool.operation(lambda: None) as owner:
-            pool.begin_native(owner)
             pool.retain(owner, read)
             read.apply(SimpleNamespace(num_reqs=3))
         assert len(submitted) == 1
-        assert pool.poisoned and owner.state.name == "QUARANTINED"
+        assert pool.poisoned
         assert any(item is submitted[0] for item in owner.retained)
         with pytest.raises(RuntimeError, match="quarantined"):
             pool.acquire()

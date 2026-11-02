@@ -141,7 +141,6 @@ def _plan_draft_window(
     full_rows,
     query_offsets,
     slots,
-    starts,
     visible,
     mask,
     TABLE_ROW_STRIDE: tl.constexpr,
@@ -176,7 +175,6 @@ def _plan_draft_window(
         start = tl.where(tl.load(full_rows + req) != 0, 0, start)
     length = end - start
     if tl.program_id(1) == 0 and query == 0:
-        tl.store(starts + req, start)
         tl.store(visible + req, length)
     # Only the first query writes the shared token read set. Capacity padding
     # repeats a valid token, never an unwritten or NaN Full-cache tail.
@@ -217,17 +215,17 @@ def plan_draft_window(
     full_rows: torch.Tensor | None = None,
     query_offsets: torch.Tensor | None = None,
     retain: Callable[..., None] | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return owned slots/S/V/mask; Host values are allocation geometry only."""
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return owned slots/visible/mask; Host values bound allocation only."""
     n = exact.numel()
     slots = torch.empty((n, capacity), dtype=torch.int64, device=exact.device)
-    starts, visible = torch.empty_like(exact), torch.empty_like(exact)
+    visible = torch.empty_like(exact)
     mask = torch.empty((n, 1, query_width, capacity), dtype=torch.bool, device=exact.device)
     if retain is not None:
         # A launcher can raise after submitting device work. The proposal
         # must already own every private output when that happens, including
         # when recording the exception-path completion subsequently fails.
-        retain(table, rows, exact, frozen, query_ends, full_rows, query_offsets, slots, starts, visible, mask)
+        retain(table, rows, exact, frozen, query_ends, full_rows, query_offsets, slots, visible, mask)
     _plan_draft_window[(n, triton.cdiv(capacity, PLAN_BLOCK_SIZE), query_width)](
         table,
         rows,
@@ -237,7 +235,6 @@ def plan_draft_window(
         exact if full_rows is None else full_rows,
         exact if query_offsets is None else query_offsets,
         slots,
-        starts,
         visible,
         mask,
         table.stride(0),
@@ -258,4 +255,4 @@ def plan_draft_window(
         query_offsets is not None,
         PLAN_BLOCK_SIZE,
     )
-    return slots, starts, visible, mask
+    return slots, visible, mask

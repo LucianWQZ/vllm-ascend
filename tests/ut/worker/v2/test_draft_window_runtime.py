@@ -289,7 +289,7 @@ def test_eagle_uniform_first_pass_reads_current_device_end_without_host_snapshot
             read = metadata._draft_window_device_read
             # Rejected native padding must not move H: live E1159+K3 gives
             # H1162, S0 at W1035/B128, although native extent1160 would give S128.
-            assert read.starts.tolist() == [0, 0]
+            assert (torch.tensor([1159, 1159] if step == 0 else ends) - read.seq_lens).tolist() == [0, 0]
             assert read.seq_lens.tolist() == ([1159, 1159] if step == 0 else list(ends))
             assert read.query_width == width
 
@@ -587,7 +587,7 @@ def test_eagle_later_ar_uses_current_device_exact_with_frozen_anchor(setup, monk
             slots, positions, table = metadata.slot_mapping, metadata.positions, metadata.block_table_tensor
             runtime.metadata_callback(step, 2)(0, metadata)
             read = metadata._draft_window_device_read
-            assert read.query_width == 1 and read.starts.tolist() == [4, 20]
+            assert read.query_width == 1 and (torch.tensor(ends) - read.seq_lens).tolist() == [4, 20]
             assert read.seq_lens.tolist() == [ends[0] - 4, ends[1] - 20]
             assert metadata.slot_mapping is slots and metadata.positions is positions
             assert metadata.block_table_tensor is table
@@ -1086,7 +1086,7 @@ def test_dense_device_callback_or_exact_fallback_keeps_the_same_window(setup, up
         assert metadata.seq_lens.tolist() == [8, 11, 0]
         if max(upper) <= 32:
             read = metadata._draft_window_device_read
-            assert read.starts.tolist() == [12, 16]
+            assert (torch.tensor([20, 27]) - read.seq_lens).tolist() == [12, 16]
             assert metadata.seq_lens_cpu is None
             assert metadata.block_table_tensor is full_table
             assert any(value is read for value in runtime._owner.retained)
@@ -1140,7 +1140,7 @@ def test_eagle_prompt_only_terminal_rows_reuse_exact_without_d2h(setup, monkeypa
             apply(0, metadata)
             expected_starts = [0, 0] if step == 0 else [896, 1024 if all_terminal else 0]
             if all_terminal and step > 0:
-                assert metadata._draft_window_device_read.starts.tolist() == expected_starts
+                assert (torch.tensor(ends) - metadata._draft_window_device_read.seq_lens).tolist() == expected_starts
             else:
                 assert metadata._draft_window_read.starts_cpu.tolist() == expected_starts
             assert metadata.seq_lens[:2].tolist() == [
@@ -1232,7 +1232,7 @@ def test_eagle_mixed_decode_prompt_without_exact_copy(setup, monkeypatch):
             slots, positions = metadata.slot_mapping, metadata.positions
             runtime.metadata_callback(step, 2)(0, metadata)
             read = metadata._draft_window_device_read
-            assert read.starts.tolist() == [640, 0]
+            assert (torch.tensor([1795, 2177] if step == 0 else ends) - read.seq_lens).tolist() == [640, 0]
             assert read.seq_lens.tolist() == [1155 if step == 0 else ends[0] - 640, ends[1]]
             assert read.num_query_tokens == (261 if step == 0 else 2)
             assert read.capacity == 2208

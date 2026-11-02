@@ -32,7 +32,7 @@ def test_frozen_eagle_anchor_does_not_follow_later_exact_lengths():
             frozen_starts=frozen,
         )
         assert isinstance(read, DenseDraftRead)
-        assert read.starts.tolist() == [4]
+        assert (end - read.seq_lens).tolist() == [4]
         assert read.seq_lens.tolist() == [end - 4]
         expected = [int(source.table[0, pos // 4]) * 4 + pos % 4 for pos in range(4, end)]
         assert read.slots[0, : end - 4].tolist() == expected
@@ -92,7 +92,7 @@ def test_device_exact_read_set_reorder_rejection_and_nan_tail(causal, query_widt
         retain=lambda *objects: held.extend(objects),
     )
     assert isinstance(read, DenseDraftRead)
-    assert read.starts.tolist() == [0, 128]  # U1152 must not move row0's start.
+    assert (ends - read.seq_lens).tolist() == [0, 128]  # U1152 must not move row0's start.
     assert read.seq_lens.tolist() == [1151, 1024]
     cache = torch.full((24, block, 2, 16), torch.nan, dtype=torch.bfloat16)
     backing = None
@@ -212,7 +212,7 @@ def test_short_context_large_window_does_not_gather_window_sized_padding():
     )
     assert isinstance(read, DenseDraftRead)
     assert read.capacity == 64
-    assert read.starts.tolist() == [0] and read.seq_lens.tolist() == [31]
+    assert (31 - read.seq_lens).tolist() == [0] and read.seq_lens.tolist() == [31]
     assert read.slots[0, :31].tolist() == list(range(128, 159))
     assert read.slots[0, 31:].tolist() == [158] * 33
     assert not read.mask[..., :31].any() and read.mask[..., 31:].all()

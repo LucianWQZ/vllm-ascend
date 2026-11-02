@@ -37,4 +37,4 @@ def test_full_prompt_does_not_multiply_decode_scratch_by_full_capacity():
     assert kv_tokens == 15 * 1152 + 32768
     assert mask_elements == 15 * 4 * 1152 + full_width * 32768
     assert read.seq_lens.tolist() == [1151] * 15 + [full_end]
-    assert read.starts.tolist() == [0] * n
+    assert (ends - read.seq_lens).tolist() == [0] * n

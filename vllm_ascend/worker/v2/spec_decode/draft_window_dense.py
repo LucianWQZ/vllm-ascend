@@ -46,7 +46,6 @@ def _read_capacity_cpu(read: DenseDraftRead | DenseDraftReadBatch, common: Any) 
 class DenseDraftRead:
     slots: torch.Tensor
     seq_lens: torch.Tensor
-    starts: torch.Tensor
     mask: torch.Tensor
     capacity: int
     query_width: int
@@ -82,7 +81,6 @@ class DenseDraftReadBatch:
 
     parts: tuple[tuple[torch.Tensor, DenseDraftRead], ...]
     seq_lens: torch.Tensor
-    starts: torch.Tensor
     capacity: int
     num_query_tokens: int
     retain: Callable[..., None]
@@ -123,8 +121,7 @@ def _prepare_partitioned_reads(
 ) -> DenseDraftReadBatch:
     parts = []
     visible = torch.empty_like(exact_device[: len(source.request_rows)])
-    starts = torch.empty_like(visible)
-    retain(visible, starts)
+    retain(visible)
     for (full, width, _capacity), rows in groups.items():
         host_rows = torch.tensor(rows, dtype=torch.int64, device="cpu")
         selected = _copy_owned_read_tensor(host_rows, retain, device=exact_device.device)
@@ -157,12 +154,10 @@ def _prepare_partitioned_reads(
         )
         assert isinstance(read, DenseDraftRead)
         visible.index_copy_(0, selected, read.seq_lens)
-        starts.index_copy_(0, selected, read.starts)
         parts.append((queries, read))
     result = DenseDraftReadBatch(
         tuple(parts),
         visible,
-        starts,
         max(read.capacity for _, read in parts),
         sum(indices.numel() for indices, _ in parts),
         retain,
@@ -315,7 +310,7 @@ def prepare_dense_draft_read(
     capacity = (capacity_bound + DENSE_KV_ALIGNMENT - 1) // DENSE_KV_ALIGNMENT * DENSE_KV_ALIGNMENT
     from vllm_ascend.ops.triton.v2.spec_decode.draft_window import plan_draft_window
 
-    slots, starts, visible, mask = plan_draft_window(
+    slots, visible, mask = plan_draft_window(
         source.table,
         row_indices,
         exact,
@@ -334,7 +329,6 @@ def prepare_dense_draft_read(
     read = DenseDraftRead(
         slots,
         visible,
-        starts,
         mask,
         capacity,
         query_width,

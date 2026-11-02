@@ -34,7 +34,7 @@ def test_ragged_queries_keep_full_row_and_use_device_exact_at_boundary(causal):
         query_start_loc_cpu=offsets,
         query_start_loc_device=offsets.clone(),
     )
-    assert read.starts.tolist() == [0, 0]
+    assert (exact - read.seq_lens).tolist() == [0, 0]
     assert read.seq_lens.tolist() == [1151, 1408]
     assert read.capacity == 1440  # Full-row U controls allocation only.
     assert read.num_query_tokens == 8
@@ -78,7 +78,7 @@ def test_ragged_eagle_native_padding_preserves_frozen_anchor_and_full_continuati
         query_start_loc_device=offsets.clone(),
         retain=lambda *items: None,
     )
-    assert read.starts.tolist() == [640, 0]
+    assert (torch.tensor([1795, 2177]) - read.seq_lens).tolist() == [640, 0]
     assert read.seq_lens.tolist() == [1155, 2177]
     assert read.num_query_tokens == 261
     assert isinstance(read, DenseDraftReadBatch)
@@ -102,7 +102,7 @@ def test_uniform_full_read_rows_keep_original_query_layout():
         full_rows_cpu=torch.tensor([False, True]),
         retain=lambda *items: None,
     )
-    assert read.starts.tolist() == [0, 0]
+    assert (torch.tensor([1151, 1287]) - read.seq_lens).tolist() == [0, 0]
     assert read.capacity == 1312
     assert read.num_query_tokens == 16
     assert isinstance(read, DenseDraftReadBatch)
