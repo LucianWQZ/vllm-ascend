@@ -13,7 +13,6 @@ from vllm.v1.worker.gpu.spec_decode.eagle.speculator import EagleSpeculator
 from vllm.v1.worker.gpu.spec_decode.target_dependent_ar.speculator import TargetDependentARSpeculator
 
 from vllm_ascend.worker.v2.spec_decode import draft_window_eager
-from vllm_ascend.worker.v2.spec_decode.draft_window_eager import AscendDraftAttentionReadInputs
 from vllm_ascend.worker.v2.spec_decode.draft_window_eagle3 import (
     Eagle3DraftWindowMixin,
     _eagle3_graph_scheduled_consumers,
@@ -21,6 +20,7 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_eagle3 import (
 from vllm_ascend.worker.v2.spec_decode.draft_window_eagle3_adapter import Eagle3GraphIntegrationMixin
 from vllm_ascend.worker.v2.spec_decode.draft_window_eagle3_capture import Eagle3GraphSession
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphCarrierState
+from vllm_ascend.worker.v2.spec_decode.draft_window_read import DraftReadView
 from vllm_ascend.worker.v2.spec_decode.eagle.speculator import AscendEagleSpeculator
 from vllm_ascend.worker.v2.spec_decode.target_dependent_ar.speculator import AscendTargetDependentARSpeculator
 
@@ -41,7 +41,7 @@ def test_eagle_integration_keeps_the_existing_execution_mro():
 def assembly(monkeypatch):
     table = torch.arange(16, dtype=torch.int32).reshape(4, 4)
     lengths = torch.tensor([7, 9, 0, 0], dtype=torch.int32)
-    read = AscendDraftAttentionReadInputs((table,), lengths.clone(), lengths, lengths.clone(), 9)
+    read = DraftReadView(table, lengths.clone(), lengths, lengths, None, 9, num_reqs=4)
     owner = SimpleNamespace(
         arange_np=np.arange(5, dtype=np.int32),
         num_query_per_req=8,
@@ -59,6 +59,7 @@ def assembly(monkeypatch):
         vllm_config=SimpleNamespace(parallel_config=object()),
         attn_vllm_config=SimpleNamespace(parallel_config=object()),
         model_state=SimpleNamespace(attn_metadata={"target": SimpleNamespace(attn_state="decode")}),
+        _draft_window_graph_binding_provider=SimpleNamespace(source=SimpleNamespace(group=SimpleNamespace(gid=0))),
         kv_cache_config=object(),
     )
     from vllm_ascend.worker.v2 import attn_utils
@@ -95,7 +96,6 @@ def test_shared_assembler_preserves_uniform_full_capture_and_nonuniform_queries(
         query_width=width,
         causal=True,
         query_start_loc_np=query,
-        dcp_local_seq_lens=None,
     )
     assert len(owner.assembly_calls) == 1
     assert result["draft"].query_start_loc.data_ptr() == owner.input_buffers.query_start_loc.data_ptr()
@@ -107,15 +107,21 @@ def test_shared_assembler_preserves_uniform_full_capture_and_nonuniform_queries(
     assert result["parallel_config"] is not owner.vllm_config.parallel_config
     assert result["query_start_loc_cpu"].tolist() == expected
     assert result["max_query_len"] == max_query
-    assert result["draft_window_read_inputs"] is read
+    assert "draft_window_read_inputs" not in result
+    slots_marker, positions_marker = object(), object()
+    common = SimpleNamespace(num_reqs=4, slot_mapping=slots_marker, positions=positions_marker)
+    result["common_metadata_callback"](0, common)
+    assert common._draft_window_read is read
+    assert read.exact_cpu_for(common) is read.seq_lens_cpu
+    assert common.slot_mapping is slots_marker and common.positions is positions_marker
     assert result["seq_lens"] is read.seq_lens
-    assert result["seq_lens_cpu"] is read.seq_lens_cpu_exact
+    assert result["seq_lens_cpu"] is read.seq_lens_cpu
     assert result["seq_lens_cpu_upper_bound"] is read.seq_lens_cpu_upper_bound
-    assert result["block_tables"][0] is read.block_tables[0]
+    assert result["block_tables"][0] is read.block_table
     slots = owner.block_tables.slot_mappings
     assert result["slot_mappings"].data_ptr() == slots.data_ptr()
     assert result["slot_mappings"].shape == (1, tokens)
-    assert torch.equal(owner.block_tables.input_block_tables[0], torch.full_like(read.block_tables[0], 99))
+    assert torch.equal(owner.block_tables.input_block_tables[0], torch.full_like(read.block_table, 99))
 
 
 @pytest.mark.parametrize("fail", [False, True])
@@ -309,17 +315,8 @@ def test_first_and_ar_share_one_materialization_path_without_moving_the_anchor(p
         draft_window_eagle3, "gather_valid_num_blocks_cpu", lambda *args, **kwargs: torch.tensor([4], dtype=torch.int32)
     )
 
-    def plan(**kwargs):
-        calls.append(kwargs)
-        return SimpleNamespace(
-            read_descriptors=(),
-            cpu_window_exact=kwargs["cpu_full_exact"],
-            cpu_valid_num_blocks=kwargs["cpu_valid_num_blocks"],
-        )
-
-    monkeypatch.setattr(draft_window_eagle3, "build_phase_aware_materialization_plan", plan)
-
     def materialize(**kwargs):
+        calls.append(kwargs)
         identity = SimpleNamespace(proposal=kwargs["proposal"], step=kwargs["step"])
         current = SimpleNamespace(identity=identity, retired=False)
         current.validate_for = lambda expected: expected is identity

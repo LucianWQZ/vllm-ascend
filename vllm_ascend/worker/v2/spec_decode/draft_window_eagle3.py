@@ -19,9 +19,6 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_eager import (
     _requires_prefill_baseline_bypass,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphBindingProvider
-from vllm_ascend.worker.v2.spec_decode.draft_window_nongraph import (
-    build_phase_aware_materialization_plan,
-)
 from vllm_ascend.worker.v2.spec_decode.draft_window_plan import DraftWindowPlan, compute_draft_window_plan
 
 
@@ -253,23 +250,14 @@ class Eagle3DraftWindowMixin:
             num_reqs=num_reqs,
             num_reqs_padded=num_reqs_padded,
         )
-        plan = build_phase_aware_materialization_plan(
-            source=provider.source,
-            frozen_row_plans=proposal,
-            cpu_full_exact=exact,
-            cpu_valid_num_blocks=valid,
-            phase_plan=context.phase_plan,
-            actual_request_count=num_reqs,
-            padded_request_count=num_reqs_padded,
-        )
         self._eagle3_window_epoch_source.validate(context, batch)
         inputs = provider.materialize(
             previous_identity=previous,
             proposal=context,
             idx_mapping=batch.idx_mapping,
-            read_descriptors=plan.read_descriptors,
-            cpu_window_exact=plan.cpu_window_exact,
-            cpu_valid_num_blocks=plan.cpu_valid_num_blocks,
+            frozen_row_plans=proposal,
+            cpu_full_exact=exact,
+            cpu_valid_num_blocks=valid,
             num_reqs_padded=num_reqs_padded,
             step=step,
             output_workspace=output_workspace,

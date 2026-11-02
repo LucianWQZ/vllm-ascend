@@ -156,71 +156,40 @@ def test_graph_source_guard_keeps_actual_capability_parallel_object_and_rank(sou
 
 @pytest.fixture
 def bridge():
-    from vllm_ascend.worker.v2.spec_decode.draft_window_eager import AscendDraftAttentionReadInputs
+    from vllm_ascend.worker.v2.spec_decode.draft_window_read import DraftReadView
 
     device = torch.tensor([17, 1025, 0, 0], dtype=torch.int32)
     exact = device.clone()
-    upper = torch.tensor([24, 1040, 0, 0], dtype=torch.int32)
-    tables = (torch.arange(8).reshape(4, 2), torch.arange(8, 16).reshape(4, 2))
-    read = AscendDraftAttentionReadInputs(tables, device, exact, upper, 1040)
-    common = SimpleNamespace(
-        num_reqs=4,
-        max_seq_len=1040,
-        seq_lens=device.view(-1),
-        seq_lens_cpu=exact,
-        seq_lens_cpu_upper_bound=upper,
-        block_table_tensor=read.block_tables[0],
-        slot_mapping=object(),
-        positions=object(),
-    )
+    table = torch.arange(8).reshape(4, 2)
+    read = DraftReadView(table, device, exact, exact, None, 1025, num_reqs=4)
+    common = SimpleNamespace(num_reqs=4, slot_mapping=object(), positions=object())
+    read.apply(common)
     return SimpleNamespace(read=read, common=common)
 
 
-def test_current_exact_pair_is_certified_without_reprojection_or_write_mutation(bridge):
+def test_current_exact_uses_the_common_backend_read_interface_without_a_second_certificate(bridge):
     slots, positions = bridge.common.slot_mapping, bridge.common.positions
-    bridge.read.certify_common_metadata(0, bridge.common)
-    certificate = bridge.common._draft_window_read
-    assert certificate.exact_cpu_for(bridge.common) is bridge.read.seq_lens_cpu_exact
-    assert certificate.exact_cpu_for(bridge.common) is not bridge.read.seq_lens_cpu_upper_bound
+    assert bridge.common._draft_window_read is bridge.read
+    assert bridge.read.exact_cpu_for(bridge.common) is bridge.read.seq_lens_cpu
+    assert bridge.common.seq_lens_cpu_upper_bound is bridge.read.seq_lens_cpu
     assert bridge.common.seq_lens is bridge.read.seq_lens
     assert bridge.common.slot_mapping is slots and bridge.common.positions is positions
-
-
-@pytest.mark.parametrize("field", ["seq_lens", "seq_lens_cpu", "seq_lens_cpu_upper_bound", "block_table_tensor"])
-def test_same_values_from_another_owner_are_rejected_at_actual_handoff(bridge, field):
-    setattr(bridge.common, field, getattr(bridge.common, field).clone())
-    with pytest.raises(ValueError, match="lost its current read owners"):
-        bridge.read.certify_common_metadata(0, bridge.common)
-
-
-def test_upper_cannot_be_substituted_for_exact_at_actual_handoff(bridge):
-    bridge.common.seq_lens_cpu = bridge.read.seq_lens_cpu_upper_bound
-    with pytest.raises(ValueError, match="lost its current read owners"):
-        bridge.read.certify_common_metadata(0, bridge.common)
-
-
-@pytest.mark.parametrize("field,value", [("num_reqs", 3), ("max_seq_len", 1025)])
-def test_wrong_actual_handoff_geometry_is_rejected(bridge, field, value):
-    setattr(bridge.common, field, value)
-    with pytest.raises(ValueError, match="lost its current read owners"):
-        bridge.read.certify_common_metadata(0, bridge.common)
 
 
 @pytest.mark.parametrize(
     "field", ["seq_lens", "seq_lens_cpu", "_seq_lens_cpu", "seq_lens_cpu_upper_bound", "block_table_tensor", "num_reqs"]
 )
-def test_replaced_read_operand_invalidates_certificate(bridge, field):
-    bridge.read.certify_common_metadata(0, bridge.common)
-    certificate = bridge.common._draft_window_read
-    setattr(bridge.common, field, object())
+def test_replaced_read_operand_is_rejected_at_the_actual_backend_read_boundary(bridge, field):
+    value = getattr(bridge.common, field)
+    setattr(bridge.common, field, value.clone() if isinstance(value, torch.Tensor) else 3)
     with pytest.raises(ValueError, match="replaced after projection"):
-        certificate.exact_cpu_for(bridge.common)
+        bridge.read.exact_cpu_for(bridge.common)
 
 
-def test_existing_projection_owner_is_not_overwritten(bridge):
-    bridge.common._draft_window_device_read = object()
-    with pytest.raises(ValueError, match="already has a read projection owner"):
-        bridge.read.certify_common_metadata(0, bridge.common)
+def test_a_different_host_upper_cannot_be_used_as_the_actual_exact_length(bridge):
+    bridge.common.seq_lens_cpu = torch.tensor([24, 1040, 0, 0], dtype=torch.int32)
+    with pytest.raises(ValueError, match="replaced after projection"):
+        bridge.read.exact_cpu_for(bridge.common)
 
 
 @pytest.mark.parametrize("actual,padded", [(1, 2), (3, 4)])

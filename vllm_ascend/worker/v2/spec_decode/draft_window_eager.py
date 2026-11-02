@@ -2,10 +2,9 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 """Graph-owned proposal inputs for the MRV2 Draft Window read plane.
 
-This module owns the parallel Graph proposal read view. It
-connects P1/P2/P3 read state through an Ascend-owned metadata-assembly seam,
-while leaving positions, query layout, slot mappings, and Target metadata
-untouched. The upstream vLLM checkout remains unmodified.
+This module joins real proposal inputs to capture-owned Window buffers and
+the normal Ascend metadata builder. Positions, query layout, slot mappings
+and Target metadata remain owned by the existing runner.
 """
 
 from collections.abc import Iterator, Mapping
@@ -15,7 +14,6 @@ from typing import Any
 
 import numpy as np
 import torch
-from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu.input_batch import InputBatch
 
 from vllm_ascend.worker.v2.spec_decode.draft_window import (
@@ -25,80 +23,9 @@ from vllm_ascend.worker.v2.spec_decode.draft_window import (
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphBindingProvider
 from vllm_ascend.worker.v2.spec_decode.draft_window_nongraph import (
     DraftWindowBatchPhasePlan,
-    build_phase_aware_materialization_plan,
     classify_draft_window_batch_phase,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_read import DraftReadView
-
-
-@dataclass(frozen=True, slots=True)
-class AscendDraftAttentionReadInputs:
-    """Ascend-owned, read-only transport for one Draft metadata build.
-
-    The repository-local seam cannot override positions, query layout, or slot
-    mappings. CPU exact and upper lengths are already final for this build.
-    """
-
-    block_tables: tuple[torch.Tensor, ...]
-    seq_lens: torch.Tensor
-    seq_lens_cpu_exact: torch.Tensor
-    seq_lens_cpu_upper_bound: torch.Tensor
-    max_seq_len: int
-    dcp_local_seq_lens: torch.Tensor | None = None
-
-    def __post_init__(self) -> None:
-        if self.max_seq_len < 0:
-            raise ValueError("Draft attention max sequence length must be non-negative")
-        for name, tensor in (
-            ("device sequence lengths", self.seq_lens),
-            ("CPU exact sequence lengths", self.seq_lens_cpu_exact),
-            ("CPU upper sequence lengths", self.seq_lens_cpu_upper_bound),
-        ):
-            if tensor.ndim != 1:
-                raise ValueError(f"Draft attention {name} must be one-dimensional")
-            if tensor.dtype != torch.int32:
-                raise TypeError(f"Draft attention {name} must use int32")
-        if self.seq_lens_cpu_exact.device.type != "cpu":
-            raise ValueError("Draft attention CPU exact sequence lengths must live on CPU")
-        if self.seq_lens_cpu_upper_bound.device.type != "cpu":
-            raise ValueError("Draft attention CPU upper sequence lengths must live on CPU")
-        if self.seq_lens.shape != self.seq_lens_cpu_exact.shape:
-            raise ValueError("Draft attention device and CPU exact lengths must have the same shape")
-        if self.seq_lens_cpu_exact.shape != self.seq_lens_cpu_upper_bound.shape:
-            raise ValueError("Draft attention CPU exact and upper lengths must have the same shape")
-
-    def certify_common_metadata(self, gid: int, common: Any) -> None:
-        """Certify a fresh per-group object; never project or clone read data."""
-        if not 0 <= gid < len(self.block_tables):
-            raise ValueError("Graph metadata group is outside current read inputs")
-        if hasattr(common, "_draft_window_read") or hasattr(common, "_draft_window_device_read"):
-            raise ValueError("Graph metadata already has a read projection owner")
-        if (
-            common.num_reqs != self.seq_lens.shape[0]
-            or common.max_seq_len != self.max_seq_len
-            or common.block_table_tensor is not self.block_tables[gid]
-            or common.seq_lens_cpu is not self.seq_lens_cpu_exact
-            or common.seq_lens_cpu_upper_bound is not self.seq_lens_cpu_upper_bound
-            or common.seq_lens.data_ptr() != self.seq_lens.data_ptr()
-            or common.seq_lens.shape != self.seq_lens.shape
-            or common.seq_lens.stride() != self.seq_lens.stride()
-            or common.seq_lens.dtype != self.seq_lens.dtype
-            or common.seq_lens.device != self.seq_lens.device
-        ):
-            raise ValueError("Fresh Graph common metadata lost its current read owners")
-        # The generic builder slices device lengths. Reattach that same view's
-        # explicit owner for the certificate; no data is copied or projected.
-        common.seq_lens = self.seq_lens
-        common._seq_lens_cpu = self.seq_lens_cpu_exact
-        common._draft_window_read = DraftReadView(
-            block_table=self.block_tables[gid],
-            seq_lens=self.seq_lens,
-            seq_lens_cpu=self.seq_lens_cpu_exact,
-            seq_lens_cpu_upper_bound=self.seq_lens_cpu_upper_bound,
-            starts_cpu=None,
-            max_seq_len=self.max_seq_len,
-            num_reqs=common.num_reqs,
-        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,20 +104,18 @@ def draft_window_read_inputs(
     *,
     actual_request_count: int,
     padded_request_count: int,
-    block_tables: Any,
-    global_group_id: int,
-) -> AscendDraftAttentionReadInputs:
-    """Narrow one real scratch/capture bank to its builder's request rows."""
-    active_exact = workspace.cpu_window_exact[:actual_request_count]
-    return AscendDraftAttentionReadInputs(
-        block_tables=tuple(
-            (workspace.window_block_table if gid == global_group_id else table)[:padded_request_count]
-            for gid, table in enumerate(block_tables)
-        ),
+) -> DraftReadView:
+    """Borrow the selected persistent bank through the common read interface."""
+    exact = workspace.cpu_window_exact[:padded_request_count]
+    active_exact = exact[:actual_request_count]
+    return DraftReadView(
+        block_table=workspace.window_block_table[:padded_request_count],
         seq_lens=workspace.device_window_exact[:padded_request_count],
-        seq_lens_cpu_exact=workspace.cpu_window_exact[:padded_request_count],
-        seq_lens_cpu_upper_bound=workspace.cpu_window_exact[:padded_request_count],
+        seq_lens_cpu=exact,
+        seq_lens_cpu_upper_bound=exact,
+        starts_cpu=None,
         max_seq_len=int(active_exact.max().item()) if active_exact.numel() else 0,
+        num_reqs=padded_request_count,
     )
 
 
@@ -200,11 +125,10 @@ def build_draft_window_attn_metadata(
     num_reqs: int,
     num_reqs_padded: int,
     num_tokens_padded: int,
-    read_inputs: AscendDraftAttentionReadInputs,
+    read_inputs: DraftReadView,
     query_width: int | None = None,
     causal: bool | Mapping[int, bool],
     query_start_loc_np: np.ndarray | None,
-    dcp_local_seq_lens: torch.Tensor | None,
     attn_groups: Any = None,
     attn_state: Any = None,
     parallel_config: Any = None,
@@ -228,21 +152,8 @@ def build_draft_window_attn_metadata(
         query_start_loc_cpu[num_reqs:] = query_start_loc_cpu[num_reqs]
         lengths = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
         max_query_len = int(lengths.max().item()) if lengths.numel() else 0
-    if len(read_inputs.block_tables) != len(owner.block_tables.input_block_tables):
-        raise ValueError("Draft attention read block-table group count does not match the configured cache groups")
     if read_inputs.seq_lens.shape[0] != num_reqs_padded:
         raise ValueError("Draft attention read lengths do not match the padded request count")
-    if dcp_local_seq_lens is None:
-        dcp_local_seq_lens = read_inputs.dcp_local_seq_lens
-    if dcp_local_seq_lens is None and owner.block_tables.cp_size > 1:
-        dcp_local_seq_lens = prepare_dcp_local_seq_lens(
-            owner.input_buffers.dcp_local_seq_lens,
-            read_inputs.seq_lens,
-            num_reqs,
-            owner.block_tables.cp_size,
-            owner.block_tables.cp_rank,
-            owner.block_tables.cp_interleave,
-        )
     # Use the fixed Ascend builder directly. Window assembly does not need to
     # replace the upstream module function or inherit an enclosing factory.
     from vllm_ascend.worker.v2.attn_utils import build_attn_metadata
@@ -251,8 +162,16 @@ def build_draft_window_attn_metadata(
         attn_state = next(layer.attn_state for layer in owner.model_state.attn_metadata.values() if layer is not None)
     if parallel_config is None:
         parallel_config = owner.attn_vllm_config.parallel_config
+    window_gid = owner._draft_window_graph_binding_provider.source.group.gid
+    tables = list(owner.block_tables.input_block_tables)
+    tables[window_gid] = read_inputs.block_table
+
+    def bind_window_read(gid, common):
+        if gid == window_gid:
+            read_inputs.apply(common)
+
     metadata = build_attn_metadata(
-        draft_window_read_inputs=read_inputs,
+        common_metadata_callback=bind_window_read,
         attn_groups=owner.attn_groups if attn_groups is None else attn_groups,
         num_reqs=num_reqs_padded,
         num_tokens=num_tokens_padded,
@@ -260,10 +179,9 @@ def build_draft_window_attn_metadata(
         query_start_loc_cpu=query_start_loc_cpu,
         max_query_len=max_query_len,
         seq_lens=read_inputs.seq_lens,
-        seq_lens_cpu=read_inputs.seq_lens_cpu_exact,
-        dcp_local_seq_lens=(None if dcp_local_seq_lens is None else dcp_local_seq_lens[:num_reqs_padded]),
+        seq_lens_cpu=read_inputs.seq_lens_cpu,
         max_seq_len=read_inputs.max_seq_len,
-        block_tables=list(read_inputs.block_tables),
+        block_tables=tables,
         slot_mappings=owner.block_tables.slot_mappings[:, :num_tokens_padded],
         kv_cache_config=owner.kv_cache_config,
         causal=causal,
@@ -483,22 +401,13 @@ class DraftWindowGraphInputMixin:
             num_reqs=num_reqs,
             num_reqs_padded=num_reqs_padded,
         )
-        plan = build_phase_aware_materialization_plan(
-            source=capability,
-            phase_plan=context.phase_plan,
-            cpu_full_exact=cpu_full_exact,
-            cpu_valid_num_blocks=valid_num_blocks,
-            actual_request_count=num_reqs,
-            padded_request_count=num_reqs_padded,
-        )
-        # Recheck freshness after the controlled length snapshot and host plan.
+        # Recheck request order after the controlled exact-length snapshot.
         self._draft_window_epoch_source.validate(context, input_batch)
         inputs = self._draft_window_graph_binding_provider.materialize(
             proposal=context,
             idx_mapping=input_batch.idx_mapping,
-            read_descriptors=plan.read_descriptors,
-            cpu_window_exact=plan.cpu_window_exact,
-            cpu_valid_num_blocks=plan.cpu_valid_num_blocks,
+            cpu_full_exact=cpu_full_exact,
+            cpu_valid_num_blocks=valid_num_blocks,
             num_reqs_padded=num_reqs_padded,
             step=0,
             output_workspace=output_workspace,

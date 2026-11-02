@@ -27,7 +27,7 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
     DraftWindowGraphRoute,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_nongraph import DraftWindowBatchPhasePlan
-from vllm_ascend.worker.v2.spec_decode.draft_window_plan import compute_draft_window_plan, project_draft_window_interval
+from vllm_ascend.worker.v2.spec_decode.draft_window_plan import compute_draft_window_plan
 from vllm_ascend.worker.v2.spec_decode.draft_window_policy import resolve_draft_window_policy
 
 
@@ -97,24 +97,12 @@ def graph_buffers():
 
 
 def _materialize(case, *, epoch=0, ends=(11, 14)):
-    plans = [
-        compute_draft_window_plan(full_exact_end=end, future_offset=0, window_size=4, block_span_tokens=4)
-        for end in ends
-    ]
-    exact = torch.tensor([plan.window_visible_length for plan in plans] + [0] * (2 - len(plans)), dtype=torch.int32)
+    exact = torch.tensor(list(ends) + [0] * (2 - len(ends)), dtype=torch.int32)
     return case.provider.materialize(
-        proposal=_proposal(epoch, ("request-a", "request-b")[: len(plans)]),
+        proposal=_proposal(epoch, ("request-a", "request-b")[: len(ends)]),
         idx_mapping=case.mapping,
-        read_descriptors=[
-            project_draft_window_interval(
-                window_start=plan.window_start,
-                full_exact_end=plan.full_exact_end,
-                block_span_tokens=case.projection.group.table_column_span,
-            )
-            for plan in plans
-        ],
-        cpu_window_exact=exact.clone(),
-        cpu_valid_num_blocks=torch.tensor([4] * len(plans) + [0] * (2 - len(plans)), dtype=torch.int32),
+        cpu_full_exact=exact,
+        cpu_valid_num_blocks=torch.tensor([4] * len(ends) + [0] * (2 - len(ends)), dtype=torch.int32),
         num_reqs_padded=2,
         step=0,
         output_workspace=case.provider.prepare_workspace(case.capture),
@@ -285,8 +273,7 @@ def test_cpu_valid_counts_are_required_before_any_bank_materialization(graph_buf
         case.provider.materialize(
             proposal=_proposal(),
             idx_mapping=case.mapping,
-            read_descriptors=(),
-            cpu_window_exact=torch.zeros(2, dtype=torch.int32),
+            cpu_full_exact=torch.zeros(2, dtype=torch.int32),
             num_reqs_padded=2,
             step=0,
             output_workspace=bank,
@@ -321,16 +308,12 @@ def test_eagle_serialized_steps_own_distinct_banks_and_preserve_previous_consume
             consumer_ordinal=max(step - 1, 0),
         )
         bank = provider.prepare_workspace(capture)
-        exact = torch.tensor([11 + step - proposal_plan.window_start] + [0] * (padded - 1), dtype=torch.int32)
+        exact = torch.tensor([11 + step] + [0] * (padded - 1), dtype=torch.int32)
         kwargs = dict(
             proposal=proposal,
             idx_mapping=case.mapping,
-            read_descriptors=[
-                project_draft_window_interval(
-                    window_start=proposal_plan.window_start, full_exact_end=11 + step, block_span_tokens=4
-                )
-            ],
-            cpu_window_exact=exact.clone(),
+            frozen_row_plans=(proposal_plan,),
+            cpu_full_exact=exact,
             cpu_valid_num_blocks=torch.tensor([4] + [0] * (padded - 1), dtype=torch.int32),
             num_reqs_padded=padded,
             step=step,
@@ -552,12 +535,7 @@ def test_actual_capture_bank_supplies_exact_cpu_as_its_own_valid_upper(graph_buf
     inputs = case.provider.materialize(
         proposal=_proposal(),
         idx_mapping=case.mapping,
-        read_descriptors=[
-            project_draft_window_interval(
-                window_start=plan.window_start, full_exact_end=plan.full_exact_end, block_span_tokens=4
-            )
-        ],
-        cpu_window_exact=torch.tensor([plan.window_visible_length], dtype=torch.int32),
+        cpu_full_exact=torch.tensor([plan.full_exact_end], dtype=torch.int32),
         cpu_valid_num_blocks=torch.tensor([4], dtype=torch.int32),
         num_reqs_padded=1,
         step=0,
@@ -569,15 +547,13 @@ def test_actual_capture_bank_supplies_exact_cpu_as_its_own_valid_upper(graph_buf
         inputs.workspace,
         actual_request_count=1,
         padded_request_count=1,
-        block_tables=[case.source._input_block_tables[0]],
-        global_group_id=case.projection.group.gid,
     )
-    assert read.block_tables[0].shape == (1, 2)
-    assert read.seq_lens.shape == read.seq_lens_cpu_exact.shape == read.seq_lens_cpu_upper_bound.shape == (1,)
-    assert read.block_tables[0].data_ptr() == inputs.workspace.window_block_table.data_ptr()
+    assert read.block_table.shape == (1, 2)
+    assert read.seq_lens.shape == read.seq_lens_cpu.shape == read.seq_lens_cpu_upper_bound.shape == (1,)
+    assert read.block_table.data_ptr() == inputs.workspace.window_block_table.data_ptr()
     assert read.seq_lens.data_ptr() == inputs.workspace.device_window_exact.data_ptr()
-    assert read.seq_lens_cpu_upper_bound.data_ptr() == read.seq_lens_cpu_exact.data_ptr()
-    assert read.seq_lens_cpu_upper_bound.item() == read.seq_lens_cpu_exact.item()
+    assert read.seq_lens_cpu_upper_bound.data_ptr() == read.seq_lens_cpu.data_ptr()
+    assert read.seq_lens_cpu_upper_bound.item() == read.seq_lens_cpu.item()
     case.provider.retire_generation(inputs.identity)
     with pytest.raises(RuntimeError, match="retired Draft inputs"):
         inputs.validate_for(inputs.identity)
@@ -606,29 +582,24 @@ def test_graph_source_has_one_readonly_owner_and_no_second_runtime(graph_buffers
 
 
 @pytest.mark.parametrize(
-    "start,columns,offset,valid,error",
+    "exact,valid,capacity,error",
     [
-        (4, 1, 0, 4, RuntimeError),
-        (0, 3, 0, 4, RuntimeError),
-        (0, 1, 1, 4, NotImplementedError),
-        (0, 1, 0, -1, RuntimeError),
-        (0, 1, 0, 5, RuntimeError),
+        (20, 4, 2, RuntimeError),
+        (11, 4, 1, RuntimeError),
+        (4, -1, 2, RuntimeError),
+        (4, 5, 2, RuntimeError),
     ],
 )
-def test_actual_bank_boundary_rejects_invalid_columns_offset_and_residency(
-    graph_buffers, start, columns, offset, valid, error
-):
-    from vllm_ascend.worker.v2.spec_decode.draft_window_plan import DirectPrefixProjection
-
+def test_actual_bank_boundary_rejects_invalid_capacity_and_residency(graph_buffers, exact, valid, capacity, error):
     case = graph_buffers
     bank = case.provider.prepare_workspace(case.capture)
+    bank.table_capacity_columns = capacity
     before = [tensor.clone() for tensor in _bank_tensors(bank)]
     with pytest.raises(error):
         case.provider.materialize(
             proposal=_proposal(),
             idx_mapping=case.mapping,
-            read_descriptors=[DirectPrefixProjection(start, offset, columns, columns * 4)],
-            cpu_window_exact=torch.tensor([4], dtype=torch.int32),
+            cpu_full_exact=torch.tensor([exact], dtype=torch.int32),
             cpu_valid_num_blocks=torch.tensor([valid], dtype=torch.int32),
             num_reqs_padded=1,
             step=0,
@@ -638,6 +609,35 @@ def test_actual_bank_boundary_rejects_invalid_columns_offset_and_residency(
     assert all(torch.equal(tensor, old) for tensor, old in zip(_bank_tensors(bank), before))
     with pytest.raises(RuntimeError, match="quarantined"):
         case.provider.prepare_workspace(case.capture)
+
+
+def test_actual_eagle_bank_rejects_an_intra_block_frozen_anchor(graph_buffers):
+    from vllm_ascend.worker.v2.spec_decode.draft_window_plan import DraftWindowPlan
+
+    case = graph_buffers
+    source = replace(
+        case.projection,
+        policy=replace(case.projection.policy, normalized_method="eagle3"),
+        runtime_route="eagle3",
+        expected_future_offset=3,
+    )
+    provider = DraftWindowGraphBindingProvider(source=source)
+    capture = provider.register_capture_identity(
+        route=DraftWindowGraphRoute.EAGLE3_FIRST_PASS, descriptor=case.capture.descriptor
+    )
+    bank = provider.prepare_workspace(capture)
+    with pytest.raises(NotImplementedError, match="intra-block"):
+        provider.materialize(
+            proposal=_proposal(),
+            idx_mapping=case.mapping,
+            cpu_full_exact=torch.tensor([4], dtype=torch.int32),
+            cpu_valid_num_blocks=torch.tensor([4], dtype=torch.int32),
+            frozen_row_plans=(DraftWindowPlan(4, 7, 1, 7),),
+            num_reqs_padded=1,
+            step=0,
+            output_workspace=bank,
+        )
+    assert provider.quarantined_identity is not None
 
 
 @pytest.fixture

@@ -10,7 +10,7 @@ identity through the actual typed Graph UPDATE entrance.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Any
@@ -25,7 +25,7 @@ from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftWindowWorkspace,
     _validate_idx_mapping,
 )
-from vllm_ascend.worker.v2.spec_decode.draft_window_plan import DirectPrefixProjection
+from vllm_ascend.worker.v2.spec_decode.draft_window_plan import DraftWindowPlan
 
 if TYPE_CHECKING:
     from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowProposalContext
@@ -196,13 +196,13 @@ class DraftWindowGraphBindingProvider:
         *,
         proposal: DraftWindowProposalContext,
         idx_mapping: torch.Tensor,
-        read_descriptors: Sequence[DirectPrefixProjection],
-        cpu_window_exact: torch.Tensor,
+        cpu_full_exact: torch.Tensor,
         cpu_valid_num_blocks: torch.Tensor,
         num_reqs_padded: int,
         step: int,
         previous_identity: DraftWindowGenerationIdentity | None = None,
         output_workspace: DraftWindowWorkspace,
+        frozen_row_plans: tuple[DraftWindowPlan, ...] | None = None,
     ) -> DraftMetadataInputs:
         """Populate a new proposal or the next retired Eagle consumer's bank."""
         if self._quarantined_identity is not None:
@@ -230,10 +230,11 @@ class DraftWindowGraphBindingProvider:
                 )
             if idx_mapping.data_ptr() != previous_identity.idx_mapping_ptr:
                 raise RuntimeError("serialized step request mapping changed within one proposal")
+        if frozen_row_plans is not None and self.method != "eagle3":
+            raise ValueError("proposal-frozen Window anchors belong only to Eagle3")
         identity = DraftWindowGenerationIdentity(
             proposal=proposal,
             padded_request_count=num_reqs_padded,
-            read_descriptors=tuple(read_descriptors),
             idx_mapping_ptr=idx_mapping.data_ptr(),
             step=step,
         )
@@ -242,9 +243,9 @@ class DraftWindowGraphBindingProvider:
         try:
             workspace.materialize(
                 identity=identity,
-                full_source=self.source.full_source,
-                global_group_id=self.source.group.gid,
-                cpu_window_exact=cpu_window_exact,
+                source=self.source,
+                cpu_full_exact=cpu_full_exact,
+                frozen_row_plans=frozen_row_plans,
                 cpu_valid_num_blocks=cpu_valid_num_blocks,
             )
             self._last_retired_identity = None

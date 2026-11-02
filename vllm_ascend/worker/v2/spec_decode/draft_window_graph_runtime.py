@@ -204,8 +204,6 @@ def _build_private_graph_metadata(
         workspace,
         actual_request_count=actual_request_count,
         padded_request_count=workspace.max_num_reqs,
-        block_tables=owner.block_tables.input_block_tables,
-        global_group_id=owner._draft_window_graph_binding_provider.source.group.gid,
     )
     metadata = build_draft_window_attn_metadata(
         owner,
@@ -216,7 +214,6 @@ def _build_private_graph_metadata(
         read_inputs=read_inputs,
         causal=owner._group_causal,
         query_start_loc_np=None,
-        dcp_local_seq_lens=None,
     )
     for layer_name in owner._draft_window_graph_binding_provider.source.group.layers:
         # The normal builder uses CPU exact while preparing tiling. FULL FIA

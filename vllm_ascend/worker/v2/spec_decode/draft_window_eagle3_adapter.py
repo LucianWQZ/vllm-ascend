@@ -175,8 +175,6 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentA
             workspace,
             actual_request_count=num_reqs,
             padded_request_count=num_reqs_padded,
-            block_tables=self.block_tables.input_block_tables,
-            global_group_id=inputs._owner.source.group.gid,
         )
         state = next(layer.attn_state for layer in target_metadata.values() if layer is not None)
         metadata = build_draft_window_attn_metadata(
@@ -188,7 +186,6 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentA
             query_width=1,
             causal=True,
             query_start_loc_np=query_start_loc_np,
-            dcp_local_seq_lens=None,
             attn_state=state if first_pass else AscendAttentionState.DecodeOnly,
             parallel_config=self.draft_vllm_config.parallel_config,
         )

@@ -444,7 +444,6 @@ def build_attn_metadata(
     seq_lens_np: np.ndarray | None = None,
     seq_lens_cpu: torch.Tensor | None = None,
     seq_lens_cpu_upper_bound: torch.Tensor | None = None,
-    draft_window_read_inputs: Any | None = None,
     num_computed_tokens_cpu: torch.Tensor | None = None,
     positions: torch.Tensor | None = None,
     attn_state: Any | None = None,
@@ -472,13 +471,6 @@ def build_attn_metadata(
     """Build attention metadata for Ascend NPUs."""
     if skip_ring_state_update is None:
         skip_ring_state_update = ring_state_update_skipped()
-    if draft_window_read_inputs is not None:
-        from vllm_ascend.worker.v2.spec_decode.draft_window_eager import AscendDraftAttentionReadInputs
-
-        if not isinstance(draft_window_read_inputs, AscendDraftAttentionReadInputs):
-            raise TypeError("Graph metadata requires typed current Draft read inputs")
-        if common_metadata_callback is not None:
-            raise ValueError("Graph read inputs and a common metadata callback cannot share one build")
     if seq_lens_cpu is None:
         if seq_lens_np is None:
             if seq_lens_cpu_upper_bound is not None:
@@ -615,8 +607,6 @@ def build_attn_metadata(
             pcp_cache_group_idx=i if pcp_context is not None else None,
             **common_attn_metadata_extra_kwargs,
         )
-        if draft_window_read_inputs is not None:
-            draft_window_read_inputs.certify_common_metadata(i, common_attn_metadata)
         if common_metadata_callback is not None:
             common_metadata_callback(i, common_attn_metadata)
 

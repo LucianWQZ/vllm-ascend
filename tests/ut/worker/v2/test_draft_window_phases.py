@@ -3,7 +3,6 @@
 """Real row phases and canonical count gathering without summary wrappers."""
 
 from types import SimpleNamespace
-from typing import Any
 
 import numpy as np
 import pytest
@@ -20,7 +19,6 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_backends import (
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowProposalEpochSource
 from vllm_ascend.worker.v2.spec_decode.draft_window_nongraph import (
-    build_phase_aware_materialization_plan,
     classify_draft_window_batch_phase,
 )
 
@@ -106,31 +104,13 @@ def test_canonical_count_gather_rejects_invalid_mapping(full_source, mapping):
         )
 
 
-@pytest.mark.parametrize("count", [-1, 5])
-def test_phase_materialization_rejects_counts_outside_canonical_row(full_source, count):
-    source: Any = SimpleNamespace(group=SimpleNamespace(table_column_span=4, gid=0), full_source=full_source)
-    phase = classify_draft_window_batch_phase(_batch([(0, 8, 2)]))
-    with pytest.raises(RuntimeError, match="valid-block count"):
-        build_phase_aware_materialization_plan(
-            source=source,
-            phase_plan=phase,
-            cpu_full_exact=torch.tensor([2], dtype=torch.int32),
-            cpu_valid_num_blocks=torch.tensor([count], dtype=torch.int32),
-            actual_request_count=1,
-            padded_request_count=1,
-        )
-
-
-@pytest.mark.parametrize("step,end", [(0, 14), (1, 13), (2, 14)])
-def test_shared_row_projection_keeps_eagle_anchor_and_full_prefill(full_source, step, end):
-    from vllm_ascend.worker.v2.spec_decode.draft_window_plan import compute_draft_window_plan
-
-    group = DraftWindowGroupRoute(0, ("draft.layer",), 4, 4, DraftWindowProviderStatus.DIRECT_DENSE)
+def _materialize(full_source, batch, exact, counts, frozen=None):
+    from vllm_ascend.worker.v2.spec_decode.draft_window import DraftWindowGenerationIdentity, DraftWindowWorkspace
     from vllm_ascend.worker.v2.spec_decode.draft_window_policy import resolve_draft_window_policy
 
-    policy = resolve_draft_window_policy(requested_window_size=8, method="eagle3")
+    group = DraftWindowGroupRoute(0, ("draft.layer",), 4, 4, DraftWindowProviderStatus.DIRECT_DENSE)
     source = DraftWindowSourceCapability(
-        policy=policy,
+        policy=resolve_draft_window_policy(requested_window_size=8, method="eagle3"),
         runtime_route="eagle3",
         group=group,
         full_source=full_source,
@@ -138,23 +118,38 @@ def test_shared_row_projection_keeps_eagle_anchor_and_full_prefill(full_source, 
         parallel_config=SimpleNamespace(tensor_parallel_size=1),
         tensor_parallel_rank=0,
     )
-    frozen = tuple(
-        compute_draft_window_plan(full_exact_end=end, future_offset=3, window_size=8, block_span_tokens=4)
-        for end in (14, 2)
+    bank = DraftWindowWorkspace(
+        max_num_reqs=len(exact), table_capacity_columns=4, table_template=full_source._input_block_tables[0]
     )
-    phases = classify_draft_window_batch_phase(_batch([(8, 8, 1), (0, 8, 2)]))
-    result = build_phase_aware_materialization_plan(
+    proposal = DraftWindowProposalEpochSource().begin(batch)
+    identity = DraftWindowGenerationIdentity(proposal, len(exact), 0, 0)
+    bank.materialize(
+        identity=identity,
         source=source,
+        cpu_full_exact=torch.tensor(exact, dtype=torch.int32),
+        cpu_valid_num_blocks=torch.tensor(counts, dtype=torch.int32),
         frozen_row_plans=frozen,
-        actual_request_count=2,
-        padded_request_count=3,
-        phase_plan=phases,
-        cpu_full_exact=torch.tensor([end, 2 + step, 0], dtype=torch.int32),
-        cpu_valid_num_blocks=torch.tensor([4, 3, 0], dtype=torch.int32),
     )
+    return bank
+
+
+@pytest.mark.parametrize("count", [-1, 5])
+def test_materialization_rejects_counts_outside_canonical_row(full_source, count):
+    with pytest.raises(RuntimeError, match="valid block count"):
+        _materialize(full_source, _batch([(0, 8, 2)]), [2], [count])
+
+
+@pytest.mark.parametrize("step,end", [(0, 14), (1, 13), (2, 14)])
+def test_actual_bank_keeps_eagle_anchor_and_full_prefill(full_source, step, end):
+    from vllm_ascend.worker.v2.spec_decode.draft_window_plan import compute_draft_window_plan
+
+    frozen = tuple(
+        compute_draft_window_plan(full_exact_end=value, future_offset=3, window_size=8, block_span_tokens=4)
+        for value in (14, 2)
+    )
+    before = full_source._input_block_tables[0].clone()
+    bank = _materialize(full_source, _batch([(8, 8, 1), (0, 8, 2)]), [end, 2 + step, 0], [4, 3, 0], frozen)
     assert frozen[0].window_start == 8
-    assert result.read_descriptors[0].source_start_column == 2
-    assert result.cpu_window_exact.tolist() == [end - 8, 2 + step, 0]
-    assert result.read_descriptors[1].source_start_column == 0
-    assert result.read_descriptors[1].required_columns == 3
-    assert full_source.input_block_table_row_width(0) == 4
+    assert bank.cpu_window_exact.tolist() == [end - 8, 2 + step, 0]
+    assert bank.window_block_table.tolist() == [[2, 3, 0, 0], [4, 5, 6, 0], [0, 0, 0, 0]]
+    assert torch.equal(full_source._input_block_tables[0], before)

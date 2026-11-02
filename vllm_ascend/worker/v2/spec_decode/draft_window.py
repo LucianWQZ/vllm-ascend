@@ -21,7 +21,9 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_backends import (
     inventory_draft_window_groups,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_plan import (
-    DirectPrefixProjection,
+    DraftWindowPlan,
+    compute_draft_window_plan,
+    project_draft_window_interval,
     window_capacity_tokens,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_policy import (
@@ -375,13 +377,12 @@ class DraftWindowGenerationIdentity:
     """A fresh consumer handle retaining its real proposal and selected shape.
 
     The proposal already freezes request order, row phases and mapping epoch.
-    This handle adds only the current consumer step, read projection and bank
-    geometry. Equal values from another runtime cannot impersonate the handle.
+    This handle adds only the current consumer step and padded bank shape.
+    Equal values from another runtime cannot impersonate the handle.
     """
 
     proposal: "DraftWindowProposalContext"
     padded_request_count: int
-    read_descriptors: tuple[DirectPrefixProjection, ...]
     idx_mapping_ptr: int
     step: int
 
@@ -395,8 +396,6 @@ class DraftWindowGenerationIdentity:
         actual = len(self.proposal.ordered_request_ids)
         if self.padded_request_count < actual:
             raise ValueError("padded request count must be at least the actual request count")
-        if len(self.read_descriptors) != actual:
-            raise ValueError("read descriptors must match the actual request count")
 
 
 class DraftWindowWorkspace:
@@ -437,10 +436,10 @@ class DraftWindowWorkspace:
         self,
         *,
         identity: DraftWindowGenerationIdentity,
-        full_source: FullDraftKVSource,
-        global_group_id: int,
-        cpu_window_exact: torch.Tensor,
+        source: DraftWindowSourceCapability,
+        cpu_full_exact: torch.Tensor,
         cpu_valid_num_blocks: torch.Tensor,
+        frozen_row_plans: tuple[DraftWindowPlan, ...] | None,
     ) -> None:
         """Rewrite all active and inert state from the canonical full source."""
         if self._bound_identity is not None:
@@ -450,8 +449,8 @@ class DraftWindowWorkspace:
         if padded > self.max_num_reqs:
             raise RuntimeError(f"draft-window request capacity exceeded: padded={padded} capacity={self.max_num_reqs}")
         _validate_window_length_input(
-            cpu_window_exact,
-            name="CPU Window exact",
+            cpu_full_exact,
+            name="CPU Full exact",
             padded_request_count=padded,
             expected_device=torch.device("cpu"),
         )
@@ -468,13 +467,17 @@ class DraftWindowWorkspace:
         )
         if any(
             _shares_storage(supplied, backing)
-            for supplied in (cpu_window_exact, cpu_valid_num_blocks)
+            for supplied in (cpu_full_exact, cpu_valid_num_blocks)
             for backing in workspace_tensors
         ):
             raise ValueError("Window length inputs must not alias workspace backing")
-        if actual and bool(torch.any(cpu_window_exact[:actual] < 0)):
-            raise ValueError("Window exact lengths must be greater than or equal to 0")
+        if actual and bool(torch.any(cpu_full_exact[:actual] < 0)):
+            raise ValueError("Full exact lengths must be greater than or equal to 0")
+        if frozen_row_plans is not None and len(frozen_row_plans) != actual:
+            raise ValueError("frozen Window anchors must match active request rows")
 
+        full_source = source.full_source
+        global_group_id = source.group.gid
         full_source.validate_owner_bindings()
         full_source._validate_global_group_id(global_group_id)
         source_table = full_source._input_block_tables[global_group_id]
@@ -485,43 +488,39 @@ class DraftWindowWorkspace:
 
         if self._needs_clear:
             self._zero_all()
-        for row, descriptor in enumerate(identity.read_descriptors):
-            if (
-                descriptor.source_start_column < 0
-                or descriptor.required_columns < 0
-                or descriptor.safe_extent_tokens < 0
-            ):
-                raise ValueError("read descriptor extents must be greater than or equal to 0")
-            if descriptor.first_token_offset != 0:
-                raise NotImplementedError("P3 supports only direct-prefix descriptors with zero token offset")
-            if descriptor.required_columns > self.table_capacity_columns:
-                raise RuntimeError(
-                    "draft-window table capacity exceeded: "
-                    f"required={descriptor.required_columns} "
-                    f"capacity={self.table_capacity_columns}"
+        span = source.group.table_column_span
+        for row, full_read in enumerate(identity.proposal.phase_plan.full_read_rows):
+            exact = int(cpu_full_exact[row])
+            valid = int(cpu_valid_num_blocks[row])
+            if not 0 <= valid <= source_table.shape[1]:
+                raise RuntimeError("current valid block count is outside the canonical source row")
+            if full_read:
+                start, required, visible = 0, valid, exact
+            else:
+                plan = (
+                    compute_draft_window_plan(
+                        full_exact_end=exact, window_size=source.window_size, block_span_tokens=span
+                    )
+                    if frozen_row_plans is None
+                    else frozen_row_plans[row].at_exact_end(exact)
                 )
-            gathered_valid = int(cpu_valid_num_blocks[row].item())
-            if not 0 <= gathered_valid <= source_table.shape[1]:
-                raise RuntimeError("current valid block count exceeds the canonical source row width")
-            if descriptor.source_end_column > gathered_valid:
-                raise RuntimeError(
-                    "draft-window source shortage during materialization: "
-                    f"row={row} end={descriptor.source_end_column} "
-                    f"valid={gathered_valid}"
+                projection = project_draft_window_interval(
+                    window_start=plan.window_start, full_exact_end=exact, block_span_tokens=span
                 )
-            required = descriptor.required_columns
-            if int(cpu_window_exact[row]) > required * full_source.kernel_block_sizes[global_group_id]:
-                raise RuntimeError("Window exact length exceeds its actual readable columns")
+                if projection.first_token_offset:
+                    raise NotImplementedError("Draft Graph cannot read an intra-block Window start")
+                start, required = projection.source_start_column, projection.required_columns
+                visible = exact - plan.window_start
+            if required > self.table_capacity_columns:
+                raise RuntimeError("draft-window table capacity exceeded")
+            if start + required > valid or visible > required * span:
+                raise RuntimeError("draft-window source does not cover the exact readable interval")
             if required:
-                self.window_block_table[row, :required].copy_(
-                    source_table[
-                        row,
-                        descriptor.source_start_column : descriptor.source_end_column,
-                    ]
-                )
-        if actual:
-            self.device_window_exact[:actual].copy_(cpu_window_exact[:actual])
-            self.cpu_window_exact[:actual].copy_(cpu_window_exact[:actual])
+                self.window_block_table[row, :required].copy_(source_table[row, start : start + required])
+            self.cpu_window_exact[row] = visible
+        # The capture-owned exact CPU buffer is also the valid metadata bound.
+        # No intermediate Window length vector or upper-vector copy is needed.
+        self.device_window_exact.copy_(self.cpu_window_exact)
         self._bound_identity = identity
 
     def assert_bound(self, expected_identity: DraftWindowGenerationIdentity) -> None:
