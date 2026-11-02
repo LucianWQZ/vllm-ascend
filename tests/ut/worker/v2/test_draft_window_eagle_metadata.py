@@ -186,7 +186,6 @@ def proposal():
     session.provider = runtime
     owner._eagle3_graph_session = session
     owner._require_eagle3_target_metadata = lambda: {}
-    session.write_reference = lambda identity, target: None
     session.resolve = lambda **kwargs: object()
     session.provider.bind_read_carrier = lambda **kwargs: SimpleNamespace(state=DraftWindowGraphCarrierState.BOUND)
 
@@ -312,3 +311,23 @@ def test_first_and_ar_share_one_materialization_path_without_moving_the_anchor(p
     assert [call["cpu_full_exact"].tolist() for call in calls] == [[10], [8], [9]]
     assert [call["cpu_apply_time_full_upper"].tolist() for call in calls] == [[12], [13], [14]]
     assert all(call["proposal"] is frozen for call in calls)
+
+
+@pytest.mark.parametrize("first,tokens,ordinal", [(True, 4, 0), (False, 1, 0), (False, 1, 1)])
+def test_eagle_capture_lookup_keeps_each_real_shape_and_consumer(first, tokens, ordinal):
+    from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphRoute
+
+    session: Any = object.__new__(Eagle3GraphSession)
+    first_route = DraftWindowGraphRoute.EAGLE3_FIRST_PASS
+    ar_route = DraftWindowGraphRoute.EAGLE3_AR_STEP
+    session._captures = {
+        (first_route, 1, 4, 0): object(),
+        (ar_route, 1, 1, 0): object(),
+        (ar_route, 1, 1, 1): object(),
+    }
+    expected = session._captures[(first_route if first else ar_route, 1, tokens, ordinal)]
+    assert session.resolve(first=first, n=1, tokens=tokens, ordinal=ordinal) is expected
+    with pytest.raises(RuntimeError, match="no exact capture bank"):
+        session.resolve(first=first, n=2, tokens=tokens, ordinal=ordinal)
+    with pytest.raises(RuntimeError, match="no exact capture bank"):
+        session.resolve(first=first, n=1, tokens=tokens + 1, ordinal=ordinal)

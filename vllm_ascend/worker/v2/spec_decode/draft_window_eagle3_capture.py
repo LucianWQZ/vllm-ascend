@@ -15,9 +15,7 @@ from contextlib import contextmanager
 from typing import Any
 
 import torch
-from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 
-from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftWindowWorkspace,
     _build_draft_window_source_capability_for_context,
@@ -28,7 +26,6 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
     DraftWindowGraphCarrierState,
     DraftWindowGraphReadCarrier,
     DraftWindowGraphRoute,
-    DraftWindowGraphWriteSideReference,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph_metadata import copy_draft_attention_metadata
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph_runtime import (
@@ -65,9 +62,7 @@ class Eagle3GraphSession:
         if not isinstance(self.provider, DraftWindowGraphBindingProvider):
             raise TypeError("Eagle3 Graph requires its initialized source owner")
         self._carriers: list[DraftWindowGraphReadCarrier] = []
-        self._captures: dict[
-            tuple[DraftWindowGraphRoute, BatchExecutionDescriptor, int], DraftWindowGraphCaptureIdentity
-        ] = {}
+        self._captures: dict[tuple[DraftWindowGraphRoute, int, int, int], DraftWindowGraphCaptureIdentity] = {}
         self._capture_call: tuple[DraftWindowGraphRoute, int, int] | None = None
         self._capture_ordinal = 0
         for first, manager in ((True, owner.prefill_cudagraph_manager), (False, owner.decode_cudagraph_manager)):
@@ -84,14 +79,8 @@ class Eagle3GraphSession:
                     if desc.num_tokens != n * q:
                         raise RuntimeError("Eagle3 startup descriptor does not match its method-specific query width")
                     for ordinal in range(1 if first else owner.num_speculative_steps - 1):
-                        key = route, desc, ordinal
-                        if any(
-                            identity.route is route
-                            and identity.descriptor.num_reqs == n
-                            and identity.descriptor.num_tokens == desc.num_tokens
-                            and identity.consumer_ordinal == ordinal
-                            for identity in self._captures.values()
-                        ):
+                        key = route, n, desc.num_tokens, ordinal
+                        if key in self._captures:
                             raise RuntimeError("ambiguous Eagle3 capture bank (including unsupported LoRA variants)")
                         self._captures[key] = self.provider.register_capture_identity(
                             route=route, descriptor=desc, consumer_ordinal=ordinal
@@ -103,7 +92,6 @@ class Eagle3GraphSession:
                             owner.max_model_len, self.provider.source.window_size + group.table_column_span - 1
                         )
                         read.window_block_table.zero_()
-                        read.valid_num_blocks.fill_(read.window_block_table.shape[1])
                         read.cpu_window_exact.fill_(capacity)
                         read.cpu_window_upper.fill_(capacity)
                         read.device_window_exact.copy_(read.cpu_window_exact)
@@ -126,17 +114,10 @@ class Eagle3GraphSession:
 
     def resolve(self, *, first: bool, n: int, tokens: int, ordinal: int) -> DraftWindowGraphCaptureIdentity:
         route = DraftWindowGraphRoute.EAGLE3_FIRST_PASS if first else DraftWindowGraphRoute.EAGLE3_AR_STEP
-        matches = tuple(
-            identity
-            for identity in self._captures.values()
-            if identity.route is route
-            and identity.descriptor.num_reqs == n
-            and identity.descriptor.num_tokens == tokens
-            and identity.consumer_ordinal == ordinal
-        )
-        if len(matches) != 1:
-            raise RuntimeError("Eagle3 Window has no exact capture bank; no eager fallback")
-        return matches[0]
+        try:
+            return self._captures[route, n, tokens, ordinal]
+        except KeyError:
+            raise RuntimeError("Eagle3 Window has no exact capture bank; no eager fallback") from None
 
     @contextmanager
     def capture_call(self, *, first: bool, n: int, tokens: int):
@@ -194,22 +175,6 @@ class Eagle3GraphSession:
             result[name] = layer
         return result, identity
 
-    def write_reference(self, identity: DraftWindowGraphCaptureIdentity, target: Mapping[str, Any]):
-        desc = identity.descriptor
-        n, tokens = identity.descriptor.num_reqs, desc.num_tokens
-        query_width = tokens // n
-        state = next(v for v in target.values() if v is not None).attn_state
-        if identity.route is DraftWindowGraphRoute.EAGLE3_AR_STEP:
-            state = AscendAttentionState.DecodeOnly
-        return DraftWindowGraphWriteSideReference(
-            slot_mapping=self.owner.block_tables.slot_mappings[self.provider.source.group.gid, :tokens],
-            query_start_loc=self.owner.input_buffers.query_start_loc[: n + 1],
-            actual_seq_lengths_q=tuple((i + 1) * query_width for i in range(n)),
-            attn_state=state,
-            num_actual_tokens=tokens,
-            causal=True,
-        )
-
     def stage(self, inputs: Any, *, first: bool, n: int, tokens: int, ordinal: int) -> None:
         from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import (
             validate_eagle_single_request_graph_stage,
@@ -226,7 +191,6 @@ class Eagle3GraphSession:
         identity = self.resolve(first=first, n=n, tokens=tokens, ordinal=ordinal)
         owner = self.owner
         target = owner._require_eagle3_target_metadata()
-        write = self.write_reference(identity, target)
 
         def build(workspace: DraftWindowWorkspace):
             private = owner._build_eagle3_graph_metadata(
@@ -239,16 +203,6 @@ class Eagle3GraphSession:
                 target_metadata=target,
                 first_pass=first,
             )
-            for name, layer in private.items():
-                if layer is None:
-                    continue
-                layer.slot_mapping, layer.query_start_loc = write.slot_mapping, write.query_start_loc
-                layer.actual_seq_lengths_q = list(write.actual_seq_lengths_q)
-                layer.attn_state, layer.num_actual_tokens, layer.causal = (
-                    write.attn_state,
-                    write.num_actual_tokens,
-                    True,
-                )
             return private
 
         try:
@@ -269,7 +223,6 @@ class Eagle3GraphSession:
                 inputs=inputs,
                 metadata_builder=build,
                 target_metadata=target,
-                write_side_reference=write,
             )
             if carrier.state is not DraftWindowGraphCarrierState.BOUND:
                 raise RuntimeError("Eagle3 consumer has no bound persistent destination")

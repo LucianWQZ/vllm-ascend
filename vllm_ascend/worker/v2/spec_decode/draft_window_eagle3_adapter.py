@@ -12,12 +12,10 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-import torch
 from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.worker.gpu.spec_decode.eagle.speculator import EagleSpeculator
 
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
-from vllm_ascend.worker.v2.attn_utils import build_attn_metadata_factory
 from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftMetadataInputs,
     DraftWindowWorkspace,
@@ -182,32 +180,26 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentA
             block_tables=self.block_tables.input_block_tables,
             global_group_id=inputs._owner.source.group.gid,
         )
-        with build_attn_metadata_factory(
-            self.input_buffers.positions,
-            num_tokens_padded,
-            torch.from_numpy(self.input_batch.is_prefilling_np),
-            parallel_config=self.draft_vllm_config.parallel_config,
-        ):
-            metadata = build_draft_window_attn_metadata(
-                self,
-                num_reqs=num_reqs,
-                num_reqs_padded=num_reqs_padded,
-                num_tokens_padded=num_tokens_padded,
-                read_inputs=view,
-                query_width=1,
-                causal=True,
-                query_start_loc_np=query_start_loc_np,
-                dcp_local_seq_lens=None,
-            )
+        state = next(layer.attn_state for layer in target_metadata.values() if layer is not None)
+        metadata = build_draft_window_attn_metadata(
+            self,
+            num_reqs=num_reqs,
+            num_reqs_padded=num_reqs_padded,
+            num_tokens_padded=num_tokens_padded,
+            read_inputs=view,
+            query_width=1,
+            causal=True,
+            query_start_loc_np=query_start_loc_np,
+            dcp_local_seq_lens=None,
+            attn_state=state if first_pass else AscendAttentionState.DecodeOnly,
+        )
         if not metadata:
             raise RuntimeError("eligible Eagle3 Window route produced no Draft metadata")
         if self.model_state.attn_metadata is not target_metadata:
             raise RuntimeError("Target metadata owner changed during Eagle3 Draft metadata build")
-        for name, layer in metadata.items():
+        for layer in metadata.values():
             if layer is None:
                 continue
-            # The builder creates Draft metadata; these are read-only Target fields.
-            layer.attn_state = target_metadata[name].attn_state if first_pass else AscendAttentionState.DecodeOnly
             layer.seq_lens = workspace.device_window_exact
             layer.seq_lens_cpu = workspace.cpu_window_exact
             layer.seq_lens_list = workspace.cpu_window_exact.tolist()
