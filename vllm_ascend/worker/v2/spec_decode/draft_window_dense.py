@@ -22,10 +22,11 @@ DENSE_KV_ALIGNMENT = 32
 
 def _apply_read_metadata(read: DenseDraftRead | DenseDraftReadBatch, common: Any) -> None:
     n = common.num_reqs
-    lengths = read.seq_lens.new_empty(n)
-    read.retain(lengths)
-    lengths.zero_()
-    lengths[: read.num_reqs] = read.seq_lens
+    lengths = read.seq_lens
+    if n != read.num_reqs:
+        lengths = read.seq_lens.new_zeros(n)
+        read.retain(lengths)
+        lengths[: read.num_reqs] = read.seq_lens
     common.seq_lens = lengths
     # These are explicitly capacity/workspace bounds, never CPU exact.
     common.seq_lens_cpu_upper_bound = torch.full((n,), read.capacity, dtype=torch.int32, device="cpu")
@@ -38,7 +39,7 @@ def _apply_read_metadata(read: DenseDraftRead | DenseDraftReadBatch, common: Any
 def _read_capacity_cpu(read: DenseDraftRead | DenseDraftReadBatch, common: Any) -> torch.Tensor:
     if getattr(common, "_draft_window_device_read", None) is not read:
         raise ValueError("Dense Draft read belongs to another common metadata object")
-    return torch.full((common.num_reqs,), read.capacity, dtype=torch.int32, device="cpu")
+    return common.seq_lens_cpu_upper_bound
 
 
 @dataclass(frozen=True)
@@ -187,7 +188,7 @@ def prepare_dense_draft_read(
     query_start_loc_cpu: torch.Tensor | None = None,
     query_start_loc_device: torch.Tensor | None = None,
 ) -> DenseDraftRead | DenseDraftReadBatch:
-    """Snapshot current device E and canonical addresses without Host exact.
+    """Materialize slots/mask from current device E without Host exact.
 
     Caller supplies current preparation's 0<E<=U and matching device request
     order. FullAttentionSpec residency retains all active pages. The Host
@@ -225,14 +226,19 @@ def prepare_dense_draft_read(
         raise ValueError("Dense read lengths and row mapping must be integer tensors")
     if exact_device.device != source.table.device or row_indices.device != source.table.device:
         raise ValueError("Dense read operands must share their source device")
-    exact = _copy_owned_read_tensor(exact_device[:n], retain)
+    # The planning kernel consumes prepared inputs on the same current
+    # stream before the next preparation may overwrite them. Its outputs,
+    # not copied E/query bounds, are the later attention consumer's state.
+    exact = exact_device[:n]
+    retain(exact)
     if query_ends is not None and (
         query_ends.shape != (n,)
         or query_ends.device != exact.device
         or query_ends.dtype not in (torch.int32, torch.int64)
     ):
         raise ValueError("Native query ends must match current request rows and device")
-    query_ends = exact if query_ends is None else _copy_owned_read_tensor(query_ends, retain)
+    query_ends = exact if query_ends is None else query_ends
+    retain(query_ends)
     if frozen_starts is not None and (
         frozen_starts.shape != (n,)
         or frozen_starts.device != exact.device
@@ -243,11 +249,6 @@ def prepare_dense_draft_read(
     if full_rows_cpu is not None:
         if full_rows_cpu.device.type != "cpu" or full_rows_cpu.dtype != torch.bool or full_rows_cpu.shape != (n,):
             raise ValueError("Full-read phase rows require one current CPU boolean per request")
-        if full_rows_cpu.any():
-            # This copies phase facts, never device exact lengths. Retain an
-            # independent Host snapshot until the asynchronous H2D completes.
-            phase_snapshot = full_rows_cpu.clone()
-            full_rows = _copy_owned_read_tensor(phase_snapshot, retain, device=exact.device)
     query_offsets = query_indices = output_indices = None
     if (query_start_loc_cpu is None) != (query_start_loc_device is None):
         raise ValueError("Packed queries require current CPU and device boundaries")
@@ -295,9 +296,12 @@ def prepare_dense_draft_read(
                 query_ends=query_ends,
                 query_start_loc_device=query_start_loc_device,
             )
+    if full_rows_cpu is not None and full_rows_cpu.any():
+        # Phase facts need an owned Host DMA source; device E does not.
+        full_rows = _copy_owned_read_tensor(full_rows_cpu.clone(), retain, device=exact.device)
     if widths is not None:
         if not bool((widths == query_width).all()):
-            query_offsets = _copy_owned_read_tensor(query_start_loc_device, retain)
+            query_offsets = query_start_loc_device
             total = int(query_start_loc_cpu[-1])
             from vllm_ascend.ops.triton.v2.spec_decode.draft_window import pack_draft_query_indices
 

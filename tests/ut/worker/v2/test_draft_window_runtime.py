@@ -673,7 +673,7 @@ def test_eagle_full_continuing_rejects_changed_preparation(setup, changed):
     runtime.gids = (0, 1)
     state = batch(computed=(8, 24), prompt=(100, 100), scheduled=(4, 3), drafts=None)
     spec.max_model_len, spec.advance_draft_positions = 4096, True
-    with pytest.raises((RuntimeError, ValueError), match="Full prefill"), runtime.proposal_context(spec, state):
+    with pytest.raises((RuntimeError, ValueError), match="Draft Window"), runtime.proposal_context(spec, state):
         callback = runtime.metadata_callback(0, 2)
         first, second = common(), common()
         second.seq_lens = first.seq_lens
@@ -726,11 +726,11 @@ def test_eagle_full_continuing_rejects_prompt_progress_change_between_ar_steps(s
     runtime.method, runtime.static_k, runtime._dense_device_reads = "eagle3", 3, True
     spec.max_model_len, spec.advance_draft_positions = 4096, True
     state = batch(computed=(8, 24), prompt=(100, 100), scheduled=(4, 3), drafts=None)
-    with pytest.raises(RuntimeError, match="prompt preparation changed"), runtime.proposal_context(spec, state):
+    with pytest.raises(RuntimeError, match="[Pp]rompt preparation changed"), runtime.proposal_context(spec, state):
         runtime.metadata_callback(0, 2)(0, common())
         state.num_computed_prefill_tokens_np[0] += 1
-        runtime.metadata_callback(1, 2)
-    assert runtime._eagle_full_prefill_base is None
+        runtime.metadata_callback(1, 2)(0, common())
+    assert runtime._eagle_prompt_exact_base is None
     assert runtime.pool.poisoned
 
 
@@ -1178,7 +1178,7 @@ def test_eagle_prompt_only_ambiguous_producer_keeps_exact_fallback(setup, invali
     else:
         spec.replicated_pcp = True
     with pytest.raises(RuntimeError, match="did not consume a read projection"), runtime.proposal_context(spec, state):
-        assert runtime._prompt_only_exact_lengths(0, 2) is None
+        assert runtime._prompt_exact_lengths(0, 2) is None
         assert runtime._eagle_prompt_exact_base is None
     assert runtime.pool.poisoned
 
@@ -1192,11 +1192,11 @@ def test_eagle_prompt_only_snapshot_cpu_and_generation_scope(setup):
     state.cu_num_logits_np = np.array([0, 1, 1])
     with pytest.raises(RuntimeError, match="preparation changed"), runtime.proposal_context(spec, state):
         with torch.device("meta"):
-            snapshot = runtime._prompt_only_exact_lengths(0, 2)
+            snapshot = runtime._prompt_exact_lengths(0, 2)
         assert snapshot.device.type == "cpu" and snapshot.tolist() == [12, 27]
         state.num_scheduled_tokens[1] += 1
         state.query_start_loc_np[-1] += 1
-        runtime._prompt_only_exact_lengths(1, 2)
+        runtime._prompt_exact_lengths(1, 2)
     assert runtime.pool.poisoned and runtime._eagle_prompt_exact_base is None
 
 
@@ -1295,7 +1295,7 @@ def test_parallel_prompt_producer_rejects_uncertified_preparation(setup, invalid
     else:
         spec.replicated_pcp = True
     with pytest.raises(RuntimeError, match="did not consume"), runtime.proposal_context(spec, state):
-        assert runtime._parallel_prefill_exact_lengths(2) is None
+        assert runtime._prompt_exact_lengths(spec.num_query_per_req, 2) is None
 
 
 def test_mla_partial_rotary_copy_failure_keeps_submitted_operands(setup, monkeypatch):
