@@ -211,7 +211,7 @@ def test_real_proposal_zero_uses_first_reader_and_keeps_static_k(proposal):
         session.stage(current, first=True, n=1, tokens=4, ordinal=0)
         session._carriers[-1].state = DraftWindowGraphCarrierState.UPDATED
     assert runtime._last_retired_identity is current.identity
-    assert owner._eagle3_window_static_k == owner._eagle3_window_expected_steps == 3
+    assert owner.num_speculative_steps == owner._eagle3_window_expected_steps == 3
     assert not session._carriers
 
 
@@ -255,3 +255,60 @@ def test_real_proposal_rejects_unconsumed_or_misattributed_reader(proposal, dama
     assert owner._eagle3_window_proposal_context is None
     if damage in ("wrong_request", "cloned_proposal", "wrong_step", "wrong_ordinal"):
         assert runtime.quarantined_identity is current.identity
+
+
+def test_first_and_ar_share_one_materialization_path_without_moving_the_anchor(proposal, monkeypatch):
+    from vllm_ascend.worker.v2.spec_decode import draft_window_eagle3
+
+    owner, batch, session, runtime, _ = proposal
+    owner.input_batch, owner.max_model_len = batch, 32
+    owner.input_buffers = SimpleNamespace(seq_lens=torch.tensor([8], dtype=torch.int32))
+    batch.seq_lens_np = np.array([10], dtype=np.int64)
+    batch.seq_lens_cpu_upper_bound = torch.tensor([12], dtype=torch.int32)
+    batch.idx_mapping = torch.tensor([0], dtype=torch.int64)
+    runtime.source.window_size = 4
+    runtime.source.group = SimpleNamespace(gid=0, table_column_span=4)
+    runtime.source.full_source = object()
+    calls = []
+    monkeypatch.setattr(
+        draft_window_eagle3, "gather_valid_num_blocks_cpu", lambda *args, **kwargs: torch.tensor([4], dtype=torch.int32)
+    )
+
+    def plan(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(
+            read_descriptors=(),
+            cpu_window_exact=kwargs["cpu_full_exact"],
+            cpu_window_upper=kwargs["cpu_apply_time_full_upper"],
+            cpu_valid_num_blocks=kwargs["cpu_valid_num_blocks"],
+        )
+
+    monkeypatch.setattr(draft_window_eagle3, "build_eagle3_step_materialization_plan", plan)
+
+    def materialize(**kwargs):
+        identity = SimpleNamespace(proposal=kwargs["proposal"], step=kwargs["step"])
+        current = SimpleNamespace(identity=identity, retired=False)
+        current.validate_for = lambda expected: expected is identity
+        runtime._active_inputs = current
+        return current
+
+    runtime.materialize = materialize
+    with owner._eagle3_draft_window_proposal_scope(batch, dummy_run=False, is_profile=False):
+        frozen = None
+        for step in range(3):
+            if step == 1:
+                owner._snapshot_eagle3_decode_step_one(num_reqs=1, num_reqs_padded=1)
+            current = owner._materialize_eagle3_step(
+                step=step,
+                num_reqs=1,
+                num_reqs_padded=1,
+                seq_lens_cpu_upper_bound=batch.seq_lens_cpu_upper_bound,
+            )
+            frozen = frozen or owner._eagle3_window_proposal_plan
+            assert owner._eagle3_window_proposal_plan is frozen
+            assert frozen.row_plans[0].window_start == 8
+            session.stage(current, first=step == 0, n=1, tokens=4 if step == 0 else 1, ordinal=max(0, step - 1))
+            session._carriers[-1].state = DraftWindowGraphCarrierState.UPDATED
+    assert [call["cpu_full_exact"].tolist() for call in calls] == [[10], [8], [9]]
+    assert [call["cpu_apply_time_full_upper"].tolist() for call in calls] == [[12], [13], [14]]
+    assert all(call["proposal"] is frozen for call in calls)

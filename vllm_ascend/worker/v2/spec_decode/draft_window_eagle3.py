@@ -1,11 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
-"""P4b host plans for static-K Eagle3 serialized eager Draft Windows.
-
-This module contains no model-forward code. It freezes the legacy proposal
-anchor from ``L0 + K`` and projects each real autoregressive end ``E_s`` onto
-the immutable P2 FullSource through the existing direct-prefix provider.
-"""
+"""Freeze Eagle's proposal anchor and prepare each real Graph consumer's read bank."""
 
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -71,13 +66,7 @@ class Eagle3FrozenProposalPlan:
 
 
 class Eagle3DraftWindowMixin:
-    """P4b proposal/step ownership for static-K Eagle3 eager execution.
-
-    This mixin deliberately stops before metadata assembly and model forward.
-    The Ascend autoregressive speculator owns those method-specific operations;
-    this class owns only proposal identity, the frozen anchor, per-step
-    materialization, and serialized retirement.
-    """
+    """Proposal identity and frozen window geometry for static-K Eagle Graph."""
 
     _draft_window_graph_binding_provider: DraftWindowGraphBindingProvider
     _eagle3_window_epoch_source: DraftWindowProposalEpochSource
@@ -88,7 +77,6 @@ class Eagle3DraftWindowMixin:
     _eagle3_window_decode_step_one_exact: torch.Tensor | None
     _eagle3_window_bypass_active: bool
     _eagle3_window_next_step: int
-    _eagle3_window_static_k: int
     input_batch: Any
     input_buffers: Any
     block_tables: Any
@@ -122,8 +110,6 @@ class Eagle3DraftWindowMixin:
         self._eagle3_window_bypass_active = False
         self._eagle3_window_continuing_prefill = False
         self._eagle3_window_next_step = 0
-        self._eagle3_window_static_k = static_k
-        self._eagle3_window_scheduled_tokens: int | None = None
         self._eagle3_window_expected_steps = static_k
         # Fused decode builds metadata once and mutates it for later steps.
         # P4b must rematerialize every step from canonical FullSource.
@@ -148,7 +134,7 @@ class Eagle3DraftWindowMixin:
             yield
             return
 
-        expected_steps = _eagle3_graph_scheduled_consumers(self._eagle3_window_static_k, num_speculative_tokens)
+        expected_steps = _eagle3_graph_scheduled_consumers(self.num_speculative_steps, num_speculative_tokens)
         graph_session = getattr(self, "_eagle3_graph_session", None)
         if graph_session is not None:
             graph_session.require_reusable()
@@ -177,7 +163,6 @@ class Eagle3DraftWindowMixin:
         self._eagle3_window_last_identity = None
         self._eagle3_window_decode_step_one_exact = None
         self._eagle3_window_next_step = 0
-        self._eagle3_window_scheduled_tokens = num_speculative_tokens
         self._eagle3_window_expected_steps = expected_steps
         try:
             yield
@@ -187,7 +172,7 @@ class Eagle3DraftWindowMixin:
                 raise RuntimeError(
                     "eligible proposal completed without consuming all Eagle3 steps: "
                     f"consumed={self._eagle3_window_next_step} expected={expected_steps} "
-                    f"static_K={self._eagle3_window_static_k}"
+                    f"static_K={self.num_speculative_steps}"
                 )
             if graph_session is not None:
                 graph_session.finish()
@@ -211,8 +196,7 @@ class Eagle3DraftWindowMixin:
                 self._eagle3_window_last_identity = None
                 self._eagle3_window_decode_step_one_exact = None
                 self._eagle3_window_next_step = 0
-                self._eagle3_window_scheduled_tokens = None
-                self._eagle3_window_expected_steps = self._eagle3_window_static_k
+                self._eagle3_window_expected_steps = self.num_speculative_steps
                 epoch_source.finish(context)
 
     def _eagle3_window_is_active(self) -> bool:
@@ -221,93 +205,6 @@ class Eagle3DraftWindowMixin:
             and not getattr(self, "_eagle3_window_bypass_active", False)
             and getattr(self, "_eagle3_window_proposal_context", None) is not None
         )
-
-    def _materialize_eagle3_first_pass(
-        self,
-        *,
-        num_reqs: int,
-        num_reqs_padded: int,
-        output_workspace: Any = None,
-    ) -> DraftMetadataInputs:
-        """Freeze proposal L0/H/S and materialize first-pass read state."""
-        if self._eagle3_window_next_step != 0 or self._eagle3_window_proposal_plan is not None:
-            raise RuntimeError("Eagle3 first-pass Window state is already materialized")
-        context = self._require_eagle3_window_context()
-        input_batch = self.input_batch
-        self._eagle3_window_epoch_source.validate(context, input_batch)
-        self._validate_request_counts(num_reqs, num_reqs_padded)
-
-        cpu_l0 = _copy_padded_cpu_exact(
-            input_batch.seq_lens_np,
-            actual_request_count=num_reqs,
-            padded_request_count=num_reqs_padded,
-            name="proposal L0",
-        )
-        from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import (
-            validate_eagle_single_request_review_exact,
-        )
-
-        validate_eagle_single_request_review_exact(
-            self,
-            input_batch,
-            cpu_l0,
-            num_reqs=num_reqs,
-            padded=num_reqs_padded,
-            step=0,
-        )
-        cpu_upper = _copy_padded_cpu_upper(
-            input_batch.seq_lens_cpu_upper_bound,
-            actual_request_count=num_reqs,
-            padded_request_count=num_reqs_padded,
-            increment=0,
-            max_model_len=self.max_model_len,
-        )
-        capability = self._draft_window_graph_binding_provider.source
-        cpu_valid_num_blocks = self._gather_eagle3_valid_counts(
-            num_reqs=num_reqs,
-            num_reqs_padded=num_reqs_padded,
-        )
-        proposal = build_eagle3_frozen_proposal_plan(
-            source=capability,
-            cpu_proposal_l0=cpu_l0,
-            actual_request_count=num_reqs,
-            padded_request_count=num_reqs_padded,
-        )
-        step_plan = build_eagle3_step_materialization_plan(
-            source=capability,
-            proposal=proposal,
-            cpu_full_exact=cpu_l0,
-            cpu_apply_time_full_upper=cpu_upper,
-            cpu_valid_num_blocks=cpu_valid_num_blocks,
-            step=0,
-            phase_plan=context.phase_plan,
-        )
-        self._eagle3_window_epoch_source.validate(context, input_batch)
-        inputs = self._draft_window_graph_binding_provider.materialize(
-            proposal=context,
-            idx_mapping=input_batch.idx_mapping,
-            read_descriptors=step_plan.read_descriptors,
-            cpu_window_exact=step_plan.cpu_window_exact,
-            cpu_window_upper=step_plan.cpu_window_upper,
-            cpu_valid_num_blocks=step_plan.cpu_valid_num_blocks,
-            num_reqs_padded=num_reqs_padded,
-            step=0,
-            quarantine_on_failure=hasattr(self, "_eagle3_graph_session"),
-            output_workspace=output_workspace,
-        )
-        self._eagle3_window_proposal_plan = proposal
-        self._eagle3_window_live_inputs = inputs
-        try:
-            self._eagle3_window_epoch_source.validate(context, input_batch)
-        except BaseException:
-            if getattr(self, "_eagle3_graph_session", None) is not None:
-                self._quarantine_eagle3_window()
-            else:
-                self._draft_window_graph_binding_provider.abort_generation(inputs.identity)
-                self._eagle3_window_live_inputs = None
-                self._eagle3_window_proposal_plan = None
-            raise
-        return inputs
 
     def _snapshot_eagle3_decode_step_one(
         self,
@@ -336,98 +233,101 @@ class Eagle3DraftWindowMixin:
         self._eagle3_window_decode_step_one_exact = exact
         return exact
 
-    def _materialize_eagle3_decode_step(
+    def _materialize_eagle3_step(
         self,
         *,
         step: int,
         num_reqs: int,
         num_reqs_padded: int,
-        seq_lens_cpu_upper_bound: torch.Tensor,
+        seq_lens_cpu_upper_bound: torch.Tensor | None = None,
         output_workspace: Any = None,
     ) -> DraftMetadataInputs:
-        """Refresh one AR step from FullSource under the proposal epoch."""
-        if step != self._eagle3_window_next_step:
-            raise RuntimeError(
-                f"Eagle3 metadata step is stale or out of order: expected={self._eagle3_window_next_step} actual={step}"
-            )
-        if self._eagle3_window_live_inputs is not None:
-            raise RuntimeError("previous Eagle3 Draft Window reader is still active")
-        proposal = self._eagle3_window_proposal_plan
-        previous_identity = self._eagle3_window_last_identity
-        step_one_exact = self._eagle3_window_decode_step_one_exact
-        if proposal is None or previous_identity is None or step_one_exact is None:
-            raise RuntimeError("Eagle3 decode step is missing proposal-owned state")
+        """Freeze the first anchor, then project each AR end into its own bank."""
+        if step != self._eagle3_window_next_step or self._eagle3_window_live_inputs is not None:
+            raise RuntimeError("Eagle3 Window step is stale or its previous reader remains active")
         context = self._require_eagle3_window_context()
-        input_batch = self.input_batch
-        self._eagle3_window_epoch_source.validate(context, input_batch)
+        batch = self.input_batch
+        self._eagle3_window_epoch_source.validate(context, batch)
         self._validate_request_counts(num_reqs, num_reqs_padded)
-        if proposal.actual_request_count != num_reqs:
-            raise RuntimeError("Eagle3 request geometry changed within one proposal")
-
-        cpu_exact = torch.zeros(num_reqs_padded, dtype=torch.int32, device="cpu")
-        if num_reqs:
-            torch.add(
-                step_one_exact[:num_reqs],
-                step - 1,
-                out=cpu_exact[:num_reqs],
+        provider = self._draft_window_graph_binding_provider
+        proposal = self._eagle3_window_proposal_plan
+        previous = self._eagle3_window_last_identity
+        if step == 0:
+            if proposal is not None:
+                raise RuntimeError("Eagle3 first-pass Window state is already materialized")
+            exact = _copy_padded_cpu_exact(
+                batch.seq_lens_np,
+                actual_request_count=num_reqs,
+                padded_request_count=num_reqs_padded,
+                name="proposal L0",
             )
-            cpu_exact[:num_reqs].clamp_(max=self.max_model_len)
+            proposal = build_eagle3_frozen_proposal_plan(
+                source=provider.source,
+                cpu_proposal_l0=exact,
+                actual_request_count=num_reqs,
+                padded_request_count=num_reqs_padded,
+            )
+            seq_lens_cpu_upper_bound = batch.seq_lens_cpu_upper_bound
+        else:
+            step_one_exact = self._eagle3_window_decode_step_one_exact
+            if proposal is None or previous is None or step_one_exact is None or seq_lens_cpu_upper_bound is None:
+                raise RuntimeError("Eagle3 decode step is missing proposal-owned state")
+            if proposal.actual_request_count != num_reqs:
+                raise RuntimeError("Eagle3 request geometry changed within one proposal")
+            exact = torch.zeros(num_reqs_padded, dtype=torch.int32, device="cpu")
+            torch.add(step_one_exact[:num_reqs], step - 1, out=exact[:num_reqs])
+            exact[:num_reqs].clamp_(max=self.max_model_len)
         from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import (
             validate_eagle_single_request_review_exact,
         )
 
         validate_eagle_single_request_review_exact(
-            self,
-            input_batch,
-            cpu_exact,
-            num_reqs=num_reqs,
-            padded=num_reqs_padded,
-            step=step,
+            self, batch, exact, num_reqs=num_reqs, padded=num_reqs_padded, step=step
         )
-        cpu_upper = _copy_padded_cpu_upper(
+        upper = _copy_padded_cpu_upper(
             seq_lens_cpu_upper_bound,
             actual_request_count=num_reqs,
             padded_request_count=num_reqs_padded,
             increment=step,
             max_model_len=self.max_model_len,
         )
-        cpu_valid_num_blocks = self._gather_eagle3_valid_counts(
+        valid = gather_valid_num_blocks_cpu(
+            provider.source.full_source,
+            global_group_id=provider.source.group.gid,
+            idx_mapping_np=batch.idx_mapping_np,
             num_reqs=num_reqs,
             num_reqs_padded=num_reqs_padded,
         )
-        step_plan = build_eagle3_step_materialization_plan(
-            source=self._draft_window_graph_binding_provider.source,
+        plan = build_eagle3_step_materialization_plan(
+            source=provider.source,
             proposal=proposal,
-            cpu_full_exact=cpu_exact,
-            cpu_apply_time_full_upper=cpu_upper,
-            cpu_valid_num_blocks=cpu_valid_num_blocks,
+            cpu_full_exact=exact,
+            cpu_apply_time_full_upper=upper,
+            cpu_valid_num_blocks=valid,
             step=step,
             phase_plan=context.phase_plan,
             padded_request_count=num_reqs_padded,
         )
-        self._eagle3_window_epoch_source.validate(context, input_batch)
-        inputs = self._draft_window_graph_binding_provider.materialize(
-            previous_identity=previous_identity,
+        self._eagle3_window_epoch_source.validate(context, batch)
+        inputs = provider.materialize(
+            previous_identity=previous,
             proposal=context,
-            idx_mapping=input_batch.idx_mapping,
-            read_descriptors=step_plan.read_descriptors,
-            cpu_window_exact=step_plan.cpu_window_exact,
-            cpu_window_upper=step_plan.cpu_window_upper,
-            cpu_valid_num_blocks=step_plan.cpu_valid_num_blocks,
+            idx_mapping=batch.idx_mapping,
+            read_descriptors=plan.read_descriptors,
+            cpu_window_exact=plan.cpu_window_exact,
+            cpu_window_upper=plan.cpu_window_upper,
+            cpu_valid_num_blocks=plan.cpu_valid_num_blocks,
             num_reqs_padded=num_reqs_padded,
             step=step,
-            quarantine_on_failure=hasattr(self, "_eagle3_graph_session"),
+            quarantine_on_failure=True,
             output_workspace=output_workspace,
         )
+        self._eagle3_window_proposal_plan = proposal
         self._eagle3_window_live_inputs = inputs
         try:
-            self._eagle3_window_epoch_source.validate(context, input_batch)
+            self._eagle3_window_epoch_source.validate(context, batch)
         except BaseException:
-            if getattr(self, "_eagle3_graph_session", None) is not None:
-                self._quarantine_eagle3_window()
-            else:
-                self._draft_window_graph_binding_provider.abort_generation(inputs.identity)
-                self._eagle3_window_live_inputs = None
+            self._quarantine_eagle3_window()
             raise
         return inputs
 
@@ -449,21 +349,6 @@ class Eagle3DraftWindowMixin:
             raise RuntimeError("Eagle3 metadata request count does not match the proposal")
         if num_reqs_padded < num_reqs:
             raise ValueError("padded request count must cover active Eagle3 requests")
-
-    def _gather_eagle3_valid_counts(
-        self,
-        *,
-        num_reqs: int,
-        num_reqs_padded: int,
-    ) -> torch.Tensor:
-        capability = self._draft_window_graph_binding_provider.source
-        return gather_valid_num_blocks_cpu(
-            capability.full_source,
-            global_group_id=capability.group.gid,
-            idx_mapping_np=self.input_batch.idx_mapping_np,
-            num_reqs=num_reqs,
-            num_reqs_padded=num_reqs_padded,
-        )
 
 
 def build_eagle3_frozen_proposal_plan(

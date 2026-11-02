@@ -125,7 +125,7 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentA
                     bank = session.provider.prepare_workspace(
                         session.resolve(first=False, n=padded, tokens=batch_desc.num_tokens, ordinal=step - 1)
                     )
-                    inputs = self._materialize_eagle3_decode_step(
+                    inputs = self._materialize_eagle3_step(
                         step=step,
                         num_reqs=num_reqs,
                         num_reqs_padded=padded,
