@@ -76,6 +76,15 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentA
             self._eagle3_graph_session = Eagle3GraphSession(self)
         return result
 
+    def _prefill(self, *args, **kwargs):
+        # DP synchronization may select native first even when this replica
+        # has no true prefill rows. Track the actual AR entry, not that flag.
+        self._eagle3_window_native_prefill_active = True
+        try:
+            return super()._prefill(*args, **kwargs)
+        finally:
+            self._eagle3_window_native_prefill_active = False
+
     def _run_model(
         self,
         num_tokens,
@@ -93,11 +102,11 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentA
             if (
                 session is None
                 or self._eagle3_window_next_step != 0
-                or not self.input_batch.has_prefill
+                or not getattr(self, "_eagle3_window_native_prefill_active", False)
                 or cudagraph_runtime_mode not in (CUDAGraphMode.NONE, CUDAGraphMode.PIECEWISE)
             ):
                 raise RuntimeError("Eagle3 Window decode uses its FULL Graph managers; no eager fallback")
-            # The fixed AR proposer deliberately executes nonuniform prefill
+            # The fixed AR proposer executes its synchronized native first
             # outside FULL graphs. Reuse its prepared query/write metadata and
             # the same persistent first-reader bank, not a second eager owner.
             n = self.input_batch.num_reqs
