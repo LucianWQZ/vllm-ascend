@@ -120,8 +120,8 @@ def test_parallel_exact_is_an_independent_completed_cpu_snapshot(graph_buffers, 
     prepared = []
     monkeypatch.setattr(c.provider, "prepare", lambda capture, **kwargs: prepared.append(kwargs["cpu_full_exact"]))
     with c.provider.proposal_scope(_proposal(active)):
-        owner._build_attn_metadata(
-            active, c.capture.descriptor, np.arange(active + 1, dtype=np.int32), torch.tensor([11, 14]), 1
+        owner._build_uniform_attn_metadata(
+            c.capture.descriptor, active, 1, torch.tensor([11, 14]), 1
         )
     exact = prepared[0]
     assert exact.device.type == "cpu" and exact.dtype == torch.int32

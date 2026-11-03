@@ -373,7 +373,7 @@ def parallel_hook():
     from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowGraphInputMixin
 
     class Baseline:
-        def _build_attn_metadata(self, *args, **kwargs):
+        def _build_uniform_attn_metadata(self, *args, **kwargs):
             return (args, kwargs)
 
     class Owner(DraftWindowGraphInputMixin, Baseline):
@@ -405,8 +405,8 @@ def test_parallel_metadata_hook_retains_the_existing_off_and_prefill_path(parall
         owner._draft_window_bypass_active = True
     else:
         del owner._draft_window_graph_binding_provider
-    args = (1, desc, np.array([0, 8], dtype=np.int32), torch.tensor([16]), 8)
-    original_args, original_kwargs = owner._build_attn_metadata(*args)
+    args = (desc, 1, 8, torch.tensor([16]), 8)
+    original_args, original_kwargs = owner._build_uniform_attn_metadata(*args)
     assert original_args[:5] == args
     assert original_args[5:] == (True, None)
     assert not original_kwargs and not calls
@@ -415,13 +415,12 @@ def test_parallel_metadata_hook_retains_the_existing_off_and_prefill_path(parall
 def test_parallel_metadata_hook_prepares_one_bank_without_a_temporary_metadata_build(parallel_hook):
     owner, desc, inputs, calls = parallel_hook
     owner.input_buffers.seq_lens[1] = 777  # Transport padding is not a request.
-    result = owner._build_attn_metadata(
-        1,
+    result = owner._build_uniform_attn_metadata(
         desc,
-        np.array([0, 8], dtype=np.int32),
+        1,
+        8,
         torch.tensor([16]),
         8,
-        slot_mappings=owner.block_tables.slot_mappings[:, :16],
     )
     assert result is None and not hasattr(owner, "_draft_window_live_inputs")
     assert len(calls) == 1 and calls[0]["step"] == 0
@@ -430,7 +429,7 @@ def test_parallel_metadata_hook_prepares_one_bank_without_a_temporary_metadata_b
     assert calls[0]["idx_mapping_np"] is owner.input_batch.idx_mapping_np
 
 
-@pytest.mark.parametrize("damage", ["mode", "query", "step", "tokens", "full_slots", "proposal", "request_rows"])
+@pytest.mark.parametrize("damage", ["mode", "query_width", "step", "tokens", "proposal", "request_rows"])
 def test_parallel_metadata_hook_rejects_bad_actual_inputs_before_bank_materialization(parallel_hook, damage):
     owner, desc, _, calls = parallel_hook
 
@@ -439,25 +438,23 @@ def test_parallel_metadata_hook_rejects_bad_actual_inputs_before_bank_materializ
             raise AssertionError("invalid metadata must be rejected before the CPU exact copy")
 
     owner.input_buffers.seq_lens = UnreadableExact()
-    query, step, slots = np.array([0, 8], dtype=np.int32), 8, owner.block_tables.slot_mappings[:, :16]
+    query_width, step = 8, 8
     if damage == "mode":
         desc.cg_mode.name = "NONE"
-    elif damage == "query":
-        query[-1] = 7
+    elif damage == "query_width":
+        query_width = 7
     elif damage == "step":
         step = 7
     elif damage == "tokens":
         desc.num_tokens = 15
-    elif damage == "full_slots":
-        slots = slots.clone()
     elif damage == "proposal":
         owner._draft_window_graph_binding_provider.proposal = None
     elif damage == "request_rows":
         owner.input_batch.num_reqs = 2
     with pytest.raises(
-        RuntimeError, match="actual uniform FULL dispatch|canonical Full write slots|active proposal|request count"
+        RuntimeError, match="actual uniform FULL dispatch|active proposal|request count"
     ):
-        owner._build_attn_metadata(1, desc, query, torch.tensor([16]), step, slot_mappings=slots)
+        owner._build_uniform_attn_metadata(desc, 1, query_width, torch.tensor([16]), step)
     assert not calls
 
 

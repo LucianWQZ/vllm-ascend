@@ -130,52 +130,38 @@ class DraftWindowGraphInputMixin:
             if provider._active_bank is None:
                 raise RuntimeError("Draft Graph proposal completed without consuming its current inputs")
 
-    def _build_attn_metadata(
+    def _build_uniform_attn_metadata(
         self,
-        num_reqs: int,
         batch_desc: Any,
-        query_start_loc_np: np.ndarray,
+        num_reqs: int,
+        num_query_per_req: int,
         seq_lens_cpu_upper_bound: torch.Tensor,
         step: int,
         causal: bool | Mapping[int, bool] = True,
         dcp_local_seq_lens: torch.Tensor | None = None,
-        slot_mappings: torch.Tensor | None = None,
     ) -> dict[str, Any] | None:
         if not hasattr(self, "_draft_window_graph_binding_provider") or self._draft_window_bypass_active:
-            slot_kwargs = {} if slot_mappings is None else {"slot_mappings": slot_mappings}
-            return super()._build_attn_metadata(  # type: ignore[misc]
-                num_reqs,
+            return super()._build_uniform_attn_metadata(  # type: ignore[misc]
                 batch_desc,
-                query_start_loc_np,
+                num_reqs,
+                num_query_per_req,
                 seq_lens_cpu_upper_bound,
                 step,
                 causal,
                 dcp_local_seq_lens,
-                **slot_kwargs,
             )
         if not self.draft_attn_layer_names:
             return None
         padded = batch_desc.num_reqs or num_reqs
         tokens = batch_desc.num_tokens
-        expected_query: np.ndarray = np.arange(num_reqs + 1, dtype=query_start_loc_np.dtype) * self.num_query_per_req
         if (
-            step != self.num_query_per_req
+            num_query_per_req != self.num_query_per_req
+            or step != self.num_query_per_req
             or batch_desc.cg_mode.name != "FULL"
             or tokens != padded * self.num_query_per_req
             or (getattr(self, "_draft_graph_review_limit", None) is not None and padded != num_reqs)
-            or query_start_loc_np.shape != expected_query.shape
-            or not np.array_equal(query_start_loc_np, expected_query)
         ):
             raise RuntimeError("Draft Window requires its actual uniform FULL dispatch; no eager fallback")
-        full_slots = self.block_tables.slot_mappings[:, :tokens]
-        if slot_mappings is not None and (
-            slot_mappings.shape != full_slots.shape
-            or slot_mappings.dtype != full_slots.dtype
-            or slot_mappings.device != full_slots.device
-            or slot_mappings.stride() != full_slots.stride()
-            or slot_mappings.data_ptr() != full_slots.data_ptr()
-        ):
-            raise RuntimeError("Draft Graph metadata must retain the canonical Full write slots")
         provider = self._draft_window_graph_binding_provider
         rows = provider.proposal
         input_batch = self.input_batch
