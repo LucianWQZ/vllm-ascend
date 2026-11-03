@@ -61,6 +61,7 @@ def contract(request, monkeypatch):
     monkeypatch.setattr(attn_utils._BUILD_ATTN_METADATA_MODULE, "build_attn_metadata", attn_utils.build_attn_metadata)
     monkeypatch.setattr(attn_utils, "ring_state_update_skipped", lambda: False)
     obj: Any = object.__new__(cls)
+    obj.method = "eagle3" if request.param == "autoregressive" else request.param
     full_table = torch.arange(8, dtype=torch.int32).view(1, 8)
     slots = torch.arange(3, dtype=torch.int64).view(1, 3)
     positions = torch.tensor([18, 19, 20])

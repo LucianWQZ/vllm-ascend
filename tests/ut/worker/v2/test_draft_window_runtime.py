@@ -43,6 +43,7 @@ def setup(monkeypatch):
     monkeypatch.setattr(torch.npu, "current_stream", lambda: None)
     canonical = torch.arange(48, dtype=torch.int32).reshape(6, 8)
     spec = SimpleNamespace(
+        method="dflash",
         draft_model_config=SimpleNamespace(enforce_eager=True),
         speculative_config=SimpleNamespace(enforce_eager=None),
         vllm_config=SimpleNamespace(max_concurrent_batches=2),
@@ -82,6 +83,7 @@ def test_effective_draft_eager_preserves_target_graph(setup, method, inherited_e
     _, spec, _, _ = setup
     spec.draft_model_config.enforce_eager = inherited_eager
     spec.speculative_config.enforce_eager = draft_override
+    spec.method = method
     policy = resolve_draft_window_policy(requested_window_size=1024, method=method)
     # Match actual graph-manager initialization: an eager Target supplies NONE,
     # and the explicit Draft eager flag additionally forces NONE. False does
@@ -96,6 +98,7 @@ def test_effective_draft_eager_preserves_target_graph(setup, method, inherited_e
 @pytest.mark.parametrize("current_capability,legacy_flag", [(True, False), (False, True)])
 def test_eagle_window_checks_current_decode_metadata_update_capability(setup, current_capability, legacy_flag):
     _, spec, _, _ = setup
+    spec.method = "eagle3"
     spec.supports_decode_metadata_update = current_capability
     spec.use_fused_multi_step_decode = legacy_flag
     policy = resolve_draft_window_policy(requested_window_size=1024, method="eagle3")
@@ -437,6 +440,7 @@ def test_off_policy_cannot_construct_runtime_or_inspect_speculator():
 
 def test_eagle_freezes_anchor_across_rejection_and_retains_all_step_reads(setup):
     runtime, spec, canonical, completions = setup
+    spec.method = "eagle3"
     policy = resolve_draft_window_policy(requested_window_size=8, method="eagle3")
     runtime = DraftWindowRuntime(spec, policy)
     state = batch()
@@ -461,6 +465,7 @@ def test_eagle_freezes_anchor_across_rejection_and_retains_all_step_reads(setup)
 @pytest.mark.parametrize("requested", [0, 1, 2, 3, None])
 def test_eagle_scheduled_prefill_and_steps_keep_static_window_geometry(setup, requested):
     _, spec, canonical, completions = setup
+    spec.method = "eagle3"
     runtime = DraftWindowRuntime(spec, resolve_draft_window_policy(requested_window_size=8, method="eagle3"))
     consumed = 3 if requested is None else max(1, requested)
     outputs = []
@@ -481,6 +486,7 @@ def test_eagle_scheduled_prefill_and_steps_keep_static_window_geometry(setup, re
 @pytest.mark.parametrize("requested", [-1, 4, True])
 def test_eagle_invalid_scheduled_count_cannot_enter_a_window_scope(setup, requested):
     _, spec, _, completions = setup
+    spec.method = "eagle3"
     runtime = DraftWindowRuntime(spec, resolve_draft_window_policy(requested_window_size=8, method="eagle3"))
     with (
         pytest.raises(ValueError, match="configured static K"),
@@ -492,6 +498,7 @@ def test_eagle_invalid_scheduled_count_cannot_enter_a_window_scope(setup, reques
 
 def test_eagle_zero_drafts_still_requires_the_real_prefill_read(setup):
     _, spec, _, _ = setup
+    spec.method = "eagle3"
     runtime = DraftWindowRuntime(spec, resolve_draft_window_policy(requested_window_size=8, method="eagle3"))
     with (
         pytest.raises(RuntimeError, match="did not consume a read projection"),
@@ -503,6 +510,7 @@ def test_eagle_zero_drafts_still_requires_the_real_prefill_read(setup):
 
 def test_eagle_partial_proposal_cannot_omit_a_requested_step(setup):
     _, spec, _, _ = setup
+    spec.method = "eagle3"
     runtime = DraftWindowRuntime(spec, resolve_draft_window_policy(requested_window_size=8, method="eagle3"))
     with (
         pytest.raises(RuntimeError, match="every configured draft step"),
@@ -514,6 +522,7 @@ def test_eagle_partial_proposal_cannot_omit_a_requested_step(setup):
 
 def test_eagle_terminal_prefill_first_pass_stays_full_then_uses_window(setup):
     _, spec, _, _ = setup
+    spec.method = "eagle3"
     spec.input_buffers.positions = torch.tensor([15, 26])
     policy = resolve_draft_window_policy(requested_window_size=8, method="eagle3")
     runtime = DraftWindowRuntime(spec, policy)
@@ -529,6 +538,7 @@ def test_eagle_terminal_prefill_first_pass_stays_full_then_uses_window(setup):
 
 def test_eagle_first_pass_anchor_uses_live_queries_after_rejection(setup):
     _, spec, _, _ = setup
+    spec.method = "eagle3"
     canonical = torch.arange(72, dtype=torch.int32).reshape(6, 12)
     spec.block_tables.block_tables[0].gpu = canonical
     spec.block_tables.num_blocks.np = np.full((1, 6), 12, dtype=np.int32)
@@ -556,6 +566,7 @@ def test_eagle_first_pass_anchor_uses_live_queries_after_rejection(setup):
 
 def test_eagle_rejects_unsafe_window_at_startup(setup):
     _, spec, _, _ = setup
+    spec.method = "eagle3"
     policy = resolve_draft_window_policy(requested_window_size=6, method="eagle3")
     with pytest.raises(ValueError, match="first-pass query width"):
         DraftWindowRuntime(spec, policy)
@@ -563,6 +574,7 @@ def test_eagle_rejects_unsafe_window_at_startup(setup):
 
 def test_eagle_later_ar_uses_current_device_exact_with_frozen_anchor(setup, monkeypatch):
     _, spec, canonical, _ = setup
+    spec.method = "eagle3"
     phases = []
     classify = runtime_module.continuing_prefill_rows
 
@@ -601,6 +613,7 @@ def test_eagle_later_ar_uses_current_device_exact_with_frozen_anchor(setup, monk
 @pytest.mark.parametrize("all_continuing", [False, True])
 def test_eagle_continuing_prefill_later_ar_preserves_full_read(setup, all_continuing):
     _, spec, _, _ = setup
+    spec.method = "eagle3"
     spec.input_buffers.positions = torch.tensor([9, 10, 11, 24, 25, 26])
     spec.last_token_indices = torch.tensor([2, 5])
     runtime = DraftWindowRuntime(spec, resolve_draft_window_policy(requested_window_size=8, method="eagle3"))
@@ -789,6 +802,7 @@ def test_real_builder_projects_every_group_and_quarantines_partial_failure(setup
 @pytest.mark.parametrize("method", ["dflash", "dspark"])
 def test_context_only_kv_write_keeps_completion_without_inventing_attention(setup, method):
     _, spec, canonical, completions = setup
+    spec.method = method
     policy = resolve_draft_window_policy(requested_window_size=8, method=method)
     runtime = DraftWindowRuntime(spec, policy)
     before = canonical.clone()
@@ -819,6 +833,7 @@ def test_context_only_scope_cannot_hide_an_actual_draft_read(setup):
 
 def test_eagle_cannot_select_parallel_context_only_scope(setup):
     _, spec, _, _ = setup
+    spec.method = "eagle3"
     policy = resolve_draft_window_policy(requested_window_size=8, method="eagle3")
     runtime = DraftWindowRuntime(spec, policy)
     with (
@@ -830,6 +845,7 @@ def test_eagle_cannot_select_parallel_context_only_scope(setup):
 
 def test_eagle_metadata_update_cannot_bypass_per_step_reads(setup):
     _, spec, _, _ = setup
+    spec.method = "eagle3"
     spec.supports_decode_metadata_update = True
     policy = resolve_draft_window_policy(requested_window_size=8, method="eagle3")
     with pytest.raises(NotImplementedError, match="per-step metadata"):
