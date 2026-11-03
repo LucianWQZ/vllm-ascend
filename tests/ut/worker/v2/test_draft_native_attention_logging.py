@@ -56,7 +56,7 @@ class DraftNativeAttentionLoggingTests(unittest.TestCase):
         ):
             owner = loaded(config(kinds=["sliding_attention"] * 2), [2048, 2048])
             owner.speculative_config = SimpleNamespace(enforce_eager=True)
-            owner.draft_window_policy = SimpleNamespace(effective_window_size=1024)
+            owner.draft_window_policy = 1024
             for _ in range(2):
                 native.report_owner_draft_native_attention(owner)
         self.assertEqual(len(records.messages), 2)
@@ -77,7 +77,7 @@ class DraftNativeAttentionLoggingTests(unittest.TestCase):
                         # once-key without a second per-owner deduplication cache.
                         owner = loaded(config(kinds=["sliding_attention"] * 2), [2048, 2048])
                         owner.speculative_config = SimpleNamespace(enforce_eager=True)
-                        owner.draft_window_policy = SimpleNamespace(effective_window_size=1024)
+                        owner.draft_window_policy = 1024
                         native.report_owner_draft_native_attention(owner)
                         native.report_owner_draft_native_attention(owner)
                 self.assertEqual(len(records.messages), 2 if rank == 0 else 0)

@@ -71,7 +71,7 @@ class NativeAttentionTests(unittest.TestCase):
         owner = loaded(cfg, [2048, 2048])
         owner.draft_model_config.model = "/does/not/need/config.json"
         owner.speculative_config = SimpleNamespace(enforce_eager=True)
-        owner.draft_window_policy = SimpleNamespace(effective_window_size=1024)
+        owner.draft_window_policy = 1024
         log = Log()
         with patch.object(Path, "read_text", side_effect=AssertionError("startup must not reload config")):
             for _ in range(2):
@@ -85,7 +85,7 @@ class NativeAttentionTests(unittest.TestCase):
         for cfg in (config(architecture="UnknownDraft"), {}, config(count=0)):
             owner = loaded(cfg, [None, None])
             owner.speculative_config = SimpleNamespace(enforce_eager=True)
-            owner.draft_window_policy = SimpleNamespace(effective_window_size=1024)
+            owner.draft_window_policy = 1024
             self.assertEqual(native.inspect_draft_native_attention(owner)[0], "UNKNOWN")
             with self.assertRaises(NotImplementedError, msg=str(cfg)):
                 report(owner, Log())
@@ -130,7 +130,7 @@ class NativeAttentionTests(unittest.TestCase):
         report(owner, log)
         self.assertEqual(log.info[0][0][1], "UNKNOWN")
         self.assertEqual(log.info[0][0][4], True)
-        owner.draft_window_policy = SimpleNamespace(effective_window_size=1024)
+        owner.draft_window_policy = 1024
         with self.assertRaises(NotImplementedError):
             report(owner, log)
 

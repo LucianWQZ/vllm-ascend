@@ -142,7 +142,7 @@ def route(native=2048):
 
 
 def validate_source(module, owner, actual_route=None, *, window_size=1024):
-    owner._draft_window_policy = SimpleNamespace(effective_window_size=window_size)
+    owner._draft_window_policy = window_size
     return module.validate_dflash2_graph_source(owner, actual_route or route())
 
 
