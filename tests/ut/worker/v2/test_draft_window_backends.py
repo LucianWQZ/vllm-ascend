@@ -81,6 +81,7 @@ def inventory(
     table_spans=None,
     group_ids=None,
     full_retention_dflash2=False,
+    impl_changes=None,
 ):
     specs = [full_spec()] if specs is None else specs
     builders = [dense_builder() for _ in specs] if builders is None else builders
@@ -103,7 +104,17 @@ def inventory(
         else []
         for gid, builder in enumerate(builders)
     ]
-    return inventory_draft_window_groups(
+    context = {}
+    for group_set in groups:
+        for group in group_set:
+            for name in group.layer_names:
+                impl = object.__new__(AscendAttentionBackendImpl)
+                impl.sliding_window = getattr(group.kv_cache_spec, "sliding_window", None)
+                impl.sinks, impl.use_bnsd_kv_cache = None, False
+                for field, value in (impl_changes or {}).items():
+                    setattr(impl, field, value)
+                context[name] = SimpleNamespace(impl=impl)
+    owner = SimpleNamespace(
         attn_groups=groups,
         kv_cache_config=SimpleNamespace(kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec) for spec in specs]),
         block_tables=SimpleNamespace(
@@ -117,9 +128,13 @@ def inventory(
             ],
             kernel_block_sizes=spans,
         ),
-        parallel_config=parallel_config,
-        full_retention_dflash2=full_retention_dflash2,
+        attn_vllm_config=SimpleNamespace(
+            parallel_config=parallel_config,
+            compilation_config=SimpleNamespace(static_forward_context=context),
+        ),
+        _dflash2_full_kv_reference=full_retention_dflash2,
     )
+    return inventory_draft_window_groups(owner)
 
 
 def require_routes(
@@ -192,6 +207,22 @@ def test_dflash2_reference_cannot_admit_recycling_or_chunked_storage(parallel_co
             specs=[actual],
             full_retention_dflash2=True,
         )
+
+
+@pytest.mark.parametrize(
+    "dtype,changes,expected",
+    [
+        (torch.bfloat16, {}, True),
+        (torch.float16, {}, True),
+        (torch.float32, {}, False),
+        (torch.bfloat16, {"sinks": object()}, False),
+        (torch.bfloat16, {"use_bnsd_kv_cache": True}, False),
+        (torch.bfloat16, {"sliding_window": 2048}, False),
+    ],
+)
+def test_dense_read_uses_the_actual_consumer_and_spec_once(parallel_config, dtype, changes, expected):
+    (route,) = inventory(parallel_config, specs=[replace(full_spec(), dtype=dtype)], impl_changes=changes)
+    assert route.dense_read is expected
 
 
 def test_consumer_gid_must_match_its_canonical_source(parallel_config):
@@ -431,11 +462,11 @@ def test_invalid_geometry_is_not_zero_padded_or_repaired(parallel_config, specs,
 
 def test_empty_inventory_is_not_success():
     with pytest.raises(ValueError, match="at least one"):
-        inventory_draft_window_groups(
-            attn_groups=[],
-            kv_cache_config=SimpleNamespace(kv_cache_groups=[]),
-            block_tables=SimpleNamespace(block_sizes=[], kernel_block_sizes=[]),
-            parallel_config=SimpleNamespace(prefill_context_parallel_size=1, decode_context_parallel_size=1),
+        inventory(
+            SimpleNamespace(prefill_context_parallel_size=1, decode_context_parallel_size=1),
+            specs=[],
+            builders=[],
+            spans=[],
         )
 
 
@@ -544,8 +575,13 @@ def test_unqualified_draft_consumers_fail_before_proposal_work(parallel_config, 
     )
     with pytest.raises(NotImplementedError, match="No read-view provider"):
         inventory_draft_window_groups(
-            attn_groups=[[group]],
-            kv_cache_config=SimpleNamespace(kv_cache_groups=[SimpleNamespace(kv_cache_spec=full_spec())]),
-            block_tables=SimpleNamespace(block_sizes=[256], kernel_block_sizes=[128]),
-            parallel_config=parallel_config,
+            SimpleNamespace(
+                attn_groups=[[group]],
+                kv_cache_config=SimpleNamespace(kv_cache_groups=[SimpleNamespace(kv_cache_spec=full_spec())]),
+                block_tables=SimpleNamespace(block_sizes=[256], kernel_block_sizes=[128]),
+                attn_vllm_config=SimpleNamespace(
+                    parallel_config=parallel_config,
+                    compilation_config=SimpleNamespace(static_forward_context={}),
+                ),
+            )
         )

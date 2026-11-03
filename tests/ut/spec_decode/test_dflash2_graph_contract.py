@@ -165,24 +165,20 @@ def test_graph_factory_qualifies_the_real_dflash2_owner(monkeypatch, owner):
 
     actual_route = route()
     monkeypatch.setattr(draft_window_graph_runtime, "validate_graph_context", lambda *_: None)
-    monkeypatch.setattr(draft_window, "inventory_draft_window_groups", lambda **_: (actual_route,))
-    kwargs = dict(
-        policy=resolve_draft_window_policy(requested_window_size=1024, method="dflash", is_dflash2=True),
-        runtime_route="dflash2",
-        attn_groups=(),
-        block_tables=owner.block_tables,
-        kv_cache_config=None,
-        vllm_config=owner.vllm_config,
-        dflash2_graph_owner=owner,
+    monkeypatch.setattr(draft_window, "inventory_draft_window_groups", lambda _: (actual_route,))
+    owner._draft_window_policy = resolve_draft_window_policy(
+        requested_window_size=1024, method="dflash", is_dflash2=True
     )
-    source = draft_window.create_draft_window_graph_provider(**kwargs)
+    owner._speculator_name = "DFlash2"
+    source = draft_window.create_draft_window_graph_provider(owner)
     assert source.table is owner.block_tables.input_block_tables[0]
     owner.model.model.layers[0].attention_conv.block_size = 7
     with pytest.raises(ValueError, match="query boundary"):
-        draft_window.create_draft_window_graph_provider(**kwargs)
-    kwargs["dflash2_graph_owner"] = None
-    with pytest.raises(TypeError, match="actual model owner"):
-        draft_window.create_draft_window_graph_provider(**kwargs)
+        draft_window.create_draft_window_graph_provider(owner)
+    owner.model.model.layers[0].attention_conv.block_size = 8
+    owner.draft_model_config.architectures = ["DFlash2DraftModel", "UnknownDraft"]
+    with pytest.raises(ValueError, match="actual DFlash2 architecture"):
+        draft_window.create_draft_window_graph_provider(owner)
 
 
 def test_full_only_source_host_contract_does_not_fake_native_model(module, owner):

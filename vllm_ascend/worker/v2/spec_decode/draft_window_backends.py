@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, cast
 
+import torch
+
 
 class DraftWindowProviderStatus(str, Enum):
     DIRECT_DENSE = "DIRECT_DENSE"
@@ -26,6 +28,7 @@ class DraftWindowGroupRoute:
     table_column_span: int
     status: DraftWindowProviderStatus
     native_window: int | None = None
+    dense_read: bool = False
 
 
 def _select_read_provider(
@@ -83,14 +86,7 @@ def _select_read_provider(
     return DraftWindowProviderStatus.NATIVE_SWA
 
 
-def inventory_draft_window_groups(
-    *,
-    attn_groups: Sequence[Sequence[Any]],
-    kv_cache_config: Any,
-    block_tables: Any,
-    parallel_config: Any,
-    full_retention_dflash2: bool = False,
-) -> tuple[DraftWindowGroupRoute, ...]:
+def inventory_draft_window_groups(speculator: Any) -> tuple[DraftWindowGroupRoute, ...]:
     """Inventory every actual consumer without inspecting tensor contents.
 
     AscendBlockTables currently expands manager blocks into kernel columns.
@@ -100,8 +96,15 @@ def inventory_draft_window_groups(
     """
     from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
 
+    from vllm_ascend.attention.attention_v1 import AscendAttentionBackendImpl
     from vllm_ascend.core.kv_cache_interface import get_kv_cache_compression_ratio, get_storage_block_size
 
+    attn_groups, block_tables = speculator.attn_groups, speculator.block_tables
+    kv_cache_config = speculator.kv_cache_config
+    config = speculator.attn_vllm_config
+    parallel_config = config.parallel_config
+    context = config.compilation_config.static_forward_context
+    full_retention_dflash2 = getattr(speculator, "_dflash2_full_kv_reference", False)
     if parallel_config.prefill_context_parallel_size != 1 or parallel_config.decode_context_parallel_size != 1:
         raise NotImplementedError("Context-parallel read coordinates need a separate provider")
     cache_groups = kv_cache_config.kv_cache_groups
@@ -161,6 +164,18 @@ def inventory_draft_window_groups(
                 )
             except NotImplementedError as error:
                 raise NotImplementedError(f"Draft Window gid={gid}: {error}") from error
+            implementations = [getattr(context.get(name), "impl", None) for name in group.layer_names]
+            dense_read = (
+                status is DraftWindowProviderStatus.DIRECT_DENSE
+                and all(item.dtype in (torch.float16, torch.bfloat16) for item in specs)
+                and all(
+                    type(impl) is AscendAttentionBackendImpl
+                    and not impl.use_bnsd_kv_cache
+                    and impl.sinks is None
+                    and impl.sliding_window is None
+                    for impl in implementations
+                )
+            )
             routes.append(
                 DraftWindowGroupRoute(
                     gid=gid,
@@ -168,6 +183,7 @@ def inventory_draft_window_groups(
                     table_column_span=column_span,
                     status=status,
                     native_window=native_window,
+                    dense_read=dense_read,
                 )
             )
     if not routes:
@@ -185,13 +201,7 @@ def require_direct_prefix_routes(
     contract here. Each admitted route is the original inventory object.
     """
     config = speculator.attn_vllm_config
-    routes = inventory_draft_window_groups(
-        attn_groups=speculator.attn_groups,
-        kv_cache_config=speculator.kv_cache_config,
-        block_tables=speculator.block_tables,
-        parallel_config=config.parallel_config,
-        full_retention_dflash2=getattr(speculator, "_dflash2_full_kv_reference", False),
-    )
+    routes = inventory_draft_window_groups(speculator)
     if {name for route in routes for name in route.layers} != set(speculator.draft_attn_layer_names):
         raise ValueError("Draft Window providers do not cover the actual draft attention layers")
     native = tuple(route for route in routes if route.status is DraftWindowProviderStatus.NATIVE_SWA)

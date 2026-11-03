@@ -55,15 +55,7 @@ class DraftWindowGraphInputMixin:
             raise RuntimeError("draft-window runtime ownership is already initialized")
         if hasattr(self, "_draft_window_runtime"):
             raise RuntimeError("Graph Window cannot replace the typed eager runtime")
-        self._draft_window_graph_binding_provider = create_draft_window_graph_provider(
-            policy=policy,
-            runtime_route=self._speculator_name.lower(),
-            attn_groups=self.attn_groups,
-            block_tables=self.block_tables,
-            kv_cache_config=self.kv_cache_config,
-            vllm_config=self.vllm_config,
-            dflash2_graph_owner=self if self._speculator_name.lower() == "dflash2" else None,
-        )
+        self._draft_window_graph_binding_provider = create_draft_window_graph_provider(self)
         self._draft_window_bypass_active = False
         self._draft_window_prefill_bypass_active = False
         self._draft_window_dp_dummy_active = False

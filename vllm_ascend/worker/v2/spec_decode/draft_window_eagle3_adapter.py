@@ -38,14 +38,7 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentA
             raise RuntimeError("draft-window runtime ownership is already initialized")
         from vllm_ascend.worker.v2.spec_decode.draft_window import create_draft_window_graph_provider
 
-        self._draft_window_graph_binding_provider = create_draft_window_graph_provider(
-            policy=policy,
-            runtime_route=self.method,
-            attn_groups=self.attn_groups,
-            block_tables=self.block_tables,
-            kv_cache_config=self.kv_cache_config,
-            vllm_config=self.vllm_config,
-        )
+        self._draft_window_graph_binding_provider = create_draft_window_graph_provider(self)
         self._initialize_eagle3_draft_window_state()
 
     def _configure_decode_metadata_update(self) -> None:
