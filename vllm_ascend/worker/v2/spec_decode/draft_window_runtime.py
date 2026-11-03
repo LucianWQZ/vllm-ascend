@@ -20,9 +20,7 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_lifetime import (
     DraftWindowOwnerPool,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_plan import (
-    DraftWindowPlan,
-    compute_draft_window_plan,
-    freeze_eagle_window_plan,
+    compute_draft_window_start,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_policy import DraftWindowPolicyDecision
 from vllm_ascend.worker.v2.spec_decode.draft_window_read import (
@@ -87,7 +85,7 @@ class DraftWindowRuntime:
         self._continuing: np.ndarray | None = None
         self._bypass = False
         self._build_count = 0
-        self._eagle_plans: tuple[DraftWindowPlan, ...] | None = None
+        self._eagle_window: tuple[tuple[int, int], ...] | None = None
 
     @property
     def reads_active(self) -> bool:
@@ -190,7 +188,7 @@ class DraftWindowRuntime:
             self._owner = owner
             self._input_batch = input_batch
             self._build_count = 0
-            self._eagle_plans = None
+            self._eagle_window = None
             try:
                 # Fixed MRV2 does not change Host prompt progress during propose.
                 self._continuing = continuing_prefill_rows(input_batch, input_batch.num_reqs)
@@ -211,7 +209,7 @@ class DraftWindowRuntime:
                 self._owner = None
                 self._input_batch = None
                 self._continuing = None
-                self._eagle_plans = None
+                self._eagle_window = None
 
     def metadata_callback(
         self,
@@ -284,38 +282,37 @@ class DraftWindowRuntime:
                     if step == 0 and not torch.equal(exact, proposal_exact):
                         raise ValueError("Full prompt metadata cannot include rejected query padding")
                 else:
-                    if self.method == "eagle3":
-                        if self._eagle_plans is None:
-                            if step > 0:
-                                raise RuntimeError("Eagle3 AR metadata has no frozen first-pass plan")
-                            assert proposal_exact is not None
-                            self._eagle_plans = tuple(
-                                freeze_eagle_window_plan(
-                                    proposal_exact_end=int(end),
-                                    static_k=self.static_k,
-                                    max_rejected_tokens=self.static_k,
+                    if self.method == "eagle3" and self._eagle_window is None:
+                        if step > 0:
+                            raise RuntimeError("Eagle3 AR metadata has no frozen first-pass plan")
+                        assert proposal_exact is not None
+                        self._eagle_window = tuple(
+                            (
+                                compute_draft_window_start(
+                                    full_exact_end=int(end),
                                     window_size=self.window_size,
                                     block_span_tokens=self.anchor_block_span,
-                                )
-                                for end in proposal_exact
+                                    future_offset=self.static_k,
+                                ),
+                                int(end) + self.static_k,
                             )
-                        starts_list = [
-                            0
-                            if continuing[row] or (step == 0 and batch.is_prefilling_np[row])
-                            else plan.at_exact_end(int(exact[row])).window_start
-                            for row, plan in enumerate(self._eagle_plans)
-                        ]
-                    else:
-                        starts_list = [
-                            0
-                            if continuing[row]
-                            else compute_draft_window_plan(
-                                full_exact_end=int(exact[row]),
+                            for end in proposal_exact
+                        )
+                    starts_list = []
+                    for row, end in enumerate(exact):
+                        if continuing[row] or (self.method == "eagle3" and step == 0 and batch.is_prefilling_np[row]):
+                            start = 0
+                        elif self._eagle_window is not None:
+                            start, horizon = self._eagle_window[row]
+                            if not start <= int(end) <= horizon:
+                                raise ValueError("Eagle3 exact end is outside its frozen window or proposal horizon")
+                        else:
+                            start = compute_draft_window_start(
+                                full_exact_end=int(end),
                                 window_size=self.window_size,
                                 block_span_tokens=self.anchor_block_span,
-                            ).window_start
-                            for row in range(num_reqs)
-                        ]
+                            )
+                        starts_list.append(start)
                     starts = torch.tensor(starts_list, dtype=torch.int32, device="cpu")
                 self._build_count += 1
             assert exact is not None

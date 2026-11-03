@@ -293,7 +293,7 @@ def test_eagle_allocation_upper_cannot_move_the_frozen_first_pass_anchor(setup, 
             metadata.query_start_loc_cpu = torch.tensor([0, width, 2 * width, 2 * width])
             runtime.metadata_callback(step, 2)(0, metadata)
             assert metadata.seq_lens[:2].tolist() == ([1159, 1159] if step == 0 else list(ends))
-        assert runtime._eagle_plans is not None
+        assert runtime._eagle_window is not None
 
 
 def test_reorder_row_replacement_and_in_place_mapping_refresh_each_proposal(setup):
@@ -660,7 +660,7 @@ def test_eagle_full_continuing_keeps_full_addressing_without_window_snapshot(set
                 assert metadata._seq_lens_cpu is metadata.seq_lens_cpu
                 retained_common.append((step, metadata))
         assert runtime._build_count == 3
-        assert runtime._eagle_plans is None
+        assert runtime._eagle_window is None
         for step, metadata in retained_common:
             assert any(item is metadata for item in owner.retained)
             assert metadata.seq_lens_cpu.tolist() == [12 + step, 27 + step, 0]
@@ -1253,3 +1253,12 @@ def test_compact_rows_and_persistent_allocation_counts_use_the_same_request_orde
     assert metadata.seq_lens.tolist() == [12, 11, 0]
     assert torch.equal(full_table, before[0]) and torch.equal(canonical, before[1])
     assert metadata.slot_mapping is slots and metadata.positions is positions
+
+
+@pytest.mark.parametrize("next_end", [19, 31])
+def test_eagle_ar_cannot_escape_its_actual_frozen_interval(setup, next_end):
+    runtime, _, _, _ = setup
+    runtime.method, runtime.static_k = "eagle3", 3
+    with pytest.raises(ValueError, match="frozen window or proposal horizon"), runtime.proposal_context(batch()):
+        runtime.metadata_callback(0, 2)(0, common())
+        runtime.metadata_callback(1, 2)(0, common(exact=(12, next_end), upper=(14, 32)))
