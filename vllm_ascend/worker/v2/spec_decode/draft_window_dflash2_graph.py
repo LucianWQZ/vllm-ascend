@@ -63,23 +63,13 @@ def validate_dflash2_graph_source(owner: Any) -> None:
         tuple(owner.draft_model_config.architectures) == ("DFlash2DraftModel",), "actual DFlash2 architecture required"
     )
     _require(owner.use_fp64_gumbel is False, "the NPU selector does not implement fp64 Gumbel")
-    # Fixed constructors derive K, Q=K+1 and sampler dimensions from the
-    # admitted config. Only the loaded model's selector/conv relation is new.
-    q, top_k = owner.num_query_per_req, owner.top_k
-    _require(0 < top_k <= owner.vocab_size, "selector top-k exceeds the actual vocabulary")
+    # The fixed DFlash2 constructors use this same config for Q=K+1,
+    # selector/sampler top-k, per-layer convolution blocks and tensor storage.
+    _require(0 < owner.top_k <= owner.vocab_size, "selector top-k exceeds the actual vocabulary")
     _require(
         getattr(owner, "_dflash2_full_kv_reference", False) is True,
         "the actual DFlash2 full-retention loader contract is missing",
     )
-    sampler, model = owner.candidate_sampler, owner.model
-    selector = model.model.candidate_selector
-    _require(
-        sampler.top_k == selector.top_k == top_k and callable(model.compute_candidates) and callable(selector),
-        "actual selector/sampler contract differs",
-    )
-    # Fixed DFlash/DFlash2 constructors own the sampler and per-request input
-    # allocations. Capture retains those original tensors; Window does not
-    # replace them or maintain a second allocation/layout schema.
     context = owner.vllm_config.compilation_config.static_forward_context
     _require(bool(owner.draft_attn_layer_names), "no actual Draft attention layers")
     for name in owner.draft_attn_layer_names:
@@ -99,14 +89,6 @@ def validate_dflash2_graph_source(owner: Any) -> None:
             native is None or (mask is not None and mask.data_ptr() != 0),
             "noncausal native mask was not created by the DFlash2 loader",
         )
-    for layer in model.model.layers:
-        for name in ("attention_conv", "mlp_conv"):
-            conv = getattr(layer, name)
-            _require(conv.block_size == q, "convolution must reset at the original anchor-plus-K query boundary")
-    _require(
-        len(model.model.layers) == len(owner.draft_attn_layer_names),
-        "DFlash2 convolution/attention layer inventory differs",
-    )
 
 
 def validate_dflash2_graph_read_source(owner: Any, group: Any, *, window_size: int) -> None:

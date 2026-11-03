@@ -172,13 +172,36 @@ def test_graph_factory_qualifies_the_real_dflash2_owner(monkeypatch, owner):
     owner._speculator_name = "DFlash2"
     source = draft_window.create_draft_window_graph_provider(owner)
     assert source.table is owner.block_tables.input_block_tables[0]
-    owner.model.model.layers[0].attention_conv.block_size = 7
-    with pytest.raises(ValueError, match="query boundary"):
+    mask = owner.vllm_config.compilation_config.static_forward_context["draft.0"].impl._dflash2_native_swa_mask
+    address, mask.address = mask.address, 0
+    with pytest.raises(ValueError, match="native mask"):
         draft_window.create_draft_window_graph_provider(owner)
-    owner.model.model.layers[0].attention_conv.block_size = 8
+    mask.address = address
     owner.draft_model_config.architectures = ["DFlash2DraftModel", "UnknownDraft"]
     with pytest.raises(ValueError, match="actual DFlash2 architecture"):
         draft_window.create_draft_window_graph_provider(owner)
+
+
+def test_fixed_model_creates_both_convolutions_from_the_same_static_k(monkeypatch):
+    import torch
+
+    from vllm_ascend.models import qwen3_dflash2
+
+    def initialize_parent(layer, *_args, **_kwargs):
+        torch.nn.Module.__init__(layer)
+
+    monkeypatch.setattr(qwen3_dflash2.DFlashQwen3DecoderLayer, "__init__", initialize_parent)
+    monkeypatch.setattr(qwen3_dflash2, "DFlashGroupedConv", lambda **kwargs: SimpleNamespace(**kwargs))
+    configuration = SimpleNamespace(hidden_size=32, dflash_config={"conv_kernel_size": 2, "conv_group_size": 8})
+    actual = qwen3_dflash2.DFlash2Qwen3DecoderLayer(
+        SimpleNamespace(
+            speculative_config=SimpleNamespace(num_speculative_tokens=7),
+            model_config=SimpleNamespace(dtype=torch.bfloat16),
+        ),
+        config=configuration,
+        layer_idx=0,
+    )
+    assert actual.attention_conv.block_size == actual.mlp_conv.block_size == 8
 
 
 def test_full_only_source_host_contract_does_not_fake_native_model(module, owner):
@@ -224,7 +247,7 @@ def test_actual_conditional_full_vocab_logits_allocation(monkeypatch, owner, sam
         ),
         (lambda x: setattr(x, "use_fp64_gumbel", True), "fp64 Gumbel"),
         (lambda x: setattr(x, "_dflash2_full_kv_reference", False), "full-retention loader"),
-        (lambda x: setattr(x.model.model.layers[0].attention_conv, "block_size", 3), "query boundary"),
+        (lambda x: setattr(x, "top_k", 9), "actual vocabulary"),
     ],
 )
 def test_malformed_capture_contract_is_rejected(module, owner, mutation, message):
