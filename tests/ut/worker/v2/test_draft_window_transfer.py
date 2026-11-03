@@ -41,7 +41,10 @@ def test_copy_failure_keeps_actual_input_and_output_owned(monkeypatch, stage, se
 
     monkeypatch.setattr(torch.Tensor, "copy_", copy)
     full_rows = torch.tensor([True, True] if stage == "phase" else [False, True])
-    with pytest.raises(RuntimeError, match="deliberate error"), runtime.proposal_context(runtime_tests.batch()):
+    with (
+        pytest.raises(RuntimeError, match="deliberate error"),
+        runtime_tests.proposal_scope(runtime, runtime_tests.batch()),
+    ):
         owner = runtime._owner
         assert owner is not None
         prepare_dense_draft_read(
@@ -60,7 +63,7 @@ def test_copy_failure_keeps_actual_input_and_output_owned(monkeypatch, stage, se
     assert len(submitted) == 1
     assert runtime._poisoned
     assert all(any(item is tensor for item in owner) for tensor in submitted[0])
-    with pytest.raises(RuntimeError, match="quarantined"), runtime.proposal_context(runtime_tests.batch()):
+    with pytest.raises(RuntimeError, match="quarantined"), runtime_tests.proposal_scope(runtime, runtime_tests.batch()):
         pytest.fail("uncertain copy must not be reused")
 
 
@@ -78,7 +81,10 @@ def test_planning_copy_failure_keeps_prepared_input_owned(monkeypatch, setup):
         raise RuntimeError("deliberate error during planning copy")
 
     monkeypatch.setattr(torch.Tensor, "copy_", failed_copy)
-    with pytest.raises(RuntimeError, match="planning copy"), runtime.proposal_context(runtime_tests.batch()):
+    with (
+        pytest.raises(RuntimeError, match="planning copy"),
+        runtime_tests.proposal_scope(runtime, runtime_tests.batch()),
+    ):
         owner = runtime._owner
         assert owner is not None
         prepare_dense_draft_read(

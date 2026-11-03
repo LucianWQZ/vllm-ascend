@@ -341,7 +341,7 @@ def test_factory_error_restores_module_but_quarantines_active_owner(factory_cont
     callbacks = {} if stage == "backend" else {stage: fail}
     with (
         pytest.raises(RuntimeError, match="partial-submit host error"),
-        runtime.proposal_context(runtime_tests.batch()),
+        runtime_tests.proposal_scope(runtime, runtime_tests.batch()),
     ):
         owner = runtime._owner
         assert owner is not None
@@ -353,5 +353,5 @@ def test_factory_error_restores_module_but_quarantines_active_owner(factory_cont
     assert runtime._poisoned
     assert owner == [payload]
     completion.assert_not_called()
-    with pytest.raises(RuntimeError, match="quarantined"), runtime.proposal_context(runtime_tests.batch()):
+    with pytest.raises(RuntimeError, match="quarantined"), runtime_tests.proposal_scope(runtime, runtime_tests.batch()):
         pytest.fail("uncertain builder must not be reused")

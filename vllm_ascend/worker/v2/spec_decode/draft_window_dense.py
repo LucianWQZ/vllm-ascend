@@ -142,7 +142,7 @@ def prepare_dense_draft_read(
             may_have_empty_rows = bool((queries < 0).any())
         mask = _copy_owned_read_tensor(excluded[:, None].contiguous(), retain, device=block_table.device)
         read = DenseDraftRead(slots, visible, mask, capacity, width, retain, may_have_empty_rows)
-        retain(read, block_table, address, logical_columns, blocks)
+        retain(read)
         return read
 
     if widths is None and not bool(full_rows_cpu.any()):

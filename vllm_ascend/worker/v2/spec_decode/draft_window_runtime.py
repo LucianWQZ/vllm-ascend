@@ -75,7 +75,6 @@ class DraftWindowRuntime:
         self._pending: list[object] = []
         self._poisoned = False
         self._owner: list[object] | None = None
-        self._input_batch: Any = None
         self._continuing: np.ndarray | None = None
         self._bypass = False
         self._build_count = 0
@@ -164,7 +163,6 @@ class DraftWindowRuntime:
             raise RuntimeError("Draft Window execution is quarantined: device completion is unknown")
         owner: list[object] = []
         self._owner = owner
-        self._input_batch = input_batch
         self._build_count = 0
         self._eagle_window = None
         try:
@@ -173,8 +171,6 @@ class DraftWindowRuntime:
             num_reqs = input_batch.num_reqs
             rows = input_batch.idx_mapping_np[:num_reqs]
             counts = self.speculator.block_tables.num_blocks.np
-            if len(input_batch.req_ids) != num_reqs:
-                raise RuntimeError("Draft Window request mapping does not cover the active preparation")
             if rows.shape != (num_reqs,) or np.any(rows < 0) or np.any(rows >= counts.shape[1]):
                 raise ValueError("Draft allocation counts require active persistent request slots")
             self._continuing = continuing_prefill_rows(input_batch, num_reqs)
@@ -202,7 +198,6 @@ class DraftWindowRuntime:
                 self._pending = owner
         finally:
             self._owner = None
-            self._input_batch = None
             self._continuing = None
             self._eagle_window = None
 
@@ -222,9 +217,10 @@ class DraftWindowRuntime:
         """
         if self._bypass:
             return None
-        owner, batch = self._owner, self._input_batch
+        owner = self._owner
         if owner is None:
             raise RuntimeError("Draft Window metadata has no active proposal")
+        batch = self.speculator.input_batch
         if self.speculator.method != "eagle3" and step != self.speculator.num_query_per_req:
             raise ValueError("Parallel Draft metadata step must match its actual query width")
         if self.speculator.method == "eagle3" and (
@@ -265,16 +261,16 @@ class DraftWindowRuntime:
                 raise RuntimeError("Draft Window callback belongs to a stale proposal")
             owner.extend(objects)
 
-        full_exact = exact = proposal_exact = starts = None
+        exact = proposal_exact = starts = None
 
         def apply(gid: int, common: Any) -> None:
-            nonlocal full_exact, exact, proposal_exact, starts, dense
+            nonlocal exact, proposal_exact, starts, dense
             if gid not in self.gids:
                 return
             retain(common)
             # The real builder enumerates each KV group once and constructs a
             # fresh Common from this same preparation before invoking us.
-            if full_exact is None:
+            if exact is None:
                 if common.num_reqs < num_reqs or common.seq_lens.ndim != 1 or common.seq_lens.numel() < num_reqs:
                     raise ValueError("Draft Window metadata does not cover the active requests")
                 full_exact = common.seq_lens

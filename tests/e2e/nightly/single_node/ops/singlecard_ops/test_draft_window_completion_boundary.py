@@ -54,6 +54,7 @@ def prepared(monkeypatch):
             causal=False,
         )
 
+    spec.input_batch = batch
     return runtime, batch, metadata
 
 

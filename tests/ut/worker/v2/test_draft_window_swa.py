@@ -46,6 +46,7 @@ def prepared(monkeypatch):
             is_prefilling_np=np.asarray(continuing),
         )
         speculator = SimpleNamespace(
+            input_batch=batch,
             method="dflash",
             num_query_per_req=8,
             num_speculative_steps=7,
