@@ -1351,8 +1351,10 @@ def test_dsa_cp_indexer_cache_follows_runtime_ownership(
 
 
 @pytest.mark.parametrize("nope", [False, True])
-def test_sfa_dsa_cp_builder_shards_tokens_and_sequence_lengths(nope) -> None:
+@pytest.mark.parametrize("v2", [False, True])
+def test_sfa_dsa_cp_builder_shards_tokens_and_sequence_lengths(nope, v2) -> None:
     builder = AscendSFADSACPMetadataBuilder.__new__(AscendSFADSACPMetadataBuilder)
+    builder.vllm_config = SimpleNamespace(use_v2_model_runner=v2)
     builder.dsa_cp_max_num_tokens = 128
     builder.dsa_cp_metadata_buffers = {}
     builder.actual_seq_lengths_query = torch.tensor([3, 5, 0], dtype=torch.int32)
@@ -1391,12 +1393,14 @@ def test_sfa_dsa_cp_builder_shards_tokens_and_sequence_lengths(nope) -> None:
     torch.testing.assert_close(context.query_start_loc, torch.tensor([0, 0, 2], dtype=torch.int32))
     torch.testing.assert_close(builder.actual_seq_lengths_query, torch.tensor([3, 5, 0], dtype=torch.int32))
     torch.testing.assert_close(builder.actual_seq_lengths_key, torch.tensor([3, 5, 0], dtype=torch.int32))
+    assert bool(builder.dsa_cp_metadata_buffers) is v2
 
 
 def test_sfa_dsa_cp_metadata_builder_masks_graph_padding() -> None:
     # TP8, graph size 80 and MTP3 produce 20 four-token request slots. With
     # nine real requests, rank 6 splits a padded slot at its local boundary.
     builder = AscendSFADSACPMetadataBuilder.__new__(AscendSFADSACPMetadataBuilder)
+    builder.vllm_config = SimpleNamespace(use_v2_model_runner=False)
     builder.dsa_cp_max_num_tokens = 128
     builder.dsa_cp_metadata_buffers = {}
     builder.dsa_cp_actual_seq_lengths_query = torch.zeros(21, dtype=torch.int32)
@@ -1524,13 +1528,14 @@ def test_sfa_dcp_builds_replicated_block_table_view() -> None:
     )
 
 
-def test_sfa_dcp_updates_dsa_cp_local_slot_mapping_with_padding() -> None:
+def test_mrv1_sfa_dcp_assigns_dsa_cp_local_slot_mapping_with_padding() -> None:
     builder = AscendSFADSADCPMetadataBuilder.__new__(AscendSFADSADCPMetadataBuilder)
+    builder.vllm_config = SimpleNamespace(use_v2_model_runner=False)
     dsa_cp_context = SimpleNamespace(
         num_tokens_pad=6,
         local_start=2,
         local_end_with_pad=5,
-        slot_mapping_cp=torch.empty(3, dtype=torch.int32),
+        slot_mapping_cp=None,
     )
     metadata = SimpleNamespace(dsa_cp_context=dsa_cp_context)
 

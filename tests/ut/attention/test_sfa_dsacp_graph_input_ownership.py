@@ -14,6 +14,7 @@ from vllm_ascend.attention.context_parallel.sfa_cp import AscendSFADSACPMetadata
 
 def builder():
     owner = AscendSFADSACPMetadataBuilder.__new__(AscendSFADSACPMetadataBuilder)
+    owner.vllm_config = SimpleNamespace(use_v2_model_runner=True)
     owner.dsa_cp_max_num_tokens = 64
     owner.dsa_cp_metadata_buffers = {}
     owner.dsa_cp_actual_seq_lengths_query = torch.zeros(5, dtype=torch.int32)
@@ -115,3 +116,26 @@ def test_outer_cp_update_preserves_captured_local_slot_address():
     assert context.slot_mapping_cp is captured
     assert captured.data_ptr() == pointer
     assert captured.tolist() == [106, 107, 108]
+
+
+@pytest.mark.parametrize("v2", [False, True])
+def test_only_mrv2_constructor_adds_capture_input_banks(v2, monkeypatch):
+    from vllm_ascend.attention.sfa_v1 import AscendSFAMetadataBuilder
+
+    def base_init(owner, spec, names, config, device, metadata_cls, supports_dcp_with_varlen):
+        owner.vllm_config, owner.speculative_config = config, None
+
+    monkeypatch.setattr(AscendSFAMetadataBuilder, "__init__", base_init)
+    config = SimpleNamespace(
+        use_v2_model_runner=v2,
+        scheduler_config=SimpleNamespace(max_num_seqs=2, max_num_batched_tokens=63),
+    )
+    with patch(
+        "vllm_ascend.attention.context_parallel.sfa_cp.get_tp_group",
+        return_value=SimpleNamespace(world_size=16),
+    ):
+        owner = AscendSFADSACPMetadataBuilder(object(), [], config, torch.device("cpu"))
+    assert hasattr(owner, "dsa_cp_metadata_buffers") is v2
+    assert hasattr(owner, "dsa_cp_max_num_tokens") is v2
+    if v2:
+        assert owner.dsa_cp_max_num_tokens == 64 and owner.dsa_cp_metadata_buffers == {}

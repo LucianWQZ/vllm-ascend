@@ -481,12 +481,12 @@ class AscendSFADSACPMetadataBuilder(AscendSFAMetadataBuilder):
         )
         # Mixed FULL graphs may append a dummy request after a full batch.
         max_num_reqs = vllm_config.scheduler_config.max_num_seqs + 1
-        self.dsa_cp_max_num_tokens = _round_up(
-            vllm_config.scheduler_config.max_num_batched_tokens, get_tp_group().world_size
-        )
-        # Capture keeps these input addresses after temporary metadata is gone.
-        # Retain one fixed-capacity bank per speculative step for this builder.
-        self.dsa_cp_metadata_buffers: dict[int | None, dict[str, torch.Tensor]] = {}
+        if vllm_config.use_v2_model_runner:
+            self.dsa_cp_max_num_tokens = _round_up(
+                vllm_config.scheduler_config.max_num_batched_tokens, get_tp_group().world_size
+            )
+            # MRV2 captures these addresses after temporary metadata is gone.
+            self.dsa_cp_metadata_buffers: dict[int | None, dict[str, torch.Tensor]] = {}
         self.dsa_cp_actual_seq_lengths_query = torch.zeros(max_num_reqs + 1, dtype=torch.int32, device=device)
         self.dsa_cp_actual_seq_lengths_key = torch.empty_like(self.dsa_cp_actual_seq_lengths_query)
         self.dsa_cp_spec_actual_seq_lengths_query: list[torch.Tensor] | None = None
@@ -573,7 +573,21 @@ class AscendSFADSACPMetadataBuilder(AscendSFAMetadataBuilder):
         local_end_with_pad = local_start + num_tokens_per_device
         local_end = min(local_end_with_pad, common_attn_metadata.num_actual_tokens)
 
-        cos, sin, slot_mapping = self._padded_metadata_inputs(cos, sin, slot_mapping, num_tokens_pad, draft_index)
+        if self.vllm_config.use_v2_model_runner:
+            cos, sin, slot_mapping = self._padded_metadata_inputs(cos, sin, slot_mapping, num_tokens_pad, draft_index)
+        else:
+            # Preserve the existing MRV1 padding and temporary input ownership.
+            if cos is not None:
+                assert sin is not None and cos.shape == sin.shape
+                pad_size = num_tokens_pad - cos.shape[0]
+                if pad_size > 0:
+                    cos = nn.functional.pad(cos, (0, 0, 0, 0, 0, 0, 0, pad_size))
+                    sin = nn.functional.pad(sin, (0, 0, 0, 0, 0, 0, 0, pad_size))
+            pad_size_slot = num_tokens_pad - slot_mapping.shape[0]
+            if pad_size_slot > 0:
+                slot_mapping = nn.functional.pad(slot_mapping, (0, pad_size_slot), value=-1)
+            else:
+                slot_mapping = slot_mapping[:num_tokens_pad]
         if cos is not None:
             assert sin is not None
             cos = cos[local_start:local_end_with_pad]
@@ -667,10 +681,12 @@ class AscendSFADSACPMetadataBuilder(AscendSFAMetadataBuilder):
             )
         else:
             local_mapping = local_mapping[: dsa_cp_context.num_tokens_pad]
-        # Keep the address captured by the native KV/RoPE operation.
-        dsa_cp_context.slot_mapping_cp.copy_(
-            local_mapping[dsa_cp_context.local_start : dsa_cp_context.local_end_with_pad]
-        )
+        local_mapping = local_mapping[dsa_cp_context.local_start : dsa_cp_context.local_end_with_pad]
+        if self.vllm_config.use_v2_model_runner:
+            # Keep the address captured by the MRV2 native KV/RoPE operation.
+            dsa_cp_context.slot_mapping_cp.copy_(local_mapping)
+        else:
+            dsa_cp_context.slot_mapping_cp = local_mapping
 
 
 class AscendSFADSACPImpl(OProjWeightSwitchMixin, AscendSFAImpl):
