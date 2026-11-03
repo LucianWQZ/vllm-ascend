@@ -72,7 +72,7 @@ def _resolve_window_policy(vllm_config: VllmConfig) -> int | None:
     # Forced OFF must precede numerical checks and accesses to optional model
     # fields, dynamic-K state, or backend capabilities.
     if method == "mtp":
-        forced_off = "MTP"
+        forced_off: str | None = "MTP"
     else:
         target = vllm_config.model_config
         target_model_type = target.hf_config.model_type

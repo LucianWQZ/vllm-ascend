@@ -623,7 +623,7 @@ def test_official_nonuniform_prefill_uses_window_first_bank_without_an_eager_own
 
     monkeypatch.setattr(provider, "complete_native", complete)
     owner._draft_window_graph_binding_provider = provider
-    provider.capture_banks_for = select
+    monkeypatch.setattr(provider, "capture_banks_for", select)
     owner._eagle3_capture_call = None
     owner._eagle3_window_next_step, owner.num_speculative_steps = 0, 3
     owner.input_batch = SimpleNamespace(

@@ -65,10 +65,10 @@ def _seed_capture_workspace(
     workspace: DraftWindowGraphBucket,
     *,
     max_model_len: int,
-    provider: DraftWindowGraphBindingProvider,
 ) -> int:
     # The actual provider borrows this same canonical BlockTables owner.
     # Capture prepares its Full dummy tables before seeding the private bank.
+    provider = workspace.owner
     source = provider.table[: workspace.descriptor.num_reqs]
     destination = workspace.window_block_table
 
@@ -122,8 +122,8 @@ def ascend_prepare_dflash_inputs_to_capture(
         return state
     if not state.attn_metadata:
         raise RuntimeError("Draft Window capture builder produced no attention metadata")
-    capacity = _seed_capture_workspace(workspace, max_model_len=max_model_len, provider=context)
-    for name in context.group.layers:
+    capacity = _seed_capture_workspace(workspace, max_model_len=max_model_len)
+    for name in workspace.owner.group.layers:
         layer = state.attn_metadata[name]
         bind_draft_window_read(layer, workspace, capacity)
         layer.seq_lens_gpu = workspace.device_window_exact

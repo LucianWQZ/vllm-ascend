@@ -381,7 +381,7 @@ def test_parallel_capture_uses_registered_geometry_and_preserves_full_tables(gra
         assert identity is case.capture
         full = case.provider.table
         before = full.clone()
-        maximum = _seed_capture_workspace(read, max_model_len=16, provider=case.provider)
+        maximum = _seed_capture_workspace(read, max_model_len=16)
         assert maximum == 7 and read.cpu_window_exact.tolist() == [7, 7]
         assert read.device_window_exact.tolist() == [7, 7]
         assert torch.equal(full, before)

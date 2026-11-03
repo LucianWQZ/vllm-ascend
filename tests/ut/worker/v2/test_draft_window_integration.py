@@ -587,8 +587,8 @@ def test_dspark_mla_reuses_prepared_exact_cpu_without_another_transfer(contract,
     prepared = prepared_cpu_copies[0]
     assert prepared.tolist() == [21]  # Actual prefix copied by the helper, not padded capacity.
     assert any(isinstance(value, torch.Tensor) and value.data_ptr() == prepared.data_ptr() for value in owner)
-    assert owner.completion is not None
-    assert owner.completion is completion
+    assert runtime._owner is None
+    assert owner is runtime._pending
     common = result["draft.a"]
     assert common.seq_lens_cpu.tolist() == [9] + [0] * (padded_rows - 1)
     assert common.seq_lens.tolist() == [9] + [0] * (padded_rows - 1)
