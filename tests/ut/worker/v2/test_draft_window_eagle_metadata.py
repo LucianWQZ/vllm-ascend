@@ -168,7 +168,8 @@ def test_real_proposal_zero_uses_first_reader_and_keeps_static_k(proposal):
     with owner._eagle3_draft_window_proposal_scope(batch, dummy_run=False, is_profile=False, num_speculative_tokens=0):
         assert owner._eagle3_window_expected_steps == 1
         session.stage(session.resolve(n=1, tokens=4, ordinal=0), 0)
-        assert runtime._active_bank is session.resolve(n=1, tokens=4, ordinal=0)
+        assert runtime._active_bank is None
+        assert runtime._pending[0][0] is session.resolve(n=1, tokens=4, ordinal=0)
         runtime.finish_update()
     assert runtime._active_bank is None
     assert owner.num_speculative_steps == owner._eagle3_window_expected_steps == 3
@@ -180,14 +181,15 @@ def test_real_proposal_keeps_each_submitted_consumer_until_update(proposal):
     with owner._eagle3_draft_window_proposal_scope(batch, dummy_run=False, is_profile=False):
         first = session.resolve(n=1, tokens=4, ordinal=0)
         session.stage(first, 0)
-        assert runtime._active_bank is first and runtime._pending == [first]
+        assert runtime._active_bank is None and [bank for bank, _ in runtime._pending] == [first]
         runtime.finish_update()
         owner._snapshot_eagle3_decode_step_one(num_reqs=1, num_reqs_padded=1)
         ar = [session.resolve(n=1, tokens=1, ordinal=i) for i in range(2)]
         for step, bank in enumerate(ar, 1):
             session.stage(bank, step)
             assert owner._eagle3_window_next_step == step + 1
-        assert runtime._pending == ar and ar[0].params is not ar[1].params
+        assert [bank for bank, _ in runtime._pending] == ar
+        assert runtime.get(None)[0] is not runtime.get(None)[1]
         runtime.finish_update()
     assert runtime.proposal is None and runtime._active_bank is None and not runtime.quarantined
 
@@ -200,10 +202,10 @@ def test_update_failure_after_host_retirement_quarantines_the_provider(proposal)
         owner._eagle3_draft_window_proposal_scope(batch, dummy_run=False, is_profile=False, num_speculative_tokens=0),
     ):
         session.stage(session.resolve(n=1, tokens=4, ordinal=0), 0)
-        assert runtime._active_bank is not None and runtime._pending
+        assert runtime._active_bank is None and runtime._pending
         raise original
     assert caught.value is original
-    assert runtime.quarantined and runtime._active_bank is not None and runtime._pending
+    assert runtime.quarantined and runtime._active_bank is None and runtime._pending
     assert runtime.proposal is None
     with (
         pytest.raises(RuntimeError, match="quarantined"),
@@ -242,7 +244,7 @@ def test_actual_manager_failure_stays_inside_the_proposal_quarantine(monkeypatch
         desc = session.resolve(n=1, tokens=4 if first else 1, ordinal=0).descriptor
         manager._run_eagle_window_fullgraph(desc, session)
     assert caught.value is original
-    assert provider.quarantined and provider._active_bank is not None and provider._pending
+    assert provider.quarantined and provider._active_bank is None and provider._pending
 
 
 def test_business_window_proposal_requires_the_real_installed_graph_manager(proposal):
@@ -470,7 +472,8 @@ def test_eagle_stage_uses_the_bank_without_rebuilding_or_reading_target_metadata
                 owner._snapshot_eagle3_decode_step_one(num_reqs=1, num_reqs_padded=1)
             capture = session.resolve(n=1, tokens=4 if step == 0 else 1, ordinal=max(0, step - 1))
             session.stage(capture, step)
-            assert runtime._active_bank is capture and owner._eagle3_window_next_step == step + 1
+            assert runtime._active_bank is None and runtime._pending[-1][0] is capture
+            assert owner._eagle3_window_next_step == step + 1
             assert owner.model_state is target and owner.draft_vllm_config is draft_config
             if step == 0 or step == scheduled - 1:
                 runtime.finish_update()

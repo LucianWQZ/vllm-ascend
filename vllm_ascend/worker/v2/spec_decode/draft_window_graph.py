@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -40,8 +40,7 @@ class DraftWindowGraphBucket:
     window_block_table: torch.Tensor
     device_window_exact: torch.Tensor
     cpu_window_exact: torch.Tensor
-    owner: DraftWindowGraphBindingProvider = field(repr=False)
-    params: dict[str, Any] | None = field(default=None, repr=False)
+    owner: DraftWindowGraphBindingProvider
 
     def materialize(
         self,
@@ -119,7 +118,7 @@ class DraftWindowGraphBindingProvider:
         self._active_bank: DraftWindowGraphBucket | None = None
         self.quarantined = False
         self._carriers: dict[tuple[int, int], tuple[DraftWindowGraphBucket, ...]] = {}
-        self._pending: list[DraftWindowGraphBucket] = []
+        self._pending: list[tuple[DraftWindowGraphBucket, dict[str, Any]]] = []
 
     @property
     def table(self) -> torch.Tensor:
@@ -137,13 +136,11 @@ class DraftWindowGraphBindingProvider:
         self.proposal = full_read_rows
         try:
             yield
-            if self._pending or (self._active_bank is not None and self._active_bank.params is None):
+            if self._pending or self._active_bank is not None:
                 raise RuntimeError("Draft Window proposal has unfinished Graph consumers")
         except BaseException:
             self.quarantine()
             raise
-        else:
-            self._active_bank = None
         finally:
             self.proposal = None
 
@@ -160,17 +157,14 @@ class DraftWindowGraphBindingProvider:
         proposal = self.proposal
         if proposal is None or capture.owner is not self:
             raise RuntimeError("Draft Window bank has no current owning proposal")
-        if self._active_bank is not None and self._active_bank.params is None:
+        if self._active_bank is not None:
             raise RuntimeError("previous Draft Window consumer is still active")
-        if capture in self._pending:
-            raise RuntimeError("cannot overwrite a pending Draft Window consumer")
         if len(proposal) > capture.descriptor.num_reqs:
             raise ValueError("Draft Window active rows exceed the selected capture bucket")
         if capture.consumer_ordinal != len(self._pending):
-            raise RuntimeError("Graph Window consumers must prepare in their actual serial ordinal order")
-        if self._pending and self._pending[0].descriptor != capture.descriptor:
+            raise RuntimeError("Graph Window consumer is pending or outside its actual serial ordinal order")
+        if self._pending and self._pending[0][0].descriptor != capture.descriptor:
             raise RuntimeError("Graph consumers belong to different execution buckets")
-        capture.params = None
         self._active_bank = capture
         capture.materialize(cpu_full_exact, idx_mapping_np, frozen_intervals)
         return capture
@@ -181,7 +175,7 @@ class DraftWindowGraphBindingProvider:
         Tensor ownership stays with capture and reuse keeps the existing
         current-stream dependency; this is not a device-completion claim.
         """
-        if self.quarantined or self._active_bank is None or self._active_bank.params is not None:
+        if self.quarantined or self._active_bank is None:
             raise RuntimeError("Draft Window has no current native first consumer")
         self._active_bank = None
 
@@ -260,23 +254,20 @@ class DraftWindowGraphBindingProvider:
     def bind_current(self, descriptor: BatchExecutionDescriptor) -> None:
         """Publish the prepared bank directly to the original Graph resolver."""
         bank = self._active_bank
-        if self.quarantined or bank is None or bank.params is not None or bank.descriptor != descriptor:
+        if self.quarantined or bank is None or bank.descriptor != descriptor:
             raise RuntimeError("Graph replay does not own the current unconsumed preparation")
         query_width = descriptor.num_tokens // descriptor.num_reqs
-        bank.params = {
+        params = {
             "actual_seq_lengths": [query_width * (row + 1) for row in range(descriptor.num_reqs)],
             "actual_seq_lengths_kv": bank.cpu_window_exact.tolist(),
             "block_table": bank.window_block_table,
         }
-        self._pending.append(bank)
+        self._pending.append((bank, params))
+        self._active_bank = None
 
     def get(self, _provider: Any) -> tuple[dict[str, Any], ...]:
         """Resolve one payload per actual layer consumer, in capture order."""
-        result = []
-        for carrier in self._pending:
-            assert carrier.params is not None
-            result.append(carrier.params)
-        return tuple(result)
+        return tuple(params for _, params in self._pending)
 
     def validate_captured_graphs(self, graphs: Mapping[BatchExecutionDescriptor, Any]) -> None:
         """Check actual FIA tasks once, after the manager has stored its graphs.

@@ -155,18 +155,21 @@ def test_real_scope_reuses_addresses_clears_tail_and_preserves_full_and_target(g
         with c.provider.proposal_scope(context):
             bank = _prepare(c, ends)
             assert bank is c.capture and c.provider.proposal is context and bank is c.provider._active_bank
-            assert bank.params is None
+            assert c.provider.get(None) == ()
             c.provider.bind_current(bank.descriptor)
-            assert bank.params["block_table"] is bank.window_block_table
-            assert bank.params["actual_seq_lengths_kv"] == bank.cpu_window_exact.tolist()
+            (params,) = c.provider.get(None)
+            assert params["block_table"] is bank.window_block_table
+            assert params["actual_seq_lengths_kv"] == bank.cpu_window_exact.tolist()
             if previous is not None:
-                assert bank.params is not previous
+                assert params is not previous
                 assert not bank.window_block_table[1].count_nonzero()
                 assert bank.cpu_window_exact.tolist() == [3, 0]
-            previous = bank.params
+            previous = params
             _resolve(c.provider)
             c.provider.finish_update()
-            assert c.provider._active_bank is bank  # Host UPDATE is not reader completion.
+            assert c.provider._active_bank is None and not c.provider._pending
+            # Host binding retirement is not completion: capture still owns all backing.
+            assert c.provider.capture_identity_for(descriptor=bank.descriptor) is bank
         assert c.provider.proposal is None and c.provider._active_bank is None
     assert [t.data_ptr() for t in _tensors(c.capture)] == addresses
     assert torch.equal(c.provider.table, full) and torch.equal(c.owner.slot_mappings, slots)
@@ -186,7 +189,9 @@ def test_actual_scope_quarantines_partial_or_uncertain_submission(graph_buffers,
             _prepare(c, valid=[1, 1])
         if failure in ("after_update", "prepare"):
             raise RuntimeError("after native work")
-    assert c.provider.quarantined and c.provider._active_bank is c.capture
+    assert c.provider.quarantined
+    assert c.provider.capture_identity_for(descriptor=c.capture.descriptor) is c.capture
+    assert (c.provider._active_bank is c.capture) is (failure in ("unbound", "prepare"))
     with pytest.raises(RuntimeError, match="quarantined"), c.provider.proposal_scope(_proposal()):
         pass
 
@@ -628,3 +633,23 @@ def test_actual_manager_keeps_resolve_wait_replay_update_order(graph_buffers, mo
         assert bool(c.provider._pending) is (fails and not idle)
     assert c.provider.table.tolist() == [[11, 12, 13, 14], [21, 22, 23, 24]]
     assert c.owner.slot_mappings.tolist() == [[40, 80]]
+
+
+def test_actual_parallel_manager_rejects_missing_preparation_before_replay(graph_buffers, monkeypatch):
+    from vllm_ascend.worker.v2.spec_decode.dflash import aclgraph
+
+    c = graph_buffers
+    manager = object.__new__(aclgraph.DFlashAclGraphManager)
+    manager.speculator = SimpleNamespace(
+        _draft_window_graph_binding_provider=c.provider, attn_backends={"draft.layer": object()}
+    )
+    monkeypatch.setattr(aclgraph, "use_updatable_graph", lambda _: True)
+    monkeypatch.setattr(
+        aclgraph.DFlashCudaGraphManager,
+        "run_fullgraph",
+        lambda *_: pytest.fail("an unprepared window reached the actual Graph replay"),
+    )
+    with pytest.raises(RuntimeError, match="unconsumed preparation"), c.provider.proposal_scope(_proposal()):
+        manager.run_fullgraph(c.capture.descriptor)
+    assert c.provider.quarantined and not c.provider._pending
+    assert c.provider.capture_identity_for(descriptor=c.capture.descriptor) is c.capture

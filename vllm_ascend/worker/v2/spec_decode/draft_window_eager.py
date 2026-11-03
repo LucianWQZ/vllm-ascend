@@ -119,8 +119,6 @@ class DraftWindowGraphInputMixin:
         provider = self._draft_window_graph_binding_provider
         with provider.proposal_scope(rows):
             yield
-            if provider._active_bank is None:
-                raise RuntimeError("Draft Graph proposal completed without consuming its current inputs")
 
     def _build_uniform_attn_metadata(
         self,
