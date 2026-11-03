@@ -4,8 +4,8 @@
 
 An enabled runtime is installed only after the actual Draft consumers have
 been checked. Target graph selection and Full write/query operands are owned
-by the existing runner. Window projections and built Draft metadata are owned
-by a proposal until its final consumer event completes.
+by the existing runner. Window projections and built Draft metadata remain owned
+until the next existing blocking exact copy completes earlier stream readers.
 """
 
 from collections.abc import Iterator
@@ -15,10 +15,6 @@ from typing import Any
 import numpy as np
 import torch
 
-from vllm_ascend.worker.v2.spec_decode.draft_window_lifetime import (
-    DraftWindowOwner,
-    DraftWindowOwnerPool,
-)
 from vllm_ascend.worker.v2.spec_decode.draft_window_plan import (
     compute_draft_window_start,
 )
@@ -76,8 +72,9 @@ class DraftWindowRuntime:
         if not read_groups:
             raise NotImplementedError("Draft Window requires at least one certified read group")
         self.anchor_block_span = int(speculator.block_tables.kernel_block_sizes[read_groups[0]])
-        self.pool = DraftWindowOwnerPool(int(speculator.vllm_config.max_concurrent_batches))
-        self._owner: DraftWindowOwner | None = None
+        self._pending: list[object] = []
+        self._poisoned = False
+        self._owner: list[object] | None = None
         self._input_batch: Any = None
         self._continuing: np.ndarray | None = None
         self._bypass = False
@@ -163,40 +160,46 @@ class DraftWindowRuntime:
             finally:
                 self._bypass = False
             return
-        with self.pool.operation() as owner:
-            self._owner = owner
-            self._input_batch = input_batch
-            self._build_count = 0
+        if self._poisoned:
+            raise RuntimeError("Draft Window execution is quarantined: device completion is unknown")
+        owner: list[object] = []
+        self._owner = owner
+        self._input_batch = input_batch
+        self._build_count = 0
+        self._eagle_window = None
+        try:
+            # Fixed 544 preserves this Host mapping and prompt progress
+            # throughout propose; validate it once before native preparation.
+            num_reqs = input_batch.num_reqs
+            rows = input_batch.idx_mapping_np[:num_reqs]
+            counts = self.speculator.block_tables.num_blocks.np
+            if len(input_batch.req_ids) != num_reqs:
+                raise RuntimeError("Draft Window request mapping does not cover the active preparation")
+            if rows.shape != (num_reqs,) or np.any(rows < 0) or np.any(rows >= counts.shape[1]):
+                raise ValueError("Draft allocation counts require active persistent request slots")
+            self._continuing = continuing_prefill_rows(input_batch, num_reqs)
+            # Preparation and builders enqueue copies/kernels before model
+            # forward. Even a later host error must retain this proposal.
+            yield
+            # DFlash/DSpark keep context KV current when the scheduler
+            # requests zero drafts. That upstream branch writes KV but
+            # never executes draft attention or allocates Window operands.
+            # Its context buffers remain owned by the original speculator.
+            if context_kv_only and self._build_count:
+                raise RuntimeError("Context-only Draft KV update unexpectedly consumed a read projection")
+            if not context_kv_only and not self._build_count:
+                raise RuntimeError("Draft Window proposal did not consume a read projection")
+            if self.speculator.method == "eagle3" and self._build_count != expected_eagle_steps:
+                raise RuntimeError("Eagle3 proposal did not consume every configured draft step")
+        except BaseException:
+            self._poisoned = True
+            raise
+        finally:
+            self._pending.extend(owner)
+            self._owner = None
+            self._input_batch = None
+            self._continuing = None
             self._eagle_window = None
-            try:
-                # Fixed 544 preserves this Host mapping and prompt progress
-                # throughout propose; validate it once before native preparation.
-                num_reqs = input_batch.num_reqs
-                rows = input_batch.idx_mapping_np[:num_reqs]
-                counts = self.speculator.block_tables.num_blocks.np
-                if len(input_batch.req_ids) != num_reqs:
-                    raise RuntimeError("Draft Window request mapping does not cover the active preparation")
-                if rows.shape != (num_reqs,) or np.any(rows < 0) or np.any(rows >= counts.shape[1]):
-                    raise ValueError("Draft allocation counts require active persistent request slots")
-                self._continuing = continuing_prefill_rows(input_batch, num_reqs)
-                # Preparation and builders enqueue copies/kernels before model
-                # forward. Even a later host error must retain this proposal.
-                yield
-                # DFlash/DSpark keep context KV current when the scheduler
-                # requests zero drafts. That upstream branch writes KV but
-                # never executes draft attention. Retain completion protection
-                # for its writes without demanding a nonexistent read view.
-                if context_kv_only and self._build_count:
-                    raise RuntimeError("Context-only Draft KV update unexpectedly consumed a read projection")
-                if not context_kv_only and not self._build_count:
-                    raise RuntimeError("Draft Window proposal did not consume a read projection")
-                if self.speculator.method == "eagle3" and self._build_count != expected_eagle_steps:
-                    raise RuntimeError("Eagle3 proposal did not consume every configured draft step")
-            finally:
-                self._owner = None
-                self._input_batch = None
-                self._continuing = None
-                self._eagle_window = None
 
     def metadata_callback(
         self,
@@ -233,7 +236,7 @@ class DraftWindowRuntime:
         def retain(*objects: object) -> None:
             if self._owner is not owner:
                 raise RuntimeError("Draft Window callback belongs to a stale proposal")
-            owner.retained.extend(objects)
+            owner.extend(objects)
 
         full_exact = exact = proposal_exact = starts = None
         dense, native_full = False, False
@@ -263,6 +266,11 @@ class DraftWindowRuntime:
                     # routes still synchronize here. An upper is never exact.
                     exact = full_exact[:num_reqs].to(device="cpu", dtype=torch.int32, copy=True)
                 retain(exact)
+                # Fixed 544 prepares every ordinary Window consumer on the
+                # worker execution stream. Its existing blocking exact copy
+                # completes all earlier proposal readers on that same stream.
+                # MLA supplies the copy completed immediately before this call.
+                self._pending.clear()
                 if native_full:
                     if step == 0 and not torch.equal(exact, proposal_exact):
                         raise ValueError("Full prompt metadata cannot include rejected query padding")
@@ -423,14 +431,14 @@ class DraftWindowRuntime:
         if owner is None:
             raise RuntimeError("Eagle3 length snapshot has no active Draft Window proposal")
         last_positions = positions.index_select(0, indices)
-        owner.retained.append(last_positions)
+        owner.append(last_positions)
         live_end = last_positions.to(dtype=torch.int32)
-        owner.retained.append(live_end)
+        owner.append(live_end)
         live_end.add_(1)
         pair = torch.stack((native_extent[:num_reqs], live_end))
-        owner.retained.append(pair)
+        owner.append(pair)
         snapshot = pair.to(device="cpu", dtype=torch.int32, copy=True)
-        owner.retained.append(snapshot)
+        owner.append(snapshot)
         extent_cpu, live_cpu = snapshot[0], snapshot[1]
         if bool(
             (
@@ -465,4 +473,4 @@ class DraftWindowRuntime:
             return
         if self._owner is None:
             raise RuntimeError("Draft Window metadata has no active proposal")
-        self._owner.retained.append(metadata)
+        self._owner.append(metadata)
