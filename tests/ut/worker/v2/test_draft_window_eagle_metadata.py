@@ -66,7 +66,7 @@ def test_ordinary_eager_forward_uses_the_existing_method_once(monkeypatch, fail)
 def test_graph_owner_keeps_normal_prefill_decode_metadata_and_updates(monkeypatch):
     for name in ("_build_attn_metadata", "_update_decode_attn_metadata"):
         assert getattr(Eagle3GraphIntegrationMixin, name) is getattr(AscendTargetDependentARSpeculator, name)
-    owner = object.__new__(Eagle3GraphIntegrationMixin)
+    owner: Any = object.__new__(Eagle3GraphIntegrationMixin)
     expected = object()
 
     def prefill(current, *args, **kwargs):
@@ -114,7 +114,7 @@ def proposal():
     )
     from vllm_ascend.worker.v2.spec_decode.draft_window_policy import resolve_draft_window_policy
 
-    owner = Eagle3DraftWindowMixin()
+    owner: Any = Eagle3DraftWindowMixin()
     owner.method, owner.num_speculative_steps, owner.max_model_len = "eagle3", 3, 32
     owner.speculative_config = SimpleNamespace(uses_dynamic_speculative_decoding=lambda: False)
     table = torch.arange(16, dtype=torch.int32).reshape(2, 8)
@@ -213,7 +213,7 @@ def test_update_failure_after_host_retirement_quarantines_the_provider(proposal)
 
 
 @pytest.mark.parametrize("first", [False, True])
-def test_actual_manager_failure_stays_inside_the_proposal_quarantine(proposal, first):
+def test_actual_manager_failure_stays_inside_the_proposal_quarantine(monkeypatch, proposal, first):
     from vllm_ascend.worker.v2.spec_decode.target_dependent_ar.aclgraph import AutoRegressiveAclGraphManager
 
     owner, batch, session, provider, _ = proposal
@@ -226,7 +226,7 @@ def test_actual_manager_failure_stays_inside_the_proposal_quarantine(proposal, f
         assert len(provider._pending) == (1 if first else 2)
         raise original
 
-    manager._updatable_graph_replay = replay
+    monkeypatch.setattr(manager, "_updatable_graph_replay", replay)
     with (
         pytest.raises(RuntimeError) as caught,
         owner._eagle3_draft_window_proposal_scope(
@@ -518,7 +518,7 @@ def test_official_nonuniform_prefill_uses_window_first_bank_without_an_eager_own
     target = {"draft": target_layer}
     slot_map = {"draft": slots}
     original_target_table = target_layer.block_tables.clone()
-    bank = SimpleNamespace(
+    bank: Any = SimpleNamespace(
         window_block_table=torch.tensor([[1, 2, 0, 0], [5, 6, 7, 8]], dtype=torch.int32),
         device_window_exact=torch.tensor([5, 11], dtype=torch.int32),
         cpu_window_exact=torch.tensor([5, 11], dtype=torch.int32),
@@ -551,7 +551,7 @@ def test_official_nonuniform_prefill_uses_window_first_bank_without_an_eager_own
         events.append("complete_native")
         complete_native()
 
-    provider.complete_native = complete
+    monkeypatch.setattr(provider, "complete_native", complete)
     owner._draft_window_graph_binding_provider = provider
     owner._eagle3_graph_session = SimpleNamespace(_capture_call=None, resolve=resolve)
     owner._eagle3_window_next_step, owner.num_speculative_steps = 0, 3
