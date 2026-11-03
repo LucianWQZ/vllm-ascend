@@ -247,6 +247,23 @@ class DraftGraphSupportTest(unittest.TestCase):
             config.speculative_config.enforce_eager = True
             self.assertFalse(_use_graph_window_owner(config, policy, support))
 
+    def test_factory_checks_static_graph_topology_before_source_creation(self):
+        from vllm_ascend.ascend_config import validate_draft_window_graph_config
+        from vllm_ascend.device import hardware_profile
+
+        config = self.config()
+        support = self.resolve(config)
+        for field in ("pipeline_parallel_size", "prefill_context_parallel_size", "decode_context_parallel_size"):
+            with self.subTest(field=field):
+                setattr(config.parallel_config, field, 2)
+                with self.assertRaisesRegex(RuntimeError, "PP=PCP=DCP=1"):
+                    validate_draft_window_graph_config(config, support=support)
+                setattr(config.parallel_config, field, 1)
+        with patch.object(
+            hardware_profile, "get_current_hardware_profile", return_value=NS(attention_backend_family=None)
+        ), self.assertRaisesRegex(NotImplementedError, "STANDARD"):
+            validate_draft_window_graph_config(config, support=support)
+
     def test_real_factory_passes_its_single_frozen_support_to_validation(self):
         from vllm_ascend import ascend_config, envs
         from vllm_ascend.worker.v2 import spec_decode as factory
@@ -254,7 +271,7 @@ class DraftGraphSupportTest(unittest.TestCase):
 
         config = self.config(rows=2)
         before = vars(config).copy()
-        policy = NS(enabled=True, state="on")
+        policy = NS(enabled=True, reason=None)
         owner = NS(_initialize_draft_window_source_capability=lambda: None)
         with (
             patch.object(envs, "VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH", True),
@@ -282,7 +299,7 @@ class DraftGraphSupportTest(unittest.TestCase):
         from vllm_ascend.worker.v2 import spec_decode as factory
 
         config = self.config()
-        policy = NS(enabled=True, state="on")
+        policy = NS(enabled=True, reason=None)
         for field in ("_draft_window_policy", "draft_window_policy", "_draft_window_runtime"):
             owner = NS(_initialize_draft_window_source_capability=lambda: None)
             setattr(owner, field, object())

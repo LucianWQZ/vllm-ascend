@@ -25,11 +25,10 @@ def create_draft_window_graph_provider(owner: Any) -> "DraftWindowGraphBindingPr
     Check the actual source layout directly, without constructing an
     artificial eager capability decision.
     """
-    from vllm_ascend.worker.v2.spec_decode.draft_window_graph_runtime import validate_graph_context
-
     policy = owner._draft_window_policy
     vllm_config, block_tables = owner.vllm_config, owner.block_tables
-    validate_graph_context(vllm_config, block_tables)
+    if getattr(block_tables, "cp_size", 1) != 1:
+        raise RuntimeError("Draft Window Graph requires unsharded Draft tables")
     if not policy.enabled:
         raise ValueError("Graph source requires an eligible Window policy")
     method = owner.speculative_config.method

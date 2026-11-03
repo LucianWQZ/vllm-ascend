@@ -15,7 +15,6 @@ from typing import Any
 from vllm.config.compilation import CUDAGraphMode
 
 import vllm_ascend.envs as envs
-from vllm_ascend.device.hardware_profile import AttentionBackendFamily, get_current_hardware_profile
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
     DraftWindowGraphBindingProvider,
 )
@@ -23,25 +22,6 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
 
 def draft_window_graph_enabled() -> bool:
     return bool(envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH)
-
-
-def validate_graph_context(vllm_config: Any, block_tables: Any) -> None:
-    """Check the actual executor and source, without copying feature state."""
-    if not draft_window_graph_enabled():
-        raise NotImplementedError("Draft Window Graph requires its explicit supported Graph configuration")
-    if get_current_hardware_profile().attention_backend_family is not AttentionBackendFamily.STANDARD:
-        raise NotImplementedError("Draft Window Graph requires the STANDARD hardware family")
-    if vllm_config.compilation_config.cudagraph_mode.name != "FULL_DECODE_ONLY":
-        raise ValueError("Draft Window Graph requires FULL_DECODE_ONLY")
-    parallel = vllm_config.parallel_config
-    if (
-        any(
-            getattr(parallel, name) != 1
-            for name in ("pipeline_parallel_size", "prefill_context_parallel_size", "decode_context_parallel_size")
-        )
-        or getattr(block_tables, "cp_size", 1) != 1
-    ):
-        raise RuntimeError("Draft Window Graph requires PP=PCP=DCP=1 and unsharded Draft tables")
 
 
 def install_parallel_graph(owner: Any) -> DraftWindowGraphBindingProvider:

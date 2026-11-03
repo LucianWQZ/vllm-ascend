@@ -63,6 +63,16 @@ def validate_additional_config_bool(value: Any, path: str) -> bool:
 
 def validate_draft_window_graph_config(vllm_config: Any, *, support: Any) -> None:
     """Validate topology after the factory resolves policy and Graph support."""
+    from vllm_ascend.device.hardware_profile import AttentionBackendFamily, get_current_hardware_profile
+
+    if get_current_hardware_profile().attention_backend_family is not AttentionBackendFamily.STANDARD:
+        raise NotImplementedError("Draft Window Graph requires the STANDARD hardware family")
+    parallel = vllm_config.parallel_config
+    if any(
+        getattr(parallel, field) != 1
+        for field in ("pipeline_parallel_size", "prefill_context_parallel_size", "decode_context_parallel_size")
+    ):
+        raise RuntimeError("Draft Window Graph requires PP=PCP=DCP=1")
     speculative = vllm_config.speculative_config
     # The qualified consumer contract already validates its exact topology,
     # buckets, static K and OFF/ON window. Do not parse/check it a second time.
