@@ -24,9 +24,9 @@ from vllm.v1.worker.gpu.spec_decode.dflash.cudagraph import (
 )
 from vllm.v1.worker.utils import AttentionGroup
 
-from vllm_ascend.worker.v2.spec_decode.draft_window import DraftWindowWorkspace
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
     DraftWindowGraphBindingProvider,
+    DraftWindowGraphBucket,
     DraftWindowGraphRoute,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph_metadata import bind_draft_window_read
@@ -63,14 +63,14 @@ def draft_window_dflash_capture_scope(
 
 
 def _seed_capture_workspace(
-    workspace: DraftWindowWorkspace,
+    workspace: DraftWindowGraphBucket,
     *,
     max_model_len: int,
     provider: DraftWindowGraphBindingProvider,
 ) -> int:
     # The actual provider borrows this same canonical BlockTables owner.
     # Capture prepares its Full dummy tables before seeding the private bank.
-    source = provider.source.table[: workspace.max_num_reqs]
+    source = provider.source.table[: workspace.descriptor.num_reqs]
     destination = workspace.window_block_table
 
     capture_upper = min(
@@ -117,7 +117,7 @@ def ascend_prepare_dflash_inputs_to_capture(
         )
     route = DraftWindowGraphRoute.DSPARK if context.method == "dspark" else DraftWindowGraphRoute.DFLASH
     identity = context.capture_banks_for(route=route, num_reqs=num_reqs, num_tokens=num_tokens)[0]
-    workspace = context.startup_capture_workspace(identity)
+    workspace = identity
 
     # Keep dummy InputBatch, Full slots, query geometry and model-specific
     # metadata construction in the fixed MRV2 helper. Only replace the actual

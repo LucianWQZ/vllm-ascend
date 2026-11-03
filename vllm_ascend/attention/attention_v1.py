@@ -350,7 +350,7 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         # TODO: This will be moved to propose and deleted after fia ops fixed.
         device_read = getattr(common_attn_metadata, "_draft_window_device_read", None)
         seq_lens = (
-            device_read.capacity_cpu(common_attn_metadata)
+            common_attn_metadata.seq_lens_cpu_upper_bound
             if device_read is not None
             else _select_seq_lens(
                 common_attn_metadata,

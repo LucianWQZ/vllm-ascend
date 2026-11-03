@@ -20,7 +20,6 @@ def test_real_private_copy_failure_retains_its_actual_operands(monkeypatch, stag
     table = torch.arange(32, dtype=torch.int32, device="npu").reshape(2, 16)
     before = table.clone()
     source = (table[list((1, 0))], (16, 16), 128)
-    exact = torch.tensor([1151, 1408], dtype=torch.int32, device="npu")
     pool = DraftWindowOwnerPool(1)
     events, submitted = [], []
     original_copy = torch.Tensor.copy_
@@ -48,16 +47,13 @@ def test_real_private_copy_failure_retains_its_actual_operands(monkeypatch, stag
     monkeypatch.setattr(torch.Tensor, "copy_", copy)
     full_rows = torch.tensor([True, True] if stage == "phase" else [False, True])
     try:
-        with pytest.raises(RuntimeError, match="after real NPU copy"), pool.operation(lambda: None) as owner:
+        with pytest.raises(RuntimeError, match="after real NPU copy"), pool.operation() as owner:
             prepare_dense_draft_read(
                 *source,
-                exact_device=exact,
                 exact_cpu=torch.tensor([1151, 1408], dtype=torch.int32),
                 query_ends_cpu=torch.tensor([1151, 1408], dtype=torch.int32),
                 frozen_starts=torch.tensor([0, 384], dtype=torch.int32),
                 upper_cpu=torch.tensor([1154, 1411], dtype=torch.int32),
-                window_size=1024,
-                anchor_span=128,
                 query_width=4,
                 causal=False,
                 full_rows_cpu=full_rows,
@@ -102,7 +98,7 @@ def test_real_metadata_fill_keeps_destination_quarantined(monkeypatch):
 
     monkeypatch.setattr(torch.Tensor, "__setitem__", filled)
     try:
-        with pytest.raises(RuntimeError, match="after real metadata fill"), pool.operation(lambda: None) as owner:
+        with pytest.raises(RuntimeError, match="after real metadata fill"), pool.operation() as owner:
             pool.retain(owner, read)
             read.apply(SimpleNamespace(num_reqs=3))
         assert len(submitted) == 1

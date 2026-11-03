@@ -26,23 +26,8 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_plan import (
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_policy import DraftWindowPolicyDecision
 from vllm_ascend.worker.v2.spec_decode.draft_window_read import (
-    DraftReadView,
     materialize_draft_read,
 )
-
-
-class _NPUCompletion:
-    def __init__(self) -> None:
-        # Construction and recording both execute under the owner pool's
-        # failure guard. No fallback token can substitute for either failure.
-        self.event = torch.npu.Event()
-        self.event.record(torch.npu.current_stream())
-
-    def is_complete(self) -> bool:
-        return bool(self.event.query())
-
-    def wait(self) -> None:
-        self.event.synchronize()
 
 
 def continuing_prefill_rows(input_batch: Any, num_reqs: int) -> np.ndarray:
@@ -101,6 +86,7 @@ class DraftWindowRuntime:
         self.pool = DraftWindowOwnerPool(int(speculator.vllm_config.max_concurrent_batches))
         self._owner: DraftWindowOwner | None = None
         self._input_batch: Any = None
+        self._continuing: np.ndarray | None = None
         self._bypass = False
         self._build_count = 0
         self._eagle_plans: tuple[DraftWindowPlan, ...] | None = None
@@ -214,13 +200,15 @@ class DraftWindowRuntime:
             finally:
                 self._bypass = False
             return
-        with self.pool.operation(_NPUCompletion) as owner:
+        with self.pool.operation() as owner:
             self._owner = owner
             self._input_batch = input_batch
             self._build_count = 0
             self._eagle_plans = None
             self._next_step = 0
             try:
+                # Fixed MRV2 does not change Host prompt progress during propose.
+                self._continuing = continuing_prefill_rows(input_batch, input_batch.num_reqs)
                 # Preparation and builders enqueue copies/kernels before model
                 # forward. Even a later host error must retain this proposal.
                 yield
@@ -237,6 +225,7 @@ class DraftWindowRuntime:
             finally:
                 self._owner = None
                 self._input_batch = None
+                self._continuing = None
                 self._eagle_plans = None
 
     def metadata_callback(
@@ -286,13 +275,13 @@ class DraftWindowRuntime:
             ):
                 raise ValueError("Prepared exact device input must cover the active int32 request prefix")
             self.pool.retain(owner, prepared_exact_cpu)
-        continuing = continuing_prefill_rows(batch, num_reqs)
+        continuing = self._continuing
+        assert continuing is not None
         counts = self.speculator.block_tables.num_blocks.np
         rows = batch.idx_mapping_np[:num_reqs]
         if rows.shape != (num_reqs,) or np.any(rows < 0) or np.any(rows >= counts.shape[1]):
             raise ValueError("Draft allocation counts require active persistent request slots")
         retain = lambda *objects: self.pool.retain(owner, *objects)
-        seen: set[int] = set()
         full_exact = exact = proposal_exact = starts = None
         dense, native_full = False, False
 
@@ -300,15 +289,14 @@ class DraftWindowRuntime:
             nonlocal full_exact, exact, proposal_exact, starts, dense, native_full
             if gid not in self.gids:
                 return
-            if self._owner is not owner or gid in seen:
-                raise RuntimeError(
-                    "Draft Window callback belongs to a stale proposal or its group was already projected"
-                )
-            if common.num_reqs < num_reqs or common.seq_lens.ndim != 1 or common.seq_lens.numel() < num_reqs:
-                raise ValueError("Draft Window metadata does not cover the active requests")
-            if hasattr(common, "_draft_window_read") or hasattr(common, "_draft_window_device_read"):
-                raise ValueError("Draft Window requires fresh, unprojected common metadata")
+            if self._owner is not owner:
+                raise RuntimeError("Draft Window callback belongs to a stale proposal")
+            retain(common)
+            # The real builder enumerates each KV group once and constructs a
+            # fresh Common from this same preparation before invoking us.
             if full_exact is None:
+                if common.num_reqs < num_reqs or common.seq_lens.ndim != 1 or common.seq_lens.numel() < num_reqs:
+                    raise ValueError("Draft Window metadata does not cover the active requests")
                 full_exact = common.seq_lens
                 retain(full_exact)
                 dense, native_full = self._read_mode(step, num_reqs, common, continuing)
@@ -369,8 +357,9 @@ class DraftWindowRuntime:
                             for row in range(num_reqs)
                         ]
                     starts = torch.tensor(starts_list, dtype=torch.int32)
-            elif common.seq_lens.data_ptr() != full_exact.data_ptr():
-                raise ValueError("Draft Window groups must share current preparation lengths")
+                self._build_count += 1
+                if self.method == "eagle3":
+                    self._next_step += 1
             assert exact is not None
             if native_full:
                 exact_cpu = torch.zeros(common.num_reqs, dtype=torch.int32, device="cpu")
@@ -379,7 +368,6 @@ class DraftWindowRuntime:
                 retain(common, exact_cpu, common.seq_lens, common.block_table_tensor)
             else:
                 assert starts is not None
-                view: Any
                 table = common.block_table_tensor
                 # The framework gathered this batch order before Target forward.
                 # Canonical allocation counts remain indexed by persistent slots.
@@ -401,29 +389,21 @@ class DraftWindowRuntime:
                     if continuing.all():
                         # Keep the native band/table, supplying the same exact CPU
                         # snapshot so its builder need not read device E again.
-                        view = DraftReadView(
-                            common.block_table_tensor,
-                            common.seq_lens,
-                            exact,
-                            common.seq_lens_cpu_upper_bound,
-                            common.max_seq_len,
-                            num_reqs,
-                        )
+                        common.seq_lens_cpu = common._seq_lens_cpu = exact
+                        common._draft_window_exact_cpu = exact
+                        retain(exact)
                     else:
                         native_starts = torch.clamp(exact - self.window_size, min=0).to(torch.int64)
                         native_starts = native_starts // block_span * block_span
                         native_starts[torch.from_numpy(continuing)] = 0
                         if bool((exact - native_starts < self.speculator.num_query_per_req).any()):
                             raise ValueError("Extra Window must cover every native query")
-                        view = materialize_draft_read(
-                            table,
+                        materialize_draft_read(
+                            common,
                             columns,
                             block_span,
                             exact_cpu=exact,
-                            exact_device=common.seq_lens,
-                            upper_cpu=common.seq_lens_cpu_upper_bound,
                             starts_cpu=native_starts,
-                            padded_rows=num_reqs,
                             retain=retain,
                         )
                 elif dense:
@@ -438,12 +418,9 @@ class DraftWindowRuntime:
                         table,
                         columns,
                         block_span,
-                        exact_device=common.seq_lens,
                         exact_cpu=proposal_exact if first else exact,
                         query_ends_cpu=exact,
                         upper_cpu=common.seq_lens_cpu_upper_bound[:num_reqs],
-                        window_size=self.window_size,
-                        anchor_span=self.anchor_block_span,
                         query_width=query_width,
                         causal=common.causal,
                         frozen_starts=starts,
@@ -454,25 +431,17 @@ class DraftWindowRuntime:
                         query_start_loc_device=common.query_start_loc[: num_reqs + 1] if ragged else None,
                         retain=retain,
                     )
+                    retain(view)
+                    view.apply(common)
                 else:
-                    view = materialize_draft_read(
-                        table,
+                    materialize_draft_read(
+                        common,
                         columns,
                         block_span,
                         exact_cpu=exact,
-                        exact_device=common.seq_lens,
-                        upper_cpu=common.seq_lens_cpu_upper_bound[:num_reqs],
                         starts_cpu=starts,
-                        padded_rows=common.num_reqs,
                         retain=retain,
                     )
-                retain(view, common)
-                view.apply(common)
-            seen.add(gid)
-            if len(seen) == len(self.gids):
-                self._build_count += 1
-                if self.method == "eagle3":
-                    self._next_step += 1
 
         return apply
 
@@ -490,21 +459,16 @@ class DraftWindowRuntime:
                 dense
                 and continuing.all()
                 and (drafts is None or not drafts[:num_reqs].any())
-                and getattr(self.speculator, "advance_draft_positions", False)
                 and not getattr(self.speculator, "replicated_pcp", False)
             ):
                 return False, True
             dense = dense and not (
-                self._input_batch.is_prefilling_np[:num_reqs].all()
-                or not getattr(self.speculator, "advance_draft_positions", False)
-                or getattr(self.speculator, "replicated_pcp", False)
+                self._input_batch.is_prefilling_np[:num_reqs].all() or getattr(self.speculator, "replicated_pcp", False)
             )
         if self.method == "eagle3" and step == 0:
             prefilling = self._input_batch.is_prefilling_np[:num_reqs]
             dense = dense and (
-                not prefilling.all()
-                and bool(getattr(self.speculator, "advance_draft_positions", False))
-                and not getattr(self.speculator, "replicated_pcp", False)
+                not prefilling.all() and not getattr(self.speculator, "replicated_pcp", False)
                 if prefilling.any()
                 else int(common.query_start_loc_cpu[: num_reqs + 1].diff().max()) <= self.static_k + 1
             )

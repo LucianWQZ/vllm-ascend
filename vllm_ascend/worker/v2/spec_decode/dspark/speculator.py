@@ -16,7 +16,6 @@
 # This file is a part of the vllm-ascend project.
 #
 from collections.abc import Mapping, Sequence
-from contextlib import AbstractContextManager, nullcontext
 from typing import Any, cast
 
 import numpy as np
@@ -361,32 +360,16 @@ class AscendDSparkSpeculator(DraftWindowGraphInputMixin, LmheadTPDraftSamplingMi
         """Build Ascend draft metadata through the upstream attention hook."""
         runtime = getattr(self, "_draft_window_runtime", None)
         if self.attn_architecture not in ("GQA", "MLA"):
-            # These consumers keep their existing preparation. Window changes
-            # only the fresh common read view and its private builder owner.
-            metadata_scope: AbstractContextManager = nullcontext()
-            if runtime is not None:
-                assert self.input_batch is not None
-                metadata_scope = build_attn_metadata_factory(
-                    self.input_buffers.positions,
-                    batch_desc.num_tokens,
-                    torch.from_numpy(self.input_batch.is_prefilling_np),
-                    parallel_config=self.attn_vllm_config.parallel_config,
-                    common_metadata_callback=runtime.metadata_callback(step, num_reqs),
-                )
-            with metadata_scope:
-                metadata = super()._build_attn_metadata(
-                    num_reqs=num_reqs,
-                    batch_desc=batch_desc,
-                    query_start_loc_np=query_start_loc_np,
-                    seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
-                    step=step,
-                    causal=causal,
-                    dcp_local_seq_lens=dcp_local_seq_lens,
-                    slot_mappings=slot_mappings,
-                )
-            if runtime is not None:
-                runtime.retain_metadata(metadata)
-            return metadata
+            return super()._build_attn_metadata(
+                num_reqs=num_reqs,
+                batch_desc=batch_desc,
+                query_start_loc_np=query_start_loc_np,
+                seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+                step=step,
+                causal=causal,
+                dcp_local_seq_lens=dcp_local_seq_lens,
+                slot_mappings=slot_mappings,
+            )
 
         num_reqs_padded = batch_desc.num_reqs or num_reqs
         # The draft forward may process padded inputs outside FULL graphs, but

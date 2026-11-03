@@ -73,7 +73,7 @@ class Eagle3GraphSession:
                     for capture in captures:
                         # Seed dummy contents before any GLOBAL capture.
                         # Synchronous H2D is forbidden inside the callback.
-                        read = self.provider.startup_capture_workspace(capture)
+                        read = capture
                         capacity = min(
                             owner.max_model_len, self.provider.source.window_size + group.table_column_span - 1
                         )
@@ -111,7 +111,7 @@ class Eagle3GraphSession:
         if identity is None:
             raise RuntimeError("Eagle3 capture visited more consumers than its real descriptor")
         n = identity.descriptor.num_reqs
-        read = self.provider.startup_capture_workspace(identity)
+        read = identity
         # Persistent dummy banks were initialized before GLOBAL capture.
         # No CPU->device copy, fill or reset is allowed in this callback.
         capacity = min(
@@ -135,19 +135,6 @@ class Eagle3GraphSession:
         return private
 
     def stage(self, capture: DraftWindowGraphBucket, step: int) -> None:
-        owner = self.owner
-        n = capture.descriptor.num_reqs
-        try:
-            self.provider.require_reusable()
-            inputs = owner._materialize_eagle3_step(
-                step=step,
-                num_reqs=owner.input_batch.num_reqs,
-                num_reqs_padded=n,
-                output_workspace=self.provider.prepare_workspace(capture),
-            )
-            self.provider.bind_read_carrier(capture_identity=capture, inputs=inputs)
-            self.provider.retire_generation(inputs)
-            owner._eagle3_window_next_step = inputs.step + 1
-        except BaseException:
-            owner._quarantine_eagle3_window()
-            raise
+        self.owner._materialize_eagle3_step(capture, step)
+        self.provider.bind_current(capture.descriptor)
+        self.owner._eagle3_window_next_step = step + 1

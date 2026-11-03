@@ -144,10 +144,9 @@ def _draft_window_context_kv_scope(owner, input_batch):
     if runtime.quarantined:
         raise RuntimeError("Draft Window backing is quarantined before a context-only KV write")
     from vllm_ascend.worker.v2.spec_decode.draft_window_lifetime import DraftWindowOwnerPool
-    from vllm_ascend.worker.v2.spec_decode.draft_window_runtime import _NPUCompletion
 
     if (
-        owner._draft_window_proposal is not None
+        runtime.proposal is not None
         or getattr(owner, "_draft_window_bypass_active", False)
         or getattr(owner, "_draft_window_context_kv_active", False)
     ):
@@ -158,7 +157,7 @@ def _draft_window_context_kv_scope(owner, input_batch):
         owner._draft_window_context_kv_pool = pool
     owner._draft_window_context_kv_active = True
     try:
-        with pool.operation(_NPUCompletion) as completion_owner:
+        with pool.operation() as completion_owner:
             pool.retain(completion_owner, owner, input_batch)
             yield
     except BaseException:
@@ -355,22 +354,15 @@ class AscendDFlashSpeculator(DraftWindowGraphInputMixin, LmheadTPDraftSamplingMi
         slot_mappings: torch.Tensor | None = None,
     ) -> dict[str, Any] | None:
         runtime = getattr(self, "_draft_window_runtime", None)
-        if runtime is None:
-            return super()._build_attn_metadata(
-                num_reqs,
-                batch_desc,
-                query_start_loc_np,
-                seq_lens_cpu_upper_bound,
-                step,
-                causal,
-                dcp_local_seq_lens,
-                slot_mappings=slot_mappings,
+        with (
+            build_attn_metadata_factory(
+                self.input_buffers.positions,
+                batch_desc.num_tokens,
+                self.draft_is_prefilling,
+                common_metadata_callback=runtime.metadata_callback(step, num_reqs),
             )
-        with build_attn_metadata_factory(
-            self.input_buffers.positions,
-            batch_desc.num_tokens,
-            self.draft_is_prefilling,
-            common_metadata_callback=runtime.metadata_callback(step, num_reqs),
+            if runtime is not None
+            else nullcontext()
         ):
             metadata = super()._build_attn_metadata(
                 num_reqs,
@@ -382,7 +374,8 @@ class AscendDFlashSpeculator(DraftWindowGraphInputMixin, LmheadTPDraftSamplingMi
                 dcp_local_seq_lens,
                 slot_mappings=slot_mappings,
             )
-        runtime.retain_metadata(metadata)
+        if runtime is not None:
+            runtime.retain_metadata(metadata)
         return metadata
 
     def propose(

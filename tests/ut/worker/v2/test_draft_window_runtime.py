@@ -3,6 +3,7 @@
 
 import ast
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -20,10 +21,13 @@ runtime_module = sys.modules[DraftWindowRuntime.__module__]
 class Completion:
     complete = False
 
-    def is_complete(self):
+    def record(self, stream):
+        self.stream = stream
+
+    def query(self):
         return self.complete
 
-    def wait(self):
+    def synchronize(self):
         self.complete = True
 
 
@@ -39,7 +43,8 @@ def setup(monkeypatch):
         completions.append(completion)
         return completion
 
-    monkeypatch.setattr(runtime_module, "_NPUCompletion", record)
+    monkeypatch.setattr(torch.npu, "Event", record)
+    monkeypatch.setattr(torch.npu, "current_stream", lambda: None)
     canonical = torch.arange(48, dtype=torch.int32).reshape(6, 8)
     spec = SimpleNamespace(
         draft_model_config=SimpleNamespace(enforce_eager=True),
@@ -347,7 +352,7 @@ def test_event_failure_after_successful_build_poison_keeps_read_metadata(setup, 
     def failed_record():
         raise RuntimeError("record failed")
 
-    monkeypatch.setattr(runtime_module, "_NPUCompletion", failed_record)
+    monkeypatch.setattr(torch.npu, "Event", failed_record)
     with pytest.raises(RuntimeError, match="record failed"), runtime.proposal_context(spec, batch()):
         runtime.metadata_callback(3, 2)(0, common())
         owner = runtime._owner
@@ -429,7 +434,6 @@ def test_eagle_freezes_anchor_across_rejection_and_retains_all_step_reads(setup)
     assert all(metadata.block_table_tensor[1, 0] == canonical[3, 5] for metadata in outputs)
     assert len({metadata.block_table_tensor.data_ptr() for metadata in outputs}) == 3
     assert all(any(value is metadata for value in owner.retained) for metadata in outputs)
-    assert sum(type(value).__name__ == "DraftReadView" for value in owner.retained) == 3
     assert len(completions) == 1
 
 
@@ -538,6 +542,14 @@ def test_eagle_rejects_unsafe_window_at_startup(setup):
 
 def test_eagle_later_ar_uses_current_device_exact_with_frozen_anchor(setup, monkeypatch):
     _, spec, canonical, _ = setup
+    phases = []
+    classify = runtime_module.continuing_prefill_rows
+
+    def phase(*args):
+        phases.append(args)
+        return classify(*args)
+
+    monkeypatch.setattr(runtime_module, "continuing_prefill_rows", phase)
     spec.input_buffers.positions = torch.tensor([6, 7, 8, 9, 23, 24, 25, 26])
     spec.last_token_indices = torch.tensor([3, 7])
     runtime = DraftWindowRuntime(spec, resolve_draft_window_policy(requested_window_size=8, method="eagle3"))
@@ -562,6 +574,7 @@ def test_eagle_later_ar_uses_current_device_exact_with_frozen_anchor(setup, monk
             assert metadata.slot_mapping is slots and metadata.positions is positions
             assert metadata.block_table_tensor is table
     torch.testing.assert_close(canonical, full, atol=0, rtol=0)
+    assert len(phases) == 1  # Prompt phase is fixed; actual device ends changed on all three consumers.
 
 
 @pytest.mark.parametrize("all_continuing", [False, True])
@@ -584,7 +597,7 @@ def test_eagle_continuing_prefill_later_ar_preserves_full_read(setup, all_contin
             # row also verifies the frozen decode anchor in a mixed batch.
             expected = [ends[0], ends[1] if all_continuing else ends[1] - 20]
             assert metadata.seq_lens[:2].tolist() == expected
-            assert not hasattr(metadata, "_draft_window_device_read")
+            assert hasattr(metadata, "_draft_window_device_read") is (not all_continuing)
 
 
 @pytest.mark.parametrize("groups", [(0,), (0, 1), (1, 0)])
@@ -635,25 +648,12 @@ def test_eagle_full_continuing_keeps_full_addressing_without_window_snapshot(set
     assert runtime.pool.reclaim_completed() == 1
 
 
-@pytest.mark.parametrize("changed", ["duplicate", "lengths", "projected", "extent"])
-def test_eagle_full_continuing_rejects_changed_preparation(setup, changed):
+def test_first_group_metadata_must_cover_the_actual_active_requests(setup):
     runtime, spec, _, _ = setup
-    runtime.method, runtime.static_k, runtime._dense_reads = "eagle3", 3, True
-    runtime.gids = (0, 1)
-    state = batch(computed=(8, 24), prompt=(100, 100), scheduled=(4, 3), drafts=None)
-    spec.max_model_len, spec.advance_draft_positions = 4096, True
-    with pytest.raises((RuntimeError, ValueError), match="Draft Window"), runtime.proposal_context(spec, state):
-        callback = runtime.metadata_callback(0, 2)
-        first, second = common(), common()
-        second.seq_lens = first.seq_lens
-        callback(0, first)
-        if changed == "lengths":
-            second.seq_lens = second.seq_lens.clone()
-        elif changed == "projected":
-            second._draft_window_read = object()
-        elif changed == "extent":
-            second.num_reqs = 1
-        callback(0 if changed == "duplicate" else 1, second)
+    metadata = common()
+    metadata.num_reqs = 1
+    with pytest.raises(ValueError, match="active requests"), runtime.proposal_context(spec, batch()):
+        runtime.metadata_callback(3, 2)(0, metadata)
     assert runtime.pool.poisoned
 
 
@@ -667,7 +667,7 @@ def test_eagle_full_continuing_with_placeholders_keeps_exact_read(setup):
             metadata = common(exact=(12 + step, 27 + step))
             runtime.metadata_callback(step, 2)(0, metadata)
             assert metadata.seq_lens[:2].tolist() == [12 + step, 27 + step]
-            assert hasattr(metadata, "_draft_window_read")
+            assert metadata._draft_window_exact_cpu is metadata.seq_lens_cpu
 
 
 def test_eagle_full_continuing_prompt_snapshot_clamps_at_model_limit(setup):
@@ -700,39 +700,64 @@ def test_eagle_full_continuing_uses_prepared_exact_not_old_progress_estimate(set
         assert second.seq_lens_cpu.tolist() == [13, 28, 0]
 
 
-def test_multiple_groups_project_same_logical_start_with_independent_backing(setup, monkeypatch):
-    _, spec, canonical, _ = setup
+@pytest.mark.parametrize("fail_second_builder", [False, True])
+def test_real_builder_projects_every_group_and_quarantines_partial_failure(setup, monkeypatch, fail_second_builder):
+    from vllm_ascend.worker.v2.attn_utils import build_attn_metadata
+
+    _, spec, canonical, completions = setup
     other_table = torch.arange(96, dtype=torch.int32).reshape(6, 16) + 100
     spec.block_tables.block_tables.append(SimpleNamespace(gpu=other_table))
     spec.block_tables.num_blocks.np = np.array([[8] * 6, [16] * 6], dtype=np.int32)
     spec.block_tables.kernel_block_sizes = [4, 2]
     monkeypatch.setattr(DraftWindowRuntime, "_validate_route", staticmethod(lambda spec: (0, 1)))
-    policy = resolve_draft_window_policy(requested_window_size=8, method="dflash")
-    runtime = DraftWindowRuntime(spec, policy)
-    first, second = common(), common()
-    # build_attn_metadata slices each group's compact table, but the same
-    # prepared seq_lens for every group.
-    second.block_table_tensor = torch.cat((other_table[[1, 3]], torch.zeros((1, 16), dtype=torch.int32)))
-    second.seq_lens = first.seq_lens
-    with runtime.proposal_context(spec, batch()):
-        callback = runtime.metadata_callback(3, 2)
-        callback(0, first)
-        callback(1, second)
-    assert first.seq_lens.tolist() == second.seq_lens.tolist() == [12, 11, 0]
-    # Same S=16 maps to column 4 in B=4 and column 8 in B=2.
-    assert first.block_table_tensor[1, :3].tolist() == canonical[3, 4:7].tolist()
-    assert second.block_table_tensor[1, :6].tolist() == other_table[3, 8:14].tolist()
-    assert first.block_table_tensor.data_ptr() != second.block_table_tensor.data_ptr()
+    runtime = DraftWindowRuntime(spec, resolve_draft_window_policy(requested_window_size=8, method="dflash"))
+    full_tables = [table[[1, 3]].clone() for table in (canonical, other_table)]
+    saved_tables = [table.clone() for table in full_tables]
+    full_slots, positions = torch.arange(12).reshape(2, 6), torch.arange(6)
+    observed = []
 
+    def group(gid):
+        def build(common_prefix_len, common_attn_metadata):
+            observed.append(common_attn_metadata)
+            if gid == 1 and fail_second_builder:
+                raise RuntimeError("second builder failed after private reads were prepared")
+            return common_attn_metadata
 
-def test_missing_group_cannot_be_silently_dropped(setup, monkeypatch):
-    _, spec, _, _ = setup
-    monkeypatch.setattr(DraftWindowRuntime, "_validate_route", staticmethod(lambda spec: (0, 1)))
-    policy = resolve_draft_window_policy(requested_window_size=8, method="dflash")
-    runtime = DraftWindowRuntime(spec, policy)
-    with pytest.raises(RuntimeError, match="did not consume"), runtime.proposal_context(spec, batch()):
-        runtime.metadata_callback(3, 2)(0, common())
-    assert runtime.pool.poisoned
+        builder = SimpleNamespace(build=build)
+        return [SimpleNamespace(layer_names=[f"draft{gid}"], get_metadata_builder=lambda lane: builder)]
+
+    error = pytest.raises(RuntimeError, match="second builder") if fail_second_builder else nullcontext()
+    with error, runtime.proposal_context(spec, batch()):
+        owner = runtime._owner
+        result = build_attn_metadata(
+            attn_groups=[group(0), group(1)],
+            num_reqs=2,
+            num_tokens=6,
+            query_start_loc_gpu=torch.tensor([0, 3, 6], dtype=torch.int32),
+            query_start_loc_cpu=torch.tensor([0, 3, 6], dtype=torch.int32),
+            max_query_len=3,
+            seq_lens=torch.tensor([12, 27], dtype=torch.int32),
+            seq_lens_cpu=torch.tensor([14, 30], dtype=torch.int32),
+            max_seq_len=30,
+            block_tables=full_tables,
+            slot_mappings=full_slots,
+            positions=positions,
+            kv_cache_config=SimpleNamespace(kv_cache_groups=[SimpleNamespace(kv_cache_spec=object())] * 2),
+            causal=False,
+            common_metadata_callback=runtime.metadata_callback(3, 2),
+        )
+        assert list(result) == ["draft0", "draft1"]
+    assert len(observed) == 2 and observed[0] is not observed[1]
+    assert all(metadata.seq_lens.tolist() == [12, 11] for metadata in observed)
+    assert observed[0].block_table_tensor[1, :3].tolist() == canonical[3, 4:7].tolist()
+    assert observed[1].block_table_tensor[1, :6].tolist() == other_table[3, 8:14].tolist()
+    for gid, metadata in enumerate(observed):
+        assert torch.equal(full_tables[gid], saved_tables[gid])
+        assert metadata.slot_mapping.data_ptr() == full_slots[gid].data_ptr()
+        assert metadata.positions is positions
+        assert any(value is metadata for value in owner.retained)
+    assert runtime.pool.poisoned is fail_second_builder
+    assert len(completions) == (0 if fail_second_builder else 1)
 
 
 @pytest.mark.parametrize("method", ["dflash", "dspark"])
@@ -786,38 +811,18 @@ def test_eagle_metadata_update_cannot_bypass_per_step_reads(setup):
 
 
 def test_actual_dense_builder_preserves_sp_padding_after_window_projection(setup, monkeypatch):
-    """Execute the checkout's real builder body with CPU-only dependency seams.
+    """Execute the actual builder class with CPU-only dependency seams.
 
     Pinning and phase classification are isolated; the production padding,
     tensor references and metadata assembly execute unmodified. This proves
     the Host builder contract, not distributed/NPU execution.
     """
     runtime, spec, _, _ = setup
-    root = Path(__file__).resolve().parents[4]
-    tree = ast.parse((root / "vllm_ascend/attention/attention_v1.py").read_text())
-    builder_class = next(
-        node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "AscendAttentionMetadataBuilder"
-    )
-    build = next(node for node in builder_class.body if isinstance(node, ast.FunctionDef) and node.name == "build")
-    utils_tree = ast.parse((root / "vllm_ascend/attention/utils.py").read_text())
-    utility_functions = [
-        node
-        for node in utils_tree.body
-        if isinstance(node, ast.FunctionDef) and node.name in {"_select_seq_lens", "uses_pcp_sharded_layout"}
-    ]
-    module = ast.Module(
-        body=[
-            ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0),
-            *utility_functions,
-            build,
-        ],
-        type_ignores=[],
-    )
-    ast.fix_missing_locations(module)
-    namespace = {"torch": torch, "CrossAttentionSpec": type("CrossAttentionSpec", (), {})}
-    exec(compile(module, "actual_dense_builder_host_extract", "exec"), namespace)
+    from vllm_ascend.attention.attention_v1 import AscendAttentionMetadataBuilder
+
     monkeypatch.setattr(torch.Tensor, "pin_memory", lambda tensor: tensor)
-    builder = SimpleNamespace(
+    builder = object.__new__(AscendAttentionMetadataBuilder)
+    builder.__dict__.update(
         pcp_enabled=False,
         use_pcp=False,
         device=torch.device("cpu"),
@@ -843,7 +848,7 @@ def test_actual_dense_builder_preserves_sp_padding_after_window_projection(setup
     slots = metadata.slot_mapping
     with runtime.proposal_context(spec, batch()):
         runtime.metadata_callback(3, 2)(0, metadata)
-        result = namespace["build"](builder, 0, metadata)
+        result = builder.build(0, metadata)
         runtime.retain_metadata(result)
     assert result.actual_seq_lengths_q == [3, 6, 8]
     assert result.seq_lens_list == [12, 11, 1]
@@ -1137,12 +1142,11 @@ def test_parallel_continuing_prefill_snapshots_actual_exact_without_full_gather(
     with runtime.proposal_context(spec, state):
         runtime.metadata_callback(8, 2)(0, metadata)
         assert not hasattr(metadata, "_draft_window_device_read"), "Full prompt unexpectedly gathered private FP32 KV"
-        read = metadata._draft_window_read
         expected_table = table[state.idx_mapping_np, :11].clone()
         expected_table[0, 9:] = 0
         assert torch.equal(metadata.block_table_tensor[:2], expected_table)
-        assert read.seq_lens.cpu().tolist() == [1151, 1281, 0]
-        assert read.exact_cpu_for(metadata)[:2].tolist() == [1151, 1281]
+        assert metadata.seq_lens.cpu().tolist() == [1151, 1281, 0]
+        assert metadata._draft_window_exact_cpu[:2].tolist() == [1151, 1281]
         assert metadata.slot_mapping is slots and metadata.positions is positions
         assert torch.equal(table, before)
 

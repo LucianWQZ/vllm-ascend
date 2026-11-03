@@ -14,14 +14,11 @@ from collections.abc import Mapping
 from typing import Any
 
 from vllm.config.compilation import CUDAGraphMode
-from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 
 import vllm_ascend.envs as envs
 from vllm_ascend.device.hardware_profile import AttentionBackendFamily, get_current_hardware_profile
-from vllm_ascend.worker.v2.spec_decode.draft_window import DraftMetadataInputs
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
     DraftWindowGraphBindingProvider,
-    DraftWindowGraphBucket,
     DraftWindowGraphRoute,
     resolve_parallel_draft_window_graph_route,
 )
@@ -81,27 +78,3 @@ def install_parallel_graph(owner: Any) -> DraftWindowGraphBindingProvider:
             descriptor=descriptor,
         )
     return provider
-
-
-def prepare_parallel_graph(
-    owner: Any,
-    descriptor: BatchExecutionDescriptor,
-) -> DraftWindowGraphBucket | None:
-    """Bind the current proposal inputs before Graph metadata consumption."""
-    provider = getattr(owner, "_draft_window_graph_binding_provider", None)
-    if provider is None:
-        return None
-    if descriptor.cg_mode is not CUDAGraphMode.FULL:
-        raise RuntimeError("runtime Draft Window Graph requires a FULL replay descriptor")
-    inputs = provider._active_inputs
-    if not isinstance(inputs, DraftMetadataInputs):
-        raise RuntimeError("Draft Window Graph replay has no current proposal inputs")
-    inputs.validate()
-    proposal_context = owner._draft_window_proposal
-    if proposal_context is not inputs.proposal:
-        raise RuntimeError("Draft Window Graph proposal identity is stale")
-    capture_identity = owner._draft_window_selected_metadata
-    if capture_identity is None or capture_identity.descriptor != descriptor or inputs.params is not None:
-        raise RuntimeError("Draft Window replay does not own the selected unconsumed FULL dispatch")
-
-    return provider.bind_read_carrier(capture_identity=capture_identity, inputs=inputs)

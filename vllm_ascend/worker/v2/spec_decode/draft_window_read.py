@@ -8,59 +8,20 @@ bounds. The proposal retains every projection until its final reader completes.
 """
 
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
 from typing import Any
 
 import torch
 
 
-@dataclass(frozen=True)
-class DraftReadView:
-    """Owned read operands; deliberately carries no positions or write slots."""
-
-    block_table: torch.Tensor
-    seq_lens: torch.Tensor
-    seq_lens_cpu: torch.Tensor
-    seq_lens_cpu_upper_bound: torch.Tensor
-    max_seq_len: int
-    num_reqs: int
-
-    def apply(self, common_metadata: Any) -> None:
-        """Apply only to a newly created draft common metadata object."""
-        common_metadata.block_table_tensor = self.block_table
-        common_metadata.seq_lens = self.seq_lens
-        common_metadata.seq_lens_cpu = self.seq_lens_cpu
-        common_metadata._seq_lens_cpu = self.seq_lens_cpu
-        common_metadata.seq_lens_cpu_upper_bound = self.seq_lens_cpu_upper_bound
-        common_metadata.max_seq_len = self.max_seq_len
-        common_metadata._draft_window_read = self
-
-    def exact_cpu_for(self, common_metadata: Any) -> torch.Tensor:
-        """Certify the snapshot only while all of its read operands are intact."""
-        if (
-            common_metadata.num_reqs != self.num_reqs
-            or common_metadata.seq_lens is not self.seq_lens
-            or common_metadata.seq_lens_cpu is not self.seq_lens_cpu
-            or common_metadata._seq_lens_cpu is not self.seq_lens_cpu
-            or common_metadata.block_table_tensor is not self.block_table
-            or common_metadata.seq_lens_cpu_upper_bound is not self.seq_lens_cpu_upper_bound
-        ):
-            raise ValueError("Draft Window read operands were replaced after projection")
-        return self.seq_lens_cpu
-
-
 def materialize_draft_read(
-    block_table: torch.Tensor,
+    common_metadata: Any,
     valid_columns: Sequence[int],
     block_span: int,
     *,
     exact_cpu: torch.Tensor,
-    exact_device: torch.Tensor,
-    upper_cpu: torch.Tensor,
     starts_cpu: torch.Tensor,
-    padded_rows: int,
     retain: Callable[..., None],
-) -> DraftReadView:
+) -> None:
     """Copy only initialized [S,E) columns from the current compact Full table.
 
     The framework has already gathered persistent request slots into batch
@@ -69,6 +30,10 @@ def materialize_draft_read(
     later batch or Eagle consumer cannot overwrite an outstanding reader.
     """
     n = len(valid_columns)
+    block_table = common_metadata.block_table_tensor
+    exact_device = common_metadata.seq_lens
+    upper_cpu = common_metadata.seq_lens_cpu_upper_bound[:n]
+    padded_rows = common_metadata.num_reqs
     if block_table.ndim != 2 or block_table.dtype != torch.int32 or block_span <= 0:
         raise ValueError("Invalid compact int32 table geometry")
     if block_table.shape[0] < n or any(count < 0 or count > block_table.shape[1] for count in valid_columns):
@@ -110,6 +75,9 @@ def materialize_draft_read(
     lengths.copy_(lengths_cpu, non_blocking=True)
     # Once E is completed, its visible lengths are also the tight allocation
     # bounds. Query extents and positions remain owned by the original builder.
-    return DraftReadView(
-        table, lengths, lengths_cpu, lengths_cpu, int(lengths_cpu.max()) if padded_rows else 0, padded_rows
-    )
+    common_metadata.block_table_tensor = table
+    common_metadata.seq_lens = lengths
+    common_metadata.seq_lens_cpu = common_metadata._seq_lens_cpu = lengths_cpu
+    common_metadata.seq_lens_cpu_upper_bound = lengths_cpu
+    common_metadata.max_seq_len = int(lengths_cpu.max()) if padded_rows else 0
+    common_metadata._draft_window_exact_cpu = lengths_cpu

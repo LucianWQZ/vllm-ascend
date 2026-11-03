@@ -132,26 +132,58 @@ def test_explicit_full_write_mapping_preserves_upstream_signature(contract):
     assert contract.slots.tolist() == [[0, 1, 2]]
 
 
+@pytest.mark.parametrize("contract", ["dspark"], indirect=True)
+@pytest.mark.parametrize("architecture", [None, "DSA", "QSA"])
+def test_dspark_other_backends_preserve_native_metadata_dispatch(contract, monkeypatch, architecture):
+    contract.obj.attn_architecture = architecture
+    build = contract.obj._build_attn_metadata
+    signature = inspect.signature(contract.base._build_attn_metadata)
+    native = Mock(return_value=object())
+    monkeypatch.setattr(contract.base, "_build_attn_metadata", native)
+    monkeypatch.setattr(contract.module, "build_attn_metadata_factory", Mock(side_effect=AssertionError))
+    slots = torch.tensor([[17, 18, 19]])
+    local_lengths = torch.tensor([21])
+
+    result = build(
+        1,
+        SimpleNamespace(num_reqs=1, num_tokens=3, cg_mode=contract.mode.NONE),
+        np.array([0, 3], dtype=np.int32),
+        torch.tensor([22], dtype=torch.int32),
+        3,
+        causal=False,
+        dcp_local_seq_lens=local_lengths,
+        slot_mappings=slots,
+    )
+
+    assert result is native.return_value
+    call = signature.bind(contract.obj, *native.call_args.args, **native.call_args.kwargs).arguments
+    assert call["num_reqs"] == 1 and call["step"] == 3
+    assert call["causal"] is False
+    assert call["slot_mappings"] is slots
+    assert call["dcp_local_seq_lens"] is local_lengths
+    assert call["query_start_loc_np"].tolist() == [0, 3]
+    assert call["seq_lens_cpu_upper_bound"].tolist() == [22]
+    assert call["batch_desc"].cg_mode is contract.mode.NONE
+
+
 def test_callback_final_writer_updates_real_common_cpu_mirrors_and_keeps_full_operands(contract):
     retained: list[Any] = []
     read_retained: list[Any] = []
     called: list[Any] = []
     read = contract.read
     exact = torch.tensor([21], dtype=torch.int32)
-    view = read.materialize_draft_read(
-        *(contract.table[list((0,))], (8,), 4),
-        exact_cpu=exact,
-        exact_device=exact,
-        upper_cpu=torch.tensor([25], dtype=torch.int32),
-        starts_cpu=torch.tensor([12], dtype=torch.int32),
-        padded_rows=1,
-        retain=lambda *items: read_retained.extend(items),
-    )
 
     def callback(gid, common):
         called.append(gid)
         assert common.seq_lens_cpu.tolist() == [25]  # Upstream scheduling upper before projection.
-        view.apply(common)
+        read.materialize_draft_read(
+            common,
+            (8,),
+            4,
+            exact_cpu=exact,
+            starts_cpu=torch.tensor([12], dtype=torch.int32),
+            retain=lambda *items: read_retained.extend(items),
+        )
 
     runtime = SimpleNamespace(
         metadata_callback=Mock(return_value=callback),
@@ -164,17 +196,19 @@ def test_callback_final_writer_updates_real_common_cpu_mirrors_and_keeps_full_op
     common = result["draft.a"]
     assert called == [0]
     assert result["draft.b"] is common
-    assert common.block_table_tensor is view.block_table
-    assert common.seq_lens_cpu is common._seq_lens_cpu is view.seq_lens_cpu
+    assert common.block_table_tensor.tolist() == [[3, 4, 5]]
+    assert common.seq_lens_cpu is common._seq_lens_cpu is common._draft_window_exact_cpu
     assert common.seq_lens_cpu.tolist() == [9]
-    assert common.seq_lens_cpu_upper_bound.tolist() == [13]
+    # The completed exact snapshot is also the tight upper bound; do not
+    # preserve a second optimistic-length projection after rebasing.
+    assert common.seq_lens_cpu_upper_bound.tolist() == [9]
     assert common.seq_lens.tolist() == [9]
     assert common.positions.untyped_storage().data_ptr() == contract.positions.untyped_storage().data_ptr()
     assert common.slot_mapping.untyped_storage().data_ptr() == contract.slots.untyped_storage().data_ptr()
     assert contract.obj.input_buffers.seq_lens.tolist() == [21]
     assert contract.table.tolist() == [list(range(8))]
     assert retained == [result]
-    assert any(value is view.block_table for value in read_retained)
+    assert any(value is common.block_table_tensor for value in read_retained)
     runtime.metadata_callback.assert_called_once_with(3, 1)
     contract.backend.build.assert_called_once()
 
@@ -497,8 +531,9 @@ def test_dspark_mla_reuses_prepared_exact_cpu_without_another_transfer(contract,
     runtime_module = draft_window_runtime
     runtime_class = runtime_module.DraftWindowRuntime
     monkeypatch.setattr(runtime_class, "_validate_route", staticmethod(lambda spec: (0,)))
-    completion = SimpleNamespace(is_complete=lambda: False, wait=lambda: None)
-    monkeypatch.setattr(runtime_module, "_NPUCompletion", lambda: completion)
+    completion = SimpleNamespace(record=lambda stream: None, query=lambda: False, synchronize=lambda: None)
+    monkeypatch.setattr(torch.npu, "Event", lambda: completion)
+    monkeypatch.setattr(torch.npu, "current_stream", lambda: object())
     obj = contract.obj
     del obj._prepare_draft_dcp_metadata_inputs  # Run the real completed CPU copy.
     obj.attn_architecture = "MLA"

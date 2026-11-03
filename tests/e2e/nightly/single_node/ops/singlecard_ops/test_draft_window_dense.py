@@ -35,13 +35,10 @@ def test_prepared_reads_preserve_frozen_window_across_queued_consumers(query_wid
         reads.append(
             prepare_dense_draft_read(
                 *source,
-                exact_device=exact_device,
                 exact_cpu=exact,
                 query_ends_cpu=exact,
                 full_rows_cpu=torch.zeros(exact.numel(), dtype=torch.bool),
                 upper_cpu=exact + 2,
-                window_size=1035,
-                anchor_span=block,
                 frozen_starts=frozen,
                 query_width=query_width,
                 causal=True,
@@ -115,13 +112,10 @@ def test_rejected_first_pass_preserves_query_alignment_without_gathering_native_
     held = []
     read = prepare_dense_draft_read(
         *source,
-        exact_device=torch.tensor([end], dtype=torch.int32, device="npu"),
         exact_cpu=torch.tensor([end], dtype=torch.int32),
         query_ends_cpu=torch.tensor([native_end], dtype=torch.int32),
         full_rows_cpu=torch.zeros(1, dtype=torch.bool),
         upper_cpu=torch.tensor([native_end + 1]),
-        window_size=1035,
-        anchor_span=block,
         query_width=4,
         causal=True,
         frozen_starts=torch.tensor([0], dtype=torch.int32),
@@ -200,7 +194,6 @@ def test_dense_device_exact_reader(geometry, query_width, future, causal, page_l
         assert compact_table.stride(1) == 2
     source = (compact_table, (12, 12), B)
     upper_cpu = torch.tensor(ends, dtype=torch.int32) + 1
-    upper_device, rejected = upper_cpu.npu(), torch.ones(2, dtype=torch.int32, device="npu")
     # E0=end-1, K=3 freezes H=end+2, independently of later current E.
     exact_cpu = torch.tensor(ends, dtype=torch.int32)
     frozen_starts = (exact_cpu + future - W).clamp(min=0) // B * B
@@ -211,13 +204,10 @@ def test_dense_device_exact_reader(geometry, query_width, future, causal, page_l
             assert source[0].stride(1) == 2
         read = prepare_dense_draft_read(
             *source,
-            exact_device=upper_device - rejected,
             exact_cpu=exact_cpu,
             query_ends_cpu=exact_cpu,
             full_rows_cpu=torch.zeros(2, dtype=torch.bool),
             upper_cpu=upper_cpu,
-            window_size=W,
-            anchor_span=B,
             query_width=query_width,
             causal=causal,
             retain=lambda *objects: retained.extend(objects),
@@ -260,14 +250,11 @@ def test_bfloat16_probability_cancellation():
     retained = []
     read = prepare_dense_draft_read(
         *source,
-        exact_device=torch.tensor([8], dtype=torch.int32, device="npu"),
         exact_cpu=torch.tensor([8], dtype=torch.int32),
         query_ends_cpu=torch.tensor([8], dtype=torch.int32),
         frozen_starts=torch.tensor([0], dtype=torch.int32),
         full_rows_cpu=torch.zeros(1, dtype=torch.bool),
         upper_cpu=torch.tensor([8], device="cpu"),
-        window_size=128,
-        anchor_span=128,
         query_width=query_width,
         causal=False,
         retain=lambda *objects: retained.extend(objects),
@@ -290,14 +277,11 @@ def test_small_causal_window_empty_rows_are_zero():
     retained = []
     read = prepare_dense_draft_read(
         *source,
-        exact_device=torch.tensor([129], dtype=torch.int32, device="npu"),
         exact_cpu=torch.tensor([129], dtype=torch.int32),
         query_ends_cpu=torch.tensor([129], dtype=torch.int32),
         frozen_starts=torch.tensor([128], dtype=torch.int32),
         full_rows_cpu=torch.zeros(1, dtype=torch.bool),
         upper_cpu=torch.tensor([130], device="cpu"),
-        window_size=1,
-        anchor_span=block,
         query_width=query_width,
         causal=True,
         retain=lambda *objects: retained.extend(objects),
@@ -310,7 +294,7 @@ def test_small_causal_window_empty_rows_are_zero():
     torch.testing.assert_close(actual.cpu(), expected, atol=0, rtol=0)
 
 
-def test_same_stream_prepared_inputs_are_consumed_before_reuse():
+def test_prepared_cpu_and_query_inputs_are_consumed_before_reuse():
     """Compact batch row order and query/length inputs survive later reuse."""
     block, dim, heads, width = 128, 128, 2, 4
     generator = torch.Generator().manual_seed(4317)
@@ -322,24 +306,19 @@ def test_same_stream_prepared_inputs_are_consumed_before_reuse():
     table_device = table_cpu.npu()
     request_rows = (1, 0)
     source = (table_device[list(request_rows)], (12, 12), block)
-    exact = torch.empty(2, dtype=torch.int32, device="npu")
     offsets = torch.empty(3, dtype=torch.int32, device="npu")
     offsets_cpu = torch.tensor([0, 3, 7], dtype=torch.int32)
     retained, results, references = [], [], []
     for ends in ((1151, 1281), (1152, 1279), (1149, 1280)):
         ends_cpu = torch.tensor(ends, dtype=torch.int32)
-        exact.copy_(ends_cpu)
         offsets.copy_(offsets_cpu)
         read = prepare_dense_draft_read(
             *source,
-            exact_device=exact,
             exact_cpu=ends_cpu,
             query_ends_cpu=ends_cpu + 1,
             frozen_starts=(ends_cpu - 1024).clamp(min=0) // block * block,
             full_rows_cpu=torch.zeros(2, dtype=torch.bool),
             upper_cpu=ends_cpu + 1,
-            window_size=1024,
-            anchor_span=block,
             query_width=width,
             causal=True,
             query_start_loc_cpu=offsets_cpu,
@@ -348,7 +327,7 @@ def test_same_stream_prepared_inputs_are_consumed_before_reuse():
         )
         # Enqueued after read preparation on the same stream, before attention. Neither
         # later attention nor output restoration may consult these inputs again.
-        exact.zero_()
+        ends_cpu.zero_()
         offsets.zero_()
         results.append(dense_draft_attention(read, query, keys, values, 1 / math.sqrt(dim)))
         expected = []

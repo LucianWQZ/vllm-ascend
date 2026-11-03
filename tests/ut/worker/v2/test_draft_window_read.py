@@ -1,15 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
-import ast
 import unittest
-from dataclasses import replace
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
 import torch
 
+from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, _select_seq_lens
 from vllm_ascend.worker.v2.spec_decode.draft_window_read import (
     materialize_draft_read,
 )
@@ -26,19 +24,32 @@ class TestCanonicalRead(unittest.TestCase):
         self.mapping = np.array([2, 0])
         self.retained: list[torch.Tensor] = []
 
+    def common(self, table, exact, upper, padded_rows=3):
+        return AscendCommonAttentionMetadata(
+            query_start_loc=torch.arange(padded_rows + 1, dtype=torch.int32),
+            query_start_loc_cpu=torch.arange(padded_rows + 1, dtype=torch.int32),
+            seq_lens=exact,
+            num_reqs=padded_rows,
+            num_actual_tokens=padded_rows,
+            max_query_len=1,
+            max_seq_len=int(upper.max()),
+            block_table_tensor=table,
+            slot_mapping=torch.arange(padded_rows, dtype=torch.int64),
+            seq_lens_cpu_upper_bound=upper,
+        )
+
     def read(self, ends=(21, 11), starts=(12, 4), upper=(24, 15), padded_rows=3):
         exact = torch.tensor(ends, dtype=torch.int32)
-        return materialize_draft_read(
-            self.table[self.mapping.tolist()],
+        common = self.common(self.table[self.mapping.tolist()], exact, torch.tensor(upper), padded_rows)
+        materialize_draft_read(
+            common,
             self.owner.num_blocks.np[0, self.mapping].tolist(),
             4,
             exact_cpu=exact,
-            exact_device=exact,
-            upper_cpu=torch.tensor(upper),
             starts_cpu=torch.tensor(starts),
-            padded_rows=padded_rows,
             retain=lambda *values: self.retained.extend(values),
         )
+        return common
 
     def test_projection_rejects_invalid_compact_geometry(self):
         for table, counts, span in (
@@ -51,24 +62,23 @@ class TestCanonicalRead(unittest.TestCase):
         ):
             with self.subTest(table=table.shape, counts=counts, span=span), self.assertRaises(ValueError):
                 materialize_draft_read(
-                    table,
+                    self.common(table, torch.tensor([21, 11]), torch.tensor([24, 15])),
                     counts,
                     span,
                     exact_cpu=torch.tensor([21, 11]),
-                    exact_device=torch.tensor([21, 11]),
-                    upper_cpu=torch.tensor([24, 15]),
                     starts_cpu=torch.tensor([12, 4]),
-                    padded_rows=3,
                     retain=lambda *values: None,
                 )
 
     def test_canonical_projection_tightens_upper_and_preserves_padding(self):
         view = self.read()
-        self.assertEqual(view.block_table.tolist(), [[19, 20, 21], [1, 2, 0], [0, 0, 0]])
+        self.assertEqual(view.block_table_tensor.tolist(), [[19, 20, 21], [1, 2, 0], [0, 0, 0]])
         self.assertEqual(view.seq_lens_cpu.tolist(), [9, 7, 0])
         self.assertIs(view.seq_lens_cpu_upper_bound, view.seq_lens_cpu)
         self.assertEqual(view.max_seq_len, 9)
-        self.assertNotEqual(view.block_table.untyped_storage().data_ptr(), self.table.untyped_storage().data_ptr())
+        self.assertNotEqual(
+            view.block_table_tensor.untyped_storage().data_ptr(), self.table.untyped_storage().data_ptr()
+        )
         self.assertEqual(self.table.tolist(), torch.arange(24).reshape(3, 8).tolist())
 
     def test_projection_copies_retain_actual_source_and_destination(self):
@@ -84,23 +94,21 @@ class TestCanonicalRead(unittest.TestCase):
             return original_copy(destination, source, *args, **kwargs)
 
         exact = torch.tensor([21, 11], dtype=torch.int32)
+        common = self.common(self.table[self.mapping.tolist()], exact, exact + 3)
         with patch.object(torch.Tensor, "copy_", copy):
-            view = materialize_draft_read(
-                self.table[self.mapping.tolist()],
+            materialize_draft_read(
+                common,
                 self.owner.num_blocks.np[0, self.mapping].tolist(),
                 4,
                 exact_cpu=exact,
-                exact_device=exact,
-                upper_cpu=exact + 3,
                 starts_cpu=torch.tensor([12, 4], dtype=torch.int32),
-                padded_rows=3,
                 retain=lambda *values: retained.extend(values),
             )
         self.assertEqual(len(copied), 3)  # Two active-row D2D copies and one exact-length H2D.
         self.assertEqual(copied[-1][0].dtype, torch.int32)
-        self.assertEqual(view.seq_lens.tolist(), [9, 7, 0])
-        self.assertTrue(any(value is view.block_table for value in retained))
-        self.assertTrue(any(value is view.seq_lens for value in retained))
+        self.assertEqual(common.seq_lens.tolist(), [9, 7, 0])
+        self.assertTrue(any(value is common.block_table_tensor for value in retained))
+        self.assertTrue(any(value is common.seq_lens for value in retained))
 
     def test_retention_failure_prevents_first_table_copy(self):
         calls = []
@@ -114,14 +122,11 @@ class TestCanonicalRead(unittest.TestCase):
         with patch.object(torch.Tensor, "copy_") as copy:
             with self.assertRaisesRegex(RuntimeError, "retain destination"):
                 materialize_draft_read(
-                    self.table[self.mapping.tolist()],
+                    self.common(self.table[self.mapping.tolist()], exact, exact + 3),
                     self.owner.num_blocks.np[0, self.mapping].tolist(),
                     4,
                     exact_cpu=exact,
-                    exact_device=exact,
-                    upper_cpu=exact + 3,
                     starts_cpu=torch.tensor([12, 4], dtype=torch.int32),
-                    padded_rows=3,
                     retain=retain,
                 )
             copy.assert_not_called()
@@ -131,8 +136,8 @@ class TestCanonicalRead(unittest.TestCase):
         self.mapping[:] = [0, 2]
         self.table[0] = torch.arange(100, 108)
         second = self.read()
-        self.assertEqual(second.block_table[0].tolist(), [103, 104, 105])
-        self.assertEqual(first.block_table[0].tolist(), [19, 20, 21])
+        self.assertEqual(second.block_table_tensor[0].tolist(), [103, 104, 105])
+        self.assertEqual(first.block_table_tensor[0].tolist(), [19, 20, 21])
 
     def test_valid_count_cannot_be_replaced_by_capacity(self):
         self.owner.num_blocks.np[0, 2] = 5
@@ -157,15 +162,13 @@ class TestCanonicalRead(unittest.TestCase):
                     storage[:, ::2] = compact
                     compact = storage[:, ::2]
                 exact = torch.tensor([21, 11], dtype=torch.int32)
-                view = materialize_draft_read(
-                    compact,
+                common = self.common(compact, exact, torch.tensor([24, 15]))
+                materialize_draft_read(
+                    common,
                     (8, 8),
                     4,
                     exact_cpu=exact,
-                    exact_device=exact,
-                    upper_cpu=torch.tensor([24, 15]),
                     starts_cpu=torch.tensor([12, 4]),
-                    padded_rows=3,
                     retain=lambda *values: self.retained.extend(values),
                 )
                 expected = torch.stack(
@@ -175,28 +178,34 @@ class TestCanonicalRead(unittest.TestCase):
                         torch.zeros(3, dtype=table.dtype),
                     )
                 )
-                torch.testing.assert_close(view.block_table, expected, rtol=0, atol=0)
+                torch.testing.assert_close(common.block_table_tensor, expected, rtol=0, atol=0)
                 torch.testing.assert_close(table, before, rtol=0, atol=0)
-                self.assertEqual(view.seq_lens.tolist(), [9, 7, 0])
+                self.assertEqual(common.seq_lens.tolist(), [9, 7, 0])
 
     def test_prepared_compact_table_requires_active_request_extent(self):
         with self.assertRaisesRegex(ValueError, "compact column extent"):
             materialize_draft_read(
-                self.table[:1],
+                self.common(self.table[:1], torch.tensor([21, 11]), torch.tensor([24, 15])),
                 (8, 8),
                 4,
                 exact_cpu=torch.tensor([21, 11]),
-                exact_device=torch.tensor([21, 11]),
-                upper_cpu=torch.tensor([24, 15]),
                 starts_cpu=torch.tensor([12, 4]),
-                padded_rows=3,
                 retain=lambda *values: None,
             )
 
-    def test_typed_application_preserves_query_and_write_identity(self):
+    def test_direct_common_projection_preserves_query_and_write_identity(self):
         slots, positions, query = object(), object(), object()
-        common = SimpleNamespace(slot_mapping=slots, positions=positions, query_start_loc=query)
-        self.read().apply(common)
+        exact = torch.tensor([21, 11], dtype=torch.int32)
+        common = self.common(self.table[self.mapping.tolist()], exact, exact + 3)
+        common.slot_mapping, common.positions, common.query_start_loc = slots, positions, query
+        materialize_draft_read(
+            common,
+            (8, 8),
+            4,
+            exact_cpu=exact,
+            starts_cpu=torch.tensor([12, 4]),
+            retain=lambda *values: self.retained.extend(values),
+        )
         self.assertIs(common.slot_mapping, slots)
         self.assertIs(common.positions, positions)
         self.assertIs(common.query_start_loc, query)
@@ -210,36 +219,17 @@ class TestCanonicalRead(unittest.TestCase):
             with self.subTest(kwargs=kwargs), self.assertRaisesRegex(ValueError, "ordering"):
                 self.read(**kwargs)
 
-    def test_graph_read_view_preserves_its_bound_request_count(self):
-        view = replace(self.read(), num_reqs=3)
-        common = SimpleNamespace(num_reqs=3)
-        view.apply(common)
-        self.assertIs(view.exact_cpu_for(common), view.seq_lens_cpu)
-        common.num_reqs = 2
-        with self.assertRaisesRegex(ValueError, "operands were replaced"):
-            view.exact_cpu_for(common)
+    def test_active_rows_cannot_exceed_the_actual_common_padded_extent(self):
+        with self.assertRaisesRegex(ValueError, "padded row extent"):
+            self.read(padded_rows=1)
 
     def test_continuing_full_row_and_window_row_share_batch(self):
         view = self.read(starts=(0, 4))
         self.assertEqual(view.seq_lens.tolist(), [21, 7, 0])
-        self.assertEqual(view.block_table[0, :6].tolist(), [16, 17, 18, 19, 20, 21])
-
-    def sequence_length_selector(self):
-        # Run the complete shared selector without initializing a native backend.
-        path = Path(__file__).resolve().parents[4] / "vllm_ascend/attention/utils.py"
-        node = next(
-            node for node in ast.parse(path.read_text()).body if getattr(node, "name", None) == "_select_seq_lens"
-        )
-        scope = {"CrossAttentionSpec": type("CrossAttentionSpec", (), {}), "_is_glm_model": lambda config: False}
-        tree = ast.Module(
-            body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), node],
-            type_ignores=[],
-        )
-        exec(compile(ast.fix_missing_locations(tree), str(path), "exec"), scope)
-        return scope["_select_seq_lens"]
+        self.assertEqual(view.block_table_tensor[0, :6].tolist(), [16, 17, 18, 19, 20, 21])
 
     def select_parallel_lengths(self, common):
-        return self.sequence_length_selector()(
+        return _select_seq_lens(
             common,
             kv_cache_spec=None,
             speculative_config=SimpleNamespace(parallel_drafting=True, use_dspark=lambda: False),
@@ -247,14 +237,12 @@ class TestCanonicalRead(unittest.TestCase):
         )
 
     def test_parallel_builder_reuses_the_current_window_exact_snapshot(self):
-        view = self.read(padded_rows=2)
-        common = SimpleNamespace(num_reqs=2)
-        view.apply(common)
+        common = self.read(padded_rows=2)
         selected = self.select_parallel_lengths(common)
         # Generic parallel drafting otherwise reselects device lengths and
         # synchronizes again at the GQA builder's tolist().
-        self.assertEqual(selected.data_ptr(), view.seq_lens_cpu.data_ptr())
-        self.assertNotEqual(selected.data_ptr(), view.seq_lens.data_ptr())
+        self.assertEqual(selected.data_ptr(), common.seq_lens_cpu.data_ptr())
+        self.assertNotEqual(selected.data_ptr(), common.seq_lens.data_ptr())
         self.assertEqual(selected.tolist(), [9, 7])
 
     def test_parallel_off_does_not_trust_an_uncertified_cpu_mirror(self):
@@ -265,11 +253,10 @@ class TestCanonicalRead(unittest.TestCase):
             _seq_lens_cpu=torch.tensor([99, 99], dtype=torch.int32),
         )
         self.assertIs(self.select_parallel_lengths(common), common.seq_lens)
-        self.assertFalse(hasattr(common, "_draft_window_read"))
+        self.assertFalse(hasattr(common, "_draft_window_exact_cpu"))
 
+    @patch("vllm_ascend.attention.utils._is_glm_model", new=lambda config: True)
     def test_glm_dspark_off_retains_official_cpu_choice_without_copy(self):
-        selector = self.sequence_length_selector()
-        selector.__globals__["_is_glm_model"] = lambda config: True
         for use_v2 in (False, True):
             with self.subTest(use_v2=use_v2):
                 common = SimpleNamespace(
@@ -279,7 +266,7 @@ class TestCanonicalRead(unittest.TestCase):
                     seq_lens_cpu=None,
                 )
                 with patch.object(torch.Tensor, "to", side_effect=AssertionError("OFF must not add an exact copy")):
-                    selected = selector(
+                    selected = _select_seq_lens(
                         common,
                         None,
                         SimpleNamespace(parallel_drafting=True, use_dspark=lambda: True),
@@ -287,35 +274,29 @@ class TestCanonicalRead(unittest.TestCase):
                     )
                 self.assertEqual(selected.data_ptr(), common._seq_lens_cpu.data_ptr())
                 self.assertEqual(selected.tolist(), [1152])
-                self.assertFalse(hasattr(common, "_draft_window_read"))
+                self.assertFalse(hasattr(common, "_draft_window_exact_cpu"))
 
-    def test_glm_dspark_on_full_and_window_reads_keep_certified_exact(self):
-        selector = self.sequence_length_selector()
-        selector.__globals__["_is_glm_model"] = lambda config: True
+    @patch("vllm_ascend.attention.utils._is_glm_model", new=lambda config: True)
+    def test_glm_dspark_on_full_and_window_reads_keep_current_exact(self):
         for starts in ((0, 4), (12, 4)):
             with self.subTest(starts=starts):
-                view = self.read(starts=starts, padded_rows=2)
-                common = SimpleNamespace(num_reqs=2)
-                view.apply(common)
-                selected = selector(
+                common = self.read(starts=starts, padded_rows=2)
+                selected = _select_seq_lens(
                     common,
                     None,
                     SimpleNamespace(parallel_drafting=True, use_dspark=lambda: True),
                     SimpleNamespace(model_config=object(), use_v2_model_runner=True),
                 )
-                self.assertEqual(selected.data_ptr(), view.seq_lens_cpu.data_ptr())
+                self.assertEqual(selected.data_ptr(), common.seq_lens_cpu.data_ptr())
                 self.assertEqual(selected.tolist(), [21 - starts[0], 7])
-                self.assertEqual(selected.tolist(), view.seq_lens_cpu_upper_bound[:2].tolist())
+                self.assertEqual(selected.tolist(), common.seq_lens_cpu_upper_bound[:2].tolist())
                 self.assertNotEqual(selected.tolist(), [24 - starts[0], 11])
 
-    def test_replacing_a_window_read_operand_invalidates_its_cpu_certificate(self):
-        for field in ("seq_lens", "_seq_lens_cpu", "seq_lens_cpu", "block_table_tensor", "seq_lens_cpu_upper_bound"):
-            with self.subTest(field=field):
-                common = SimpleNamespace(num_reqs=2)
-                self.read(padded_rows=2).apply(common)
-                setattr(common, field, getattr(common, field).clone())
-                with self.assertRaisesRegex(ValueError, "replaced"):
-                    self.select_parallel_lengths(common)
+    def test_snapshot_marker_is_the_actual_bound_cpu_tensor(self):
+        common = self.read(padded_rows=2)
+        self.assertIs(common._draft_window_exact_cpu, common.seq_lens_cpu)
+        self.assertIs(common._draft_window_exact_cpu, common._seq_lens_cpu)
+        self.assertEqual(common.seq_lens.tolist(), common._draft_window_exact_cpu.tolist())
 
     def test_compact_kernel_columns_reach_the_original_mla_builder(self):
         from vllm_ascend.attention.mla_v1 import AscendMLAMetadata, AscendMLAMetadataBuilder
@@ -327,20 +308,13 @@ class TestCanonicalRead(unittest.TestCase):
         compact = torch.arange(32, dtype=torch.int32).reshape(2, 16)
         full = compact.clone()
         exact = torch.tensor([1151, 1408], dtype=torch.int32)
-        view = materialize_draft_read(
-            compact,
-            (9, 11),
-            spec.block_size // 2,
-            exact_cpu=exact,
-            exact_device=exact,
-            upper_cpu=exact + 7,
-            starts_cpu=torch.tensor([0, 384]),
-            padded_rows=2,
-            retain=lambda *values: None,
-        )
         slots, positions = torch.arange(16), torch.arange(16) + 1135
-        common = SimpleNamespace(
+        common = AscendCommonAttentionMetadata(
             num_reqs=2,
+            seq_lens=exact,
+            seq_lens_cpu_upper_bound=exact + 7,
+            block_table_tensor=compact,
+            max_seq_len=int((exact + 7).max()),
             slot_mapping=slots,
             positions=positions,
             query_start_loc_cpu=torch.tensor([0, 8, 16]),
@@ -355,7 +329,14 @@ class TestCanonicalRead(unittest.TestCase):
             attn_state=object(),
             causal=False,
         )
-        view.apply(common)
+        materialize_draft_read(
+            common,
+            (9, 11),
+            spec.block_size // 2,
+            exact_cpu=exact,
+            starts_cpu=torch.tensor([0, 384]),
+            retain=lambda *values: None,
+        )
         builder = object.__new__(AscendMLAMetadataBuilder)
         builder.flashmla_state, builder.use_pcp, builder.use_dcp = None, False, False
         builder.decode_threshold = 8

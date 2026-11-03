@@ -717,22 +717,22 @@ def _select_seq_lens(
 ) -> torch.Tensor:
     """Choose the seq_lens tensor carried by the built attention metadata.
 
-    Without a Window read certificate, preserve the baseline choice,
+    Without a Window exact snapshot, preserve the baseline choice,
     including the GLM DSpark CPU mirror in both runners. An enabled Window
     supplies its current exact read pair before the builder, or uses the
     dedicated device-exact consumer. Its continuing-prompt Full read also
-    carries a certificate; the baseline CPU mirror is never that certificate.
+    carries a snapshot; the baseline CPU mirror is never that snapshot.
     """
     # Prefer _seq_lens_cpu (always available, updated during draft
     # iterations) over seq_lens_cpu (None in async spec decode mode).
     model_config = vllm_config.model_config
     num_reqs = common_attn_metadata.num_reqs
-    window_read = getattr(common_attn_metadata, "_draft_window_read", None)
-    if window_read is not None:
+    window_exact = getattr(common_attn_metadata, "_draft_window_exact_cpu", None)
+    if window_exact is not None:
         # Projection already owns a current exact CPU/device pair. Selecting
         # device lengths again would repeat D2H in the parallel GQA builder.
-        # Uncertified baseline CPU mirrors retain the original selection below.
-        return window_read.exact_cpu_for(common_attn_metadata)[:num_reqs]
+        # Baseline CPU mirrors retain the original selection below.
+        return window_exact[:num_reqs]
     if common_attn_metadata._seq_lens_cpu is not None:
         seq_lens = common_attn_metadata._seq_lens_cpu[:num_reqs]
     elif common_attn_metadata.seq_lens_cpu is not None:
@@ -743,8 +743,8 @@ def _select_seq_lens(
     if isinstance(kv_cache_spec, CrossAttentionSpec):
         seq_lens = common_attn_metadata.seq_lens
     if speculative_config is not None and speculative_config.parallel_drafting:
-        # Keep the official OFF behavior. Window read certificates above
-        # are scoped to their prepared table/length pair, not a global flag.
+        # Keep the official OFF behavior. The Window snapshot above belongs
+        # to this fresh common metadata, not a global flag.
         if not (speculative_config.use_dspark() and _is_glm_model(model_config)):
             seq_lens = common_attn_metadata.seq_lens
     return seq_lens

@@ -25,10 +25,7 @@ def test_different_full_row_bounds_do_not_multiply_largest_workspace(order):
         exact_cpu=exact,
         query_ends_cpu=exact,
         frozen_starts=torch.div(torch.clamp(exact - 1024, min=0), 128, rounding_mode="floor") * 128,
-        exact_device=exact,
         upper_cpu=upper,
-        window_size=1024,
-        anchor_span=128,
         query_width=8,
         causal=False,
         full_rows_cpu=full,
@@ -65,10 +62,7 @@ def test_equal_aligned_full_bounds_keep_one_existing_read():
             torch.clamp(torch.tensor([2055, 2063], dtype=torch.int32) - 1024, min=0), 128, rounding_mode="floor"
         )
         * 128,
-        exact_device=torch.tensor([2055, 2063], dtype=torch.int32),
         upper_cpu=torch.tensor([2064, 2070], dtype=torch.int32),
-        window_size=1024,
-        anchor_span=128,
         query_width=8,
         causal=False,
         full_rows_cpu=torch.tensor([True, True]),

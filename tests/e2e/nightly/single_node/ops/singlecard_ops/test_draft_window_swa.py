@@ -9,6 +9,7 @@ import torch
 
 torch_npu = pytest.importorskip("torch_npu")
 
+from vllm_ascend.attention.utils import AscendCommonAttentionMetadata  # noqa: E402
 from vllm_ascend.worker.v2.spec_decode.draft_window_read import (  # noqa: E402
     materialize_draft_read,
 )
@@ -41,13 +42,26 @@ def test_native_swa_intersection_uses_current_exact_and_canonical_pages(ends, wi
     exact = torch.tensor(ends, dtype=torch.int32)
     starts = torch.tensor([max(end - window, 0) // block * block for end in ends], dtype=torch.int32)
     retained = []
-    read = materialize_draft_read(
-        *(table[list(rows)], (columns, columns), block),
+    query_offsets = torch.tensor([0, width, 2 * width], dtype=torch.int32)
+    read = AscendCommonAttentionMetadata(
+        query_start_loc=query_offsets.npu(),
+        query_start_loc_cpu=query_offsets,
+        seq_lens=exact.npu(),
+        num_reqs=2,
+        num_actual_tokens=2 * width,
+        max_query_len=width,
+        max_seq_len=int((exact + 1).max()),
+        block_table_tensor=table[list(rows)],
+        slot_mapping=torch.arange(2 * width, dtype=torch.int64, device="npu"),
+        seq_lens_cpu_upper_bound=exact + 1,
+        causal=True,
+    )
+    materialize_draft_read(
+        read,
+        (columns, columns),
+        block,
         exact_cpu=exact,
-        exact_device=exact.npu(),
-        upper_cpu=exact + 1,
         starts_cpu=starts,
-        padded_rows=2,
         retain=lambda *items: retained.extend(items),
     )
     mask = torch.ones((2048, 2048), dtype=torch.bool).triu(1).npu()
@@ -55,7 +69,7 @@ def test_native_swa_intersection_uses_current_exact_and_canonical_pages(ends, wi
         query=query.npu(),
         key=key_device.view(pages, block, -1),
         value=value_device.view(pages, block, -1),
-        block_table=read.block_table,
+        block_table=read.block_table_tensor,
         block_size=block,
         input_layout="TND",
         actual_seq_lengths=[width, 2 * width],
@@ -84,7 +98,7 @@ def test_native_swa_intersection_uses_current_exact_and_canonical_pages(ends, wi
         expected.append(torch.einsum("hqk,khd->qhd", scores.softmax(-1), v))
         stop_column = (end + block - 1) // block
         wanted = canonical[persistent_row, start // block : stop_column]
-        torch.testing.assert_close(read.block_table[compact_row, : len(wanted)].cpu(), wanted, atol=0, rtol=0)
+        torch.testing.assert_close(read.block_table_tensor[compact_row, : len(wanted)].cpu(), wanted, atol=0, rtol=0)
     assert bool(torch.isfinite(actual).all())
     torch.testing.assert_close(actual.cpu().float(), torch.cat(expected), atol=2**-7, rtol=2**-6)
     torch.testing.assert_close(table.cpu(), canonical, atol=0, rtol=0)

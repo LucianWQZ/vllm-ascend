@@ -71,14 +71,18 @@ def prepared(monkeypatch):
             def __init__(self):
                 completions.append(self)
 
-            def is_complete(self):
+            def record(self, stream):
+                self.stream = stream
+
+            def query(self):
                 return self.complete
 
-            def wait(self):
+            def synchronize(self):
                 raise AssertionError("No wait is needed with a free proposal lane")
 
         monkeypatch.setattr(runtime_module.DraftWindowRuntime, "_validate_route", validate)
-        monkeypatch.setattr(runtime_module, "_NPUCompletion", Completion)
+        monkeypatch.setattr(torch.npu, "Event", Completion)
+        monkeypatch.setattr(torch.npu, "current_stream", lambda: None)
         runtime = runtime_module.DraftWindowRuntime(
             speculator, resolve_draft_window_policy(requested_window_size=window, method="dflash")
         )
@@ -215,7 +219,7 @@ def test_next_native_proposal_owns_independent_read_buffers(prepared):
     second.seq_lens = torch.tensor([1159, 1160], dtype=torch.int32)
     second.block_table_tensor = canonical[batch.idx_mapping_np.tolist()].clone()
     second.seq_lens_cpu_upper_bound = second.seq_lens + 3
-    del second._draft_window_read
+    del second._draft_window_exact_cpu
     with runtime.proposal_context(spec, batch):
         runtime.metadata_callback(8, 2)(0, second)
     torch.testing.assert_close(common.seq_lens, first[0], rtol=0, atol=0)
@@ -226,30 +230,13 @@ def test_next_native_proposal_owns_independent_read_buffers(prepared):
     assert runtime.pool.reclaim_completed() == 1
 
 
-@pytest.mark.parametrize("repeated", [False, True])
-def test_native_callback_keeps_owner_and_single_use_guards(prepared, repeated):
-    runtime, spec, batch, common, canonical, _ = prepared()
+def test_native_callback_cannot_cross_proposal_ownership(prepared):
+    runtime, spec, batch, common, _, _ = prepared()
     with runtime.proposal_context(spec, batch):
         callback = runtime.metadata_callback(8, 2)
         callback(0, common)
     with pytest.raises(RuntimeError, match="stale proposal"), runtime.proposal_context(spec, batch):
-        if repeated:
-            callback = runtime.metadata_callback(8, 2)
-            fresh = SimpleNamespace(**vars(common))
-            fresh.block_table_tensor = canonical[batch.idx_mapping_np.tolist()].clone()
-            fresh.seq_lens = torch.tensor([1151, 1152], dtype=torch.int32)
-            fresh.seq_lens_cpu_upper_bound = torch.tensor([1152, 1159], dtype=torch.int32)
-            del fresh._draft_window_read
-            callback(0, fresh)
         callback(0, common)
-
-
-def test_native_proposal_requires_every_group(prepared):
-    runtime, spec, batch, common, _, _ = prepared(groups=(0, 1))
-    with pytest.raises(RuntimeError, match="did not consume a read projection"), runtime.proposal_context(spec, batch):
-        runtime.metadata_callback(8, 2)(0, common)
-        assert runtime._build_count == 0
-    assert runtime.pool.poisoned
 
 
 def test_builder_failure_keeps_projected_read_operands_owned(prepared):

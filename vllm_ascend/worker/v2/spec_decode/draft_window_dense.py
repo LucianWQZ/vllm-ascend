@@ -34,12 +34,6 @@ def _apply_read_metadata(read: DenseDraftRead | DenseDraftReadBatch, common: Any
     common._draft_window_device_read = read
 
 
-def _read_capacity_cpu(read: DenseDraftRead | DenseDraftReadBatch, common: Any) -> torch.Tensor:
-    if getattr(common, "_draft_window_device_read", None) is not read:
-        raise ValueError("Dense Draft read belongs to another common metadata object")
-    return common.seq_lens_cpu_upper_bound
-
-
 @dataclass(frozen=True)
 class DenseDraftRead:
     slots: torch.Tensor
@@ -62,7 +56,6 @@ class DenseDraftRead:
         return self.slots.shape[0]
 
     apply = _apply_read_metadata
-    capacity_cpu = _read_capacity_cpu
 
 
 @dataclass(frozen=True)
@@ -86,7 +79,6 @@ class DenseDraftReadBatch:
         return self.seq_lens.numel()
 
     apply = _apply_read_metadata
-    capacity_cpu = _read_capacity_cpu
 
 
 def _copy_owned_read_tensor(
@@ -104,12 +96,9 @@ def prepare_dense_draft_read(
     valid_columns: Sequence[int],
     block_span: int,
     *,
-    exact_device: torch.Tensor,
     exact_cpu: torch.Tensor,
     query_ends_cpu: torch.Tensor,
     upper_cpu: torch.Tensor,
-    window_size: int,
-    anchor_span: int,
     query_width: int,
     causal: bool,
     retain: Callable[..., None],
@@ -130,20 +119,14 @@ def prepare_dense_draft_read(
         raise ValueError("Invalid compact dense Draft table geometry")
     if block_table.shape[0] < n or any(count < 0 or count > block_table.shape[1] for count in valid_columns):
         raise ValueError("Invalid initialized compact column extent")
-    if n < 1 or window_size < 1 or query_width < 1 or anchor_span < 1 or anchor_span % block_span:
+    if n < 1 or query_width < 1:
         raise ValueError("Invalid dense Draft read geometry")
     if upper_cpu.device.type != "cpu" or upper_cpu.shape != (n,) or upper_cpu.dtype not in (torch.int32, torch.int64):
         raise ValueError("Missing current preparation allocation upper bounds")
     available = torch.tensor(valid_columns, dtype=torch.int64, device="cpu") * block_span
     if bool((upper_cpu <= 0).any()):
         raise ValueError("Allocation upper must be positive")
-    if exact_device.ndim != 1 or exact_device.numel() < n:
-        raise ValueError("Missing current device lengths")
-    if exact_device.dtype not in (torch.int32, torch.int64):
-        raise ValueError("Dense read lengths must be integer tensors")
-    if exact_device.device != block_table.device:
-        raise ValueError("Dense read operands must share their source device")
-    retain(exact_device, block_table)
+    retain(block_table)
     # The runtime supplies its one current exact snapshot and frozen starts;
     # this reader never derives lengths or synchronizes device values again.
     if exact_cpu.device.type != "cpu" or exact_cpu.shape != (n,) or exact_cpu.dtype not in (torch.int32, torch.int64):
@@ -161,7 +144,7 @@ def prepare_dense_draft_read(
         starts.device.type != "cpu"
         or starts.dtype not in (torch.int32, torch.int64)
         or starts.shape != (n,)
-        or bool(((starts < 0) | (starts > exact_cpu) | (starts % anchor_span != 0)).any())
+        or bool(((starts < 0) | (starts >= exact_cpu)).any())
     ):
         raise ValueError("Frozen Draft anchors must match current request rows")
     retain(exact_cpu, starts, query_ends_cpu)
@@ -177,7 +160,7 @@ def prepare_dense_draft_read(
             or query_start_loc_cpu.dtype not in (torch.int32, torch.int64)
             or query_start_loc_cpu.shape != (n + 1,)
             or query_start_loc_device.shape != (n + 1,)
-            or query_start_loc_device.device != exact_device.device
+            or query_start_loc_device.device != block_table.device
             or query_start_loc_device.dtype not in (torch.int32, torch.int64)
         ):
             raise ValueError("Packed query boundaries must match the active preparation")
@@ -208,13 +191,15 @@ def prepare_dense_draft_read(
                 blocks = block_table[physical_rows[:, None], logical_columns]
         slots = blocks.to(torch.int64) * block_span + address % block_span
         excluded = (columns[None, None, :] >= visible[:, None, None]).expand(-1, width, -1)
+        may_have_empty_rows = False
         if causal:
             query_end = query_ends_cpu.index_select(0, host_rows)
             queries = query_end[:, None] - origins[:, None] - width + torch.arange(width, device="cpu")
             excluded = excluded | (columns[None, None, :] > queries[:, :, None])
+            may_have_empty_rows = bool((queries < 0).any())
         mask = _copy_owned_read_tensor(excluded[:, None].contiguous(), retain, device=block_table.device)
         lengths = _copy_owned_read_tensor(visible, retain, device=block_table.device)
-        read = DenseDraftRead(slots, lengths, mask, capacity, width, retain, causal and window_size < width)
+        read = DenseDraftRead(slots, lengths, mask, capacity, width, retain, may_have_empty_rows)
         retain(read, block_table, address, logical_columns, blocks, slots, lengths, mask)
         return read
 
@@ -256,10 +241,12 @@ def gather_dense_draft_kv(
     read: DenseDraftRead,
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
-    *,
-    output_buffers: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Gather ND token rows, including interleaved/padded physical KV pages."""
+    """Prepare the immediate FA reader, preserving physical KV page strides.
+
+    The only production caller queues attention before the next gather. Its
+    per-read ND geometry scratch can therefore be reused in stream order.
+    """
     if key_cache.ndim != 4 or key_cache.shape != value_cache.shape:
         raise ValueError("Dense Draft KV requires matching four-dimensional caches")
     if key_cache.dtype not in (torch.float16, torch.bfloat16) or value_cache.dtype != key_cache.dtype:
@@ -288,17 +275,17 @@ def gather_dense_draft_kv(
         # Raw Triton addresses require an ND physical layout. Other formats
         # retain the existing format-aware PyTorch gather/conversion path.
         if all(torch_npu.get_npu_format(cache) in (0, 2) for cache in (key_cache, value_cache)):
+            workspace_key = key_cache.shape[2:]
             keys, values = gather_draft_kv_fp32(
                 read.slots,
                 key_cache,
                 value_cache,
                 retain=read.retain,
-                **({"output_buffers": output_buffers} if output_buffers is not None else {}),
+                output_buffers=read._attention_workspaces.get(workspace_key),
             )
+            read._attention_workspaces[workspace_key] = (keys, values)
             read.retain(keys, values)
             return keys, values
-    if output_buffers is not None:
-        raise ValueError("Reusable Draft operands require the native ND FP32 gather")
     slots = read.slots.reshape(-1)
     indices_by_stride = {}
     gathered = []
@@ -347,29 +334,7 @@ def dense_draft_attention(
             value = dense_draft_attention(part, queries, key_cache, value_cache, scale)
             output.index_copy_(0, indices, value)
         return output
-    workspace_key = None
-    if (
-        key_cache.device.type == "npu"
-        and value_cache.device == key_cache.device
-        and key_cache.ndim == value_cache.ndim == 4
-        and all(torch_npu.get_npu_format(cache) in (0, 2) for cache in (key_cache, value_cache))
-    ):
-        # Only this immediate native FA consumer reuses scratch. Its next
-        # gather is queued after the preceding FA on the same NPU stream,
-        # so the overwrite executes after that reader. A different stream,
-        # KV geometry, read/group or proposal gets independent storage.
-        # Standalone gather callers retain independent materializations.
-        stream = torch.npu.current_stream(key_cache.device)
-        workspace_key = (stream.npu_stream, read.num_reqs, read.capacity, *key_cache.shape[2:])
-    buffers = read._attention_workspaces.get(workspace_key) if workspace_key is not None else None
-    keys_fp32, values_fp32 = gather_dense_draft_kv(
-        read,
-        key_cache,
-        value_cache,
-        **({"output_buffers": buffers} if buffers is not None else {}),
-    )
-    if workspace_key is not None:
-        read._attention_workspaces[workspace_key] = (keys_fp32, values_fp32)
+    keys_fp32, values_fp32 = gather_dense_draft_kv(read, key_cache, value_cache)
     query = query[: read.num_query_tokens]
     query = query.reshape(read.num_reqs, read.query_width, *query.shape[-2:])
     queries_fp32 = query.float().contiguous()

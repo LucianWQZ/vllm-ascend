@@ -4,14 +4,15 @@
 
 Startup capture fixes addresses. Each proposal updates only its private read
 banks and metadata; canonical Full write tables, slots, and absolute positions
-remain unchanged. The bank owner retains current generation and request
-identity through the actual typed Graph UPDATE entrance.
+remain unchanged. One proposal scope owns preparation and UPDATE, retaining
+capture banks across failure and until the original stream can reuse them.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from dataclasses import dataclass
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 
@@ -19,11 +20,9 @@ import torch
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 
 from vllm_ascend.worker.v2.spec_decode.draft_window import (
-    DraftMetadataInputs,
     DraftWindowGraphSource,
-    DraftWindowWorkspace,
 )
-from vllm_ascend.worker.v2.spec_decode.draft_window_plan import DraftWindowPlan
+from vllm_ascend.worker.v2.spec_decode.draft_window_plan import DraftWindowPlan, compute_draft_window_plan
 
 if TYPE_CHECKING:
     from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowProposalContext
@@ -38,15 +37,72 @@ class DraftWindowGraphRoute(Enum):
     DSPARK = "dspark"
 
 
-@dataclass(frozen=True, slots=True, eq=False)
+@dataclass(slots=True, eq=False)
 class DraftWindowGraphBucket:
-    """One real descriptor/consumer and its immutable-address read bank."""
+    """Actual capture consumer, its read tensors and last prepared payload.
+
+    Only its provider writes these private fields. Capture and replay borrow
+    the same tensors; a proposal updates their contents, never their address.
+    """
 
     route: DraftWindowGraphRoute
     descriptor: BatchExecutionDescriptor
     consumer_ordinal: int
-    workspace: DraftWindowWorkspace
-    inputs: DraftMetadataInputs | None = None
+    window_block_table: torch.Tensor
+    device_window_exact: torch.Tensor
+    cpu_window_exact: torch.Tensor
+    owner: DraftWindowGraphBindingProvider = field(repr=False)
+    params: dict[str, Any] | None = field(default=None, repr=False)
+
+    def materialize(
+        self,
+        source: DraftWindowGraphSource,
+        cpu_full_exact: torch.Tensor,
+        cpu_valid_num_blocks: torch.Tensor,
+        frozen_row_plans: tuple[DraftWindowPlan, ...] | None,
+    ) -> None:
+        assert self.owner.proposal is not None
+        rows = self.owner.proposal.full_read_rows
+        if any(
+            t.device.type != "cpu" or t.ndim != 1 or len(t) < len(rows) or t.dtype not in (torch.int32, torch.int64)
+            for t in (cpu_full_exact, cpu_valid_num_blocks)
+        ):
+            raise ValueError("current CPU exact lengths and initialized block counts are required")
+        if frozen_row_plans is not None and len(frozen_row_plans) != len(rows):
+            raise ValueError("frozen Window anchors must match active request rows")
+        source_table, span = source.table, source.group.table_column_span
+        intervals = []
+        # Validate the whole current preparation before the first tensor write.
+        for row, full_read in enumerate(rows):
+            exact, valid = int(cpu_full_exact[row]), int(cpu_valid_num_blocks[row])
+            if exact < 0 or not 0 <= valid <= source_table.shape[1]:
+                raise RuntimeError("current exact length or initialized block count is invalid")
+            if full_read:
+                start, required, visible = 0, valid, exact
+            else:
+                plan = (
+                    compute_draft_window_plan(
+                        full_exact_end=exact, window_size=source.window_size, block_span_tokens=span
+                    )
+                    if frozen_row_plans is None
+                    else frozen_row_plans[row].at_exact_end(exact)
+                )
+                if plan.window_start % span:
+                    raise NotImplementedError("Draft Graph cannot read an intra-block Window start")
+                start, visible = plan.window_start // span, plan.window_visible_length
+                required = (visible + span - 1) // span
+            if required > self.window_block_table.shape[1]:
+                raise RuntimeError("draft-window table capacity exceeded")
+            if start + required > valid or visible > required * span:
+                raise RuntimeError("draft-window source does not cover the exact readable interval")
+            intervals.append((start, required, visible))
+        self.window_block_table.zero_()
+        self.cpu_window_exact.zero_()
+        for row, (start, required, visible) in enumerate(intervals):
+            if required:
+                self.window_block_table[row, :required].copy_(source_table[row, start : start + required])
+            self.cpu_window_exact[row] = visible
+        self.device_window_exact.copy_(self.cpu_window_exact)
 
 
 _ROUTE_METHODS = {
@@ -58,11 +114,12 @@ _ROUTE_METHODS = {
 
 
 class DraftWindowGraphBindingProvider:
-    """Own stable capture banks and bind each current runtime generation."""
+    """Own capture banks and the single active proposal's bindings."""
 
     def __init__(self, *, source: DraftWindowGraphSource) -> None:
         self._source = source
-        self._active_inputs: DraftMetadataInputs | None = None
+        self.proposal: DraftWindowProposalContext | None = None
+        self._active_bank: DraftWindowGraphBucket | None = None
         self._quarantined = False
         self._carriers: dict[tuple[DraftWindowGraphRoute, int, int], tuple[DraftWindowGraphBucket, ...]] = {}
         self._pending: list[DraftWindowGraphBucket] = []
@@ -79,59 +136,70 @@ class DraftWindowGraphBindingProvider:
         """Retain all banks after uncertain work, even without active inputs."""
         self._quarantined = True
 
-    def materialize(
+    @contextmanager
+    def proposal_scope(self, proposal: DraftWindowProposalContext) -> Iterator[None]:
+        self.require_reusable()
+        if self.proposal is not None or self._active_bank is not None or self._pending:
+            raise RuntimeError("a Draft Window proposal is already active")
+        self.proposal = proposal
+        try:
+            yield
+            if self._pending or (self._active_bank is not None and self._active_bank.params is None):
+                raise RuntimeError("Draft Window proposal has unfinished Graph consumers")
+        except BaseException:
+            self.quarantine()
+            raise
+        else:
+            self._active_bank = None
+        finally:
+            self.proposal = None
+
+    def prepare(
         self,
+        capture: DraftWindowGraphBucket,
         *,
-        proposal: DraftWindowProposalContext,
         cpu_full_exact: torch.Tensor,
         cpu_valid_num_blocks: torch.Tensor,
-        num_reqs_padded: int,
         step: int,
-        output_workspace: DraftWindowWorkspace,
         frozen_row_plans: tuple[DraftWindowPlan, ...] | None = None,
-    ) -> DraftMetadataInputs:
-        """Populate a new proposal or the next retired Eagle consumer's bank."""
-        if self.quarantined:
-            raise RuntimeError("draft-window backing is quarantined after uncertain Graph submission")
-        if self._active_inputs is not None:
-            raise RuntimeError("Draft Graph provider still owns an active read bank")
-        if (
-            type(step) is not int
-            or step < 0
-            or type(num_reqs_padded) is not int
-            or num_reqs_padded < len(proposal.full_read_rows)
-        ):
+    ) -> DraftWindowGraphBucket:
+        """Select and update the actual consumer before any preparation write."""
+        self.require_reusable()
+        proposal = self.proposal
+        if proposal is None or capture.owner is not self:
+            raise RuntimeError("Draft Window bank has no current owning proposal")
+        if self._active_bank is not None and self._active_bank.params is None:
+            raise RuntimeError("previous Draft Window consumer is still active")
+        if capture in self._pending:
+            raise RuntimeError("cannot overwrite a pending Draft Window consumer")
+        if type(step) is not int or step < 0 or len(proposal.full_read_rows) > capture.descriptor.num_reqs:
             raise ValueError("Draft Window consumer step or active/padded geometry is invalid")
+        if (capture.route is DraftWindowGraphRoute.EAGLE3_AR_STEP) != (step > 0):
+            raise RuntimeError("Graph route does not match the actual consumer step")
         if frozen_row_plans is not None and self.method != "eagle3":
             raise ValueError("proposal-frozen Window anchors belong only to Eagle3")
-        inputs = DraftMetadataInputs(proposal, num_reqs_padded, step, output_workspace, self)
-        self._active_inputs = inputs
+        if capture.consumer_ordinal != len(self._pending):
+            raise RuntimeError("Graph Window consumers must prepare in their actual serial ordinal order")
+        if self._pending and self._pending[0].route is not capture.route:
+            raise RuntimeError("Graph consumers belong to different routes")
+        capture.params = None
+        self._active_bank = capture
         try:
-            output_workspace.materialize(
-                inputs=inputs,
-                source=self.source,
-                cpu_full_exact=cpu_full_exact,
-                frozen_row_plans=frozen_row_plans,
-                cpu_valid_num_blocks=cpu_valid_num_blocks,
-            )
-            return inputs
+            capture.materialize(self.source, cpu_full_exact, cpu_valid_num_blocks, frozen_row_plans)
         except BaseException:
-            # Preparation may have queued writes. Keep the current bank and
-            # refuse reuse, without clearing or inspecting device work.
-            self._quarantined = True
+            self.quarantine()
             raise
+        return capture
 
-    def retire_generation(self, inputs: DraftMetadataInputs) -> None:
-        inputs.validate()
-        # Host retirement does not imply device completion. Capture owns the
-        # banks; the established tail dependency orders their next overwrite.
-        self._active_inputs = None
+    def complete_native(self) -> None:
+        """Release the Host preparation after the real native first forward.
 
-    def finish_proposal(self) -> None:
-        """All staged consumers must have reached the real Graph UPDATE seam."""
-        self.require_reusable()
-        if self._active_inputs is not None or self._pending:
-            raise RuntimeError("Draft Window proposal has unfinished Graph consumers")
+        Tensor ownership stays with capture and reuse keeps the existing
+        current-stream dependency; this is not a device-completion claim.
+        """
+        if self.quarantined or self._active_bank is None or self._active_bank.params is not None:
+            raise RuntimeError("Draft Window has no current native first consumer")
+        self._active_bank = None
 
     def capture_banks_for(
         self, *, route: DraftWindowGraphRoute, num_reqs: int, num_tokens: int
@@ -153,15 +221,6 @@ class DraftWindowGraphBindingProvider:
         if banks[0].descriptor != descriptor or not 0 <= consumer_ordinal < len(banks):
             raise RuntimeError(f"runtime descriptor does not resolve a captured consumer: {descriptor!r}")
         return banks[consumer_ordinal]
-
-    def startup_capture_workspace(
-        self,
-        capture_identity: DraftWindowGraphBucket,
-    ) -> DraftWindowWorkspace:
-        """Return the real persistent bank before any business generation."""
-        if capture_identity in self._pending:
-            raise RuntimeError("startup capture carrier is already bound to a runtime generation")
-        return capture_identity.workspace
 
     @property
     def method(self) -> str:
@@ -203,25 +262,20 @@ class DraftWindowGraphBindingProvider:
         source = self.source
         if num_reqs > source.table.shape[0]:
             raise RuntimeError("capture request bucket exceeds source capacity")
-        backing = DraftWindowWorkspace(
-            max_num_reqs=num_reqs,
-            table_capacity_columns=source.table.shape[1],
-            table_template=source.table,
+        table = source.table
+        if table.ndim != 2 or table.dtype != torch.int32:
+            raise ValueError("Draft capture requires a two-dimensional int32 table")
+        bucket = DraftWindowGraphBucket(
+            route,
+            descriptor,
+            consumer_ordinal,
+            table.new_zeros((num_reqs, table.shape[1])),
+            torch.zeros(num_reqs, dtype=torch.int32, device=table.device),
+            torch.zeros(num_reqs, dtype=torch.int32),
+            self,
         )
-        bucket = DraftWindowGraphBucket(route, descriptor, consumer_ordinal, backing)
         self._carriers[key] = (*banks, bucket)
         return bucket
-
-    def prepare_workspace(self, capture_identity: DraftWindowGraphBucket) -> DraftWindowWorkspace:
-        """Select the final capture bank before any canonical read is written.
-
-        The existing Graph tail-notify/current-stream dependency orders reuse.
-        A successful Host UPDATE is not device completion.
-        """
-        self.require_reusable()
-        if capture_identity in self._pending:
-            raise RuntimeError("cannot overwrite an active Draft Window graph read carrier")
-        return capture_identity.workspace
 
     def require_reusable(self) -> None:
         """Keep every proposal on its established completion stream."""
@@ -235,59 +289,25 @@ class DraftWindowGraphBindingProvider:
                 raise RuntimeError("Draft Window bank reuse changed stream without a completion dependency")
             self._owner_stream = stream
 
-    def bind_read_carrier(
-        self,
-        *,
-        capture_identity: DraftWindowGraphBucket,
-        inputs: DraftMetadataInputs,
-    ) -> DraftWindowGraphBucket:
-        """Publish this generation against its selected persistent Graph bank."""
-        carrier = capture_identity
-        inputs.validate()
-        if inputs.params is not None:
-            raise RuntimeError("cannot overwrite active draft metadata")
-        if carrier in self._pending:
-            raise RuntimeError("cannot overwrite an active Draft Window graph read carrier")
-        if inputs._owner is not self:
-            raise RuntimeError("graph carrier inputs do not belong to the provider runtime")
-        route = capture_identity.route
-        if (route is DraftWindowGraphRoute.EAGLE3_AR_STEP) != (inputs.step > 0):
-            raise RuntimeError("Graph route does not match the actual consumer step")
-        if inputs.padded_request_count != capture_identity.descriptor.num_reqs:
-            raise RuntimeError("capture/runtime padded request count mismatch")
-        if inputs.workspace is not carrier.workspace:
-            raise RuntimeError("Graph generation was not materialized into its exact capture bank")
-        ordinal = capture_identity.consumer_ordinal
-        if ordinal != len(self._pending):
-            raise RuntimeError("Graph Window consumers must bind in their actual serial ordinal order")
-        if self._pending:
-            previous = self._pending[0]
-            assert previous.inputs is not None
-            if previous.route is not route or previous.inputs.proposal is not inputs.proposal:
-                raise RuntimeError("graph read carriers do not belong to the same actual proposal/route")
-        descriptor = carrier.descriptor
+    def bind_current(self, descriptor: BatchExecutionDescriptor) -> None:
+        """Publish the prepared bank directly to the original Graph resolver."""
+        bank = self._active_bank
+        if self.quarantined or bank is None or bank.params is not None or bank.descriptor != descriptor:
+            raise RuntimeError("Graph replay does not own the current unconsumed preparation")
         query_width = descriptor.num_tokens // descriptor.num_reqs
-        # Capture owns all query/write/position addresses. UPDATE changes only
-        # the same three operands that the fixed FIAParamProvider resolves.
-        object.__setattr__(
-            inputs,
-            "params",
-            {
-                "actual_seq_lengths": [query_width * (row + 1) for row in range(descriptor.num_reqs)],
-                "actual_seq_lengths_kv": carrier.workspace.cpu_window_exact.tolist(),
-                "block_table": carrier.workspace.window_block_table,
-            },
-        )
-        object.__setattr__(carrier, "inputs", inputs)
-        self._pending.append(carrier)
-        return carrier
+        bank.params = {
+            "actual_seq_lengths": [query_width * (row + 1) for row in range(descriptor.num_reqs)],
+            "actual_seq_lengths_kv": bank.cpu_window_exact.tolist(),
+            "block_table": bank.window_block_table,
+        }
+        self._pending.append(bank)
 
     def get(self, _provider: Any) -> tuple[dict[str, Any], ...]:
         """Resolve one payload per actual layer consumer, in capture order."""
         result = []
         for carrier in self._pending:
-            assert carrier.inputs is not None and carrier.inputs.params is not None
-            result.append(carrier.inputs.params)
+            assert carrier.params is not None
+            result.append(carrier.params)
         return tuple(result)
 
     def validate_captured_graphs(self, graphs: Mapping[BatchExecutionDescriptor, Any]) -> None:

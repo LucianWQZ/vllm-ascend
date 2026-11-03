@@ -17,11 +17,13 @@ import torch
 from vllm.v1.worker.gpu.input_batch import InputBatch
 
 from vllm_ascend.worker.v2.spec_decode.draft_window import (
-    DraftMetadataInputs,
     _build_draft_window_source_capability_for_context,
     gather_valid_num_blocks_cpu,
 )
-from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphBindingProvider
+from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
+    DraftWindowGraphBindingProvider,
+    resolve_parallel_draft_window_graph_route,
+)
 from vllm_ascend.worker.v2.spec_decode.draft_window_runtime import continuing_prefill_rows
 
 
@@ -52,7 +54,6 @@ class DraftWindowGraphInputMixin:
     _speculator_name: str
     _group_causal: bool | Mapping[int, bool]
     _draft_window_graph_binding_provider: DraftWindowGraphBindingProvider
-    _draft_window_proposal: DraftWindowProposalContext | None
     _draft_window_bypass_active: bool
     _draft_window_prefill_bypass_active: bool
     _draft_window_dp_dummy_active: bool
@@ -94,13 +95,11 @@ class DraftWindowGraphInputMixin:
     def _initialize_draft_window_graph_inputs(self) -> None:
         if not hasattr(self, "_draft_window_graph_binding_provider"):
             raise RuntimeError("Draft Window Graph inputs require an initialized Source owner")
-        if hasattr(self, "_draft_window_proposal"):
+        if hasattr(self, "_draft_window_bypass_active"):
             raise RuntimeError("Draft Window Graph inputs are already initialized")
-        self._draft_window_proposal = None
         self._draft_window_bypass_active = False
         self._draft_window_prefill_bypass_active = False
         self._draft_window_dp_dummy_active = False
-        self._draft_window_selected_metadata = None
 
     @contextmanager
     def _draft_window_proposal_scope(
@@ -113,7 +112,7 @@ class DraftWindowGraphInputMixin:
         if not hasattr(self, "_draft_window_graph_binding_provider"):
             yield
             return
-        if self._draft_window_bypass_active or self._draft_window_proposal is not None:
+        if self._draft_window_bypass_active or self._draft_window_graph_binding_provider.proposal is not None:
             raise RuntimeError("a draft-window proposal scope is already active")
         if self._draft_window_graph_binding_provider.quarantined:
             raise RuntimeError("draft-window backing is quarantined after uncertain Graph submission")
@@ -154,24 +153,11 @@ class DraftWindowGraphInputMixin:
                 self._draft_window_dp_dummy_active = False
             return
         assert context is not None
-        self._draft_window_proposal = context
-        self._draft_window_selected_metadata = None
         provider = self._draft_window_graph_binding_provider
-        try:
+        with provider.proposal_scope(context):
             yield
-            live_inputs = provider._active_inputs
-            if live_inputs is None:
+            if provider._active_bank is None:
                 raise RuntimeError("Draft Graph proposal completed without consuming its current inputs")
-            provider.retire_generation(live_inputs)
-            provider.finish_proposal()
-        except BaseException:
-            # Preparation, context writes or UPDATE may already be submitted.
-            # One provider flag covers both live and Host-retired consumers.
-            provider.quarantine()
-            raise
-        finally:
-            self._draft_window_selected_metadata = None
-            self._draft_window_proposal = None
 
     def _snapshot_prepared_draft_seq_lens(
         self,
@@ -188,21 +174,21 @@ class DraftWindowGraphInputMixin:
         self,
         *,
         num_reqs: int,
-        num_reqs_padded: int,
-    ) -> DraftMetadataInputs:
+        batch_desc: Any,
+    ) -> None:
         context = self._require_current_draft_window_proposal()
         input_batch = self.input_batch
+        num_reqs_padded = batch_desc.num_reqs
         if num_reqs != input_batch.num_reqs:
             raise RuntimeError("metadata request count does not match proposal epoch")
         if num_reqs_padded < num_reqs:
             raise ValueError("padded request count must be at least actual requests")
 
-        selected = self._draft_window_selected_metadata
-        if selected is None:
-            raise RuntimeError("Draft Window input preparation requires the actual FULL dispatch")
         provider = self._draft_window_graph_binding_provider
-        output_workspace = provider.prepare_workspace(selected)
-
+        route = resolve_parallel_draft_window_graph_route(self)
+        if route is None:
+            raise RuntimeError("Draft Window has no parallel Graph capture route")
+        selected = provider.capture_identity_for(route=route, descriptor=batch_desc)
         cpu_full_exact = self._snapshot_prepared_draft_seq_lens(num_reqs_padded)
         capability = self._draft_window_graph_binding_provider.source
         valid_num_blocks = gather_valid_num_blocks_cpu(
@@ -213,15 +199,12 @@ class DraftWindowGraphInputMixin:
         )
         # Recheck request order after the controlled exact-length snapshot.
         context.validate(input_batch)
-        inputs = self._draft_window_graph_binding_provider.materialize(
-            proposal=context,
+        provider.prepare(
+            selected,
             cpu_full_exact=cpu_full_exact,
             cpu_valid_num_blocks=valid_num_blocks,
-            num_reqs_padded=num_reqs_padded,
             step=0,
-            output_workspace=output_workspace,
         )
-        return inputs
 
     def _build_attn_metadata(
         self,
@@ -258,8 +241,6 @@ class DraftWindowGraphInputMixin:
             or (getattr(self, "_draft_graph_review_limit", None) is not None and padded != num_reqs)
             or query_start_loc_np.shape != expected_query.shape
             or not np.array_equal(query_start_loc_np, expected_query)
-            or self._draft_window_selected_metadata is None
-            or self._draft_window_selected_metadata.descriptor != batch_desc
         ):
             raise RuntimeError("Draft Window requires its actual uniform FULL dispatch; no eager fallback")
         full_slots = self.block_tables.slot_mappings[:, :tokens]
@@ -271,14 +252,14 @@ class DraftWindowGraphInputMixin:
             or slot_mappings.data_ptr() != full_slots.data_ptr()
         ):
             raise RuntimeError("Draft Graph metadata must retain the canonical Full write slots")
-        self._materialize_draft_window_read_inputs(num_reqs=num_reqs, num_reqs_padded=padded)
+        self._materialize_draft_window_read_inputs(num_reqs=num_reqs, batch_desc=batch_desc)
         # The fixed manager builds this bank's metadata once immediately before replay.
         return None
 
     def _require_current_draft_window_proposal(
         self,
     ) -> DraftWindowProposalContext:
-        context = self._draft_window_proposal
+        context = self._draft_window_graph_binding_provider.proposal
         if context is None:
             raise RuntimeError("Draft Window metadata build has no active proposal")
         return context

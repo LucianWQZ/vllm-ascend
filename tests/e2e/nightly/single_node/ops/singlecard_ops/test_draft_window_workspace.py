@@ -14,7 +14,6 @@ torch_npu = pytest.importorskip("torch_npu")
 
 from vllm_ascend.worker.v2.spec_decode.draft_window_dense import (  # noqa: E402
     dense_draft_attention,
-    gather_dense_draft_kv,
     prepare_dense_draft_read,
 )
 
@@ -28,13 +27,10 @@ def make_read(capacity, held):
     table = torch.arange(blocks, dtype=torch.int32, device="npu")[None]
     read = prepare_dense_draft_read(
         *(table[list((0,))], (blocks,), block),
-        exact_device=torch.tensor([capacity], dtype=torch.int32, device="npu"),
         exact_cpu=torch.tensor([capacity], dtype=torch.int32),
         query_ends_cpu=torch.tensor([capacity], dtype=torch.int32),
         frozen_starts=torch.zeros(1, dtype=torch.int32),
         upper_cpu=torch.tensor([capacity], dtype=torch.int32),
-        window_size=1024,
-        anchor_span=128,
         query_width=8,
         causal=False,
         full_rows_cpu=torch.tensor([True]),
@@ -73,13 +69,13 @@ def test_sequential_attention_has_bounded_private_operands(capacity):
     assert sum(actual.values()) == 2 * capacity * 4 * 192 * 4
 
 
-def test_standalone_gather_outputs_remain_independent():
+def test_next_gather_cannot_overwrite_queued_attention():
     held: list[object] = []
-    read, keys, values, _ = make_read(1152, held)
+    read, keys, values, query = make_read(1152, held)
     values.fill_(1)
-    first = gather_dense_draft_kv(read, keys, values)[1]
+    first = dense_draft_attention(read, query, keys, values, 192**-0.5)
     values.fill_(2)
-    second = gather_dense_draft_kv(read, keys, values)[1]
+    second = dense_draft_attention(read, query, keys, values, 192**-0.5)
     torch.npu.synchronize()
     assert first.untyped_storage().data_ptr() != second.untyped_storage().data_ptr()
     torch.testing.assert_close(first, torch.ones_like(first), atol=0, rtol=0)

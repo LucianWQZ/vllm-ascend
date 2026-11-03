@@ -115,10 +115,8 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentA
                     "additional padding requests are not qualified for this read bank"
                 )
             capture = session.resolve(first=True, n=n, tokens=n * (self.num_speculative_steps + 1), ordinal=0)
-            provider = self._draft_window_graph_binding_provider
-            bank = provider.prepare_workspace(capture)
             self.block_tables.gather_block_tables(self.input_batch.idx_mapping, num_reqs_padded=n)
-            prefill_inputs = self._materialize_eagle3_step(step=0, num_reqs=n, num_reqs_padded=n, output_workspace=bank)
+            bank = prefill_inputs = self._materialize_eagle3_step(capture, 0)
             attn_metadata = copy_draft_attention_metadata(attn_metadata)
             max_seq_len = int(bank.cpu_window_exact.max().item())
             for layer in attn_metadata.values():
@@ -126,25 +124,20 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentA
                     bind_draft_window_read(layer, bank, max_seq_len)
                     layer.seq_lens_gpu = bank.device_window_exact
                     layer.attn_state = AscendAttentionState.ChunkedPrefill
-        try:
-            output = super()._run_model(
-                num_tokens,
-                attn_metadata,
-                slot_mappings,
-                num_tokens_across_dp,
-                cudagraph_runtime_mode,
-                mm_inputs,
-            )
-            if prefill_inputs is not None:
-                # Host retirement is not device completion. The capture bank
-                # remains owned, and reuse stays on the checked current stream.
-                self._draft_window_graph_binding_provider.retire_generation(prefill_inputs)
-                self._eagle3_window_next_step = 1
-            return output
-        except BaseException:
-            if prefill_inputs is not None:
-                self._quarantine_eagle3_window()
-            raise
+        output = super()._run_model(
+            num_tokens,
+            attn_metadata,
+            slot_mappings,
+            num_tokens_across_dp,
+            cudagraph_runtime_mode,
+            mm_inputs,
+        )
+        if prefill_inputs is not None:
+            # Host preparation ends here, not the device reader. The original
+            # proposal scope quarantines any later failure without losing banks.
+            self._draft_window_graph_binding_provider.complete_native()
+            self._eagle3_window_next_step = 1
+        return output
 
     def _multi_step_decode(
         self,
@@ -164,15 +157,11 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentA
                 or num_speculative_steps not in (None, self.num_speculative_steps)
             ):
                 raise RuntimeError("Eagle3 Window requires its actual static-K FULL AR descriptor; no eager fallback")
-            try:
-                padded = batch_desc.num_reqs or num_reqs
-                self._snapshot_eagle3_decode_step_one(num_reqs=num_reqs, num_reqs_padded=padded)
-                for step in range(1, self.num_speculative_steps):
-                    capture = session.resolve(first=False, n=padded, tokens=batch_desc.num_tokens, ordinal=step - 1)
-                    session.stage(capture, step)
-            except BaseException:
-                self._quarantine_eagle3_window()
-                raise
+            padded = batch_desc.num_reqs or num_reqs
+            self._snapshot_eagle3_decode_step_one(num_reqs=num_reqs, num_reqs_padded=padded)
+            for step in range(1, self.num_speculative_steps):
+                capture = session.resolve(first=False, n=padded, tokens=batch_desc.num_tokens, ordinal=step - 1)
+                session.stage(capture, step)
         return super()._multi_step_decode(
             num_reqs,
             skip_attn,

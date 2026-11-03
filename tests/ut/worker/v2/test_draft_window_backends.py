@@ -523,8 +523,9 @@ def test_admitted_providers_use_the_actual_draft_parallel_contract(parallel_conf
         inventory(parallel_config, specs=[spec], builders=[builder])
 
 
-@pytest.mark.parametrize("consumer", ["SFA", "INDEXER", "DSA"])
-def test_unqualified_sparse_draft_consumers_fail_before_proposal_work(parallel_config, consumer):
+@pytest.mark.parametrize("consumer", ["SFA", "INDEXER", "DSA", "C8MXFP"])
+def test_unqualified_draft_consumers_fail_before_proposal_work(parallel_config, consumer):
+    from vllm_ascend.attention.attention_c8_mxfp import AscendC8MXFPAttentionBackend, AscendC8MXFPMetadataBuilder
     from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder, AscendDSASWABackend
     from vllm_ascend.attention.indexer import AscendSFAIndexerBackend, AscendSFAIndexerMetadataBuilder
     from vllm_ascend.attention.sfa_v1 import AscendSFABackend, AscendSFAMetadataBuilder
@@ -533,6 +534,7 @@ def test_unqualified_sparse_draft_consumers_fail_before_proposal_work(parallel_c
         "SFA": (AscendSFABackend, AscendSFAMetadataBuilder),
         "INDEXER": (AscendSFAIndexerBackend, AscendSFAIndexerMetadataBuilder),
         "DSA": (AscendDSASWABackend, AscendDSAMetadataBuilder),
+        "C8MXFP": (AscendC8MXFPAttentionBackend, AscendC8MXFPMetadataBuilder),
     }[consumer]
     group = SimpleNamespace(
         backend=backend,

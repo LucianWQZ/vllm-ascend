@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
-"""Canonical Draft KV sources and generation-owned Graph read buffers.
+"""Canonical Draft KV source geometry for capture-owned Graph read banks.
 
 Method policy and interval arithmetic are shared with the ordinary eager
 runtime. This module owns only source geometry and persistent Graph backing;
@@ -9,7 +9,7 @@ Full write tables and Target state remain owned by the existing runner.
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import numpy as np
 import torch
@@ -21,18 +21,12 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_backends import (
     inventory_draft_window_groups,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_plan import (
-    DraftWindowPlan,
-    compute_draft_window_plan,
     window_capacity_tokens,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_policy import (
     DraftWindowPolicyDecision,
     DraftWindowPolicyState,
 )
-
-if TYPE_CHECKING:
-    from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowProposalContext
-    from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphBindingProvider
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,17 +69,12 @@ def gather_valid_num_blocks_cpu(
     num_reqs_padded: int,
 ) -> torch.Tensor:
     """Gather canonical request-slot counts into the current batch order."""
-    mapping = np.asarray(idx_mapping_np)
-    if num_reqs < 0 or num_reqs_padded < num_reqs or mapping.ndim != 1 or mapping.shape[0] < num_reqs:
+    if num_reqs < 0 or num_reqs_padded < num_reqs or len(idx_mapping_np) < num_reqs:
         raise ValueError("CPU mapping and active/padded request counts disagree")
-    if not np.issubdtype(mapping.dtype, np.integer):
-        raise TypeError("CPU idx_mapping must contain integer indices")
     counts = source.block_tables.num_blocks.cpu[source.group.gid]
     out = torch.zeros(num_reqs_padded, dtype=torch.int32, device="cpu")
     if num_reqs:
-        torch.index_select(
-            counts, 0, torch.from_numpy(mapping[:num_reqs].astype(np.int64, copy=False)), out=out[:num_reqs]
-        )
+        torch.index_select(counts, 0, torch.from_numpy(idx_mapping_np[:num_reqs]), out=out[:num_reqs])
     return out
 
 
@@ -103,8 +92,8 @@ def _build_draft_window_source_capability_for_context(
     """Build source geometry after the caller validates its real Graph executor.
 
     Executor features do not turn a dense Draft cache into a sharded provider.
-    Keep the actual context in the owner identity and check the source layout
-    directly, without constructing an artificial eager capability decision.
+    Check the actual source layout directly, without constructing an
+    artificial eager capability decision.
     """
     from vllm_ascend.worker.v2.spec_decode.draft_window_graph_runtime import validate_graph_context
 
@@ -142,114 +131,3 @@ def _build_draft_window_source_capability_for_context(
     if vllm_config.speculative_config.uses_dynamic_speculative_decoding():
         raise NotImplementedError("Draft Window Graph source requires static speculative decoding")
     return DraftWindowGraphSource(policy=policy, group=group, block_tables=block_tables)
-
-
-@dataclass(frozen=True, slots=True, init=False)
-class DraftWindowWorkspace:
-    """Fixed-capacity, stable-address backing for one serialized read lane."""
-
-    max_num_reqs: int
-    table_capacity_columns: int
-    window_block_table: torch.Tensor
-    device_window_exact: torch.Tensor
-    cpu_window_exact: torch.Tensor
-
-    def __init__(
-        self,
-        *,
-        max_num_reqs: int,
-        table_capacity_columns: int,
-        table_template: torch.Tensor,
-    ) -> None:
-        if max_num_reqs <= 0:
-            raise ValueError("workspace request capacity must be greater than 0")
-        if table_capacity_columns <= 0:
-            raise ValueError("workspace table capacity must be greater than 0")
-        if table_template.ndim != 2:
-            raise ValueError("Draft workspace requires a two-dimensional source table")
-        if table_template.dtype != torch.int32:
-            raise TypeError("Draft workspace tables must use int32")
-        object.__setattr__(self, "max_num_reqs", max_num_reqs)
-        object.__setattr__(self, "table_capacity_columns", table_capacity_columns)
-        object.__setattr__(self, "window_block_table", table_template.new_zeros((max_num_reqs, table_capacity_columns)))
-        object.__setattr__(
-            self, "device_window_exact", torch.zeros(max_num_reqs, dtype=torch.int32, device=table_template.device)
-        )
-        object.__setattr__(self, "cpu_window_exact", torch.zeros(max_num_reqs, dtype=torch.int32))
-
-    def materialize(
-        self,
-        *,
-        inputs: "DraftMetadataInputs",
-        source: DraftWindowGraphSource,
-        cpu_full_exact: torch.Tensor,
-        cpu_valid_num_blocks: torch.Tensor,
-        frozen_row_plans: tuple[DraftWindowPlan, ...] | None,
-    ) -> None:
-        """Rewrite all active and inert state from the canonical full source."""
-        actual = len(inputs.proposal.full_read_rows)
-        padded = inputs.padded_request_count
-        if padded > self.max_num_reqs:
-            raise RuntimeError(f"draft-window request capacity exceeded: padded={padded} capacity={self.max_num_reqs}")
-        if actual and bool(torch.any(cpu_full_exact[:actual] < 0)):
-            raise ValueError("Full exact lengths must be greater than or equal to 0")
-        if frozen_row_plans is not None and len(frozen_row_plans) != actual:
-            raise ValueError("frozen Window anchors must match active request rows")
-
-        source_table = source.table
-        self.window_block_table.zero_()
-        self.cpu_window_exact.zero_()
-        span = source.group.table_column_span
-        for row, full_read in enumerate(inputs.proposal.full_read_rows):
-            exact = int(cpu_full_exact[row])
-            valid = int(cpu_valid_num_blocks[row])
-            if not 0 <= valid <= source_table.shape[1]:
-                raise RuntimeError("current valid block count is outside the canonical source row")
-            if full_read:
-                start, required, visible = 0, valid, exact
-            else:
-                plan = (
-                    compute_draft_window_plan(
-                        full_exact_end=exact, window_size=source.window_size, block_span_tokens=span
-                    )
-                    if frozen_row_plans is None
-                    else frozen_row_plans[row].at_exact_end(exact)
-                )
-                if plan.window_start % span:
-                    raise NotImplementedError("Draft Graph cannot read an intra-block Window start")
-                start = plan.window_start // span
-                visible = plan.window_visible_length
-                required = (visible + span - 1) // span
-            if required > self.table_capacity_columns:
-                raise RuntimeError("draft-window table capacity exceeded")
-            if start + required > valid or visible > required * span:
-                raise RuntimeError("draft-window source does not cover the exact readable interval")
-            if required:
-                self.window_block_table[row, :required].copy_(source_table[row, start : start + required])
-            self.cpu_window_exact[row] = visible
-        # The capture-owned exact CPU buffer is also the valid metadata bound.
-        # No intermediate Window length vector or upper-vector copy is needed.
-        self.device_window_exact.copy_(self.cpu_window_exact)
-
-
-@dataclass(frozen=True, slots=True, eq=False)
-class DraftMetadataInputs:
-    """One generation handle retaining its actual read bank and runtime owner.
-
-    The bank owns all read tensors. A new handle on every materialization
-    rejects stale references even when the next generation reuses that bank.
-    Positions, query layout, write slots and Target metadata remain separate.
-    """
-
-    proposal: "DraftWindowProposalContext"
-    padded_request_count: int
-    step: int
-    workspace: DraftWindowWorkspace = field(repr=False, compare=False)
-    _owner: "DraftWindowGraphBindingProvider" = field(repr=False, compare=False)
-    params: dict[str, Any] | None = field(init=False, default=None, repr=False, compare=False)
-
-    def validate(self) -> None:
-        if self._owner._active_inputs is not self:
-            raise RuntimeError("cannot use retired Draft inputs")
-        if self._owner.quarantined:
-            raise RuntimeError("cannot use quarantined Draft inputs")

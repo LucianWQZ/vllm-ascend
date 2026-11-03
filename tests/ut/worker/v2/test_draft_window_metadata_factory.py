@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
 """Normal metadata ownership and existing factory contracts; CPU only."""
 
-from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -40,22 +39,26 @@ def _attention_metadata():
     )
 
 
-def test_metadata_copy_owns_mutable_fields_and_borrows_read_only_operands(metadata_isolation):
+def test_metadata_copy_owns_header_and_borrows_read_only_operands(metadata_isolation):
     copy_metadata = metadata_isolation
     layer = _attention_metadata()
     private = copy_metadata({"draft": layer})
     copied = private["draft"]
     assert copied is not layer
-    for field in ("block_tables", "seq_lens", "seq_lens_cpu", "slot_mapping", "query_start_loc", "attn_mask"):
+    for field in (
+        "block_tables",
+        "seq_lens",
+        "seq_lens_cpu",
+        "seq_lens_list",
+        "actual_seq_lengths_q",
+        "slot_mapping",
+        "query_start_loc",
+        "attn_mask",
+        "qfa_metadata_cache",
+    ):
         assert getattr(copied, field) is getattr(layer, field)
-    # Cache payloads are read-only operator outputs; only the mutable cache
-    # dictionary belongs to the per-build metadata object.
-    assert copied.qfa_metadata_cache is not layer.qfa_metadata_cache
-    assert copied.qfa_metadata_cache["lengths"] is layer.qfa_metadata_cache["lengths"]
     copied.attn_state = "draft"
-    copied.seq_lens_list[0] = 99
-    copied.actual_seq_lengths_q.append(3)
-    copied.qfa_metadata_cache.clear()
+    copied.seq_lens_list = [99]
     assert layer.attn_state == "target"
     assert layer.seq_lens_list == [3, 4]
     assert layer.actual_seq_lengths_q == [1, 2]
@@ -70,7 +73,7 @@ def test_real_ascend_metadata_preserves_canonical_full_operands(metadata_isolati
     private = copy_metadata({"draft": layer})
     copied = private["draft"]
     copied.attn_state = AscendAttentionState.DecodeOnly
-    copied.seq_lens_list[0] = 9
+    copied.seq_lens_list = [9, 4]
     assert layer.attn_state == "target" and layer.seq_lens_list == [3, 4]
     assert copied.slot_mapping is layer.slot_mapping
     assert copied.query_start_loc is layer.query_start_loc
@@ -84,37 +87,9 @@ def test_metadata_copy_preserves_group_aliases_and_missing_layers(metadata_isola
     assert private["unused"] is None
 
 
-def test_frozen_slotted_metadata_is_copied_before_field_replacement(metadata_isolation):
-    copy_metadata = metadata_isolation
-
-    @dataclass(frozen=True, slots=True)
-    class Metadata:
-        seq_lens_list: list[int]
-        actual_seq_lengths_q: list[int]
-        qfa_metadata_cache: dict
-        block_tables: torch.Tensor
-
-    table = torch.arange(4, dtype=torch.int32).view(1, 4)
-    layer = Metadata([3], [1], {}, table)
-    private = copy_metadata({"draft": layer})
-    private["draft"].seq_lens_list[0] = 9
-    assert layer.seq_lens_list == [3]
-    assert private["draft"].block_tables is table
-
-
-def test_metadata_copy_rejects_invalid_known_host_fields(metadata_isolation):
-    copy_metadata = metadata_isolation
-    for field, value in (
-        ("seq_lens_list", (3, 4)),
-        ("actual_seq_lengths_q", torch.tensor([1, 2])),
-        ("qfa_metadata_cache", []),
-    ):
-        layer = _attention_metadata()
-        setattr(layer, field, value)
-        with pytest.raises(TypeError, match=field):
-            copy_metadata({"draft": layer})
+def test_metadata_copy_requires_an_actual_consumer(metadata_isolation):
     with pytest.raises(ValueError, match="non-empty layer mapping"):
-        copy_metadata({})
+        metadata_isolation({})
 
 
 def test_real_builder_constructs_private_window_metadata_without_touching_target(monkeypatch):
@@ -180,11 +155,11 @@ def test_real_builder_constructs_private_window_metadata_without_touching_target
     assert draft.block_tables.shape == bank.window_block_table.shape
     assert draft.seq_lens_cpu.data_ptr() == bank.cpu_window_exact.data_ptr()
     assert draft.seq_lens_list == [7, 6] and draft.seq_lens_list is not target.seq_lens_list
-    assert draft.actual_seq_lengths_q is not target.actual_seq_lengths_q
+    assert draft.actual_seq_lengths_q is target.actual_seq_lengths_q
     assert draft.slot_mapping.data_ptr() == target.slot_mapping.data_ptr() == slots.data_ptr()
     assert draft.query_start_loc_gpu.data_ptr() == target.query_start_loc_gpu.data_ptr() == query.data_ptr()
     draft.seq_lens_list[0] = 99
-    draft.actual_seq_lengths_q.append(3)
+    draft.actual_seq_lengths_q = [1, 2, 3]
     assert target.seq_lens_list == [11, 14] and target.actual_seq_lengths_q == [1, 2]
     assert target.block_tables is common.block_table_tensor is table
     assert target.seq_lens_cpu.data_ptr() == exact.data_ptr()
@@ -339,11 +314,12 @@ def test_factory_wrapper_nesting_restores_outer_factory(factory_contract, fail_i
 
 
 @pytest.mark.parametrize("stage", ["backend", *CALLBACK_NAMES])
-def test_factory_error_restores_module_but_quarantines_active_owner(factory_contract, stage):
+def test_factory_error_restores_module_but_quarantines_active_owner(factory_contract, stage, monkeypatch):
     contract = factory_contract
     pool = DraftWindowOwnerPool(1)
     payload = object()
     completion = Mock(side_effect=AssertionError("failed proposal cannot record a success completion"))
+    monkeypatch.setattr(torch.npu, "Event", completion)
 
     def fail(*args, **kwargs):
         raise RuntimeError("injected partial-submit host error")
@@ -355,7 +331,7 @@ def test_factory_error_restores_module_but_quarantines_active_owner(factory_cont
 
     contract.ascend.side_effect = backend
     callbacks = {} if stage == "backend" else {stage: fail}
-    with pytest.raises(RuntimeError, match="partial-submit host error"), pool.operation(completion) as owner:
+    with pytest.raises(RuntimeError, match="partial-submit host error"), pool.operation() as owner:
         pool.retain(owner, payload)
         # Entered proposal lifetime; no native operation is claimed here.
         with contract.wrapper(), contract.factory([0], 1, False, **callbacks):

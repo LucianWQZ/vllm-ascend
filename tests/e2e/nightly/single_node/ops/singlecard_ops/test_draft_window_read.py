@@ -9,6 +9,7 @@ import torch
 
 torch_npu = pytest.importorskip("torch_npu")
 
+from vllm_ascend.attention.utils import AscendCommonAttentionMetadata  # noqa: E402
 from vllm_ascend.worker.v2.spec_decode.draft_window_plan import compute_draft_window_plan  # noqa: E402
 from vllm_ascend.worker.v2.spec_decode.draft_window_read import (  # noqa: E402
     materialize_draft_read,
@@ -50,13 +51,26 @@ def test_same_window_attention_from_canonical_rows(causal, query_width, exact_en
     ]
     starts = torch.tensor([plan.window_start for plan in plans], dtype=torch.int32)
     retained: list[torch.Tensor] = []
-    read = materialize_draft_read(
-        *source,
+    query_offsets = torch.tensor([0, query_width, 2 * query_width, 2 * query_width], dtype=torch.int32)
+    read = AscendCommonAttentionMetadata(
+        query_start_loc=query_offsets.npu(),
+        query_start_loc_cpu=query_offsets,
+        seq_lens=ends.npu(),
+        num_reqs=3,
+        num_actual_tokens=2 * query_width,
+        max_query_len=query_width,
+        max_seq_len=int((ends + 3).max()),
+        block_table_tensor=source[0],
+        slot_mapping=torch.arange(2 * query_width, dtype=torch.int64, device="npu"),
+        seq_lens_cpu_upper_bound=ends + 3,
+        causal=causal,
+    )
+    materialize_draft_read(
+        read,
+        source[1],
+        source[2],
         exact_cpu=ends,
-        exact_device=ends.npu(),
-        upper_cpu=ends + 3,
         starts_cpu=starts,
-        padded_rows=3,
         retain=lambda *objects: retained.extend(objects),
     )
     torch.testing.assert_close(read.seq_lens.cpu(), read.seq_lens_cpu, rtol=0, atol=0)
@@ -71,7 +85,7 @@ def test_same_window_attention_from_canonical_rows(causal, query_width, exact_en
         # Match AscendAttentionBackendImpl._get_kv_cache_view for TND.
         key=key.view(2 * columns, block_size, -1),
         value=value.view(2 * columns, block_size, -1),
-        block_table=read.block_table[:2],
+        block_table=read.block_table_tensor[:2],
         block_size=block_size,
         input_layout="TND",
         actual_seq_lengths=[query_width, 2 * query_width],
@@ -102,7 +116,7 @@ def test_same_window_attention_from_canonical_rows(causal, query_width, exact_en
     torch.testing.assert_close(value.cpu(), cache_before[1], rtol=0, atol=0)
     torch.testing.assert_close(query.cpu(), query_before, rtol=0, atol=0)
     assert read.seq_lens_cpu[-1] == 0
-    assert read.block_table.data_ptr() != canonical.data_ptr()
+    assert read.block_table_tensor.data_ptr() != canonical.data_ptr()
 
 
 @pytest.mark.parametrize("causal", [True, False])
@@ -139,13 +153,26 @@ def test_same_window_mla_latent_and_rope(query_width, causal):
         dtype=torch.int32,
     )
     retained: list[torch.Tensor] = []
-    read = materialize_draft_read(
-        *source,
+    query_offsets = torch.tensor([0, query_width, 2 * query_width], dtype=torch.int32)
+    read = AscendCommonAttentionMetadata(
+        query_start_loc=query_offsets.npu(),
+        query_start_loc_cpu=query_offsets,
+        seq_lens=ends.npu(),
+        num_reqs=2,
+        num_actual_tokens=2 * query_width,
+        max_query_len=query_width,
+        max_seq_len=int((ends + 3).max()),
+        block_table_tensor=source[0],
+        slot_mapping=torch.arange(2 * query_width, dtype=torch.int64, device="npu"),
+        seq_lens_cpu_upper_bound=ends + 3,
+        causal=causal,
+    )
+    materialize_draft_read(
+        read,
+        source[1],
+        source[2],
         exact_cpu=ends,
-        exact_device=ends.npu(),
-        upper_cpu=ends + 3,
         starts_cpu=starts,
-        padded_rows=2,
         retain=lambda *objects: retained.extend(objects),
     )
     mask = torch.ones((2048, 2048), dtype=torch.bool).triu(1).npu() if causal else None
@@ -161,7 +188,7 @@ def test_same_window_mla_latent_and_rope(query_width, causal):
         atten_mask=mask,
         sparse_mode=3 if causal else 0,
         softmax_scale=scale,
-        block_table=read.block_table,
+        block_table=read.block_table_tensor,
         block_size=block_size,
         actual_seq_qlen=[query_width, 2 * query_width],
         actual_seq_kvlen=read.seq_lens_cpu.tolist(),

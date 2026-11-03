@@ -9,15 +9,14 @@ from typing import Any
 
 
 def copy_draft_attention_metadata(metadata: Mapping[str, Any]) -> dict[str, Any]:
-    """Copy the concrete metadata fields that Draft preparation may modify.
+    """Give Draft its own mutable header, preserving read-only Full operands.
 
     Builders create one metadata object per attention group. Preserve those
-    layer aliases, but give Draft its own object and Host length/cache
-    containers. Tensor operands remain borrowed: window read operands are
-    bound explicitly to the owned bank, while Full query/write fields and
-    masks are intentionally read-only canonical references.
+    layer aliases. Both callers immediately replace read fields with the
+    bank; the supported dense consumer only reads inherited query/Full fields.
+    Copy the header rather than reconstructing it so dynamic fields survive.
     """
-    if not isinstance(metadata, Mapping) or not metadata:
+    if not metadata:
         raise ValueError("Draft attention metadata must be a non-empty layer mapping")
     copies: dict[int, Any] = {}
     result: dict[str, Any] = {}
@@ -26,21 +25,7 @@ def copy_draft_attention_metadata(metadata: Mapping[str, Any]) -> dict[str, Any]
             result[name] = None
             continue
         if id(layer) not in copies:
-            private = copy(layer)
-            if private is layer:
-                raise TypeError("Draft attention metadata layers must support a private shallow copy")
-            for field in ("seq_lens_list", "actual_seq_lengths_q"):
-                value = getattr(layer, field, None)
-                if value is not None:
-                    if not isinstance(value, list):
-                        raise TypeError(f"Draft attention metadata {field} must be a list")
-                    object.__setattr__(private, field, list(value))
-            cache = getattr(layer, "qfa_metadata_cache", None)
-            if cache is not None:
-                if not isinstance(cache, dict):
-                    raise TypeError("Draft attention metadata qfa_metadata_cache must be a dict")
-                object.__setattr__(private, "qfa_metadata_cache", dict(cache))
-            copies[id(layer)] = private
+            copies[id(layer)] = copy(layer)
         result[name] = copies[id(layer)]
     return result
 

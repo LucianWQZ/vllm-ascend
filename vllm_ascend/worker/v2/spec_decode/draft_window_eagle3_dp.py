@@ -16,9 +16,9 @@ def _validate_eagle_dp_dummy(owner, session):
         owner.input_batch.is_dummy is not True
         or getattr(owner, "_eagle3_window_bypass_active", False) is not True
         or getattr(owner, "_eagle3_window_continuing_prefill", False) is not False
-        or getattr(owner, "_eagle3_window_proposal", None) is not None
         or provider is None
-        or getattr(provider, "_active_inputs", None) is not None
+        or provider.proposal is not None
+        or provider._active_bank is not None
         or session._capture_call is not None
         or provider is not session.provider
     ):

@@ -6,13 +6,14 @@ import copy
 import importlib.util
 import sys
 import tempfile
-import types
 import unittest
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace as NS
 from typing import Any
 from unittest.mock import Mock, patch
+
+import numpy as np
 
 MODULE_PATH = Path(__file__).resolve().parents[3] / "vllm_ascend/worker/v2/spec_decode/draft_graph_review_limits.py"
 spec = importlib.util.spec_from_file_location("draft_graph_support_test", MODULE_PATH)
@@ -260,64 +261,49 @@ class DraftGraphSupportTest(unittest.TestCase):
             self.resolve(config)
 
     def test_startup_reuses_the_frozen_support_without_reparsing(self):
+        from vllm_ascend import envs
+        from vllm_ascend.worker.v2.spec_decode import _use_graph_window_owner
+        from vllm_ascend.worker.v2.spec_decode import draft_graph_review_limits as actual_guard
+
         config = self.config(rows=2)
         support = self.resolve(config)
-        validator = actual_source_function(
-            MODULE_PATH.parents[3] / "ascend_config.py",
-            "validate_draft_window_graph_config",
-            {"Any": Any},
-        )
-        package = types.ModuleType("vllm_ascend")
-        package.__dict__["envs"] = NS(VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH=True)
-        with patch.dict(
-            sys.modules, {"vllm_ascend": package, "vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits": GUARD}
+        policy = NS(enabled=True)
+        with (
+            patch.object(envs, "VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH", True),
+            patch.object(
+                actual_guard, "resolve_draft_graph_review_limit", side_effect=AssertionError("already resolved")
+            ),
         ):
-            with patch.object(
-                GUARD, "resolve_draft_graph_review_limit", wraps=GUARD.resolve_draft_graph_review_limit
-            ) as resolve:
-                self.assertTrue(validator(config))
-                self.assertEqual(resolve.call_count, 1)
-            with patch.object(Path, "read_text", side_effect=AssertionError("already resolved")):
-                self.assertTrue(validator(config, support=support))
-                config.speculative_config.enforce_eager = True
-                self.assertFalse(validator(config))
+            self.assertTrue(_use_graph_window_owner(config, policy, support))
+            config.speculative_config.enforce_eager = True
+            self.assertFalse(_use_graph_window_owner(config, policy, support))
 
     def test_real_factory_passes_its_single_frozen_support_to_validation(self):
+        from vllm_ascend import ascend_config, envs
+        from vllm_ascend.worker.v2 import spec_decode as factory
+        from vllm_ascend.worker.v2.spec_decode import draft_graph_review_limits as actual_guard
+
         config = self.config(rows=2)
         before = vars(config).copy()
         policy = NS(enabled=True, state="on")
-        namespace = {
-            "_resolve_window_policy": lambda _: policy,
-            "_init_speculator": lambda *_: NS(_initialize_draft_window_source_capability=lambda: None),
-            "logger": Mock(),
-            "DraftWindowPolicyState": NS(FORCED_OFF="forced"),
-        }
-        factory_path = MODULE_PATH.with_name("__init__.py")
-        namespace["_use_graph_window_owner"] = actual_source_function(
-            factory_path, "_use_graph_window_owner", namespace
-        )
-        factory = actual_source_function(factory_path, "init_speculator", namespace)
-        package = types.ModuleType("vllm_ascend")
-        package.__dict__["envs"] = NS(VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH=True)
-        module = types.ModuleType("vllm_ascend.ascend_config")
-        observed: list[Any] = []
-        module.__dict__["validate_draft_window_graph_config"] = lambda _, **kwargs: observed.append(kwargs["support"])
+        owner = NS(_initialize_draft_window_source_capability=lambda: None)
         with (
-            patch.dict(
-                sys.modules,
-                {
-                    "vllm_ascend": package,
-                    "vllm_ascend.ascend_config": module,
-                    "vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits": GUARD,
-                },
-            ),
+            patch.object(envs, "VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH", True),
+            patch.object(factory, "_resolve_window_policy", return_value=policy),
+            patch.object(factory, "_init_speculator", return_value=owner),
+            patch.object(factory, "logger", Mock()),
             patch.object(
-                GUARD, "resolve_draft_graph_review_limit", wraps=GUARD.resolve_draft_graph_review_limit
+                actual_guard, "resolve_draft_graph_review_limit", wraps=actual_guard.resolve_draft_graph_review_limit
             ) as resolve,
+            patch.object(
+                ascend_config,
+                "validate_draft_window_graph_config",
+                wraps=ascend_config.validate_draft_window_graph_config,
+            ) as validate,
         ):
-            owner = factory(config, None)
+            self.assertIs(factory.init_speculator(config, None), owner)
             self.assertEqual(resolve.call_count, 1)
-        self.assertEqual(observed, [owner._draft_graph_review_limit])
+        self.assertIs(validate.call_args.kwargs["support"], owner._draft_graph_review_limit)
         self.assertIs(owner._draft_window_policy, policy)
         self.assertFalse(hasattr(owner, "draft_window_policy"))
         self.assertEqual(vars(config), before)
@@ -459,11 +445,12 @@ class DraftGraphSupportTest(unittest.TestCase):
         owner = NS(
             _draft_graph_review_limit=scope,
             max_model_len=scope.max_model_len,
-            _eagle3_window_proposal=NS(full_read_rows=(True,)),
+            _draft_window_graph_binding_provider=NS(proposal=NS(full_read_rows=(True,))),
         )
         batch = self.batch()
-        batch.num_computed_prefill_tokens_np = [512]
-        batch.num_scheduled_tokens = [128]
+        batch.num_computed_prefill_tokens_np = np.array([512], dtype=np.int32)
+        batch.num_scheduled_tokens = np.array([128], dtype=np.int32)
+        batch.prefill_len_np = np.asarray(batch.prefill_len_np, dtype=np.int32)
         for step in (0, 1, 2):
             GUARD.validate_eagle_single_request_review_exact(
                 owner, batch, Exact(640 + step), num_reqs=1, padded=1, step=step
@@ -513,7 +500,6 @@ class DraftGraphSupportTest(unittest.TestCase):
                 batch = self.batch(rows=actual)
                 GUARD.validate_draft_graph_review_requests(owner, batch)
                 descriptor = NS(num_reqs=padded, num_tokens=padded * 8, cg_mode=NS(name="FULL"))
-                owner._draft_window_selected_metadata = NS(descriptor=descriptor)
                 owner._materialize_draft_window_read_inputs.reset_mock()
                 expected: Any = (
                     nullcontext() if actual == padded else self.assertRaisesRegex(RuntimeError, "uniform FULL")
@@ -530,7 +516,7 @@ class DraftGraphSupportTest(unittest.TestCase):
                     )
                 if actual == padded:
                     owner._materialize_draft_window_read_inputs.assert_called_once_with(
-                        num_reqs=actual, num_reqs_padded=padded
+                        num_reqs=actual, batch_desc=descriptor
                     )
                 else:
                     owner._materialize_draft_window_read_inputs.assert_not_called()
@@ -785,9 +771,10 @@ class EagleMixedRequestControls(unittest.TestCase):
         )
         namespace["_update_seq_lens_cpu"](runner, scheduler, ids)
         self.assertEqual(cpu_lengths, [1280, 513])
-        batch.num_computed_prefill_tokens_np = [1152, 384]
-        batch.num_scheduled_tokens = [128, 129]
-        owner._eagle3_window_proposal = NS(full_read_rows=(True, False))
+        batch.num_computed_prefill_tokens_np = np.array([1152, 384], dtype=np.int32)
+        batch.num_scheduled_tokens = np.array([128, 129], dtype=np.int32)
+        batch.prefill_len_np = np.asarray(batch.prefill_len_np, dtype=np.int32)
+        owner._draft_window_graph_binding_provider = NS(proposal=NS(full_read_rows=(True, False)))
         for step in (0, 1, 2):
             M.validate_eagle_single_request_review_exact(
                 owner, batch, Vector([1280 + step, 513 + step]), num_reqs=2, padded=2, step=step
@@ -798,7 +785,7 @@ class EagleMixedRequestControls(unittest.TestCase):
                         owner, batch, Vector(values), num_reqs=2, padded=2, step=step
                     )
         # Absent/changed phase cannot relabel a terminal/decode row as continuing.
-        owner._eagle3_window_proposal = NS(full_read_rows=(False, False))
+        owner._draft_window_graph_binding_provider.proposal = NS(full_read_rows=(False, False))
         with self.assertRaises(NotImplementedError):
             M.validate_eagle_single_request_review_exact(
                 owner, batch, Vector(cpu_lengths), num_reqs=2, padded=2, step=0
@@ -815,14 +802,14 @@ class EagleMixedRequestControls(unittest.TestCase):
             "capacity",
             "preempted",
             "missing",
-            "fractional",
             "negative",
             "terminal",
             "zero",
         ):
             owner, batch = _pair_owner_batch()
-            batch.num_computed_prefill_tokens_np = [1152, 384]
-            batch.num_scheduled_tokens = [128, 129]
+            batch.num_computed_prefill_tokens_np = np.array([1152, 384], dtype=np.int32)
+            batch.num_scheduled_tokens = np.array([128, 129], dtype=np.int32)
+            batch.prefill_len_np = np.asarray(batch.prefill_len_np, dtype=np.int32)
             batch.num_draft_tokens_per_req = None
             batch.is_prefilling_np, batch.has_prefill = [True, True], True
             if damage == "wrong-id":
@@ -835,8 +822,6 @@ class EagleMixedRequestControls(unittest.TestCase):
                 owner._draft_graph_review_preempted_request_ids = {batch.req_ids[0]}
             elif damage == "missing":
                 del batch.num_scheduled_tokens
-            elif damage == "fractional":
-                batch.num_scheduled_tokens[0] = 128.5
             elif damage == "negative":
                 batch.num_computed_prefill_tokens_np[0] = -1
             elif damage == "terminal":
@@ -855,7 +840,7 @@ class EagleMixedRequestControls(unittest.TestCase):
                 from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowProposalContext
 
                 runner_bounds(owner, batch)
-                owner._eagle3_window_proposal = DraftWindowProposalContext.from_batch(batch)
+                owner._draft_window_graph_binding_provider = NS(proposal=DraftWindowProposalContext.from_batch(batch))
                 M.validate_draft_graph_review_requests(owner, batch)
                 M.validate_eagle_single_request_review_exact(
                     owner, batch, Vector([1280, 513]), num_reqs=2, padded=2, step=0
@@ -863,7 +848,7 @@ class EagleMixedRequestControls(unittest.TestCase):
 
 
 def idle_owner():
-    provider = NS(method="eagle3", _active_inputs=None, quarantined=False)
+    provider = NS(method="eagle3", _active_bank=None, proposal=None, quarantined=False)
     session = NS(provider=provider, _capture_call=None)
     batch = NS(is_dummy=True, num_reqs=1, num_reqs_after_padding=1)
     owner = NS(
@@ -877,7 +862,6 @@ def idle_owner():
         update_stream=object(),
         _eagle3_graph_session=session,
         _eagle3_window_bypass_active=True,
-        _eagle3_window_proposal=None,
         _eagle3_window_continuing_prefill=False,
         _draft_window_graph_binding_provider=provider,
     )
@@ -910,7 +894,7 @@ class EagleIdleOwnershipControls(unittest.TestCase):
                 self.assertTrue(IDLE["validate_eagle_dp_dummy_replay"](owner, manager, descriptor, [{}] * count))
                 with self.assertRaises(RuntimeError):
                     IDLE["validate_eagle_dp_dummy_replay"](owner, manager, descriptor, [{}] * (count + 1))
-            self.assertIsNone(owner._eagle3_window_proposal)
+            self.assertIsNone(owner._draft_window_graph_binding_provider.proposal)
         self.assertFalse(owner._eagle3_graph_dp_dummy_active)
         self.assertFalse(owner._draft_window_graph_binding_provider.quarantined)
         # K0 business first-only is a genuine request, never dummy/idle.
@@ -933,7 +917,7 @@ class EagleIdleOwnershipControls(unittest.TestCase):
         ):
             self.fail("uncertain idle work must reject the next Graph scope")
         owner, batch, session = idle_owner()
-        owner._eagle3_window_proposal = object()
+        owner._draft_window_graph_binding_provider.proposal = object()
         with (
             self.assertRaises(RuntimeError),
             IDLE["eagle3_dp_dummy_scope"](owner, batch, dummy_run=True, is_profile=False),
@@ -941,7 +925,7 @@ class EagleIdleOwnershipControls(unittest.TestCase):
             self.fail("live business generation entered dummy replay")
         self.assertTrue(owner._draft_window_graph_binding_provider.quarantined)
         owner, batch, session = idle_owner()
-        owner._draft_window_graph_binding_provider._active_inputs = object()
+        owner._draft_window_graph_binding_provider._active_bank = object()
         with (
             self.assertRaises(RuntimeError),
             IDLE["eagle3_dp_dummy_scope"](owner, batch, dummy_run=True, is_profile=False),

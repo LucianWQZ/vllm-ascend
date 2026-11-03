@@ -105,9 +105,7 @@ def _resolve_window_policy(vllm_config: VllmConfig) -> DraftWindowPolicyDecision
     )
 
 
-def _use_graph_window_owner(
-    vllm_config: VllmConfig, policy: DraftWindowPolicyDecision | None, support: Any = ...
-) -> bool:
+def _use_graph_window_owner(vllm_config: VllmConfig, policy: DraftWindowPolicyDecision | None, support: Any) -> bool:
     """Keep the ordinary eager runtime and persistent Graph owner exclusive."""
     if policy is None or not policy.enabled or vllm_config.speculative_config.enforce_eager:
         return False

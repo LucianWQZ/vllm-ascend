@@ -9,7 +9,6 @@ model, numerical, capture and lifetime evidence remains separate.
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import Any
 from unittest.mock import Mock
 
 import pytest
@@ -134,135 +133,94 @@ def test_graph_initialization_validates_actual_unsharded_context_once(monkeypatc
             runtime.validate_graph_context(config, tables)
 
 
-@pytest.fixture
-def bridge():
-    from vllm_ascend.worker.v2.spec_decode.draft_window_read import DraftReadView
+@pytest.mark.parametrize("upper", [1153, 1160])
+def test_common_builder_consumes_the_window_exact_tensor_not_the_original_upper(upper):
+    from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, _select_seq_lens
+    from vllm_ascend.worker.v2.spec_decode.draft_window_read import materialize_draft_read
 
-    device = torch.tensor([17, 1025, 0, 0], dtype=torch.int32)
-    exact = device.clone()
-    table = torch.arange(8).reshape(4, 2)
-    read = DraftReadView(table, device, exact, exact, 1025, num_reqs=4)
-    common = SimpleNamespace(num_reqs=4, slot_mapping=object(), positions=object())
-    read.apply(common)
-    return SimpleNamespace(read=read, common=common)
+    offsets = torch.tensor([0, 8, 16], dtype=torch.int32)
+    exact = torch.tensor([1151, 1152], dtype=torch.int32)
+    table = torch.arange(24, dtype=torch.int32).reshape(2, 12)
+    slots = torch.arange(16, dtype=torch.int64)
+    common = AscendCommonAttentionMetadata(
+        query_start_loc=offsets,
+        query_start_loc_cpu=offsets,
+        seq_lens=exact,
+        num_reqs=2,
+        num_actual_tokens=16,
+        max_query_len=8,
+        max_seq_len=upper,
+        block_table_tensor=table,
+        slot_mapping=slots,
+        seq_lens_cpu_upper_bound=torch.full((2,), upper, dtype=torch.int32),
+    )
+    materialize_draft_read(
+        common,
+        (12, 12),
+        128,
+        exact_cpu=exact,
+        starts_cpu=torch.tensor([0, 128], dtype=torch.int32),
+        retain=lambda *objects: None,
+    )
+    selected = _select_seq_lens(
+        common,
+        None,
+        SimpleNamespace(parallel_drafting=True, use_dspark=lambda: False),
+        SimpleNamespace(model_config=object()),
+    )
+    assert selected.data_ptr() == common._draft_window_exact_cpu.data_ptr()
+    assert selected.data_ptr() == common.seq_lens_cpu_upper_bound.data_ptr()
+    assert selected.tolist() == [1151, 1024]
+    assert common.slot_mapping is slots and common.query_start_loc is offsets
+    assert table.tolist() == [list(range(12)), list(range(12, 24))]
 
 
-def test_current_exact_uses_the_common_backend_read_interface_without_a_second_certificate(bridge):
-    slots, positions = bridge.common.slot_mapping, bridge.common.positions
-    assert bridge.common._draft_window_read is bridge.read
-    assert bridge.read.exact_cpu_for(bridge.common) is bridge.read.seq_lens_cpu
-    assert bridge.common.seq_lens_cpu_upper_bound is bridge.read.seq_lens_cpu
-    assert bridge.common.seq_lens is bridge.read.seq_lens
-    assert bridge.common.slot_mapping is slots and bridge.common.positions is positions
-
-
-@pytest.mark.parametrize(
-    "field", ["seq_lens", "seq_lens_cpu", "_seq_lens_cpu", "seq_lens_cpu_upper_bound", "block_table_tensor", "num_reqs"]
-)
-def test_replaced_read_operand_is_rejected_at_the_actual_backend_read_boundary(bridge, field):
-    value = getattr(bridge.common, field)
-    setattr(bridge.common, field, value.clone() if isinstance(value, torch.Tensor) else 3)
-    with pytest.raises(ValueError, match="replaced after projection"):
-        bridge.read.exact_cpu_for(bridge.common)
-
-
-def test_a_different_host_upper_cannot_be_used_as_the_actual_exact_length(bridge):
-    bridge.common.seq_lens_cpu = torch.tensor([24, 1040, 0, 0], dtype=torch.int32)
-    with pytest.raises(ValueError, match="replaced after projection"):
-        bridge.read.exact_cpu_for(bridge.common)
-
-
-@pytest.mark.parametrize("active", [False, True])
-def test_actual_dispatch_selects_the_capture_bank_once(monkeypatch, active):
+def test_dispatch_keeps_the_original_framework_selection_without_a_bank_mirror(monkeypatch):
     from vllm_ascend.worker.v2.spec_decode.dflash.aclgraph import DFlashAclGraphManager, DFlashCudaGraphManager
 
     descriptor = SimpleNamespace()
-    bucket = object()
-    select = Mock(return_value=bucket)
-    provider = SimpleNamespace(capture_identity_for=select)
     monkeypatch.setattr(DFlashCudaGraphManager, "dispatch", lambda *args: descriptor)
     manager = object.__new__(DFlashAclGraphManager)
-    manager.speculator = SimpleNamespace(
-        _draft_window_graph_binding_provider=provider,
-        _draft_window_proposal=object() if active else None,
+    for owner in (SimpleNamespace(), SimpleNamespace(_draft_window_graph_binding_provider=object())):
+        manager.speculator = owner
+        assert manager.dispatch(1, 8, 8, 0) is descriptor
+        assert not hasattr(owner, "_draft_window_selected_metadata")
+
+
+@pytest.mark.parametrize("wrong_descriptor", [False, True])
+def test_real_metadata_preparation_selects_the_final_descriptor_once(monkeypatch, wrong_descriptor):
+    from dataclasses import replace
+
+    import numpy as np
+
+    from tests.ut.worker.v2.test_draft_window_graph_buffers import graph_buffers
+    from vllm_ascend.worker.v2.spec_decode.draft_window_eager import (
+        DraftWindowGraphInputMixin,
+        DraftWindowProposalContext,
     )
-    monkeypatch.setattr(
-        "vllm_ascend.worker.v2.spec_decode.dflash.aclgraph.resolve_parallel_draft_window_graph_route",
-        lambda owner: "dflash",
-    )
-    assert manager.dispatch(1, 8, 8, 0) is descriptor
-    assert manager.speculator._draft_window_selected_metadata is (bucket if active else None)
-    if active:
-        select.assert_called_once_with(route="dflash", descriptor=descriptor)
+
+    c = graph_buffers.__wrapped__()
+    owner = DraftWindowGraphInputMixin()
+    owner._draft_window_graph_binding_provider, owner._draft_window_bypass_active = c.provider, False
+    owner.block_tables, owner.num_query_per_req, owner.draft_attn_layer_names = c.owner, 1, {"draft.layer"}
+    owner.input_batch = SimpleNamespace(num_reqs=2, idx_mapping_np=np.array([0, 1]))
+    snapshot = Mock(return_value=torch.tensor([11, 14], dtype=torch.int32))
+    owner._snapshot_prepared_draft_seq_lens = snapshot
+    select = Mock(wraps=c.provider.capture_identity_for)
+    monkeypatch.setattr(c.provider, "capture_identity_for", select)
+    desc = replace(c.capture.descriptor, max_query_len=9) if wrong_descriptor else c.capture.descriptor
+    context = DraftWindowProposalContext(owner.input_batch, (False, False))
+    if wrong_descriptor:
+        with pytest.raises(RuntimeError, match="runtime descriptor"), c.provider.proposal_scope(context):
+            owner._build_attn_metadata(2, desc, np.array([0, 1, 2]), torch.tensor([99, 99]), 1)
+        snapshot.assert_not_called()
     else:
-        select.assert_not_called()
-    manager.speculator = SimpleNamespace()
-    assert manager.dispatch(1, 8, 8, 0) is descriptor
-    assert not hasattr(manager.speculator, "_draft_window_selected_metadata")
-
-
-@pytest.fixture
-def full_metadata_dispatch(monkeypatch):
-    from vllm.config.compilation import CUDAGraphMode
-    from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
-
-    from vllm_ascend.worker.v2.spec_decode import draft_window_graph_runtime as runtime
-    from vllm_ascend.worker.v2.spec_decode.draft_window import DraftMetadataInputs
-    from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphBindingProvider
-
-    proposal: Any = SimpleNamespace(full_read_rows=(False, False))
-    provider: Any = object.__new__(DraftWindowGraphBindingProvider)
-    provider._quarantined = False
-    provider._source = SimpleNamespace(policy=SimpleNamespace(normalized_method="dflash"))
-    bank: Any = SimpleNamespace(
-        max_num_reqs=2,
-        window_block_table=torch.ones((2, 2), dtype=torch.int32),
-        cpu_window_exact=torch.tensor([5, 7], dtype=torch.int32),
-        device_window_exact=torch.tensor([5, 7], dtype=torch.int32),
-    )
-    inputs = DraftMetadataInputs(proposal, 2, 0, bank, provider)
-    provider._active_inputs = inputs
-    descriptor = BatchExecutionDescriptor(CUDAGraphMode.FULL, num_tokens=16, num_reqs=2, uniform_token_count=8)
-    capture = SimpleNamespace(descriptor=descriptor, route=SimpleNamespace())
-    carrier = object()
-    provider.bind_read_carrier = Mock(return_value=carrier)
-    owner = SimpleNamespace(
-        _draft_window_proposal=proposal,
-        _draft_window_graph_binding_provider=provider,
-        _draft_window_selected_metadata=capture,
-        _group_causal=False,
-        model_state=SimpleNamespace(attn_metadata={"target.layer": object()}),
-    )
-    return SimpleNamespace(
-        owner=owner,
-        inputs=inputs,
-        descriptor=descriptor,
-        provider=provider,
-        carrier=carrier,
-        prepare=runtime.prepare_parallel_graph,
-    )
-
-
-def test_actual_replay_uses_the_current_provider_bank_without_a_second_generation_ledger(full_metadata_dispatch):
-    c = full_metadata_dispatch
-    assert c.prepare(c.owner, c.descriptor) is c.carrier
-    c.provider.bind_read_carrier.assert_called_once()
-    assert c.provider.bind_read_carrier.call_args.kwargs["inputs"] is c.inputs
-    assert not hasattr(c.owner, "_draft_window_live_inputs")
-    assert not hasattr(c.owner, "_draft_window_deferred_metadata")
-
-
-@pytest.mark.parametrize("damage", ["proposal", "descriptor", "published", "retired"])
-def test_actual_replay_rejects_stale_rows_bucket_or_already_published_generation(full_metadata_dispatch, damage):
-    c = full_metadata_dispatch
-    if damage == "proposal":
-        c.owner._draft_window_proposal = object()
-    elif damage == "descriptor":
-        c.owner._draft_window_selected_metadata = SimpleNamespace(descriptor=object())
-    elif damage == "published":
-        object.__setattr__(c.inputs, "params", {"old": object()})
-    else:
-        c.provider._active_inputs = None
-    with pytest.raises(RuntimeError, match="proposal|bucket|unconsumed|generation|retired"):
-        c.prepare(c.owner, c.descriptor)
-    c.provider.bind_read_carrier.assert_not_called()
+        with c.provider.proposal_scope(context):
+            assert owner._build_attn_metadata(2, desc, np.array([0, 1, 2]), torch.tensor([99, 99]), 1) is None
+            assert c.provider._active_bank is c.capture
+            assert c.capture.cpu_window_exact.tolist() == [7, 6]
+            c.provider.bind_current(desc)
+            c.provider.finish_update()
+        snapshot.assert_called_once_with(2)
+    select.assert_called_once_with(route=c.capture.route, descriptor=desc)
+    assert not hasattr(owner, "_draft_window_selected_metadata")

@@ -343,7 +343,7 @@ class AscendTargetDependentARSpeculator(LmheadTPDraftSamplingMixin, TargetDepend
         # so we can call super().propose() directly.
         runtime = getattr(self, "_draft_window_runtime", None)
         graph_scope = None
-        if hasattr(self, "_eagle3_window_proposal"):
+        if getattr(self, "_draft_window_graph_binding_provider", None) is not None:
             graph_scope = getattr(self, "_eagle3_draft_window_proposal_scope", None)
             if not callable(graph_scope):
                 raise RuntimeError("Eagle3 Graph has no proposal owner")

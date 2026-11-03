@@ -3,39 +3,48 @@
 
 import gc
 import weakref
-from typing import cast
+from unittest.mock import patch
 
 import pytest
+import torch
 
 from vllm_ascend.worker.v2.spec_decode.draft_window_lifetime import (
-    DraftWindowCompletion,
     DraftWindowOwnerPool,
 )
 
 
 class Completion:
-    def __init__(self, *, complete=False, query_error=False, wait_error=False, false_wait=False):
+    def __init__(self, *, complete=False, query_error=False, wait_error=False):
         self.complete = complete
         self.query_error = query_error
         self.wait_error = wait_error
-        self.false_wait = false_wait
         self.queries = 0
         self.waits = 0
         self.on_wait = None
 
-    def is_complete(self):
+    def record(self, stream):
+        self.stream = stream
+
+    def query(self):
         self.queries += 1
         if self.query_error:
             raise RuntimeError("event query failed")
         return self.complete
 
-    def wait(self):
+    def synchronize(self):
         self.waits += 1
         if self.on_wait is not None:
             self.on_wait()
         if self.wait_error:
             raise RuntimeError("event wait failed")
-        self.complete = not self.false_wait
+        self.complete = True
+
+
+@pytest.fixture(autouse=True)
+def event_boundary(monkeypatch):
+    # These controlled Event methods prove Host ownership, not device progress.
+    monkeypatch.setattr(torch.npu, "Event", Completion)
+    monkeypatch.setattr(torch.npu, "current_stream", lambda: None)
 
 
 class Payload:
@@ -43,14 +52,14 @@ class Payload:
 
 
 def submit(pool, completion, *payloads):
-    with pool.operation(lambda: completion) as owner:
+    with patch.object(torch.npu, "Event", return_value=completion), pool.operation() as owner:
         pool.retain(owner, *payloads)
     return owner
 
 
 def test_entered_proposal_failure_never_infers_that_no_work_was_submitted():
     pool = DraftWindowOwnerPool(1)
-    with pytest.raises(ValueError, match="invalid input"), pool.operation(lambda: Completion()) as owner:
+    with pytest.raises(ValueError, match="invalid input"), pool.operation() as owner:
         pool.retain(owner, Payload())
         raise ValueError("invalid input")
     assert owner.retained and owner.completion is None and pool.poisoned
@@ -60,7 +69,7 @@ def test_entered_proposal_failure_never_infers_that_no_work_was_submitted():
 
 def test_empty_entered_proposal_still_records_a_completion():
     pool, completion = DraftWindowOwnerPool(1), Completion()
-    with pool.operation(lambda: completion) as owner:
+    with patch.object(torch.npu, "Event", return_value=completion), pool.operation() as owner:
         pass
     assert owner.completion is completion and not pool.poisoned
     assert pool.reclaim_completed() == 0
@@ -74,7 +83,7 @@ def test_partial_native_submission_then_host_error_retains_and_blocks_reuse():
     reader_view = weakref.ref(payload)
     with (
         pytest.raises(RuntimeError, match="host failed after enqueue"),
-        pool.operation(lambda: pytest.fail("success event must not be recorded")) as owner,
+        pool.operation() as owner,
     ):
         pool.retain(owner, payload)
         del payload
@@ -91,51 +100,31 @@ def test_partial_native_submission_then_host_error_retains_and_blocks_reuse():
     assert reader_view() is not None
 
 
-@pytest.mark.parametrize("failure", ["event construction", "event recording", "submit bookkeeping"])
-def test_completion_creation_recording_and_bookkeeping_errors_quarantine(failure):
+@pytest.mark.parametrize("failure", ["event construction", "event recording"])
+def test_event_construction_or_partial_record_failure_keeps_all_ownership(monkeypatch, failure):
     pool = DraftWindowOwnerPool(1)
     payload = Payload()
 
-    def failed_completion():
-        raise RuntimeError(failure)
+    class Event(Completion):
+        def record(self, stream):
+            assert owner.completion is self
+            assert owner.retained == [payload]
+            raise RuntimeError("event recording")
 
-    with pytest.raises(RuntimeError, match=failure), pool.operation(failed_completion) as owner:
+    event = Event()
+
+    def make_event():
+        if failure == "event construction":
+            raise RuntimeError(failure)
+        return event
+
+    monkeypatch.setattr(torch.npu, "Event", make_event)
+    with pytest.raises(RuntimeError, match=failure), pool.operation() as owner:
         pool.retain(owner, payload)
-    assert pool.poisoned
-    assert owner.retained == [payload]
-    assert pool.poisoned
+    assert pool.poisoned and owner.retained == [payload]
+    assert owner.completion is (event if failure == "event recording" else None)
     with pytest.raises(RuntimeError, match="quarantined"):
         pool.acquire()
-
-
-def test_invalid_completion_cannot_release_already_submitted_work():
-    pool = DraftWindowOwnerPool(1)
-    invalid = object()
-    with (
-        pytest.raises(TypeError, match="completion must implement"),
-        pool.operation(lambda: cast(DraftWindowCompletion, invalid)) as owner,
-    ):
-        pool.retain(owner, Payload())
-    assert owner.completion is invalid
-    assert owner.retained
-    assert pool.poisoned
-
-
-def test_completion_protocol_validation_failure_retains_the_token():
-    class InvalidCompletion:
-        @property
-        def is_complete(self):
-            raise RuntimeError("bookkeeping property failed")
-
-    pool = DraftWindowOwnerPool(1)
-    invalid = InvalidCompletion()
-    with (
-        pytest.raises(RuntimeError, match="bookkeeping property failed"),
-        pool.operation(lambda: cast(DraftWindowCompletion, invalid)) as owner,
-    ):
-        pool.retain(owner, Payload())
-    assert owner.completion is invalid
-    assert pool.poisoned
 
 
 def test_free_capacity_does_not_query_or_wait_for_unrelated_reader():
@@ -174,12 +163,10 @@ def test_pressure_waits_for_oldest_and_retains_until_that_wait_completes():
     assert second.retained
 
 
-@pytest.mark.parametrize("failure", ["query", "wait", "false_wait"])
+@pytest.mark.parametrize("failure", ["query", "wait"])
 def test_completion_failure_never_releases_the_backing(failure):
     pool = DraftWindowOwnerPool(1)
-    completion = Completion(
-        query_error=failure == "query", wait_error=failure == "wait", false_wait=failure == "false_wait"
-    )
+    completion = Completion(query_error=failure == "query", wait_error=failure == "wait")
     payload = Payload()
     owner = submit(pool, completion, payload)
     with pytest.raises(RuntimeError):
@@ -198,7 +185,7 @@ def test_all_eagle_steps_and_nested_derived_state_live_until_proposal_completion
     pool = DraftWindowOwnerPool(1)
     completion = Completion()
     read_views, derived_views = [], []
-    with pool.operation(lambda: completion) as owner:
+    with patch.object(torch.npu, "Event", return_value=completion), pool.operation() as owner:
         for _step in range(4):
             reads, derived = Payload(), Payload()
             read_views.append(weakref.ref(reads))
@@ -230,16 +217,16 @@ def test_recorded_reader_keeps_completion_authoritative_until_it_finishes():
 
 
 def test_late_reader_requires_all_reader_completion_not_primary_only():
-    class AllReaders:
+    class AllReaders(Completion):
         def __init__(self, readers):
             self.readers = readers
 
-        def is_complete(self):
-            return all(reader.is_complete() for reader in self.readers)
+        def query(self):
+            return all(reader.query() for reader in self.readers)
 
-        def wait(self):
+        def synchronize(self):
             for reader in self.readers:
-                reader.wait()
+                reader.synchronize()
 
     primary, communication = Completion(complete=True), Completion()
     pool = DraftWindowOwnerPool(1)

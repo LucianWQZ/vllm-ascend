@@ -10,7 +10,6 @@ import numpy as np
 import torch
 
 from vllm_ascend.worker.v2.spec_decode.draft_window import (
-    DraftMetadataInputs,
     gather_valid_num_blocks_cpu,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_eager import (
@@ -35,10 +34,9 @@ def _eagle3_graph_scheduled_consumers(static_k: int, scheduled: int | None) -> i
 
 
 class Eagle3DraftWindowMixin:
-    """Proposal identity and frozen window geometry for static-K Eagle Graph."""
+    """Proposal scope and frozen window geometry for static-K Eagle Graph."""
 
     _draft_window_graph_binding_provider: DraftWindowGraphBindingProvider
-    _eagle3_window_proposal: DraftWindowProposalContext | None
     _eagle3_window_proposal_plan: tuple[DraftWindowPlan, ...] | None
     _eagle3_window_decode_step_one_exact: torch.Tensor | None
     _eagle3_window_bypass_active: bool
@@ -53,7 +51,6 @@ class Eagle3DraftWindowMixin:
 
     def _initialize_eagle3_draft_window_state(self) -> None:
         """Initialize proposal state after source/configuration validation."""
-        self._eagle3_window_proposal = None
         self._eagle3_window_proposal_plan = None
         self._eagle3_window_decode_step_one_exact = None
         self._eagle3_window_bypass_active = False
@@ -70,17 +67,18 @@ class Eagle3DraftWindowMixin:
         is_profile: bool,
         num_speculative_tokens: int | None = None,
     ) -> Iterator[None]:
-        """Own one real proposal epoch, or explicitly run the baseline path."""
-        if not hasattr(self, "_eagle3_window_proposal"):
+        """Own one real proposal, or explicitly run the baseline path."""
+        if not hasattr(self, "_draft_window_graph_binding_provider"):
             yield
             return
-        if self._eagle3_window_bypass_active or self._eagle3_window_proposal is not None:
+        if self._eagle3_window_bypass_active or self._draft_window_graph_binding_provider.proposal is not None:
             raise RuntimeError("an Eagle3 Draft Window proposal scope is already active")
 
         expected_steps = _eagle3_graph_scheduled_consumers(self.num_speculative_steps, num_speculative_tokens)
         graph_session = getattr(self, "_eagle3_graph_session", None)
-        if graph_session is not None:
-            graph_session.provider.require_reusable()
+        provider = self._draft_window_graph_binding_provider
+        if provider.quarantined:
+            raise RuntimeError("Eagle3 Draft Window backing is quarantined")
         context = None
         if not dummy_run and not is_profile and not bool(getattr(input_batch, "is_dummy", False)):
             context = DraftWindowProposalContext.from_batch(input_batch)
@@ -101,32 +99,30 @@ class Eagle3DraftWindowMixin:
         if graph_session is None:
             raise RuntimeError("Eagle3 Draft Window business proposals require their installed Graph manager")
         assert context is not None
-        self._eagle3_window_proposal = context
         self._eagle3_window_proposal_plan = None
         self._eagle3_window_decode_step_one_exact = None
         self._eagle3_window_next_step = 0
         self._eagle3_window_expected_steps = expected_steps
         try:
-            yield
-            if self._eagle3_window_next_step != expected_steps:
-                raise RuntimeError(
-                    "eligible proposal completed without consuming all Eagle3 steps: "
-                    f"consumed={self._eagle3_window_next_step} expected={expected_steps} "
-                    f"static_K={self.num_speculative_steps}"
-                )
-            self._draft_window_graph_binding_provider.finish_proposal()
-        except BaseException:
-            self._quarantine_eagle3_window()
-            raise
+            with provider.proposal_scope(context):
+                yield
+                if self._eagle3_window_next_step != expected_steps:
+                    raise RuntimeError(
+                        "eligible proposal completed without consuming all Eagle3 steps: "
+                        f"consumed={self._eagle3_window_next_step} expected={expected_steps} "
+                        f"static_K={self.num_speculative_steps}"
+                    )
         finally:
             self._eagle3_window_proposal_plan = None
             self._eagle3_window_decode_step_one_exact = None
             self._eagle3_window_next_step = 0
             self._eagle3_window_expected_steps = self.num_speculative_steps
-            self._eagle3_window_proposal = None
 
     def _eagle3_window_is_active(self) -> bool:
-        return hasattr(self, "_draft_window_graph_binding_provider") and self._eagle3_window_proposal is not None
+        return (
+            hasattr(self, "_draft_window_graph_binding_provider")
+            and self._draft_window_graph_binding_provider.proposal is not None
+        )
 
     def _snapshot_eagle3_decode_step_one(
         self,
@@ -154,23 +150,19 @@ class Eagle3DraftWindowMixin:
 
     def _materialize_eagle3_step(
         self,
-        *,
+        capture: Any,
         step: int,
-        num_reqs: int,
-        num_reqs_padded: int,
-        output_workspace: Any,
-    ) -> DraftMetadataInputs:
+    ) -> Any:
         """Freeze the first anchor, then project each AR end into its own bank."""
         if (
             type(step) is not int
             or not 0 <= step < self._eagle3_window_expected_steps
             or step != self._eagle3_window_next_step
-            or self._draft_window_graph_binding_provider._active_inputs is not None
         ):
             raise RuntimeError("Eagle3 Window step is stale or its previous reader remains active")
         context = self._require_eagle3_window_context()
         batch = self.input_batch
-        self._validate_request_counts(num_reqs, num_reqs_padded)
+        num_reqs, num_reqs_padded = batch.num_reqs, capture.descriptor.num_reqs
         provider = self._draft_window_graph_binding_provider
         proposal = self._eagle3_window_proposal_plan
         if step == 0:
@@ -225,26 +217,24 @@ class Eagle3DraftWindowMixin:
             num_reqs_padded=num_reqs_padded,
         )
         context.validate(batch)
-        inputs = provider.materialize(
-            proposal=context,
+        bank = provider.prepare(
+            capture,
             frozen_row_plans=proposal,
             cpu_full_exact=exact,
             cpu_valid_num_blocks=valid,
-            num_reqs_padded=num_reqs_padded,
             step=step,
-            output_workspace=output_workspace,
         )
         self._eagle3_window_proposal_plan = proposal
-        return inputs
+        return bank
 
     def _quarantine_eagle3_window(self) -> None:
         """Keep actual banks alive after an uncertain partial submission."""
         self._draft_window_graph_binding_provider.quarantine()
 
     def _require_eagle3_window_context(self) -> DraftWindowProposalContext:
-        context = self._eagle3_window_proposal
+        context = self._draft_window_graph_binding_provider.proposal
         if context is None:
-            raise RuntimeError("Eagle3 Draft Window operation has no active proposal epoch")
+            raise RuntimeError("Eagle3 Draft Window operation has no active proposal")
         return context
 
     def _validate_request_counts(self, num_reqs: int, num_reqs_padded: int) -> None:

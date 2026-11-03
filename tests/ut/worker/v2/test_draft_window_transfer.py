@@ -20,6 +20,11 @@ def unrecorded_completion() -> NoReturn:
     raise AssertionError("failed preparation must not record a success event")
 
 
+@pytest.fixture(autouse=True)
+def no_event_after_partial_submission(monkeypatch):
+    monkeypatch.setattr(torch.npu, "Event", unrecorded_completion)
+
+
 @pytest.mark.parametrize("stage", ["phase", "cohort"])
 def test_copy_failure_keeps_actual_input_and_output_owned(monkeypatch, stage):
     table = torch.arange(32, dtype=torch.int32).reshape(2, 16)
@@ -46,16 +51,13 @@ def test_copy_failure_keeps_actual_input_and_output_owned(monkeypatch, stage):
 
     monkeypatch.setattr(torch.Tensor, "copy_", copy)
     full_rows = torch.tensor([True, True] if stage == "phase" else [False, True])
-    with pytest.raises(RuntimeError, match="deliberate error"), pool.operation(unrecorded_completion) as owner:
+    with pytest.raises(RuntimeError, match="deliberate error"), pool.operation() as owner:
         prepare_dense_draft_read(
             *source,
             exact_cpu=exact,
             query_ends_cpu=exact,
             frozen_starts=torch.div(torch.clamp(exact - 1024, min=0), 128, rounding_mode="floor") * 128,
-            exact_device=exact,
             upper_cpu=exact + 3,
-            window_size=1024,
-            anchor_span=128,
             query_width=4,
             causal=False,
             full_rows_cpu=full_rows,
@@ -82,17 +84,14 @@ def test_planning_copy_failure_keeps_prepared_input_owned(monkeypatch):
         raise RuntimeError("deliberate error during planning copy")
 
     monkeypatch.setattr(torch.Tensor, "copy_", failed_copy)
-    with pytest.raises(RuntimeError, match="planning copy"), pool.operation(unrecorded_completion) as owner:
+    with pytest.raises(RuntimeError, match="planning copy"), pool.operation() as owner:
         prepare_dense_draft_read(
             *source,
             exact_cpu=exact,
             query_ends_cpu=exact,
             frozen_starts=torch.div(torch.clamp(exact - 1024, min=0), 128, rounding_mode="floor") * 128,
             full_rows_cpu=torch.zeros_like(exact, dtype=torch.bool, device="cpu"),
-            exact_device=exact,
             upper_cpu=exact + 1,
-            window_size=1024,
-            anchor_span=128,
             query_width=4,
             causal=False,
             retain=lambda *items: pool.retain(owner, *items),
@@ -122,7 +121,7 @@ def test_metadata_length_copy_is_owned_before_partial_fill(monkeypatch):
         return result
 
     monkeypatch.setattr(torch.Tensor, "__setitem__", filled)
-    with pytest.raises(RuntimeError, match="after metadata fill"), pool.operation(unrecorded_completion) as owner:
+    with pytest.raises(RuntimeError, match="after metadata fill"), pool.operation() as owner:
         pool.retain(owner, read)
         read.apply(SimpleNamespace(num_reqs=3))
     assert len(submitted) == 1

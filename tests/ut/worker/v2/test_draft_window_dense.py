@@ -22,10 +22,7 @@ def test_frozen_eagle_anchor_does_not_follow_later_exact_lengths():
             exact_cpu=torch.tensor([end], dtype=torch.int32),
             query_ends_cpu=torch.tensor([end], dtype=torch.int32),
             full_rows_cpu=torch.zeros_like(torch.tensor([end], dtype=torch.int32), dtype=torch.bool, device="cpu"),
-            exact_device=torch.tensor([end], dtype=torch.int32),
             upper_cpu=torch.tensor([14]),
-            window_size=8,
-            anchor_span=4,
             query_width=1,
             causal=True,
             retain=lambda *objects: None,
@@ -47,11 +44,8 @@ def test_rejected_first_pass_keeps_native_query_alignment_and_excludes_unwritten
         *source,
         exact_cpu=torch.tensor([end], dtype=torch.int32),
         full_rows_cpu=torch.zeros_like(torch.tensor([end], dtype=torch.int32), dtype=torch.bool, device="cpu"),
-        exact_device=torch.tensor([end], dtype=torch.int32),
         query_ends_cpu=torch.tensor([native_end], dtype=torch.int32),
         upper_cpu=torch.tensor([native_end + 1]),
-        window_size=1035,
-        anchor_span=block,
         query_width=4,
         causal=True,
         frozen_starts=torch.tensor([0], dtype=torch.int32),
@@ -86,10 +80,7 @@ def test_device_exact_read_set_reorder_rejection_and_nan_tail(causal, query_widt
         query_ends_cpu=ends,
         frozen_starts=torch.div(torch.clamp(ends - 1024, min=0), block, rounding_mode="floor") * block,
         full_rows_cpu=torch.zeros_like(ends, dtype=torch.bool, device="cpu"),
-        exact_device=ends,
         upper_cpu=upper,
-        window_size=1024,
-        anchor_span=block,
         query_width=query_width,
         causal=causal,
         retain=lambda *objects: held.extend(objects),
@@ -147,10 +138,7 @@ def test_apply_keeps_full_write_and_absolute_query_operands():
         )
         * 128,
         full_rows_cpu=torch.zeros_like(torch.tensor([129], dtype=torch.int32), dtype=torch.bool, device="cpu"),
-        exact_device=torch.tensor([129], dtype=torch.int32),
         upper_cpu=torch.tensor([130]),
-        window_size=128,
-        anchor_span=128,
         query_width=9,
         causal=False,
         retain=lambda *objects: None,
@@ -163,9 +151,7 @@ def test_apply_keeps_full_write_and_absolute_query_operands():
     assert common.block_table_tensor is full and common.slot_mapping is slots and common.positions is positions
     assert common.seq_lens.tolist() == [129, 0]
     assert common.seq_lens_cpu is None and common._seq_lens_cpu is None
-    assert read.capacity_cpu(common).tolist() == [160, 160]
-    with pytest.raises(ValueError, match="another common"):
-        read.capacity_cpu(SimpleNamespace(num_reqs=2))
+    assert common.seq_lens_cpu_upper_bound.tolist() == [160, 160]
 
 
 def test_allocation_upper_cannot_authorize_uninitialized_columns():
@@ -177,10 +163,7 @@ def test_allocation_upper_cannot_authorize_uninitialized_columns():
             query_ends_cpu=torch.tensor([129]),
             frozen_starts=torch.div(torch.clamp(torch.tensor([129]) - 128, min=0), 128, rounding_mode="floor") * 128,
             full_rows_cpu=torch.zeros_like(torch.tensor([129]), dtype=torch.bool, device="cpu"),
-            exact_device=torch.tensor([129]),
             upper_cpu=torch.tensor([129]),
-            window_size=128,
-            anchor_span=128,
             query_width=8,
             causal=False,
             retain=lambda *objects: None,
@@ -197,10 +180,7 @@ def test_cpu_capacity_fields_ignore_default_tensor_device():
             query_ends_cpu=exact,
             frozen_starts=torch.div(torch.clamp(exact - 128, min=0), 128, rounding_mode="floor") * 128,
             full_rows_cpu=torch.zeros_like(exact, dtype=torch.bool, device="cpu"),
-            exact_device=exact,
             upper_cpu=upper,
-            window_size=128,
-            anchor_span=128,
             query_width=8,
             causal=False,
             retain=lambda *objects: None,
@@ -209,7 +189,7 @@ def test_cpu_capacity_fields_ignore_default_tensor_device():
         common = SimpleNamespace(num_reqs=1)
         read.apply(common)
         assert common.seq_lens_cpu_upper_bound.device.type == "cpu"
-        assert read.capacity_cpu(common).device.type == "cpu"
+        assert common.seq_lens_cpu_upper_bound.device.type == "cpu"
 
 
 def test_short_context_large_window_does_not_gather_window_sized_padding():
@@ -223,10 +203,7 @@ def test_short_context_large_window_does_not_gather_window_sized_padding():
         )
         * 128,
         full_rows_cpu=torch.zeros_like(torch.tensor([31], dtype=torch.int32), dtype=torch.bool, device="cpu"),
-        exact_device=torch.tensor([31], dtype=torch.int32),
         upper_cpu=torch.tensor([34]),
-        window_size=4096,
-        anchor_span=128,
         query_width=8,
         causal=False,
         retain=lambda *objects: None,
@@ -266,11 +243,8 @@ def test_uniform_compact_table_needs_no_request_row_transfer(monkeypatch, stride
         query_ends_cpu=ends,
         frozen_starts=torch.div(torch.clamp(ends - 1024, min=0), 128, rounding_mode="floor") * 128,
         full_rows_cpu=torch.zeros_like(ends, dtype=torch.bool, device="cpu"),
-        exact_device=ends,
         exact_cpu=ends,
         upper_cpu=ends + 2,
-        window_size=1024,
-        anchor_span=128,
         query_width=8,
         causal=False,
         retain=lambda *values: None,

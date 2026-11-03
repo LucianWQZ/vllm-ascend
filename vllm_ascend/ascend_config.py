@@ -72,28 +72,16 @@ def _eagle3_tp4_graph_review(vllm_config: Any) -> bool:
     return scope is not None and scope.method == "eagle3"
 
 
-def validate_draft_window_graph_config(vllm_config: Any, *, support: Any = ...) -> bool:
-    """Validate the actual selected Draft Graph topology and provider geometry."""
-    from vllm_ascend import envs
-
+def validate_draft_window_graph_config(vllm_config: Any, *, support: Any) -> None:
+    """Validate topology after the factory resolves policy and Graph support."""
     speculative = vllm_config.speculative_config
-    if not envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH or speculative is None or speculative.enforce_eager:
-        return False
-    from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import resolve_draft_graph_review_limit
-
-    if support is ...:
-        support = resolve_draft_graph_review_limit(vllm_config, experimental_graph_review=True)
     # The qualified consumer contract already validates its exact topology,
     # buckets, static K and OFF/ON window. Do not parse/check it a second time.
     if support is not None:
-        return True
+        return
     additional = vllm_config.additional_config or {}
-    if (
-        speculative.method not in ("dspark", "dflash", "eagle3")
-        or speculative.uses_dynamic_speculative_decoding()
-        or additional.get("draft_window_size") != 1024
-    ):
-        raise ValueError("Draft Window Graph requires a supported static method and W1024")
+    if additional.get("draft_window_size") != 1024:
+        raise ValueError("Draft Window Graph requires W1024 for this consumer")
     draft_parallel = speculative.draft_parallel_config
     tp = vllm_config.parallel_config.tensor_parallel_size
     if (
@@ -129,7 +117,6 @@ def validate_draft_window_graph_config(vllm_config: Any, *, support: Any = ...) 
         )
     if getattr(vllm_config.compilation_config.cudagraph_mode, "name", None) != "FULL_DECODE_ONLY":
         raise ValueError("replicated TP Graph review requires FULL_DECODE_ONLY")
-    return True
 
 
 @config(config=ConfigDict(frozen=True))

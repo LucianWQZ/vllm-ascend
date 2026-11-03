@@ -23,18 +23,6 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-class NativeCompletion:
-    def __init__(self, stream):
-        self.event = torch.npu.Event()
-        self.event.record(stream)
-
-    def is_complete(self):
-        return self.event.query()
-
-    def wait(self):
-        self.event.synchronize()
-
-
 @pytest.mark.parametrize("operation", ["gather"])
 def test_private_kernel_outputs_survive_exception_after_real_enqueue(monkeypatch, operation):
     from vllm_ascend.ops.triton.v2.spec_decode import draft_window
@@ -71,7 +59,7 @@ def test_private_kernel_outputs_survive_exception_after_real_enqueue(monkeypatch
     with (
         pytest.raises(RuntimeError, match="after real kernel enqueue"),
         torch.npu.stream(stream),
-        pool.operation(lambda: NativeCompletion(stream)) as owner,
+        pool.operation() as owner,
     ):
         retain = lambda *objects: pool.retain(owner, *objects)
         if operation == "gather":
@@ -96,27 +84,29 @@ def test_private_kernel_outputs_survive_exception_after_real_enqueue(monkeypatch
         pool.acquire()
 
 
-@pytest.mark.parametrize("failure", ["host_after_enqueue", "event_create", "event_record", "submit_result"])
-def test_native_enqueue_failure_quarantines_backing(failure):
+@pytest.mark.parametrize("failure", ["host_after_enqueue", "event_create", "event_record"])
+def test_native_enqueue_failure_quarantines_backing(monkeypatch, failure):
     pool = DraftWindowOwnerPool(1)
     stream = torch.npu.Stream()
     payload = torch.arange(1024, dtype=torch.float32, device="npu")
     stream.wait_stream(torch.npu.current_stream())
 
-    def completion():
-        if failure == "event_create":
-            raise RuntimeError("injected event creation failure")
-        event = torch.npu.Event()
-        if failure == "event_record":
-            raise RuntimeError("injected event recording failure")
-        event.record(stream)
-        if failure == "submit_result":
-            # Real work and a real recorded event exist, but the owner did
-            # not receive a valid completion token.
-            return event
-        return NativeCompletion(stream)
+    native_event = torch.npu.Event
 
-    with pytest.raises((RuntimeError, TypeError)), torch.npu.stream(stream), pool.operation(completion) as owner:
+    class FaultEvent(native_event):
+        def __new__(cls):
+            if failure == "event_create":
+                raise RuntimeError("injected event creation failure")
+            return super().__new__(cls)
+
+        def record(self, stream=None):
+            super().record(stream)
+            if failure == "event_record":
+                raise RuntimeError("injected event recording failure")
+
+    monkeypatch.setattr(torch.npu, "Event", FaultEvent)
+
+    with pytest.raises((RuntimeError, TypeError)), torch.npu.stream(stream), pool.operation() as owner:
         pool.retain(owner, payload)
         observed = payload.square()
         pool.retain(owner, observed)
@@ -137,7 +127,7 @@ def test_native_enqueue_failure_quarantines_backing(failure):
 def test_native_completion_covers_an_explicit_late_reader_join():
     pool = DraftWindowOwnerPool(1)
     producer, reader = torch.npu.Stream(), torch.npu.Stream()
-    with torch.npu.stream(producer), pool.operation(lambda: NativeCompletion(producer)) as owner:
+    with torch.npu.stream(producer), pool.operation() as owner:
         payload = torch.arange(1024, dtype=torch.float32, device="npu")
         pool.retain(owner, payload)
         reader.wait_stream(producer)
@@ -148,22 +138,22 @@ def test_native_completion_covers_an_explicit_late_reader_join():
         # secondary reader before recording its proposal completion.
         producer.wait_stream(reader)
     replacement = pool.acquire()
-    assert replacement.lane == owner.lane
+    assert replacement is not owner
     assert not owner.retained and owner.completion is None
     torch.testing.assert_close(result.cpu(), torch.arange(1024, dtype=torch.float32) * 3)
 
 
-class ObservedNativeCompletion(NativeCompletion):
+class ObservedNativeEvent(torch.npu.Event):
     """Record native observations without substituting a completion result."""
 
-    def __init__(self, stream):
-        super().__init__(stream)
+    def __init__(self):
+        super().__init__()
         self.queries = []
         self.waits = 0
         self.failure = None
 
-    def is_complete(self):
-        complete = self.event.query()
+    def query(self):
+        complete = super().query()
         self.queries.append(complete)
         if self.failure is not None and complete:
             pytest.skip("reader completed before native pending-completion fault boundary")
@@ -171,13 +161,13 @@ class ObservedNativeCompletion(NativeCompletion):
             raise RuntimeError("injected host error after native pending query")
         return complete
 
-    def wait(self):
+    def synchronize(self):
         self.waits += 1
         if self.failure == "wait":
-            if self.event.query():
+            if super().query():
                 pytest.skip("reader completed before native pending-wait fault boundary")
             raise RuntimeError("injected host error before native completion wait")
-        self.event.synchronize()
+        super().synchronize()
 
 
 @contextmanager
@@ -189,24 +179,26 @@ def pending_native_reader(pool):
     before observation this fixture is inconclusive. Keep every allocation
     alive and synchronize only this test's stream during cleanup.
     """
-    completion: ObservedNativeCompletion
+    completion: ObservedNativeEvent
     matrix_size = 4096
     delay_operations = 128
     stream = torch.npu.Stream()
     try:
-        with torch.npu.stream(stream), pool.operation(lambda: completion) as owner:
-            payload = torch.arange(1024, dtype=torch.float32, device="npu")
-            observed = torch.empty_like(payload)
-            left = torch.full((matrix_size, matrix_size), 1 / matrix_size, dtype=torch.bfloat16, device="npu")
-            right = torch.eye(matrix_size, dtype=torch.bfloat16, device="npu")
-            scratch = torch.empty_like(left)
-            pool.retain(owner, payload, observed, left, right, scratch)
-            for _ in range(delay_operations):
-                torch.mm(left, right, out=scratch)
-                left, scratch = scratch, left
-            observed.copy_(payload)
-            completion = ObservedNativeCompletion(stream)
-        if completion.event.query():
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(torch.npu, "Event", ObservedNativeEvent)
+            with torch.npu.stream(stream), pool.operation() as owner:
+                payload = torch.arange(1024, dtype=torch.float32, device="npu")
+                observed = torch.empty_like(payload)
+                left = torch.full((matrix_size, matrix_size), 1 / matrix_size, dtype=torch.bfloat16, device="npu")
+                right = torch.eye(matrix_size, dtype=torch.bfloat16, device="npu")
+                scratch = torch.empty_like(left)
+                pool.retain(owner, payload, observed, left, right, scratch)
+                for _ in range(delay_operations):
+                    torch.mm(left, right, out=scratch)
+                    left, scratch = scratch, left
+                observed.copy_(payload)
+        completion = owner.completion
+        if super(ObservedNativeEvent, completion).query():
             pytest.skip("bounded native queue completed before an in-flight reader was observed")
         yield owner, completion, payload, observed
     finally:
@@ -223,24 +215,24 @@ def test_native_pool_pressure_waits_before_overwriting_read_backing():
         assert completion.queries[-1] is True
         assert completion.waits == 1
         assert not owner.retained and owner.completion is None
-        assert replacement.lane == owner.lane
+        assert replacement is not owner
         # The replacement may now overwrite the exact backing read by the
         # delayed native copy. That copy must have consumed the old values.
         payload.fill_(-1)
         torch.testing.assert_close(observed.cpu(), torch.arange(1024, dtype=torch.float32))
 
 
-def test_native_reverse_completion_reuses_only_the_completed_lane():
+def test_native_reverse_completion_reclaims_only_the_completed_owner():
     pool = DraftWindowOwnerPool(2)
     with pending_native_reader(pool) as (slow_owner, slow, payload, observed):
         fast_stream = torch.npu.Stream()
         try:
-            with torch.npu.stream(fast_stream), pool.operation(lambda: NativeCompletion(fast_stream)) as fast_owner:
+            with torch.npu.stream(fast_stream), pool.operation() as fast_owner:
                 fast_payload = torch.ones(1024, device="npu")
                 fast_result = fast_payload + 1
                 pool.retain(fast_owner, fast_payload, fast_result)
-            fast_owner.completion.wait()
-            if slow.event.query():
+            fast_owner.completion.synchronize()
+            if super(ObservedNativeEvent, slow).query():
                 pytest.skip("device did not exhibit reverse completion of the two native readers")
             replacement = pool.acquire()
             if not slow_owner.retained and slow_owner.completion is None:
@@ -249,9 +241,9 @@ def test_native_reverse_completion_reuses_only_the_completed_lane():
             assert slow.waits == 0
             assert slow_owner.completion is not None
             assert any(value is payload for value in slow_owner.retained)
-            assert replacement.lane == fast_owner.lane
+            assert replacement is not fast_owner and replacement is not slow_owner
             assert not fast_owner.retained and fast_owner.completion is None
-            slow.wait()
+            slow.synchronize()
             torch.testing.assert_close(observed.cpu(), torch.arange(1024, dtype=torch.float32))
         finally:
             fast_stream.synchronize()
@@ -273,7 +265,7 @@ def test_native_pending_completion_fault_quarantines_the_execution(failure):
             pool.acquire()
         # A later successful native completion cannot silently unpoison an
         # executor after its bookkeeping failed. No replacement can write.
-        completion.event.synchronize()
+        super(ObservedNativeEvent, completion).synchronize()
         torch.testing.assert_close(observed.cpu(), torch.arange(1024, dtype=torch.float32))
         with pytest.raises(RuntimeError, match="quarantined"):
             pool.acquire()

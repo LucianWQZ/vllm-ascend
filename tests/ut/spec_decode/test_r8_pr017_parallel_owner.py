@@ -15,8 +15,8 @@ from typing import Any
 from unittest.mock import PropertyMock, patch
 
 import numpy as np
+import torch
 
-from vllm_ascend.worker.v2.spec_decode import draft_window_runtime
 from vllm_ascend.worker.v2.spec_decode.dflash import aclgraph as dflash_graph
 from vllm_ascend.worker.v2.spec_decode.dflash import speculator as dflash
 from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import DraftGraphSupport
@@ -29,26 +29,28 @@ from vllm_ascend.worker.v2.spec_decode.dspark import speculator as dspark
 class Completion:
     recorded = 0
 
-    def __init__(self):
+    def record(self, _stream):
         type(self).recorded += 1
 
-    def is_complete(self):
+    def query(self):
         return True
 
-    def wait(self):
+    def synchronize(self):
         return None
 
 
 class ParallelOwnerTests(unittest.TestCase):
     def setUp(self):
         Completion.recorded = 0
-        completion = patch.object(draft_window_runtime, "_NPUCompletion", Completion)
+        completion = patch.object(torch.npu, "Event", Completion)
         completion.start()
         self.addCleanup(completion.stop)
+        stream = patch.object(torch.npu, "current_stream", return_value=object())
+        stream.start()
+        self.addCleanup(stream.stop)
         self.batch = SimpleNamespace(is_dummy=False)
         self.owner = SimpleNamespace(
-            _draft_window_graph_binding_provider=SimpleNamespace(quarantined=False),
-            _draft_window_proposal=None,
+            _draft_window_graph_binding_provider=SimpleNamespace(quarantined=False, proposal=None),
             _draft_window_bypass_active=False,
             vllm_config=SimpleNamespace(max_concurrent_batches=2),
             num_speculative_steps=8,
@@ -76,7 +78,7 @@ class ParallelOwnerTests(unittest.TestCase):
         self.assertIsInstance(self.owner._draft_window_context_kv_pool, DraftWindowOwnerPool)
         self.assertFalse(self.owner._draft_window_context_kv_pool._poisoned)
         self.assertFalse(hasattr(self.owner, "_draft_window_runtime"))
-        self.assertIsNone(self.owner._draft_window_proposal)
+        self.assertIsNone(self.owner._draft_window_graph_binding_provider.proposal)
 
     def test_zero_original_error_quarantines_and_actual_normal_scope_rejects(self):
         first = RuntimeError("native context write stand-in")
@@ -111,10 +113,10 @@ class ParallelOwnerTests(unittest.TestCase):
         first = RuntimeError("completion record stand-in")
 
         class BrokenCompletion:
-            def __init__(self):
+            def record(self, _stream):
                 raise first
 
-        broken = patch.object(draft_window_runtime, "_NPUCompletion", BrokenCompletion)
+        broken = patch.object(torch.npu, "Event", BrokenCompletion)
         broken.start()
         self.addCleanup(broken.stop)
         with (
@@ -132,7 +134,7 @@ class ParallelOwnerTests(unittest.TestCase):
                 self.scope(8)
             with self.assertRaisesRegex(RuntimeError, "already active"):
                 self.scope(0)
-        self.owner._draft_window_proposal = object()
+        self.owner._draft_window_graph_binding_provider.proposal = object()
         with (
             self.assertRaisesRegex(RuntimeError, "already active"),
             self.scope(0),

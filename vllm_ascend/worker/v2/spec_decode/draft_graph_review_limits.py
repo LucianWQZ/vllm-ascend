@@ -328,7 +328,8 @@ def validate_eagle_single_request_review_exact(owner, input_batch, exact, *, num
     # Only the admitted active/padded extent and current values can vary here.
     if num_reqs != len(rows) or padded != num_reqs:
         raise RuntimeError("Eagle review lost its exact admitted-row CPU consumer input")
-    context = getattr(owner, "_eagle3_window_proposal", None)
+    provider = getattr(owner, "_draft_window_graph_binding_provider", None)
+    context = getattr(provider, "proposal", None)
     continuing_rows = context.full_read_rows if context is not None else ()
     for position, (prompt, maximum) in enumerate(rows):
         value = exact[position].item()

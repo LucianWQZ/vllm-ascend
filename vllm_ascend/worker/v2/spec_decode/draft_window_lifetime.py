@@ -6,22 +6,19 @@ Only the proposal scope may submit a reader. Tensor allocation and stream
 ordering belong to its caller; a retained reference never prevents writes.
 """
 
-from collections.abc import Callable, Iterator
+from __future__ import annotations
+
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Protocol
 
-
-class DraftWindowCompletion(Protocol):
-    def is_complete(self) -> bool: ...
-
-    def wait(self) -> None: ...
+import torch
 
 
 @dataclass(eq=False)
 class DraftWindowOwner:
     retained: list[object] = field(default_factory=list, repr=False)
-    completion: DraftWindowCompletion | None = field(default=None, repr=False)
+    completion: torch.npu.Event | None = field(default=None, repr=False)
 
 
 class DraftWindowOwnerPool:
@@ -67,10 +64,10 @@ class DraftWindowOwnerPool:
         try:
             assert owner.completion is not None
             if wait:
-                owner.completion.wait()
-            complete = owner.completion.is_complete()
-            if wait and not complete:
-                raise RuntimeError("Draft Window completion wait did not complete the reader")
+                owner.completion.synchronize()
+                complete = True
+            else:
+                complete = owner.completion.query()
         except BaseException:
             self._poisoned = True
             raise
@@ -86,7 +83,7 @@ class DraftWindowOwnerPool:
         return sum(self._reclaim(owner) for owner in tuple(self._owners) if owner.completion is not None)
 
     @contextmanager
-    def operation(self, record_completion: Callable[[], DraftWindowCompletion]) -> Iterator[DraftWindowOwner]:
+    def operation(self) -> Iterator[DraftWindowOwner]:
         """Enter before preparation can enqueue; finish after all readers join.
 
         No separate caller-driven PREPARING/ACTIVE/submit state exists: the
@@ -97,12 +94,10 @@ class DraftWindowOwnerPool:
         owner = self.acquire()
         try:
             yield owner
-            # Keep even an invalid/partially recorded token on bookkeeping error.
-            owner.completion = record_completion()
-            if not callable(getattr(owner.completion, "is_complete", None)) or not callable(
-                getattr(owner.completion, "wait", None)
-            ):
-                raise TypeError("Draft Window completion must implement is_complete and wait")
+            # Own the event before recording: a failed/partial record must not
+            # release either the token or any possibly submitted read operands.
+            owner.completion = torch.npu.Event()
+            owner.completion.record(torch.npu.current_stream())
         except BaseException:
             self._poisoned = True
             raise

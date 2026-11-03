@@ -93,32 +93,48 @@ def test_canonical_cpu_counts_keep_mapping_order_padding_and_source(full_source)
     assert torch.equal(full_source.block_tables.num_blocks.cpu, before)
 
 
-@pytest.mark.parametrize("mapping", [np.array([0.5]), np.array([2])])
+@pytest.mark.parametrize("mapping", [np.array([-1]), np.array([2])])
 def test_canonical_count_gather_rejects_invalid_mapping(full_source, mapping):
-    with pytest.raises((TypeError, IndexError)):
+    with pytest.raises(IndexError):
         gather_valid_num_blocks_cpu(full_source, idx_mapping_np=mapping, num_reqs=1, num_reqs_padded=1)
 
 
 def _materialize(full_source, batch, exact, counts, frozen=None):
-    from vllm_ascend.worker.v2.spec_decode.draft_window import DraftMetadataInputs, DraftWindowWorkspace
-    from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphBindingProvider
+    from dataclasses import replace
+    from types import SimpleNamespace
 
-    bank = DraftWindowWorkspace(max_num_reqs=len(exact), table_capacity_columns=4, table_template=full_source.table)
-    proposal = DraftWindowProposalContext.from_batch(batch)
-    inputs = DraftMetadataInputs(proposal, len(exact), 0, bank, DraftWindowGraphBindingProvider(source=full_source))
-    bank.materialize(
-        inputs=inputs,
-        source=full_source,
+    from vllm.config.compilation import CUDAGraphMode
+    from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
+
+    from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
+        DraftWindowGraphBindingProvider,
+        DraftWindowGraphRoute,
+    )
+
+    if len(exact) > full_source.table.shape[0]:
+        table = torch.cat(
+            (
+                full_source.table,
+                full_source.table.new_zeros(len(exact) - full_source.table.shape[0], full_source.table.shape[1]),
+            )
+        )
+        full_source = replace(full_source, block_tables=SimpleNamespace(input_block_tables=[table]))
+    provider = DraftWindowGraphBindingProvider(source=full_source)
+    descriptor = BatchExecutionDescriptor(CUDAGraphMode.FULL, len(exact), len(exact), uniform_token_count=1)
+    bank = provider.register_capture_identity(route=DraftWindowGraphRoute.EAGLE3_FIRST_PASS, descriptor=descriptor)
+    provider.proposal = DraftWindowProposalContext.from_batch(batch)
+    return provider.prepare(
+        bank,
         cpu_full_exact=torch.tensor(exact, dtype=torch.int32),
         cpu_valid_num_blocks=torch.tensor(counts, dtype=torch.int32),
         frozen_row_plans=frozen,
+        step=0,
     )
-    return bank
 
 
 @pytest.mark.parametrize("count", [-1, 5])
 def test_materialization_rejects_counts_outside_canonical_row(full_source, count):
-    with pytest.raises(RuntimeError, match="valid block count"):
+    with pytest.raises(RuntimeError, match="initialized block count"):
         _materialize(full_source, _batch([(0, 8, 2)]), [2], [count])
 
 

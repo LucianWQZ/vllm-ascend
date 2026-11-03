@@ -12,7 +12,7 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.worker.gpu.spec_decode.eagle.speculator import EagleSpeculator
 from vllm.v1.worker.gpu.spec_decode.target_dependent_ar.speculator import TargetDependentARSpeculator
 
-from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.attention_v1 import AscendAttentionState, AscendMetadata
 from vllm_ascend.worker.v2.spec_decode import draft_window_eager
 from vllm_ascend.worker.v2.spec_decode.draft_window_eagle3 import (
     Eagle3DraftWindowMixin,
@@ -105,95 +105,68 @@ def test_eagle_partial_schedule_is_not_dynamic_k(scheduled):
 
 
 @pytest.fixture
-def proposal(monkeypatch):
-    owner: Any = Eagle3DraftWindowMixin()
-    owner.method, owner.num_speculative_steps = "eagle3", 3
-    owner.speculative_config = SimpleNamespace(uses_dynamic_speculative_decoding=lambda: False)
-    runtime: Any = SimpleNamespace(
-        source=SimpleNamespace(
-            policy=SimpleNamespace(normalized_method="eagle3"),
-            window_size=4,
-            group=SimpleNamespace(gid=0, table_column_span=4),
-            block_tables=SimpleNamespace(num_blocks=SimpleNamespace(cpu=torch.tensor([[4]], dtype=torch.int32))),
-        ),
-        _active_inputs=None,
-        quarantined=False,
-        retired=None,
-        pending=[],
-        require_reusable=lambda: None,
+def proposal():
+    from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
+
+    from vllm_ascend.worker.v2.spec_decode.draft_window import DraftWindowGraphSource
+    from vllm_ascend.worker.v2.spec_decode.draft_window_backends import DraftWindowGroupRoute, DraftWindowProviderStatus
+    from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
+        DraftWindowGraphBindingProvider,
+        DraftWindowGraphRoute,
     )
+    from vllm_ascend.worker.v2.spec_decode.draft_window_policy import resolve_draft_window_policy
 
-    def retire(inputs):
-        assert runtime._active_inputs is inputs
-        runtime.retired, runtime._active_inputs = inputs, None
-
-    runtime.retire_generation = retire
-    runtime.quarantine = lambda: setattr(runtime, "quarantined", True)
-
-    def require_reusable():
-        if runtime.quarantined:
-            raise RuntimeError("quarantined")
-
-    runtime.require_reusable = require_reusable
-
-    def finish():
-        if runtime._active_inputs is not None or runtime.pending:
-            raise RuntimeError("unfinished Graph consumer")
-
-    runtime.finish_proposal = finish
-    runtime.prepare_workspace = lambda capture: capture.workspace
-    owner._draft_window_graph_binding_provider = runtime
+    owner = Eagle3DraftWindowMixin()
+    owner.method, owner.num_speculative_steps, owner.max_model_len = "eagle3", 3, 32
+    owner.speculative_config = SimpleNamespace(uses_dynamic_speculative_decoding=lambda: False)
+    table = torch.arange(16, dtype=torch.int32).reshape(2, 8)
+    tables = SimpleNamespace(
+        input_block_tables=[table],
+        num_blocks=SimpleNamespace(cpu=torch.tensor([[8, 8]], dtype=torch.int32)),
+        block_sizes=(4,),
+        kernel_block_sizes=(4,),
+    )
+    group = DraftWindowGroupRoute(0, ("draft.layer",), 4, 4, DraftWindowProviderStatus.DIRECT_DENSE)
+    source = DraftWindowGraphSource(
+        resolve_draft_window_policy(requested_window_size=4, method="eagle3"), group, tables
+    )
+    provider = owner._draft_window_graph_binding_provider = DraftWindowGraphBindingProvider(source=source)
     owner._initialize_eagle3_draft_window_state()
     batch = SimpleNamespace(
         num_reqs=1,
         req_ids=["request"],
         idx_mapping_np=np.array([0]),
+        idx_mapping=torch.tensor([0]),
         num_computed_prefill_tokens_np=np.array([10]),
         prefill_len_np=np.array([10]),
         num_scheduled_tokens=np.array([1]),
         num_draft_tokens_per_req=None,
         is_prefilling_np=np.array([False]),
         has_prefill=False,
+        seq_lens_np=np.array([10], dtype=np.int32),
+        query_start_loc_np=np.array([0, 4], dtype=np.int32),
+        attn_state=AscendAttentionState.DecodeOnly,
     )
-    session: Any = object.__new__(Eagle3GraphSession)
-    session.owner = owner
-    session.provider = runtime
-    owner._eagle3_graph_session = session
-    owner.model_state = SimpleNamespace(attn_metadata={})
-    owner.input_batch = batch
-    owner.max_model_len = 32
+    owner.input_batch, owner.block_tables = batch, tables
     owner.input_buffers = SimpleNamespace(seq_lens=torch.tensor([8], dtype=torch.int32))
-    batch.seq_lens_np = np.array([10], dtype=np.int32)
-    owner.draft_vllm_config = SimpleNamespace(parallel_config=object())
-    batch.query_start_loc_np = np.array([0, 4], dtype=np.int32)
-    batch.attn_state = AscendAttentionState.DecodeOnly
-    bank = SimpleNamespace(
-        window_block_table=torch.tensor([[1, 2]], dtype=torch.int32),
-        device_window_exact=torch.tensor([5], dtype=torch.int32),
-        cpu_window_exact=torch.tensor([5], dtype=torch.int32),
+    session = object.__new__(Eagle3GraphSession)
+    session.owner, session.provider, session._capture_call = owner, provider, None
+    for n in (1, 2, 4):
+        for route, q, count in (
+            (DraftWindowGraphRoute.EAGLE3_FIRST_PASS, 4, 1),
+            (DraftWindowGraphRoute.EAGLE3_AR_STEP, 1, 2),
+        ):
+            if n > 2:
+                continue
+            desc = BatchExecutionDescriptor(CUDAGraphMode.FULL, q * n, n, uniform_token_count=q)
+            for ordinal in range(count):
+                provider.register_capture_identity(route=route, descriptor=desc, consumer_ordinal=ordinal)
+    owner._eagle3_graph_session = session
+    owner.model_state, owner.draft_vllm_config = (
+        SimpleNamespace(attn_metadata={}),
+        SimpleNamespace(parallel_config=object()),
     )
-    from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphRoute
-
-    session.resolve = lambda *, first, n, tokens, ordinal: SimpleNamespace(
-        route=DraftWindowGraphRoute.EAGLE3_FIRST_PASS if first else DraftWindowGraphRoute.EAGLE3_AR_STEP,
-        descriptor=SimpleNamespace(num_reqs=n, num_tokens=tokens),
-        consumer_ordinal=ordinal,
-        workspace=bank,
-    )
-    session.provider.bind_read_carrier = lambda **kwargs: runtime.pending.append(kwargs["inputs"])
-
-    def inputs(step, **changes):
-        context = owner._require_eagle3_window_context()
-        values = dict(proposal=context, step=step)
-        values.update(changes)
-        values.setdefault("padded_request_count", 1)
-        current = SimpleNamespace(**values)
-        current.validate = lambda: runtime._active_inputs is current or pytest.fail("stale inputs")
-        runtime._active_inputs = current
-        return current
-
-    runtime.materialize = lambda **kwargs: inputs(kwargs["step"], padded_request_count=kwargs["num_reqs_padded"])
-    return owner, batch, session, runtime, inputs
+    return owner, batch, session, provider, None
 
 
 def test_real_proposal_zero_uses_first_reader_and_keeps_static_k(proposal):
@@ -201,30 +174,28 @@ def test_real_proposal_zero_uses_first_reader_and_keeps_static_k(proposal):
     with owner._eagle3_draft_window_proposal_scope(batch, dummy_run=False, is_profile=False, num_speculative_tokens=0):
         assert owner._eagle3_window_expected_steps == 1
         session.stage(session.resolve(first=True, n=1, tokens=4, ordinal=0), 0)
-        assert runtime.retired.step == 0
-        runtime.pending.clear()
-    assert runtime.retired is not None
+        assert runtime._active_bank is session.resolve(first=True, n=1, tokens=4, ordinal=0)
+        runtime.finish_update()
+    assert runtime._active_bank is None
     assert owner.num_speculative_steps == owner._eagle3_window_expected_steps == 3
-    assert not runtime.pending
+    assert not runtime._pending
 
 
 def test_real_proposal_keeps_each_submitted_consumer_until_update(proposal):
-    owner, batch, session, runtime, inputs = proposal
+    owner, batch, session, runtime, _ = proposal
     with owner._eagle3_draft_window_proposal_scope(batch, dummy_run=False, is_profile=False):
-        for step in range(3):
-            if step == 1:
-                owner._snapshot_eagle3_decode_step_one(num_reqs=1, num_reqs_padded=1)
-            session.stage(
-                session.resolve(first=step == 0, n=1, tokens=4 if step == 0 else 1, ordinal=max(0, step - 1)), step
-            )
-            current = runtime.retired
+        first = session.resolve(first=True, n=1, tokens=4, ordinal=0)
+        session.stage(first, 0)
+        assert runtime._active_bank is first and runtime._pending == [first]
+        runtime.finish_update()
+        owner._snapshot_eagle3_decode_step_one(num_reqs=1, num_reqs_padded=1)
+        ar = [session.resolve(first=False, n=1, tokens=1, ordinal=i) for i in range(2)]
+        for step, bank in enumerate(ar, 1):
+            session.stage(bank, step)
             assert owner._eagle3_window_next_step == step + 1
-            assert runtime.retired is current
-            assert runtime._active_inputs is None
-            assert runtime.pending == [current]
-            runtime.pending.clear()
-    assert not runtime.pending
-    assert not runtime.quarantined
+        assert runtime._pending == ar and ar[0].params is not ar[1].params
+        runtime.finish_update()
+    assert runtime.proposal is None and runtime._active_bank is None and not runtime.quarantined
 
 
 def test_update_failure_after_host_retirement_quarantines_the_provider(proposal):
@@ -235,16 +206,49 @@ def test_update_failure_after_host_retirement_quarantines_the_provider(proposal)
         owner._eagle3_draft_window_proposal_scope(batch, dummy_run=False, is_profile=False, num_speculative_tokens=0),
     ):
         session.stage(session.resolve(first=True, n=1, tokens=4, ordinal=0), 0)
-        assert runtime._active_inputs is None and runtime.pending
+        assert runtime._active_bank is not None and runtime._pending
         raise original
     assert caught.value is original
-    assert runtime.quarantined and runtime.retired is not None and runtime.pending
-    assert owner._eagle3_window_proposal is None
+    assert runtime.quarantined and runtime._active_bank is not None and runtime._pending
+    assert runtime.proposal is None
     with (
         pytest.raises(RuntimeError, match="quarantined"),
         owner._eagle3_draft_window_proposal_scope(batch, dummy_run=False, is_profile=False),
     ):
         pytest.fail("an UPDATE failure must reject the next proposal before reuse")
+
+
+@pytest.mark.parametrize("first", [False, True])
+def test_actual_manager_failure_stays_inside_the_proposal_quarantine(proposal, first):
+    from vllm_ascend.worker.v2.spec_decode.target_dependent_ar.aclgraph import AutoRegressiveAclGraphManager
+
+    owner, batch, session, provider, _ = proposal
+    manager = object.__new__(AutoRegressiveAclGraphManager)
+    manager.speculator, manager.is_draft_model_prefill = owner, first
+    original = RuntimeError("actual Graph replay or UPDATE failed")
+
+    def replay(desc, metadata, *, window_source):
+        assert window_source is provider and not metadata
+        assert len(provider._pending) == (1 if first else 2)
+        raise original
+
+    manager._updatable_graph_replay = replay
+    with (
+        pytest.raises(RuntimeError) as caught,
+        owner._eagle3_draft_window_proposal_scope(
+            batch, dummy_run=False, is_profile=False, num_speculative_tokens=0 if first else 3
+        ),
+    ):
+        if not first:
+            session.stage(session.resolve(first=True, n=1, tokens=4, ordinal=0), 0)
+            provider.finish_update()
+            owner._snapshot_eagle3_decode_step_one(num_reqs=1, num_reqs_padded=1)
+            for step in (1, 2):
+                session.stage(session.resolve(first=False, n=1, tokens=1, ordinal=step - 1), step)
+        desc = session.resolve(first=first, n=1, tokens=4 if first else 1, ordinal=0).descriptor
+        manager._run_eagle_window_fullgraph(desc, session)
+    assert caught.value is original
+    assert provider.quarantined and provider._active_bank is not None and provider._pending
 
 
 def test_business_window_proposal_requires_the_real_installed_graph_manager(proposal):
@@ -255,8 +259,8 @@ def test_business_window_proposal_requires_the_real_installed_graph_manager(prop
         owner._eagle3_draft_window_proposal_scope(batch, dummy_run=False, is_profile=False),
     ):
         pytest.fail("a business request reached the old private eager owner")
-    assert owner._eagle3_window_proposal is None
-    assert runtime._active_inputs is None
+    assert runtime.proposal is None
+    assert runtime._active_bank is None
 
 
 @pytest.mark.parametrize("damage", ["missing_reader", "missing_update", "wrong_batch", "wrong_step"])
@@ -271,50 +275,29 @@ def test_real_proposal_rejects_unconsumed_or_misattributed_reader(proposal, dama
                 owner.input_batch = SimpleNamespace(**vars(batch))
             session.stage(session.resolve(first=True, n=1, tokens=4, ordinal=0), 1 if damage == "wrong_step" else 0)
     assert runtime.quarantined
-    assert owner._eagle3_window_proposal is None
+    assert runtime.proposal is None
 
 
 @pytest.mark.parametrize("first_padding", [1, 2])
 def test_first_and_ar_share_one_materialization_path_without_moving_the_anchor(proposal, monkeypatch, first_padding):
-    from vllm_ascend.worker.v2.spec_decode import draft_window_eagle3
-
     owner, batch, session, runtime, _ = proposal
-    owner.input_batch, owner.max_model_len = batch, 32
-    owner.input_buffers = SimpleNamespace(seq_lens=torch.tensor([8], dtype=torch.int32))
-    batch.seq_lens_np = np.array([10], dtype=np.int64)
-    batch.seq_lens_cpu_upper_bound = torch.tensor([12], dtype=torch.int32)
-    batch.idx_mapping = torch.tensor([0], dtype=torch.int64)
-    runtime.source.window_size = 4
-    runtime.source.group = SimpleNamespace(gid=0, table_column_span=4)
-    calls = []
-    monkeypatch.setattr(
-        draft_window_eagle3, "gather_valid_num_blocks_cpu", lambda *args, **kwargs: torch.tensor([4], dtype=torch.int32)
-    )
+    original, calls = runtime.prepare, []
 
-    def materialize(**kwargs):
+    def prepare(capture, **kwargs):
         calls.append(kwargs)
-        current = SimpleNamespace(proposal=kwargs["proposal"], step=kwargs["step"])
-        current.validate = lambda: runtime._active_inputs is current
-        runtime._active_inputs = current
-        return current
+        return original(capture, **kwargs)
 
-    runtime.materialize = materialize
+    monkeypatch.setattr(runtime, "prepare", prepare)
     with owner._eagle3_draft_window_proposal_scope(batch, dummy_run=False, is_profile=False):
-        frozen = None
-        for step in range(3):
-            if step == 1:
-                owner._snapshot_eagle3_decode_step_one(num_reqs=1, num_reqs_padded=1)
-            padded = first_padding if step == 0 else 1
-            session.stage(
-                session.resolve(
-                    first=step == 0, n=padded, tokens=4 * padded if step == 0 else padded, ordinal=max(0, step - 1)
-                ),
-                step,
-            )
-            frozen = frozen or owner._eagle3_window_proposal_plan
+        session.stage(session.resolve(first=True, n=first_padding, tokens=4 * first_padding, ordinal=0), 0)
+        frozen = owner._eagle3_window_proposal_plan
+        assert frozen[0].window_start == 8
+        runtime.finish_update()
+        owner._snapshot_eagle3_decode_step_one(num_reqs=1, num_reqs_padded=1)
+        for step in (1, 2):
+            session.stage(session.resolve(first=False, n=1, tokens=1, ordinal=step - 1), step)
             assert owner._eagle3_window_proposal_plan is frozen
-            assert frozen[0].window_start == 8
-            runtime.pending.clear()
+        runtime.finish_update()
     assert [call["cpu_full_exact"].tolist() for call in calls] == [[10] + [0] * (first_padding - 1), [8], [9]]
     assert all(call["frozen_row_plans"] is frozen for call in calls)
 
@@ -363,7 +346,9 @@ def test_eagle_capture_lookup_keeps_each_real_shape_and_consumer(first, tokens, 
 def test_eagle_capture_borrows_full_query_write_fields_and_owns_only_reads():
     query = torch.tensor([0, 4], dtype=torch.int32)
     slots, positions = torch.arange(4), torch.arange(8, 12)
-    original = SimpleNamespace(slot_mapping=slots, positions=positions, seq_lens_list=[12])
+    original = SimpleNamespace(
+        slot_mapping=slots, positions=positions, seq_lens_list=[12], actual_seq_lengths_q=[4], qfa_metadata_cache={}
+    )
     metadata = {"layer": original, "shared": original, "empty": None}
     bank = SimpleNamespace(
         window_block_table=torch.tensor([[2, 3]], dtype=torch.int32),
@@ -374,9 +359,8 @@ def test_eagle_capture_borrows_full_query_write_fields_and_owns_only_reads():
     session.owner = SimpleNamespace(max_model_len=32, input_buffers=SimpleNamespace(query_start_loc=query))
     session.provider = SimpleNamespace(
         source=SimpleNamespace(window_size=4, group=SimpleNamespace(table_column_span=2)),
-        startup_capture_workspace=lambda identity: bank,
     )
-    capture = SimpleNamespace(descriptor=SimpleNamespace(num_reqs=1))
+    capture = SimpleNamespace(descriptor=SimpleNamespace(num_reqs=1), **vars(bank))
     session._capture_call = iter((capture,))
     result = session.capture_metadata(metadata)
     assert result["layer"] is result["shared"]
@@ -414,7 +398,6 @@ def parallel_hook():
 
     owner._materialize_draft_window_read_inputs = materialize
     desc = SimpleNamespace(cg_mode=SimpleNamespace(name="FULL"), num_reqs=2, num_tokens=16)
-    owner._draft_window_selected_metadata = SimpleNamespace(descriptor=desc)
     return owner, desc, inputs, calls
 
 
@@ -443,10 +426,10 @@ def test_parallel_metadata_hook_prepares_one_bank_without_a_temporary_metadata_b
         slot_mappings=owner.block_tables.slot_mappings[:, :16],
     )
     assert result is None and not hasattr(owner, "_draft_window_live_inputs")
-    assert calls == [{"num_reqs": 1, "num_reqs_padded": 2}]
+    assert calls == [{"num_reqs": 1, "batch_desc": desc}]
 
 
-@pytest.mark.parametrize("damage", ["mode", "query", "step", "tokens", "selection", "full_slots"])
+@pytest.mark.parametrize("damage", ["mode", "query", "step", "tokens", "full_slots"])
 def test_parallel_metadata_hook_rejects_bad_actual_inputs_before_bank_materialization(parallel_hook, damage):
     owner, desc, _, calls = parallel_hook
     query, step, slots = np.array([0, 8], dtype=np.int32), 8, owner.block_tables.slot_mappings[:, :16]
@@ -458,8 +441,6 @@ def test_parallel_metadata_hook_rejects_bad_actual_inputs_before_bank_materializ
         step = 7
     elif damage == "tokens":
         desc.num_tokens = 15
-    elif damage == "selection":
-        owner._draft_window_selected_metadata = None
     elif damage == "full_slots":
         slots = slots.clone()
     with pytest.raises(RuntimeError, match="actual uniform FULL dispatch|canonical Full write slots"):
@@ -481,19 +462,22 @@ def test_eagle_stage_uses_the_bank_without_rebuilding_or_reading_target_metadata
                 owner._snapshot_eagle3_decode_step_one(num_reqs=1, num_reqs_padded=1)
             capture = session.resolve(first=step == 0, n=1, tokens=4 if step == 0 else 1, ordinal=max(0, step - 1))
             session.stage(capture, step)
-            assert runtime.retired.step == step
+            assert runtime._active_bank is capture and owner._eagle3_window_next_step == step + 1
             assert owner.model_state is target and owner.draft_vllm_config is draft_config
-            runtime.pending.clear()
+            if step == 0 or step == scheduled - 1:
+                runtime.finish_update()
 
 
 @pytest.mark.parametrize("mode", [CUDAGraphMode.NONE, CUDAGraphMode.PIECEWISE])
-@pytest.mark.parametrize("skip_sample", [False, True])
-@pytest.mark.parametrize("fail", [False, True])
+@pytest.mark.parametrize(
+    "failure,skip_sample", [(None, False), (None, True), ("forward", False), ("forward", True), ("sample", False)]
+)
 @pytest.mark.parametrize("padding", ["none", "tensor", "extra_request"])
 def test_official_nonuniform_prefill_uses_window_first_bank_without_an_eager_owner(
-    monkeypatch, mode, skip_sample, fail, padding
+    monkeypatch, mode, skip_sample, failure, padding
 ):
     from vllm_ascend.attention.attention_v1 import AscendAttentionState
+    from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphBindingProvider
 
     class Owner(Eagle3GraphIntegrationMixin):
         def _eagle3_window_is_active(self):
@@ -525,32 +509,29 @@ def test_official_nonuniform_prefill_uses_window_first_bank_without_an_eager_own
         window_block_table=torch.tensor([[1, 2, 0, 0], [5, 6, 7, 8]], dtype=torch.int32),
         device_window_exact=torch.tensor([5, 11], dtype=torch.int32),
         cpu_window_exact=torch.tensor([5, 11], dtype=torch.int32),
+        params=None,
     )
     capture = object()
-    pending = SimpleNamespace(workspace=bank)
-    provider = SimpleNamespace(_active_inputs=None)
+    provider = DraftWindowGraphBindingProvider(source=SimpleNamespace(table=torch.empty(0)))
 
     def resolve(**kwargs):
         assert kwargs == dict(first=True, n=2, tokens=8, ordinal=0)
         return capture
 
-    def prepare(actual):
-        assert actual is capture
-        events.append("prepare")
+    def materialize(actual, step):
+        assert actual is capture and step == 0
+        provider._active_bank = bank
+        events.append("materialize")
         return bank
 
-    def materialize(**kwargs):
-        assert kwargs == dict(step=0, num_reqs=2, num_reqs_padded=2, output_workspace=bank)
-        provider._active_inputs = pending
-        events.append("materialize")
-        return pending
+    complete_native = provider.complete_native
 
-    def retire(actual):
-        assert actual is pending and provider._active_inputs is pending
-        events.append("retire")
-        provider._active_inputs = None
+    def complete():
+        assert provider._active_bank is bank
+        events.append("complete_native")
+        complete_native()
 
-    provider.prepare_workspace, provider.retire_generation = prepare, retire
+    provider.complete_native = complete
     owner._draft_window_graph_binding_provider = provider
     owner._eagle3_graph_session = SimpleNamespace(_capture_call=None, resolve=resolve)
     owner._eagle3_window_next_step, owner.num_speculative_steps = 0, 3
@@ -568,7 +549,6 @@ def test_official_nonuniform_prefill_uses_window_first_bank_without_an_eager_own
     owner.block_tables = SimpleNamespace(gather_block_tables=gather)
     owner._materialize_eagle3_step = materialize
     owner.model_state = SimpleNamespace(attn_metadata=target)
-    owner._quarantine_eagle3_window = lambda: events.append("quarantine")
     owner._prepare_replicated_prefill_attn = lambda metadata, mappings, *args, **kwargs: (metadata, mappings)
     owner.draft_attn_layer_names, owner.pcp_manager = {"draft"}, None
     model_tokens = 8 if padding == "tensor" else 7
@@ -586,7 +566,7 @@ def test_official_nonuniform_prefill_uses_window_first_bank_without_an_eager_own
 
     def forward(current, num_tokens, metadata, mappings, across, actual_mode, mm_inputs):
         assert current is owner and num_tokens == model_tokens and actual_mode is mode and mappings is slot_map
-        assert provider._active_inputs is pending
+        assert provider._active_bank is bank
         layer = metadata["draft"]
         assert metadata is not target and layer is not target_layer
         assert layer.block_tables is bank.window_block_table
@@ -595,38 +575,51 @@ def test_official_nonuniform_prefill_uses_window_first_bank_without_an_eager_own
         assert layer.attn_state is AscendAttentionState.ChunkedPrefill
         assert layer.slot_mapping is slots and layer.query_start_loc is query and layer.positions is absolute
         assert layer.actual_seq_lengths_q == [3, 7]
-        assert layer.actual_seq_lengths_q is not target_layer.actual_seq_lengths_q
+        assert layer.actual_seq_lengths_q is target_layer.actual_seq_lengths_q
         assert layer.seq_lens_list is not target_layer.seq_lens_list
         assert target_layer.seq_lens_list == [77, 88]
         assert target_layer.attn_state is AscendAttentionState.PrefillNoCache
         torch.testing.assert_close(target_layer.block_tables, original_target_table)
         events.append("native")
-        if fail:
+        if failure == "forward":
             raise ValueError("native prefill failed")
         return output, output
 
     def sample(hidden, *args):
         sampled.append(hidden.clone())
+        if failure == "sample":
+            raise ValueError("sampling after native completion failed")
         return torch.tensor([21, 22], dtype=torch.int64)
 
     owner.sample_draft = sample
     monkeypatch.setattr(AscendTargetDependentARSpeculator, "_run_model", forward)
+    context = draft_window_eager.DraftWindowProposalContext(owner.input_batch, (False, False))
     if padding == "extra_request":
-        with pytest.raises(NotImplementedError, match="additional padding requests"):
+        with (
+            pytest.raises(NotImplementedError, match="additional padding requests"),
+            provider.proposal_scope(context),
+        ):
             owner._prefill(2, model_tokens, target, slot_map, None, mode, skip_sample=skip_sample)
-        assert events == [] and provider._active_inputs is None and not sampled
+        assert events == [] and provider._active_bank is None and not sampled
         assert target_layer.actual_seq_lengths_q == [3, 7, 8]
         return
-    if fail:
-        with pytest.raises(ValueError, match="native prefill failed"):
+    if failure is not None:
+        with pytest.raises(ValueError, match="failed"), provider.proposal_scope(context):
             owner._prefill(2, model_tokens, target, slot_map, None, mode, skip_sample=skip_sample)
-        assert events == ["prepare", "gather_full", "materialize", "native", "quarantine"]
-        assert provider._active_inputs is pending and owner._eagle3_window_next_step == 0
-        assert not sampled
+        assert events == ["gather_full", "materialize", "native"] + (["complete_native"] if failure == "sample" else [])
+        assert provider.quarantined
+        if failure == "sample":
+            assert provider._active_bank is None and not provider._pending
+            assert owner._eagle3_window_next_step == 1 and sampled
+        else:
+            assert provider._active_bank is bank and owner._eagle3_window_next_step == 0 and not sampled
+        with pytest.raises(RuntimeError, match="quarantined"), provider.proposal_scope(context):
+            pytest.fail("a later sampling failure must reject the next proposal before bank reuse")
     else:
-        owner._prefill(2, model_tokens, target, slot_map, None, mode, skip_sample=skip_sample)
-        assert events == ["prepare", "gather_full", "materialize", "native", "retire"]
-        assert provider._active_inputs is None and owner._eagle3_window_next_step == 1
+        with provider.proposal_scope(context):
+            owner._prefill(2, model_tokens, target, slot_map, None, mode, skip_sample=skip_sample)
+        assert events == ["gather_full", "materialize", "native", "complete_native"]
+        assert provider._active_bank is None and owner._eagle3_window_next_step == 1
         if skip_sample:
             assert not sampled and not bool(owner.draft_tokens.any())
         else:
@@ -676,7 +669,7 @@ def test_dp_synchronized_native_first_without_local_prefill(monkeypatch, mode, f
         route=DraftWindowGraphRoute.EAGLE3_FIRST_PASS,
         descriptor=BatchExecutionDescriptor(CUDAGraphMode.FULL, 4, 1, uniform_token_count=4),
     )
-    bank = provider.startup_capture_workspace(capture)
+    bank = capture
     owner._eagle3_graph_session = SimpleNamespace(_capture_call=None, resolve=lambda **kwargs: capture)
     owner._initialize_eagle3_draft_window_state()
     owner.input_batch = SimpleNamespace(
@@ -706,6 +699,7 @@ def test_dp_synchronized_native_first_without_local_prefill(monkeypatch, mode, f
         positions=positions,
         slot_mapping=slots,
         attn_state=AscendAttentionState.DecodeOnly,
+        qfa_metadata_cache={},
     )
     target = {"draft": target_layer}
     owner.input_buffers = SimpleNamespace(positions=torch.cat((positions.clone(), torch.zeros(4, dtype=torch.int64))))
@@ -733,18 +727,16 @@ def test_dp_synchronized_native_first_without_local_prefill(monkeypatch, mode, f
         assert layer.query_start_loc is query and layer.positions is positions and layer.slot_mapping is slots
         assert mappings["draft"] is slots and target_layer.attn_state is AscendAttentionState.DecodeOnly
         torch.testing.assert_close(current.input_buffers.positions[:4], positions)
-        observed.append(provider._active_inputs)
+        observed.append(provider._active_bank)
         return torch.zeros((8, 2)), torch.zeros((8, 2))
 
     monkeypatch.setattr(AscendTargetDependentARSpeculator, "_run_model", forward)
-    owner._eagle3_window_proposal = draft_window_eager.DraftWindowProposalContext.from_batch(owner.input_batch)
-    try:
+    context = draft_window_eager.DraftWindowProposalContext.from_batch(owner.input_batch)
+    with provider.proposal_scope(context):
         owner._prefill(1, 8, target, {"draft": slots}, None, mode)
-    finally:
-        owner._eagle3_window_proposal = None
     assert len(observed) == 1
-    assert observed[0].proposal.full_read_rows == (False,)
-    assert provider._active_inputs is None and not owner._eagle3_window_native_prefill_active
+    assert observed[0] is bank and context.full_read_rows == (False,)
+    assert provider._active_bank is None and not owner._eagle3_window_native_prefill_active
     assert owner._eagle3_window_next_step == 1 and owner.draft_tokens[0, 0] == 23
     assert bank.cpu_window_exact.tolist() == [full_end - start]  # Retirement did not clear live backing.
     torch.testing.assert_close(table, torch.arange(10, 42, dtype=torch.int32).reshape(1, 32))
@@ -761,8 +753,6 @@ def test_terminal_prefill_rejects_a_query_outside_the_frozen_window_before_writi
     batch.prefill_len_np = batch.num_scheduled_tokens = batch.seq_lens_np = np.array([10])
     batch.is_prefilling_np, batch.has_prefill = np.array([True]), True
     batch.query_start_loc_np = np.array([0, 10], dtype=np.int32)
-    runtime.source.window_size = 4
-    runtime.source.group = SimpleNamespace(gid=0, table_column_span=4)
     monkeypatch.setattr(
         draft_window_eagle3,
         "gather_valid_num_blocks_cpu",
@@ -772,8 +762,8 @@ def test_terminal_prefill_rejects_a_query_outside_the_frozen_window_before_writi
         pytest.raises(NotImplementedError, match="query begins before its frozen read window"),
         owner._eagle3_draft_window_proposal_scope(batch, dummy_run=False, is_profile=False),
     ):
-        owner._materialize_eagle3_step(step=0, num_reqs=1, num_reqs_padded=1, output_workspace=object())
-    assert runtime._active_inputs is None
+        owner._materialize_eagle3_step(session.resolve(first=True, n=1, tokens=4, ordinal=0), 0)
+    assert runtime._active_bank is None
 
 
 def test_mixed_prefill_query_guard_keeps_full_rows_and_checks_only_actual_window_rows(proposal, monkeypatch):
@@ -787,23 +777,22 @@ def test_mixed_prefill_query_guard_keeps_full_rows_and_checks_only_actual_window
     batch.prefill_len_np, batch.num_scheduled_tokens = np.array([100, 10]), np.array([10, 2])
     batch.seq_lens_np, batch.query_start_loc_np = np.array([20, 10]), np.array([0, 10, 12], dtype=np.int32)
     batch.is_prefilling_np, batch.has_prefill = np.array([True, True]), True
-    runtime.source.window_size = 4
-    runtime.source.group = SimpleNamespace(gid=0, table_column_span=4)
     monkeypatch.setattr(
         draft_window_eagle3, "gather_valid_num_blocks_cpu", lambda *args, **kwargs: torch.tensor([5, 3, 0, 0])
     )
     calls = []
 
-    def materialize(**kwargs):
+    def prepare(capture, **kwargs):
         calls.append(kwargs)
-        return SimpleNamespace()
+        return capture
 
-    runtime.materialize = materialize
-    context = owner._eagle3_window_proposal = draft_window_eager.DraftWindowProposalContext.from_batch(batch)
+    monkeypatch.setattr(runtime, "prepare", prepare)
+    context = runtime.proposal = draft_window_eager.DraftWindowProposalContext.from_batch(batch)
+    capture = SimpleNamespace(descriptor=SimpleNamespace(num_reqs=4))
     try:
-        owner._materialize_eagle3_step(step=0, num_reqs=2, num_reqs_padded=4, output_workspace=object())
+        owner._materialize_eagle3_step(capture, 0)
     finally:
-        owner._eagle3_window_proposal = None
+        runtime.proposal = None
     assert context.full_read_rows == (True, False)
     assert len(calls) == 1 and calls[0]["cpu_full_exact"].tolist() == [20, 10, 0, 0]
     assert [plan.window_visible_length for plan in calls[0]["frozen_row_plans"]] == [4, 2]
@@ -813,15 +802,15 @@ def test_mixed_prefill_query_guard_keeps_full_rows_and_checks_only_actual_window
 def test_eagle_rejects_invalid_canonical_lengths_before_writing_a_bank(proposal, monkeypatch, values):
     from vllm_ascend.worker.v2.spec_decode import draft_window_eagle3
 
-    owner, batch, _, runtime, _ = proposal
+    owner, batch, session, runtime, _ = proposal
     owner.input_batch = batch
     batch.seq_lens_np = values
     monkeypatch.setattr(
         draft_window_eagle3, "gather_valid_num_blocks_cpu", lambda *args, **kwargs: pytest.fail("invalid bank write")
     )
     with pytest.raises(ValueError), owner._eagle3_draft_window_proposal_scope(batch, dummy_run=False, is_profile=False):
-        owner._materialize_eagle3_step(step=0, num_reqs=1, num_reqs_padded=1, output_workspace=object())
-    assert runtime._active_inputs is None
+        owner._materialize_eagle3_step(session.resolve(first=True, n=1, tokens=4, ordinal=0), 0)
+    assert runtime._active_bank is None
 
 
 @pytest.mark.parametrize("consumers", [1, 2])
@@ -838,11 +827,9 @@ def test_capture_scope_selects_banks_once_and_requires_every_real_consumer(consu
     captures = tuple(
         SimpleNamespace(
             descriptor=SimpleNamespace(num_reqs=1),
-            workspace=SimpleNamespace(
-                window_block_table=torch.tensor([[index, index + 1]], dtype=torch.int32),
-                device_window_exact=torch.tensor([5 + index], dtype=torch.int32),
-                cpu_window_exact=torch.tensor([5 + index], dtype=torch.int32),
-            ),
+            window_block_table=torch.tensor([[index, index + 1]], dtype=torch.int32),
+            device_window_exact=torch.tensor([5 + index], dtype=torch.int32),
+            cpu_window_exact=torch.tensor([5 + index], dtype=torch.int32),
         )
         for index in range(consumers)
     )
@@ -855,15 +842,14 @@ def test_capture_scope_selects_banks_once_and_requires_every_real_consumer(consu
     session.provider = SimpleNamespace(
         source=SimpleNamespace(window_size=4, group=SimpleNamespace(table_column_span=2)),
         capture_banks_for=select,
-        startup_capture_workspace=lambda capture: capture.workspace,
     )
-    full = SimpleNamespace(slot_mapping=torch.tensor([10]), seq_lens_list=[99])
+    full = AscendMetadata(slot_mapping=torch.tensor([10]), seq_lens_list=[99], actual_seq_lengths_q=[4])
 
     def execute():
         with session.capture_call(first=consumers == 1, n=1, tokens=4 if consumers == 1 else 1):
             for index in range(visited):
                 private = session.capture_metadata({"layer": full})["layer"]
-                assert private.block_tables is captures[index].workspace.window_block_table
+                assert private.block_tables is captures[index].window_block_table
                 assert private.slot_mapping is full.slot_mapping
                 assert full.seq_lens_list == [99]
 

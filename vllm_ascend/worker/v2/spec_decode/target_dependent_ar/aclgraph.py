@@ -326,15 +326,9 @@ class AutoRegressiveAclGraphManager(SpeculatorCudaGraphManager):
         )
 
     def _run_eagle_window_fullgraph(self, desc, session):
-        owner = self.speculator
-        try:
-            session.provider.require_reusable()
-            if self.is_draft_model_prefill:
-                capture = session.resolve(first=True, n=desc.num_reqs, tokens=desc.num_tokens, ordinal=0)
-                session.stage(capture, 0)
-            ret = self._updatable_graph_replay(desc, (), window_source=session.provider)
-            session.provider.finish_update()
-            return ret
-        except BaseException:
-            owner._quarantine_eagle3_window()
-            raise
+        if self.is_draft_model_prefill:
+            capture = session.resolve(first=True, n=desc.num_reqs, tokens=desc.num_tokens, ordinal=0)
+            session.stage(capture, 0)
+        ret = self._updatable_graph_replay(desc, (), window_source=session.provider)
+        session.provider.finish_update()
+        return ret

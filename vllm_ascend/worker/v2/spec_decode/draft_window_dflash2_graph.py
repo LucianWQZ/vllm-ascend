@@ -19,13 +19,6 @@ def _require(condition: bool, message: str) -> None:
         raise ValueError("DFlash2 Graph: " + message)
 
 
-def _attention_impl_type():
-    # Worker-only import; CONFIG_OFF/policy evaluation stays host-only.
-    from vllm_ascend.attention.attention_v1 import AscendAttentionBackendImpl
-
-    return AscendAttentionBackendImpl
-
-
 def validate_dflash2_graph_config(vllm_config: Any) -> None:
     """First Graph qualification is static K7 on the actual uncombined TP2 route.
 
@@ -73,7 +66,6 @@ def validate_dflash2_graph_read_source(
     """Qualify the real owner and its inventory without a second buffer owner."""
     validate_dflash2_graph_source(owner)
     gid, kernel, native = group.gid, group.table_column_span, group.native_window
-    _require(type(window_size) is int and window_size > 0, "positive integer Window required")
     context = owner.vllm_config.compilation_config.static_forward_context
     _require(
         len(group.layers) == len(owner.draft_attn_layer_names)
@@ -85,18 +77,8 @@ def validate_dflash2_graph_read_source(
         (causal if type(causal) is bool else causal.get(gid)) is False,
         "DFlash2 Graph source requires actual noncausal attention",
     )
-    table = owner.block_tables.input_block_tables[gid]
-    expansion = owner.block_tables.blocks_per_kv_block[gid]
-    _require(
-        expansion == group.scheduler_block_size // kernel
-        and len(table.shape) == 2
-        and table.shape[0] == owner.max_num_reqs
-        and table.shape[1] > 0
-        and table.shape[1] % expansion == 0
-        and tuple(table.stride()) == (table.shape[1], 1)
-        and str(table.dtype) == "torch.int32",
-        "canonical source must retain the actual complete expanded int32 table rows",
-    )
+    # Policy validates W; inventory validates scheduler/kernel spans. The
+    # original BlockTables constructor owns the expanded int32 row layout.
     if native is not None:
         _require(
             window_size + kernel - 1 + owner.num_query_per_req <= native,
@@ -111,6 +93,8 @@ def validate_dflash2_graph_source(owner: Any) -> None:
     its Source inventory is admitted; Graph OFF uses the same execution check
     at manager construction, without creating a Window runtime or zero owner.
     """
+    from vllm_ascend.attention.attention_v1 import AscendAttentionBackendImpl
+
     validate_dflash2_graph_config(owner.vllm_config)
     config = owner.speculative_config
     _require(
@@ -120,20 +104,11 @@ def validate_dflash2_graph_source(owner: Any) -> None:
         config.method == "dflash" and config.enforce_eager is not True,
         "this is the Graph execution contract, not a typed eager owner",
     )
-    _require(
-        not config.uses_dynamic_speculative_decoding() and not owner.enable_adaptive_verification,
-        "first DFlash2 Graph implementation requires static nonadaptive K",
-    )
     _require(owner.use_fp64_gumbel is False, "the NPU selector does not implement fp64 Gumbel")
-    k, q, top_k, capacity = owner.num_speculative_steps, owner.num_query_per_req, owner.top_k, owner.max_num_reqs
-    _require(
-        all(type(v) is int and v > 0 for v in (k, q, top_k, capacity)) and q == k + 1,
-        "static DFlash2 K/anchor query geometry differs",
-    )
-    _require(
-        config.num_speculative_tokens == k and 0 < top_k <= owner.vocab_size,
-        "selector or speculative configuration changed",
-    )
+    # Fixed constructors derive K, Q=K+1 and sampler dimensions from the
+    # admitted config. Only the loaded model's selector/conv relation is new.
+    q, top_k = owner.num_query_per_req, owner.top_k
+    _require(0 < top_k <= owner.vocab_size, "selector top-k exceeds the actual vocabulary")
     _require(getattr(owner, "_draft_window_runtime", None) is None, "typed eager and Graph owners cannot coexist")
     _require(
         getattr(owner, "_dflash2_full_kv_reference", False) is True,
@@ -142,10 +117,7 @@ def validate_dflash2_graph_source(owner: Any) -> None:
     sampler, model = owner.candidate_sampler, owner.model
     selector = model.model.candidate_selector
     _require(
-        sampler.num_steps == k
-        and sampler.top_k == selector.top_k == top_k
-        and callable(model.compute_candidates)
-        and callable(selector),
+        sampler.top_k == selector.top_k == top_k and callable(model.compute_candidates) and callable(selector),
         "actual selector/sampler contract differs",
     )
     # Fixed DFlash/DFlash2 constructors own the sampler and per-request input
@@ -157,16 +129,14 @@ def validate_dflash2_graph_source(owner: Any) -> None:
         (owner.draft_logits is not None) is probabilistic,
         "probabilistic selector requires its existing full-vocab cache; greedy must not add one",
     )
-    impl_type = _attention_impl_type()
     context = owner.vllm_config.compilation_config.static_forward_context
-    _require(
-        owner.attn_vllm_config.compilation_config.static_forward_context is context,
-        "Draft attention and model execution do not share the actual static context owner",
-    )
     _require(bool(owner.draft_attn_layer_names), "no actual Draft attention layers")
     for name in owner.draft_attn_layer_names:
         impl = context[name].impl
-        _require(type(impl) is impl_type, "DFlash2 native Graph requires the actual dense FIA implementation")
+        _require(
+            type(impl) is AscendAttentionBackendImpl,
+            "DFlash2 native Graph requires the actual dense FIA implementation",
+        )
         native = impl.sliding_window
         _require(native is None or type(native) is int and native > 0, "invalid model native window")
         mask = getattr(impl, "_dflash2_native_swa_mask", None)

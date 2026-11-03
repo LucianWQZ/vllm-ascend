@@ -1,14 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
-"""Host descriptors of real DFlash2 Graph inputs, without a device import.
+"""Host contracts of real DFlash2 Graph inputs, without device execution.
 
 These headers model fixed 544 allocations, not tensor contents or a numeric
 oracle. Device capture, selector results and completion require device tests.
 """
 
-import importlib.util
-import sys
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -35,11 +32,14 @@ class TensorHeader:
         raise AssertionError(f"contract tried a nonmetadata tensor operation: {name}")
 
 
-class DenseImpl:
-    def __init__(self, native=2048):
-        self.sliding_window, self.sinks, self.use_bnsd_kv_cache = native, None, False
-        if native is not None:
-            self._dflash2_native_swa_mask = TensorHeader((2048, 2048), "torch.int8")
+def dense_impl(native=2048):
+    from vllm_ascend.attention.attention_v1 import AscendAttentionBackendImpl
+
+    impl = AscendAttentionBackendImpl.__new__(AscendAttentionBackendImpl)
+    impl.sliding_window, impl.sinks, impl.use_bnsd_kv_cache = native, None, False
+    if native is not None:
+        impl._dflash2_native_swa_mask = TensorHeader((2048, 2048), "torch.int8")
+    return impl
 
 
 class Selector:
@@ -50,21 +50,15 @@ class Selector:
 
 
 @pytest.fixture
-def module(monkeypatch):
-    path = Path(__file__).parents[3] / "vllm_ascend/worker/v2/spec_decode/draft_window_dflash2_graph.py"
-    name = "_test_dflash2_graph_contract"
-    spec = importlib.util.spec_from_file_location(name, path)
-    assert spec is not None and spec.loader is not None
-    loaded = importlib.util.module_from_spec(spec)
-    monkeypatch.setitem(sys.modules, name, loaded)
-    spec.loader.exec_module(loaded)
-    monkeypatch.setattr(loaded, "_attention_impl_type", lambda: DenseImpl)
-    return loaded
+def module():
+    from vllm_ascend.worker.v2.spec_decode import draft_window_dflash2_graph
+
+    return draft_window_dflash2_graph
 
 
 @pytest.fixture
 def owner():
-    context = {"draft.0": SimpleNamespace(impl=DenseImpl())}
+    context = {"draft.0": SimpleNamespace(impl=dense_impl())}
     cfg = SimpleNamespace(
         method="dflash",
         enforce_eager=False,
@@ -168,15 +162,12 @@ def test_native_source_keeps_actual_mask_and_exact_boundary(module, owner):
 
 
 def test_graph_factory_qualifies_the_real_dflash2_owner(monkeypatch, owner):
-    # This integration boundary imports the paired worker; header-only checks
-    # above still load the qualification module without device dependencies.
-    from vllm_ascend.worker.v2.spec_decode import draft_window, draft_window_dflash2_graph, draft_window_graph_runtime
+    from vllm_ascend.worker.v2.spec_decode import draft_window, draft_window_graph_runtime
     from vllm_ascend.worker.v2.spec_decode.draft_window_policy import resolve_draft_window_policy
 
     actual_route = route()
     monkeypatch.setattr(draft_window_graph_runtime, "validate_graph_context", lambda *_: None)
     monkeypatch.setattr(draft_window, "inventory_draft_window_groups", lambda **_: (actual_route,))
-    monkeypatch.setattr(draft_window_dflash2_graph, "_attention_impl_type", lambda: DenseImpl)
     kwargs = dict(
         policy=resolve_draft_window_policy(requested_window_size=1024, method="dflash", is_dflash2=True),
         runtime_route="dflash2",
@@ -198,7 +189,7 @@ def test_graph_factory_qualifies_the_real_dflash2_owner(monkeypatch, owner):
 
 
 def test_full_only_source_host_contract_does_not_fake_native_model(module, owner):
-    owner.vllm_config.compilation_config.static_forward_context["draft.0"].impl = DenseImpl(None)
+    owner.vllm_config.compilation_config.static_forward_context["draft.0"].impl = dense_impl(None)
     module.validate_dflash2_graph_source(owner)
     validate_source(module, owner, route(None))
 
@@ -217,21 +208,15 @@ def test_actual_conditional_full_vocab_logits_allocation(module, owner, sampling
 @pytest.mark.parametrize(
     "mutation, message",
     [
-        (lambda x: setattr(x, "num_query_per_req", 5), "anchor query geometry"),
         (
             lambda x: setattr(x.speculative_config, "uses_dynamic_speculative_decoding", lambda: True),
             "static nonadaptive",
         ),
-        (lambda x: setattr(x, "enable_adaptive_verification", True), "static nonadaptive"),
         (lambda x: setattr(x, "use_fp64_gumbel", True), "fp64 Gumbel"),
         (lambda x: setattr(x, "_draft_window_runtime", object()), "cannot coexist"),
         (lambda x: setattr(x, "_dflash2_full_kv_reference", False), "full-retention loader"),
         (lambda x: setattr(x.speculative_config, "enforce_eager", True), "typed eager owner"),
         (lambda x: setattr(x.model.model.layers[0].attention_conv, "block_size", 3), "query boundary"),
-        (
-            lambda x: setattr(x.attn_vllm_config, "compilation_config", SimpleNamespace(static_forward_context={})),
-            "static context",
-        ),
     ],
 )
 def test_malformed_capture_contract_is_rejected(module, owner, mutation, message):
@@ -267,9 +252,53 @@ def test_actual_ascend_expanded_manager_blocks_use_kernel_span(module, owner):
     validate_source(module, owner, actual_route, window_size=1913)
     with pytest.raises(ValueError, match="original noncausal native band"):
         validate_source(module, owner, actual_route, window_size=1914)
-    owner.block_tables.input_block_tables[0].shape = (4, 1023)
-    with pytest.raises(ValueError, match="complete expanded"):
-        validate_source(module, owner, actual_route)
+
+
+def test_real_constructor_owns_expanded_complete_table_layout(monkeypatch):
+    import torch
+
+    from vllm_ascend.patch.worker.patch_v2 import patch_uva
+    from vllm_ascend.worker.v2.block_table import AscendBlockTables
+
+    original_zeros = torch.zeros
+
+    def zeros_without_pinning(*args, **kwargs):
+        kwargs.pop("pin_memory", None)
+        return original_zeros(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "zeros", zeros_without_pinning)
+    monkeypatch.setattr(patch_uva, "is_uva_available", lambda: True)
+    monkeypatch.setattr(torch.ops._C_ascend, "get_npu_view_from_cpu_tensor", lambda value: value, raising=False)
+    tables = AscendBlockTables(
+        block_sizes=[512],
+        kernel_block_sizes=[128],
+        max_num_reqs=4,
+        max_num_batched_tokens=32,
+        max_num_blocks_per_group=[256],
+        device=torch.device("cpu"),
+    )
+    assert tables.blocks_per_kv_block == [4]
+    assert tables.input_block_tables[0].shape == (4, 1024)
+    assert tables.input_block_tables[0].dtype == torch.int32
+    assert tables.input_block_tables[0].stride() == (1024, 1)
+
+
+def test_real_draft_attention_config_borrows_the_model_context():
+    from vllm.config import AttentionConfig
+
+    from vllm_ascend.worker.v2.spec_decode.dflash2.speculator import AscendDFlash2Speculator
+
+    owner = AscendDFlash2Speculator.__new__(AscendDFlash2Speculator)
+    context = {"draft.0": object()}
+    owner.vllm_config = SimpleNamespace(
+        compilation_config=SimpleNamespace(static_forward_context=context),
+        attention_config=AttentionConfig(),
+    )
+    owner.requires_non_causal = True
+    derived = owner.attn_vllm_config
+    assert derived.compilation_config.static_forward_context is context
+    assert derived.attention_config.use_non_causal is True
+    assert owner.vllm_config.attention_config.use_non_causal is False
 
 
 @pytest.mark.parametrize(
@@ -293,6 +322,7 @@ def test_first_graph_qualification_rejects_unvalidated_topologies(module, owner,
     [
         (lambda c: setattr(c.speculative_config.draft_parallel_config, "tensor_parallel_size", 1), "TP2"),
         (lambda c: setattr(c.speculative_config, "num_speculative_tokens", 3), "K7/Q8"),
+        (lambda c: setattr(c.speculative_config, "enable_adaptive_verification", True), "K7/Q8"),
         (lambda c: c.additional_config.update(enable_dsa_cp=True), "FlashComm, SP"),
         (lambda c: c.additional_config.update(enable_flashcomm1=True), "FlashComm, SP"),
         (lambda c: setattr(c.parallel_config, "use_sequence_parallel_moe", True), "FlashComm, SP"),

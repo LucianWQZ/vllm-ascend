@@ -28,9 +28,6 @@ from vllm_ascend.utils import use_updatable_graph
 from vllm_ascend.worker.v2.aclgraph_utils import collect_sorted_captured_token_sizes, model_capture_wrapper
 from vllm_ascend.worker.v2.spec_decode.dflash.capture import draft_window_dflash_capture_scope
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import resolve_parallel_draft_window_graph_route
-from vllm_ascend.worker.v2.spec_decode.draft_window_graph_runtime import (
-    prepare_parallel_graph,
-)
 from vllm_ascend.worker.v2.utils import communicator_switch
 
 
@@ -86,19 +83,9 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
                 num_active_loras=self._resolve_effective_loras(num_active_loras),
                 num_ubatches=num_ubatches,
             )
-        descriptor = super().dispatch(
+        return super().dispatch(
             num_reqs, num_tokens, uniform_token_count, num_active_loras, max_query_len, num_ubatches
         )
-        if hasattr(self.speculator, "_draft_window_graph_binding_provider"):
-            provider = self.speculator._draft_window_graph_binding_provider
-            self.speculator._draft_window_selected_metadata = (
-                provider.capture_identity_for(
-                    route=resolve_parallel_draft_window_graph_route(self.speculator), descriptor=descriptor
-                )
-                if self.speculator._draft_window_proposal is not None
-                else None
-            )
-        return descriptor
 
     def capture(
         self,
@@ -152,8 +139,8 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
             # Length preparation and FlashAttn tiling run inside the graph,
             # reading the draft's persistent device buffers on every replay.
             return super().run_fullgraph(desc)
-        if not dp_dummy:
-            prepare_parallel_graph(self.speculator, desc)
+        if graph_route is not None:
+            self.speculator._draft_window_graph_binding_provider.bind_current(desc)
         if graph_route is None:
             draft_attn_metadatas = self.speculator.build_draft_attn_metadatas(
                 desc.num_reqs,
