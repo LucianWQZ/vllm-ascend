@@ -50,12 +50,6 @@ class DraftNativeAttention:
     def actual_complete(self) -> bool:
         return self.kind != "UNKNOWN"
 
-    def narrowed_windows(self, window_size: int | None) -> tuple[int, ...]:
-        # Only observed/certified native consumers establish this warning.
-        if window_size is None or not self.actual_complete:
-            return ()
-        return tuple(sorted({value for value in self.windows if window_size < value}))
-
 
 def inspect_draft_native_attention(speculator: Any) -> DraftNativeAttention:
     """Inspect loaded Draft consumers, after the real loader and ``set_attn``.
@@ -123,22 +117,6 @@ def inspect_draft_native_attention(speculator: Any) -> DraftNativeAttention:
     )
 
 
-def require_known_draft_native_attention(
-    inventory: DraftNativeAttention, *, window_size: int | None, graph_requested: bool
-) -> None:
-    """A detection prerequisite, not a provider/Graph support certificate.
-
-    Ordinary OFF eager remains legal and allocates no Window state. Existing
-    method/provider guards must still admit every known Window/Graph route.
-    """
-    if window_size is None and not graph_requested:
-        return
-    if not inventory.actual_complete:
-        raise NotImplementedError(
-            "Draft Window/Graph requires a known native attention contract: " + "; ".join(inventory.issues)
-        )
-
-
 def report_owner_draft_native_attention(owner: Any, logger: Any) -> DraftNativeAttention:
     """Startup-only summary of the actual speculator's loaded attention.
 
@@ -166,7 +144,12 @@ def report_owner_draft_native_attention(owner: Any, logger: Any) -> DraftNativeA
         inventory.issues,
         scope="global",
     )
-    narrowed = inventory.narrowed_windows(window)
+    # Only observed/certified native consumers establish this warning.
+    narrowed = (
+        tuple(value for value in inventory.windows if window < value)
+        if window is not None and inventory.actual_complete
+        else ()
+    )
     if narrowed:
         logger.warning_once(
             "The Draft model contains native SWA layers with windows %s. "
@@ -183,5 +166,8 @@ def report_owner_draft_native_attention(owner: Any, logger: Any) -> DraftNativeA
     # in this change and needs it even when the additional Window is OFF.
     architectures = getattr(owner.draft_model_config.hf_config, "architectures", ()) or ()
     new_dflash2_graph = graph_requested and tuple(architectures) == ("DFlash2DraftModel",)
-    require_known_draft_native_attention(inventory, window_size=window, graph_requested=new_dflash2_graph)
+    if (window is not None or new_dflash2_graph) and not inventory.actual_complete:
+        raise NotImplementedError(
+            "Draft Window/Graph requires a known native attention contract: " + "; ".join(inventory.issues)
+        )
     return inventory

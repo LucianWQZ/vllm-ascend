@@ -75,10 +75,12 @@ class NativeAttentionTests(unittest.TestCase):
 
     def test_unknown_architecture_or_missing_count_does_not_become_full(self):
         for cfg in (config(architecture="UnknownDraft"), {}, config(count=0)):
-            result = native.inspect_draft_native_attention(loaded(cfg, [None, None]))
-            self.assertEqual(result.kind, "UNKNOWN")
-            with self.assertRaises(NotImplementedError):
-                native.require_known_draft_native_attention(result, window_size=1024, graph_requested=False)
+            owner = loaded(cfg, [None, None])
+            owner.speculative_config = SimpleNamespace(enforce_eager=True)
+            owner.draft_window_policy = SimpleNamespace(effective_window_size=1024)
+            self.assertEqual(native.inspect_draft_native_attention(owner).kind, "UNKNOWN")
+            with self.assertRaises(NotImplementedError, msg=str(cfg)):
+                native.report_owner_draft_native_attention(owner, Log())
 
     def test_actual_window_and_complete_layer_registration_are_required(self):
         for windows in ([0, 2048], [True, 2048], [2048], [None, None, None]):
@@ -159,12 +161,16 @@ class NativeAttentionTests(unittest.TestCase):
         self.assertEqual(native.inspect_draft_native_attention(owner).kind, "UNKNOWN")
 
     def test_off_no_runtime_and_unknown_window_graph_fail_closed(self):
-        owner = loaded(config(architecture="UnknownDraft"), [None, None])
-        inventory = native.inspect_draft_native_attention(owner)
-        native.require_known_draft_native_attention(inventory, window_size=None, graph_requested=False)
-        for window, graph in ((1024, False), (None, True)):
+        owner = loaded(config(), [2048, 2048], mask=False)
+        owner.speculative_config = SimpleNamespace(enforce_eager=True)
+        log = Log()
+        self.assertEqual(native.report_owner_draft_native_attention(owner, log).kind, "UNKNOWN")
+        for window, eager in ((1024, True), (None, False)):
+            owner.draft_window_policy = SimpleNamespace(effective_window_size=window)
+            owner.speculative_config.enforce_eager = eager
             with self.assertRaises(NotImplementedError):
-                native.require_known_draft_native_attention(inventory, window_size=window, graph_requested=graph)
+                native.report_owner_draft_native_attention(owner, log)
+        self.assertFalse(log.warnings)  # Partial native windows cannot certify narrowing.
         self.assertFalse(hasattr(owner, "_draft_window_runtime"))
         self.assertFalse(hasattr(owner, "_draft_window_runtime_state"))
 
