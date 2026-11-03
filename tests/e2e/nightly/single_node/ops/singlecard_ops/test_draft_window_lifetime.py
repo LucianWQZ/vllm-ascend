@@ -212,7 +212,9 @@ def test_native_pool_pressure_waits_before_overwriting_read_backing():
         if completion.waits == 0:
             pytest.skip("reader completed before pool pressure reached the native wait")
         assert completion.queries[0] is False
-        assert completion.queries[-1] is True
+        # A successful native wait already establishes completion. Observe
+        # the real event independently; no extra production poll is required.
+        assert super(ObservedNativeEvent, completion).query() is True
         assert completion.waits == 1
         assert not owner.retained and owner.completion is None
         assert replacement is not owner
