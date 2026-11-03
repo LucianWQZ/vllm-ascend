@@ -8,9 +8,9 @@ draft, the mean acceptance length dropped from ~5 to ~1 at 32k context, making
 speculation a net loss.
 
 The KV sliding window caps the **draft model's attention** to the most recent
-`draft_window_size` tokens. The target model is untouched - it always attends
-to the full context, so generation quality is preserved; only the draft reads
-a shorter, in-distribution window. On acceptance-collapsed drafts this
+`draft_window_size` tokens. The target keeps its original attention and
+verification semantics, including any native SWA; only eligible Draft reads
+are shortened. On acceptance-collapsed drafts this
 restores acceptance (the same GLM-5.2 draft recovered from ~1.0 to ~4.7-5.5
 at 32k, up to +381% end-to-end throughput in the original evaluation).
 
@@ -92,554 +92,249 @@ There are two apply points because of how the drafts construct metadata:
 
 ## MRV2 implementation
 
-MRV2 applies the window to fresh, per-group common metadata through the
-existing `build_attn_metadata` callback, immediately before the actual backend
-builder. It never temporarily replaces `input_buffers.seq_lens` or the
-canonical Full tables. The factory resolves CONFIG_OFF and forced-OFF before
-allocating any window runtime. The dedicated built-in DeepSeek V4 DSpark
-category is identified from normalized model configuration, including Ascend's
-V4.1 architecture normalization. This disables only the window; the original
-speculative method is still constructed.
+MRV2 resolves one method policy before allocating a Window owner. MTP and the
+config-identified built-in DeepSeek-V4 DSpark category force Window OFF while
+preserving their original speculative method. Plain Eagle and dynamic
+speculative length are not supported with an extra Window. Checkpoint names
+and missing configuration fields do not establish a supported consumer.
 
-### Explicit Graph support and capacity
+### Execution and support boundaries
 
-`VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH=1` selects the experimental
-Graph integration. Draft `enforce_eager=false` selects actual capture/replay;
-Target Graph is configured independently. `draft_window_size` remains optional
-and disabled by default. The same Graph support checks apply to additional
-Window OFF, because a Graph integration error can also affect that arm.
-Ordinary eager Window OFF bypasses this new Graph admission and creates no
-Graph owner. No implicit eager fallback is used.
+The ordinary entry uses `speculative_config.enforce_eager=true`. Target Graph
+is independent of that Draft setting. To select an admitted Draft Graph route,
+set `VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH=1` and Draft
+`enforce_eager=false`. Keep the Target in `FULL_DECODE_ONLY`. An absent
+`draft_window_size` disables the extra Window; it does not disable native SWA.
+No unsupported route silently falls back to eager.
 
-The startup contract recognizes the actual Draft configuration and consumer,
-not a directory name or a raw configuration-file hash. Unsupported or changed
-semantic profiles remain rejected. One immutable support contract is shared by
-configuration, owner and execution checks. Historical single/two-request/DP2,
-recorder, oracle and matched-eager experiment flags are no longer product APIs.
+The experimental Graph contract checks the actual normalized model,
+projection/auxiliary geometry, backend, topology and capture capacity. It
+applies to both additional Window OFF and ON when that experimental route is
+selected. Ordinary Window-OFF eager creates no Window runtime and bypasses
+these new Graph checks. Historical single/two-request, recorder, oracle and
+matched-eager experiment flags are not product APIs.
 
-For the qualified Qwen3.6 eight-layer Full DFlash and Eagle3 profiles:
-
-| Consumer | TP / parent DP | Local capacity | Query / extra Window |
+| Qualified Draft consumer | Target TP / parent DP | Local request capacity | Query / extra Window |
 | --- | --- | --- | --- |
-| Full DFlash | TP4 / DP1 | `max_num_seqs` 1 or 2 | static K7/Q8; OFF or W32768 |
-| Full DFlash | TP4 / DP2 | `max_num_seqs=1` per replica | static K7/Q8; OFF or W32768 |
-| Eagle3 | TP4 / DP1 | `max_num_seqs` 1 or 2 | static K3; first Q4, later Q1; OFF or W1024 |
-| Eagle3 | TP4 / DP2 | `max_num_seqs=1` per replica | same static first/AR geometry |
+| Qwen3.6 eight-layer Full DFlash | TP4 / DP1 | 1 or 2 | static K7/Q8; OFF or W32768 |
+| Qwen3.6 eight-layer Full DFlash | TP4 / DP2 | 1 per replica | static K7/Q8; OFF or W32768 |
+| Qwen3.6 Eagle3 | TP4 / DP1 | 1 or 2 | static K3; first Q4, AR Q1; OFF or W1024 |
+| Qwen3.6 Eagle3 | TP4 / DP2 | 1 per replica | same first/AR geometry |
+| GLM DSpark / GLM DFlash | TP16 | qualified model/executor configuration | actual prepared query width |
+| Qwen3.8 DFlash2 | TP2 / DP1 | qualified static capture geometry | static K7/Q8; native P2048, OFF or W1024 |
 
-Actual active and padded request counts must match an admitted capture bank.
-Each row retains its original request ID, source row, prompt and maximum-output
-capacity; static-query lookahead must fit both configured and allocated model
-capacity. Preempted/resumed requests, larger local batches and unqualified
-padding remain rejected before modifying Graph state. A capacity check does not
-by itself qualify a new model, backend or shape. The former fixed prompt/output
-numbers are test points, not permanent APIs.
+This table does not qualify arbitrary checkpoints sharing a method name.
+The Full DFlash and Eagle guards retain the known multi-request and padding
+limits. Preempted/resumed requests and unqualified shapes are rejected before
+Graph state changes. The specified six-layer mixed-SWA DFlash checkpoint is
+blocked for an unresolved valid-output counterexample; the native-SWA
+performance warning does not override this protection.
 
-The parent DP2 executor retains independent local requests, Full KV and capture
-banks; its fixed upstream Draft descriptor is TP4/DP1. Idle replicas use the
-existing Full/PAD dummy computation without creating a business generation.
-Failures quarantine the owner. Eagle zero proposals still execute a first
-attention consumer; parallel DFlash/DSpark zero proposals instead retain their
-context-KV-only completion owner. Neither case enables dynamic K.
+Request limits use actual per-DP active rows, capture padding, model capacity
+and static-query lookahead. Former fixed prompt/output lengths are validation
+points, not user APIs. In parent DP2, each replica owns independent requests,
+Full KV and banks; the independent Draft descriptor remains TP4/DP1. Idle
+replicas execute the original Full/PAD dummy for collectives without creating
+a business Window proposal. Partial static-K Eagle Graph proposals are not
+qualified: zero proposals still execute the first attention consumer, while
+a full proposal uses its configured AR consumers. This is not dynamic-K support.
 
-All applicable features are verified together. Target SP/FlashComm does not
-make an independent dense Draft a sharded consumer; GLM legacy DSA-CP is not
-applied to these Qwen profiles. The specifically blocked mixed-SWA DFlash
-checkpoint remains blocked for correctness reasons, independently of the
-native-SWA performance warning. Device numerical, ordinary-service and reader
-qualification remain separate from startup admission.
+Actual applicable features are used together. Target SP/FlashComm does not
+turn an independent dense Draft into a sharded reader. GLM legacy DSA-CP does
+not apply to Qwen consumers. Target CP compatibility retains its padded
+model-input count and separate actual query/write coordinates; no sparse
+Draft SFA/indexer/DSA provider is added by this implementation. Unsupported
+compressed, packed, transferred, offloaded or context-parallel Draft layouts
+fail explicitly at provider initialization.
 
-### Canonical reads and method phases
+### Canonical reads and method preparation
 
-`DirectPrefixSource` borrows `AscendBlockTables.block_tables[gid].gpu` and
-snapshots the current request-to-state-row mapping. Each build gathers a new
-read table from that owner. It never clips a previous window result. The
-canonical table is kernel-column addressed: physical allocator blocks may
-have been expanded into several columns. `kernel_block_sizes[gid]`, not a
-similarly named scheduler or physical block field, supplies the column span.
+The existing runner owns canonical Full tables, initialized block counts,
+request slots, positions and write slots. Its normal preparation gathers the
+read source into current batch order. Ordinary reads project that freshly
+prepared table; Graph banks borrow `BlockTables.input_block_tables`. Initialized
+counts are gathered from the canonical CPU state in persistent request-slot
+order with that same current mapping, independent of rotating UVA transport.
+No read projection clips a previous Window result.
 
-The first active group's span defines the historical alignment of `S`.
-Other groups must represent that same logical start exactly. A larger LCM
-alignment would change the feature's semantics and is not substituted. Each
-group receives its own read table and backend-derived state. Initialized
-column counts alone do not prove residency for recycled or offloaded caches.
+`kernel_block_sizes[gid]` supplies the logical span of a table column, which
+can differ from physical allocation blocks. One shared scalar implementation
+computes the historical block-aligned start. Every participating group must
+represent that start exactly; a new LCM alignment is not substituted.
 
-DFlash and DSpark use their actual prepared query width and exact end; DSpark
-may use `K` or `K+1` queries. Eagle3 freezes its proposal horizon and block
-start at the first pass, then refreshes exact lengths at each AR step. The
-startup bound `W >= 2*K+1` is sufficient for the configured rejection
-range and first-pass query width of at most `K+1`; it is not the smallest
-possible window for every favorable block alignment. For example, K=3 accepts
-W=7 and rejects W=6 even when one particular block alignment would fit. A continuing
-prefill row keeps its full read view; an Eagle3 first prefill pass also keeps
-full reads so long prompt queries are preserved. Per-row phase decisions use
-computed prompt tokens, prompt length, and scheduled tokens excluding draft
+DFlash and DSpark consume their actual prepared query width and current exact
+end. Eagle3 freezes its proposal horizon and start at the first pass, then
+updates the end through rejection-corrected AR preparation. Ordinary Eagle
+requires `W >= 2*K+1` to cover its query width and configured rejection bound.
+An unfinished prefill keeps Full reads. Prompt progress is computed once per
+proposal from computed prompt tokens and scheduled tokens excluding Draft
 placeholders.
 
-Eagle3's first pass preserves rejected query padding in the native layout.
-Its logical proposal end is the current last valid query position plus one;
-the padded native extent must not choose the frozen anchor. For example,
-live E=1159, native extent=1160, K=3, W=1035 and B=128 require S=0, whereas
-using the native extent would incorrectly choose S=128. Eligible ordinary
-GQA reads keep the current live/native pair and frozen anchor on device,
-including their admitted ragged and mixed layouts. Legacy consumers outside
-that route take one combined current Host snapshot, shared across groups;
-their synchronization is not removed by the dense reader.
-
-An all-continuing ordinary GQA Eagle3 batch without draft placeholders has a
-narrower exact producer: current computed prompt progress plus this batch's
-scheduled prompt tokens. Before prompt completion the rejection sampler sets
-rejected tokens to zero. The runtime retains this proposal's prompt-exact CPU
-base and supplies a fresh, clamped `base + AR step` to the native builder. It
-does not read the optimistic CPU sequence-length mirror. Full device lengths,
-tables, positions, query padding and write slots remain unchanged; only the
-fresh common metadata's CPU exact fields change. Their storage is retained
-through the existing proposal completion event. Request mapping or prompt
-preparation changes invalidate this base. Placeholder and replicated-PCP
-batches continue through their existing exact path. This preserves the
-required Full read rather than turning Window off for short contexts.
-
-Native first-pass lengths retain the original padded query alignment. With R
-rejected query slots, native extent=E+R and padded query count=Q+R, so their
-difference still equals E-Q for the live causal queries. Shortening only the
-native length would shift that causal mask. Positions, query rows and Full KV
-writes therefore retain the existing layout; the logical anchor uses E, while
-the native read extent accounts explicitly for its query padding. Subsequent
-AR steps consume their newly prepared current exact lengths with the frozen S.
-
-`DraftReadView` changes only the table, device exact length, both exact CPU
-mirrors, scheduling upper bound, and maximum length. Positions, query layout,
-Full KV write slots, and target metadata keep their original ownership.
-Backend builders run after this projection. The Eagle3 metadata update that
-would otherwise restore Full CPU lengths is bypassed only while an enabled
-window proposal owns the metadata.
-
-### Actual consumers and parallel execution
-
-Window OFF and forced-OFF preserve the fixed official length selection,
-including the GLM DSpark CPU-mirror choice in both runners. The known public
-MRV2 length issue is outside this Window PR's repair scope; compatibility
-does not establish that the official choice is exact after rejection.
-
-Effective Window ON uses its current device-exact consumer or a certified
-CPU/device read pair. Continuing-prompt Full reads retain their exact producer
-and certificate; an optimistic CPU bound never authorizes a Window read.
-Generic native-list consumers can still synchronize when converting current
-device lengths. The existing ordinary MLA preparation's exact snapshot and
-Target CP adaptation are unchanged.
-
-Backend selection uses the actual backend, builder, spec, and layer names,
-not the target model's architecture. For example, a DSA target can use a dense
-MLA or GQA draft. Ordinary TP/EP and sequence-parallel hidden-state collectives
-retain their original query/write coordinates. DSA-CP needs a distinct
-provider for its local query ranges and global KV read coordinates.
-
-Draft providers cover the exercised direct GQA, ordinary MLA and dense
-native-SWA routes. No qualified SFA/indexer or DSA Draft pairing has been
-identified in the current model scope; those Draft consumers fail explicitly
-before proposal work. Their historical Host-only provider prototypes are not
-product support, and the conditional model requirement remains unresolved.
-This does not change the Target's SFA/indexer or legacy DSA-CP execution.
-
-MRV2 Target DSA-CP is admitted for the uncompressed SFA MLA route with
-sequence-parallel MoE, PP=1 and DCP=1. Its existing builder receives padded
-model-input counts for TP token projection, while actual query/write
-coordinates remain separate. A Target CP flag does not turn a dense Draft
-into a sharded reader. Ordinary MLA preserves full absolute rotary inputs and
-owns scratch that would otherwise be overwritten. Compressed, packed,
-offloaded and unsupported context-parallel Draft layouts remain rejected.
-PCP does not substitute for legacy DSA-CP, and one model's validation does not
-qualify an unknown Draft consumer.
-
-### Asynchronous ownership
-
-Every proposal owns independently allocated read views and all derived
-metadata through a completion token. All Eagle3 steps belong to that proposal.
-The proposal scope starts before preparation can enqueue a copy or kernel.
-Successful completion
-recording retains the owner until the event completes; capacity pressure may
-wait for the oldest submitted proposal. Normal acquisition of a free lane
-performs no global synchronization.
-
-If host execution, event creation/recording, bookkeeping, or completion
-query/wait fails after possible native submission, the pool retains the
-backing and quarantines the execution context. Host return, process progress,
-or a failed event cannot authorize reuse. A new pool is not a safe recovery
-mechanism unless the executor separately establishes device completion. The
-final event must cover all readers, including any secondary communication
-stream; retaining a Python reference alone does not establish that boundary.
-
-### Device exact consumers and remaining async-first constraint
-
-Eligible ordinary ND GQA DSpark/DFlash proposals use current device exact
-lengths to plan starts, valid KV addresses and attention masks in one Triton
-kernel. Only initialized readable KV rows enter private scratch; capacity
-padding repeats the last valid row and remains masked. FP32 native attention
-consumes the mask without extracting exact device lengths on Host. Its
-workspace and conversion costs remain part of the performance evaluation.
-
-Eagle3 uses this consumer for admitted first-pass and later AR layouts,
-retaining the proposal's frozen start. Continuing prefill rows keep Full reads
-at every step. In a mixed decode/prompt batch, private cohorts separate Full
-and windowed rows and their query widths; the device exact lengths still
-select each valid read interval. A prompt-only producer may instead retain
-the native Full reader under the certificate described below.
-
-Legacy consumers obtain one current exact CPU snapshot per metadata build,
-shared across groups. DSpark with ordinary MLA and no DCP is an explicit
-exception: its existing preparation
-already completes a fresh CPU copy of the current Draft lengths. The caller
-binds that snapshot to the current device prefix and request mapping; the
-proposal owner retains it, avoiding a second Window copy. This does not reuse
-an optimistic common CPU field or remove the baseline copy. Other paths
-retain the added synchronization. This is an unresolved
-architecture constraint, not an approved performance tradeoff. It does not
-meet the MRV2 async-first requirement. Hardware measurement can quantify its
-cost but cannot by itself approve this design.
-
-The existing runner copies completed request counts to the CPU for the next
-Target input. Draft preparation subsequently consumes rejection results on
-the device; that earlier CPU snapshot is not generally the current Draft
-exact length. It is distinct from the post-preparation DSpark MLA snapshot
-explicitly reused above. An upper bound also cannot replace exact: for W=1024, B=128,
-E=1151 and upper=1152, exact planning starts at zero but upper-based planning
-starts at 128, changing the read set.
-
-Removing only the copy is insufficient. CPU planning chooses the table width
-and validates the exact query interval. GQA eager builders materialize length
-lists; MLA builders derive chunk loops and decode lists from CPU lengths.
-Generic parallel GQA drafting already selects device lengths and calls
-`tolist()`, adding a separate baseline synchronization. An enabled Window
-projection now certifies its owned CPU/device exact pair to this selector,
-so parallel GQA does not repeat that transfer. Replacing any certified read
-operand invalidates the pair. OFF leaves no certificate on common metadata
-and keeps the baseline selection. The initial legacy Window exact D2H remains;
-this reuse does not resolve the whole async-first architecture constraint.
-Default CPU-to-device
-copies for projection indices also require an asynchronous staging contract.
-An unrelated backend's device-length API does not remove the admitted GQA
-and MLA consumers' requirements. Any future device projector needs a
-consumer contract separating
-device exact lengths from host capacity bounds, together with verified native
-tensor-length inputs and bounded chunk planning. That migration is not yet
-implemented. No previous-step exact value or estimated acceptance is used as
-a substitute, and Async is not disabled to hide this limitation.
-
-Each group/build currently allocates a fresh read table sized to its active
-column maximum, length tensors and owned starts. These survive until proposal
-completion; Full KV is borrowed, not copied. Allocation and synchronization
-costs require separate device evidence. CPU ownership tests are not proof of
-NPU completion, overlap or a throughput improvement.
-
-### Integration responsibilities
-
-The baseline and Window flows share input preparation and canonical writes:
-
-```mermaid
-flowchart TD
-    A[Selector and speculator factory] --> B{Window enabled?}
-    B -->|Yes| C[Acquire proposal owner]
-    B -->|No| D[Baseline preparation]
-    C --> E[Prepare rejection-corrected per-step inputs]
-    D --> F[Canonical Full table, slots and absolute positions]
-    E --> F
-    F --> G{Window enabled?}
-    G -->|No| H[Baseline metadata and builder]
-    G -->|Yes| I[Fresh Draft read view and selected builder]
-    H --> J[Draft forward]
-    I --> J
-    J --> K[Last reader completion]
-    K --> L[Release enabled proposal owner]
-```
-
-Persistent request state remains separate from per-step input ordering. Target
-execution keeps its own baseline metadata.
-
-| Change | Condition and responsibility |
-| --- | --- |
-| Selector blacklist removal | An explicit runner choice is preserved. Auto selection may now choose MRV2 when Window is requested; other existing exclusions still apply. Unsupported Window configurations are rejected by the factory/provider rather than silently ignored. |
-| Fresh first Eagle3 metadata | Window reads cannot reuse Target metadata. Keep Full preparation, then build Draft metadata with the prepared query extent and chunked-prefill state. Replicated PCP preparation may already do this build; do not build step zero twice. |
-| Skip baseline AR CPU update | Enabled Window metadata already carries the step's projected lengths. Restoring Full CPU lengths would corrupt the view. OFF retains the original update. |
-| Callback and builder selection | Apply once to fresh common metadata per group before the last builder writes. Preserve query, positions, Full slots and baseline shared DSA kwargs. |
-| Factory module interception | This is an existing Ascend mechanism extended with explicit callbacks. It assumes serial worker execution and LIFO nesting, restores the previous function on exceptions, and rejects callback conflicts. It is not a thread-local API. An instance-level upstream hook would remove the need for interception. |
-| Completion | Retain all steps and mutable derived buffers until the last reader completes. Unknown completion quarantines the pool; capacity pressure may wait for a known submitted owner. |
-
-CONFIG_OFF and forced-OFF allocate no Window runtime, owner or view. This does
-not exempt shared backend changes from OFF regression testing. The selector
-change is user-visible even for forced-OFF: it can permit auto-selected MRV2
-while leaving the original speculative method enabled.
-
-### Target DSA-CP compatibility
-
-The SFA Target DSA-CP input-count adaptation preserves its existing
-projection and collectives and has its own all-rank correctness and Graph
-regression. It does not create a sparse Draft provider or change native DSA
-index construction. Compressed DSA and unsupported PP/DCP startup guards
-remain intact.
-
-### Validation boundaries
-
-Host tests exercise the paired source interfaces, current mapping, exact vs
-upper arithmetic, phase transitions, final writers, and partial-submit owner
-failures. Device validation must compare fixed queries and logical KV against an
-independent reference for the same window and preserve Full/query operands.
-The included device tests require an NPU run; Host results do not establish
-that this validation has completed.
-Separate real-model tests must establish actual backend/gid identity, prefix
-hits, multiple chunks, mixed arrival, row reuse, parallel layouts, and the
-last-reader completion boundary. OFF and ON may produce different draft
-proposals; naturally decoded token positions are not a same-state numerical
-oracle. Performance is measured only after correctness, using the same source
-candidate for both OFF and ON.
-
-## Performance considerations
-
-A shorter Draft context can improve acceptance for drafts trained on short
-contexts, but the result depends on the checkpoint and workload. A window
-below a draft's training or native window can reduce acceptance. Both effects
-must be measured for the selected model rather than inferred from input length.
-
-End-to-end performance combines acceptance, Draft KV-read cost, metadata
-preparation, and scheduling overlap. A smaller read view alone does not prove
-a speedup. Compare OFF and ON on the same candidate and runtime, retain short
-context regressions, and separately compare candidate OFF to the clean base.
-
-## Related Files
-
-- Shared window adapter: `vllm_ascend/worker/v1/spec_decode/utils.py`
-- MRV1 proposer (apply points, config validation): `vllm_ascend/worker/v1/spec_decode/llm_base_proposer.py`
-
-- MRV2 policy and integration: `vllm_ascend/worker/v2/spec_decode/`
-- MRV2 source/math/ownership: `draft_window_read.py`, `draft_window_plan.py`, `draft_window_lifetime.py`
-- MRV2 builder seam: `vllm_ascend/worker/v2/attn_utils.py`
-
-## Parallel GQA device exact reader (candidate)
-
-For ordinary ND FP16/BF16 GQA caches, DFlash and DSpark can prepare
-the read set from the current device exact lengths. The owned read contains
-physical token indices and a device exact attention mask. Each layer gathers
-only valid tokens into private KV scratch; padding repeats the last valid
-token and is masked. Host native lengths describe scratch capacity, explicitly
-separate from device exact lengths. Capacity never selects the window start.
-Directly masking an unwritten paged-cache tail is unsafe: NaNs in that tail
-can contaminate the result despite zero attention weights.
-
-This path requires ordinary unquantized cache layout and scheduling uppers
-covered by initialized Full block-table columns. Each private cohort has a
-uniform query width; packed Eagle3 queries retain explicit gather/output maps.
-Combined K/V pages may have gaps between blocks and nonzero storage offsets;
-the reader maps token indices through the actual page stride without copying
-the full cache or reading the gaps.
-The preparation contract supplies current-generation `0 < E <= U`; the CPU
-upper checks address capacity for that contract, without reconstructing E.
-Scratch capacity is bounded by both `W+B-1` and the current batch's maximum
-Host upper, then rounded for allocation. This avoids gathering a large
-window's padding on short contexts; it does not change exact `S` or `V`.
-A continuing prefill row retains its Full read. Mixed Full/windowed rows
-are partitioned by phase, query width and CPU-known aligned capacity, so short
-Full rows do not inherit a long peer's allocation. These capacity decisions
-never reconstruct exact lengths or choose S. Unsupported layouts retain their
-existing exact consumer and its synchronization; dense-route evidence cannot
-be extended to MLA, DSA, SFA or other providers without their own contract.
-
-The GQA builder carries a typed device read only on enabled proposals. Its
-capacity CPU fields are consumed exclusively by the dedicated eager reader;
-the original Full write slots, absolute positions and canonical cache stay
-unchanged. Copy sources and destinations are retained before submission,
-including a submission that raises after work may have been queued. Scratch
-is retained through the proposal completion boundary. Immediate attention
-consumers reuse FP32 KV buffers only across sequential layers of the same
-read, NPU stream and geometry. Other reads or streams receive distinct buffers;
-standalone gather callers retain independent materializations. No early release
-or new synchronization is used to obtain this bound. OFF, Target metadata and
-dummy/profile paths create
-no device read; Target Graph remains compatible with Draft eager execution.
-Device-to-device gathering adds traffic and storage; actual
-engine correctness, reader completion and performance must be measured before
-declaring this candidate accepted. In the installed torch_npu version,
-`torch._assert_async` itself synchronizes through a scalar copy and is not
-used to validate device lengths in this path.
-
-To keep Target Graph with Draft eager, set
-`speculative_config.enforce_eager=true`. The MRV2 runtime checks this explicit
-Draft override as well as the inherited model eager flag, matching the actual
-Ascend speculator graph-manager selection.
-
-The reader keeps attention scores and probabilities in FP32 on device, then
-casts the output to the original query dtype. Fused BF16 attention reproduced
-a small-result cancellation failure even with exact native lengths; the
-FP32 path preserves the independent same-window numerical contract without
-relaxing its tolerance. This adds intermediate storage and compute that must
-be included in actual correctness, lifetime and performance measurements.
-
-## Prompt-only exact producers
-
-Ordinary GQA Eagle3 can reuse a current prompt producer when the entire batch
-is prefilling without Draft placeholders, actual query widths equal scheduled
-prompt widths, scheduling does not cross the prompt end, and terminal rows
-have one Target logit. Replicated PCP and non-advancing positions are excluded.
-Current prompt progress plus the actual scheduled count then gives the exact
-native extent: continuing prompts reject zero tokens, and a terminal row has
-no speculative candidates to reject. Request identity, state-row mapping and
-preparation fields are bound to the proposal. AR steps advance and clamp that
-retained base using the existing method preparation semantics. A changed
-identity invalidates it; the optimistic CPU length mirror is not a producer.
-
-Continuing rows retain Full reads; terminal rows preserve the method's frozen
-window after the first prefill pass. The current device live/native pair and
-frozen anchor remain available to later dense AR consumers. Mixed decode and
-prompt batches use device exact planning rather than estimating accepted counts.
-
-DFlash and DSpark have a separate certificate for all-unfinished, unsharded
-prompt batches with no Draft placeholders and matching scheduled query widths.
-Their preparation places the actual parallel query block after the last valid
-Target position. The certified current prompt end plus the actual method query
-width supplies the clamped native extent. Terminal, mixed or replicated-PCP
-batches keep their device-exact or provider-specific route. This does not
-extend the ordinary-MLA same-preparation snapshot contract to other backends.
-
-## Memory and validation limits
-
-Window bounds Draft reads; Full KV storage and writes remain allocated. Plan
-batch capacity using the actual Full KV groups, model memory and private
-workspace, including mixed long-prefill/decode workloads. Reducing W does not
-make many long Full contexts fit automatically.
-
-The dense planner and gather derive allocation extent from their actual Triton
-grid and named padding constants. This avoids capacity-specific scalar
-specialization without changing exact lengths, addresses, masks or alignment.
-Full/windowed request cohorts are distinct from KV groups: they do not change
-the historical group-start compatibility rule above.
-
-Validate actual methods and backends with an independent same-window reference,
-Full-write and Target-isolation checks, and device completion evidence. Keep
-intrusive numerical observation separate from natural asynchronous lifetime
-and unprofiled timing. Native operation schemas or a few trace samples alone
-do not establish copy elimination for every fallback. Compare fixed-source OFF
-and ON with matching warmup, cache state, request arrival and sampling settings;
-report acceptance changes and low-load regressions alongside throughput.
-
-## DFlash native SWA and an extra Draft Window
-
-A mixed DFlash draft can contain ordinary causal `SlidingWindowSpec` groups
-and a Full-attention group. A native SWA group is not a resident Full-prefix
-provider: its older logical table entries may point at null or evicted pages.
-The ordinary ND GQA route therefore keeps its native band and Full KV writes.
-It does not convert a native SWA group to dense Full attention.
-
-When the requested Window covers the complete native band for every supported
-query, that native reader remains unchanged and only the Full group receives
-a Window projection. For a native-SWA-only causal draft, each
-native group retains the typed adapter even when the extra window covers
-its band: there is no companion Full callback to certify preparation.
-Otherwise a proposal-local adapter calls the original
-concrete metadata builder first. The adapter reuses the native length list
-that this invocation has already obtained from current device exact lengths.
-The field named `seq_lens_cpu` alone does not certify a CPU snapshot: on the
-parallel-Draft path it may still refer to the device tensor. No second D2H
-length copy is introduced by the adapter. The original builder's list
-conversion and its existing synchronization remain explicit.
-
-For each native group, its actual kernel table column span B defines
-`S = floor(max(E - W, 0) / B) * B`. Only the newly built Draft read metadata
-receives the table starting at S and lengths E-S. The native causal window P
-is unchanged. Its right-aligned query coordinates rebase by -S, so the
-absolute read set is the original native band intersected with `[S, E)`.
-Continuing prompt rows retain their original native read. Query positions,
-write slots, canonical tables and Target metadata retain their original
-coordinates and identities. Original metadata, DMA sources, private table
-and length destinations remain owned until the existing native reader
-completion releases the proposal.
-
-The causal-band provider is limited to the concrete ordinary causal ND GQA consumer,
-with no sinks, compression, offload or CP-sharded Draft layout. It requires
-an unpadded current request extent. Native-only proposals are certified only
-after every participating native group has built its fresh metadata. Mixed
-Full/SWA proposals keep the existing Full-group authority. Unsupported
-consumers and padding are rejected explicitly. This Draft-eager extension
-does not select the Target Graph builders.
-
-DFlash2 is identified by `DFlash2DraftModel` with `method="dflash"`. Its
-inherited Ascend proposal wrapper encloses the original DFlash2 candidate
-Top-K, selector, path walk and realized-probability cache. The final owner
-event follows these consumers; their algorithm and probability semantics
-are not replaced by ordinary DFlash. Window OFF returns before creating a
-Window policy runtime, and keeps the baseline DFlash2 dispatch and checks.
-An enabled Window rejects unknown DFlash architectures during initialization.
-Target Graph selection remains independent.
-
-A supported DFlash2 checkpoint can explicitly declare `is_causal=False` while
-using native `SlidingWindowSpec` layers. Its attention remains symmetric SWA:
-for an absolute query position p, the allowed native interval is
-`[max(0, p-(P-1)), min(E, p+(P-1)+1))`. The DFlash2 loader marks only the admitted
-ordinary GQA native-SWA consumers. They use FIA's compressed SWA mask with
-`sparse_mode=4`, `pre_tokens=P-1` and `next_tokens=P-1`; no causal mask is inserted.
-This restores the model's native range in both OFF and ON. ON additionally
-intersects that range with the aligned interval `[S,E)`.
-
-For these marked DFlash2 layers, the Ascend MRV2 cache-spec hook retains the
-complete KV backing using `FullAttentionSpec` while preserving the native window
-in the attention implementation. This is a storage-compatibility measure:
-Full retention does not enable Full attention. It avoids stale historical
-pages in the full-prefix descriptor passed to the native paged SWA call.
-It does not promote Target/GDN cache specs or disable the engine's other
-hybrid-cache policies. OFF creates no additional Window runtime or projected
-read table, but retains this necessary model-native SWA/cache correction.
-
-The noncausal Window provider remains restricted to native-only DFlash2 groups
-with `W + B - 1 + Q <= P`, where B is the kernel-column span and Q is the prepared
-query width. Current exact lengths, request rows and generation still certify
-each fresh read. Unknown architectures and unsupported providers are rejected.
-Target Graph remains independent.
-
-### Experimental DFlash2 Draft Graph
-
-The default-off `VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH=1` review gate
-also controls DFlash2 Graph with the additional Window OFF. The first admitted
-implementation is static K7/Q8 with Target/Draft TP2, DP1, and
-`FULL`/`FULL_DECODE_ONLY` Graph modes. It excludes SP, FlashComm and CP variants
-until separately qualified. Set speculative `enforce_eager=true` for the
-ordinary typed eager implementation; no implicit eager fallback is used.
-
-The existing DFlash2 `_generate_draft` remains the captured computation: Draft
-forward and convolution, candidate Top-K, selector, Ascend path walk and
-probability-cache writes. Capture also includes the `prepare_forward` steps that
-combine staged features, prepare the context anchor and store Full context K/V,
-plus any device metadata updates supported by the model. CPU request/metadata
-construction, runtime UPDATE parameter resolution and scheduling remain outside
-capture. Stable model, selector, sampler, mask and input addresses are validated
-before submission. The shared Graph source banks and completion dependencies
-own projected read metadata; an eager runtime is not created in parallel. Full KV
-writes, absolute positions, canonical tables and Target state
-retain their original meaning. Context-only writes retain their existing
-completion owner even when there is no proposal attention.
-
-Full-retention storage preserves the actual native attention window. The
-noncausal Graph FIA call uses the same compressed mask and symmetric P-1
-pre/next distances as the ordinary DFlash2 path. The ON provider checks its
-actual kernel-column span B and the original `W + B - 1 + Q <= P` boundary.
-Source admission and Host checks are not device qualification: consult the
-candidate's model, topology, shape and normal-service evidence before enabling
-this experimental route.
-
-At startup, both execution modes report the Draft's loaded attention structure:
-Full, native SWA, mixed, or unknown. This combines supported architecture
-semantics, normalized/raw Draft configuration and actual attention consumers;
-the Target and retained KV allocation spec do not determine the result.
-An explicitly requested Window narrowing native SWA emits one startup warning.
-Unknown or conflicting semantics reject an unqualified extra Window/Graph
-combination, without rejecting the original Window-OFF eager path. No Window
-is automatically enabled and no performance benefit is promised.
-
-The verified BF16 Qwen DFlash2 deployment has five native P2048 layers and runs
-TP2 with K7/Q8 and optional W1024. With the same 8 GiB/rank KV budget, retaining
-these five layers reduced estimated engine cache-token capacity by about 6.89%
-(179,973 to 167,573 tokens in that configuration). Actual capacity depends on
-cache grouping and deployment settings. The additional W1024 is not currently
-recommended as a speedup setting for this already-windowed checkpoint. Finite
-native numerical tolerance failures remain separately reported; finite output
-and successful requests are not a universal numerical PASS.
-
-The native-SWA adapter pins its completed CPU int64 start vector before H2D.
-The exact pinned DMA source remains held by the proposal owner; converting it
-after pinning must not create a new pageable copy. Real warmed transfer and
-model traces must distinguish this step from the baseline native-list sync.
+Ordinary Eagle first-pass native extent includes rejected query padding. The
+logical proposal end is the last valid absolute query position plus one; it
+must not be replaced by that padded extent. The Runtime snapshots the live/native pair
+from prepared positions and lengths together. Later AR consumers use their
+current exact end and the frozen start. Query layout, absolute positions,
+Full block writes and Target metadata retain their original semantics.
+
+### Ordinary preparation and reader ownership
+
+One proposal scope owns preparation, per-group metadata and the final reader
+completion event. A single callback modifies fresh common metadata before the
+existing Ascend builder. Host/native projections bind their read tables and
+exact lengths. Dense preparation instead attaches its slot/mask read state,
+clears Common CPU exact fields and exposes only workspace capacity to the
+builder. Query/write operands remain unchanged. Enabled Eagle metadata is not
+subsequently overwritten by the baseline Full-length AR update. Window OFF
+keeps the original path.
+
+All ordinary layouts use a current, completed exact snapshot. DSpark MLA can
+reuse the CPU copy its existing preparation just completed; other paths may
+perform a blocking device-to-CPU copy. The completed-request counts prepared
+for the next Target input and optimistic scheduling uppers are not generally
+the current rejection-corrected Draft lengths. For W1024/B128, E1151 starts at
+zero, whereas upper1152 would incorrectly start at128.
+
+The existing parallel selector can reuse the exact CPU list attached by the
+Window preparation, avoiding a duplicate conversion. Ordinary MLA still uses
+its original builder and read consumer; its mutable decode RoPE scratch is
+copied before forward and retained with the proposal. This synchronization
+and allocation cost remains visible in same-mode OFF/ON measurements. Async
+scheduling is not disabled, and this implementation does not claim zero D2H
+or complete preparation/decode overlap.
+
+The ordinary dense reader receives explicit CPU exact ends, query ends,
+frozen starts and Full-row flags from that preparation boundary. It builds
+only initialized physical token addresses and the corresponding mask. Scratch
+padding repeats the last valid token: masking an uninitialized KV tail alone
+can still propagate NaNs. Packed/ragged queries retain explicit input and
+output maps; mixed Full/Window rows use separate cohorts so short decodes do
+not inherit a long prompt's allocation. Real page strides, nonzero K/V storage
+offsets and non-ND format-aware gathering are preserved.
+
+Native FP32 attention and the original fused ND gather/cast are retained for
+the saved BF16 cancellation counterexample under the original tolerance.
+The actual read owner selects one FP32 pair per geometry and submits the
+unchanged kernel before attention. A subsequent layer reuses that pair in
+stream order. This does not permit sharing one writable pair across proposals,
+streams or concurrent consumers. The extra scratch and conversion cost is
+part of the implementation, not an implied performance benefit.
+
+Copy sources, pinned DMA sources, destinations and derived metadata remain
+strongly held before possible submission. At pool capacity, completed owners
+are reclaimed or the oldest submitted event is waited for. Free capacity
+requires no global synchronization. Any uncertain preparation, record,
+query or wait failure quarantines the pool and retains its backing. Host
+return is not reader completion; a final event must cover every actual reader.
+
+### Graph capture, UPDATE and replay
+
+The existing method managers own capture descriptors, graphs, UPDATE and
+replay. One provider indexes only the geometry supplied by the fixed capture
+callbacks. Each actual consumer owns a persistent read table and CPU/device
+exact lengths. Eagle's merged AR graph needs independent ordinal banks because
+multiple consumers are staged before one replay. Those banks stay strongly
+owned even though captured framework resources can be weak references.
+
+A proposal provides its real phase rows, current exact lengths and persistent
+request mapping. Preparation validates all readable intervals before modifying
+a bank, zeros inactive rows, and writes directly into the final capture-owned
+buffers. The original metadata builder supplies the baseline metadata;
+shallow private headers preserve layer aliases and leave Target objects untouched.
+Eagle capture binds its owned Full query coordinates and sets `causal=True`. Its native
+first consumer retains the prepared query layout and uses `ChunkedPrefill` with
+the bank's GPU lengths. DFlash preserves its per-group causality and also binds
+those GPU lengths. UPDATE supplies each descriptor's cumulative query lengths.
+
+The existing `ParamSource` resolves each consumer's table and exact-length
+arguments for UPDATE. Bank addresses remain stable. Current/update-stream
+ordering, ExternalEvent dependencies and the original graph completion
+notification/FIFO protect reuse. UPDATE return, leaving a Host proposal scope
+and HTTP completion are not substitutes for the last reader. An uncertain
+partial submission quarantines the provider without dropping its banks.
+
+Capture dummy inputs, normal padding and initialization remain part of the
+framework. Normal execution needs no oracle, tensor dump, experimental worker,
+source hash, private evidence file or injected business request.
+
+### Native SWA and DFlash2
+
+Startup detection uses the actual Draft consumer implementations, normalized
+architecture/layer count and actual native window/mask. It distinguishes Full,
+SWA, mixed and unknown. Full KV retention alone does not establish Full
+attention; a missing field does not establish that a model has no SWA.
+Unknown or conflicting semantics reject an unqualified extra Window or new
+DFlash2 Graph route, while leaving the original legal Window-OFF path intact.
+A narrowing extra Window produces one startup warning. It is explicit and
+never enabled automatically; acceptance or throughput can decrease.
+
+Ordinary causal native-SWA groups retain their native band and Full writes.
+If an extra Window covers every possible native read, an eligible mixed-model
+native group can remain unchanged. Otherwise preparation intersects its read
+interval with `[S,E)` before the existing builder. Its exact completed length
+is reused and any H2D source is pinned and retained. Unsupported nonresident
+layouts and additional padded request rows remain rejected.
+
+DFlash2 is `DFlash2DraftModel` with `method="dflash"`. Its candidate Top-K,
+convolution, selector, path walk, sampling and probability cache retain their
+original implementation. With native noncausal SWA, a query at absolute p
+reads `[max(0,p-(P-1)), min(E,p+(P-1)+1))`. The loader binds the native mask;
+FIA uses sparse mode4 and symmetric pre/next P-1. Window ON intersects that
+range with `[S,E)`; it does not make the model causal.
+
+The DFlash2 cache-spec hook keeps those Draft groups in Full KV storage to
+avoid stale pages in native paged reads. Native P is preserved in the executing
+attention implementation. Target/GDN cache specifications and unrelated
+hybrid-cache policies remain unchanged. A noncausal native-only extra-Window
+provider requires `W + B - 1 + Q <= P`, using its actual column span and query
+width. These safeguards also apply when the new Graph path uses extra Window ON.
+
+The DFlash2 Graph route uses static K7/Q8, Target/Draft TP2 and DP1 with the
+explicit experimental switch. FlashComm, SP, CP and other unqualified variants
+remain rejected. Capture reuses the original forward/convolution, context-KV
+preparation, selector/walk and probability-cache operations. CPU request
+preparation and parameter resolution stay outside capture. A context-only
+zero-proposal call still completes its actual Full KV writes and ownership;
+no nonexistent Draft attention is demanded. Eager and Graph do not co-own the
+same mutable Window state.
+
+The verified five-layer P2048 Qwen3.8 deployment retains its disclosed capacity
+tradeoff: at the same 8GiB/rank KV budget, estimated cache capacity changed
+from179,973 to167,573 tokens (about6.89% lower). Exact capacity depends on the
+engine configuration. Extra W1024 is not currently recommended as a speedup
+setting for this checkpoint. Its original finite numerical tolerance failures
+remain separately recorded; successful requests do not convert them to PASS.
+
+### Validation and measurement
+
+Use an independent same-window reference with comparable valid rows,
+positions, shape and KV prestate. Check Full writes, Target isolation, request
+mapping, padding and safe reader reuse separately from service success.
+Natural generation differences across scheduling or Window settings are not
+by themselves a numerical counterexample, and HTTP success is not an
+independent numerical proof. Source/API ordering, actual binding/ownership
+and independent numerical evidence support the stated engineering scope;
+hardware operand/read-set observation is not claimed.
+
+Validate all actually applicable features together rather than their switch
+permutations. Formal timing excludes intrusive numerical tools and uses the
+same code, model, topology, physical cards, Graph mode, other features, inputs,
+output budget, sampling, warmup and cache policy. Only extra Window OFF/ON
+changes; OFF retains native SWA. Report throughput, TTFT, TPOT, per-request and
+group E2E, mean acceptance length and accepted/drafted counts, including
+negative results and interference. Same-candidate OFF/ON does not establish
+absence of regression against an independent official baseline.
+
+Window limits reads, not Full KV storage. Account for model/cache capacity,
+private dense scratch and mixed prefill/decode allocations. A smaller read
+view alone promises neither capacity nor speedup. Numerical limits, normal
+service, performance and release approval remain separate conclusions.
+
+### Related MRV2 files
+
+- `worker/v2/spec_decode/draft_window_policy.py` and `draft_window_plan.py`: method policy and interval math.
+- `draft_window_runtime.py`, `draft_window_read.py`, `draft_window_dense.py`, `draft_window_mla.py`: ordinary preparation and reads.
+- `draft_window.py`, `draft_window_graph.py`, `draft_window_eager.py`: Graph source geometry, banks and proposal inputs.
+- `draft_window_eagle3*` and the existing DFlash/AR managers: method-specific capture/replay integration.
+- `draft_window_backends.py`, `draft_window_native_attention.py`, `draft_graph_review_limits.py`: real consumer inventory and support boundaries.
+- `worker/v2/attn_utils.py`: the existing metadata-builder seam.

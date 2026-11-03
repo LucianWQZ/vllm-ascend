@@ -532,7 +532,7 @@ options.
   and the frozen proposal horizon through rejection.
 - MRV2's default entry requires an eager draft
   (`speculative_config.enforce_eager=true`). The target retains its configured
-  graph mode. Limited, default-off Draft Window Graph routes have separate
+  graph mode. Limited, default-off Draft Window Graph routes have
   an explicit experimental switch and model/topology/shape restrictions described in the
   [design document](../../developer_guide/Design_Documents/speculative_kv_sliding_window.md).
   Actual draft backend and KV-group compatibility are checked after attention
