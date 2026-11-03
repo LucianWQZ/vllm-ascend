@@ -74,7 +74,6 @@ class DraftWindowRuntime:
             raise ValueError("Draft Window requires an eager Draft model; Target graph mode is independent")
         self.speculator = speculator
         self.window_size = policy.effective_window_size
-        self.mla_layer_names: tuple[str, ...] = ()
         self.native_swa_causal: dict[int, bool] = {}
         self._dense_reads = False
         self.gids = self._validate_route(speculator)
@@ -150,9 +149,6 @@ class DraftWindowRuntime:
                 and impl.sliding_window is None
                 for impl in implementations
             )
-        self.mla_layer_names = tuple(
-            name for route in routes if route.status is DraftWindowProviderStatus.DIRECT_MLA for name in route.layers
-        )
         return all_gids
 
     @contextmanager
@@ -490,11 +486,4 @@ class DraftWindowRuntime:
             return
         if self._owner is None:
             raise RuntimeError("Draft Window metadata has no active proposal")
-        if self.mla_layer_names:
-            from vllm_ascend.worker.v2.spec_decode.draft_window_mla import freeze_mla_read_metadata
-
-            owner = self._owner
-            freeze_mla_read_metadata(
-                metadata, self.mla_layer_names, retain=lambda *objects: self.pool.retain(owner, *objects)
-            )
         self.pool.retain(self._owner, metadata)

@@ -9,7 +9,6 @@ import numpy as np
 import pytest
 import torch
 
-from vllm_ascend.worker.v2.spec_decode.draft_window_lifetime import DraftWindowOwner
 from vllm_ascend.worker.v2.spec_decode.draft_window_policy import resolve_draft_window_policy
 from vllm_ascend.worker.v2.spec_decode.draft_window_runtime import DraftWindowRuntime, continuing_prefill_rows
 
@@ -1107,41 +1106,24 @@ def test_parallel_prompt_producer_rejects_uncertified_preparation(setup, invalid
         assert not runtime._parallel_full_prefill(2, continuing_prefill_rows(state, 2))
 
 
-def test_mla_partial_rotary_copy_failure_keeps_submitted_operands(setup, monkeypatch):
-    runtime, spec, canonical, _ = setup
-    runtime.mla_layer_names = ("draft",)
+def test_mla_final_metadata_is_owned_without_rotary_copies(setup):
+    runtime, _, canonical, completions = setup
     cos, sin = torch.tensor([1.0, 2.0]), torch.tensor([3.0, 4.0])
-    metadata = {"draft": SimpleNamespace(external_flashmla=None, decode=SimpleNamespace(cos=cos, sin=sin))}
-    original_clone, original_copy = torch.Tensor.clone, torch.Tensor.copy_
+    metadata = {"draft": SimpleNamespace(decode=SimpleNamespace(cos=cos, sin=sin))}
     full = canonical.clone()
-    owner: DraftWindowOwner | None = None
-
-    def clone(source, *args, **kwargs):
-        if source is sin:
-            raise RuntimeError("MLA second RoPE copy failed")
-        return original_clone(source, *args, **kwargs)
-
-    def copy(destination, source, *args, **kwargs):
-        if source is cos or source is sin:
-            assert owner is not None
-            assert any(value is destination for value in owner.retained)
-            assert any(value is source for value in owner.retained)
-            if source is sin:
-                raise RuntimeError("MLA second RoPE copy failed")
-        return original_copy(destination, source, *args, **kwargs)
-
-    monkeypatch.setattr(torch.Tensor, "clone", clone)
-    monkeypatch.setattr(torch.Tensor, "copy_", copy)
-    with pytest.raises(RuntimeError, match="MLA second RoPE copy failed"), runtime.proposal_context(batch()):
+    with runtime.proposal_context(batch()):
         owner = runtime._owner
+        runtime.metadata_callback(3, 2)(0, common())
         runtime.retain_metadata(metadata)
-    assert runtime.pool.poisoned
-    assert owner is not None
-    first_copy = metadata["draft"].decode.cos
-    assert first_copy is not cos
-    assert any(value is first_copy for value in owner.retained)
-    with pytest.raises(RuntimeError, match="quarantined"):
-        runtime.pool.acquire()
+        assert any(value is metadata for value in owner.retained)
+        assert metadata["draft"].decode.cos is cos
+        assert metadata["draft"].decode.sin is sin
+    assert owner.completion is completions[-1]
+    assert runtime.pool.reclaim_completed() == 0
+    assert any(value is metadata for value in owner.retained)
+    completions[-1].complete = True
+    assert runtime.pool.reclaim_completed() == 1
+    assert not owner.retained
     torch.testing.assert_close(canonical, full, rtol=0, atol=0)
 
 
