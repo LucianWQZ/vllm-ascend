@@ -370,7 +370,7 @@ A few important things to consider when using DFlash2 draft models:
 2. **Model runner V2 defaults to an eager draft**: use `"enforce_eager": true`
    in `speculative_config` for the default DFlash2 entry. The limited,
    default-off experimental route is described in
-   [Experimental DFlash2 Draft Graph](../../developer_guide/Design_Documents/speculative_kv_sliding_window.md#experimental-dflash2-draft-graph).
+   [Native SWA and DFlash2](../../developer_guide/Design_Documents/speculative_kv_sliding_window.md#native-swa-and-dflash2).
    The target model keeps its own graph mode (e.g. `FULL_DECODE_ONLY`).
 
 3. **Graph capture sizes**: each decode step runs `(1 + K)` tokens per

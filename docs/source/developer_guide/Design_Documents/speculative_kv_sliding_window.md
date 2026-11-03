@@ -172,19 +172,21 @@ placeholders.
 
 Ordinary Eagle first-pass native extent includes rejected query padding. The
 logical proposal end is the last valid absolute query position plus one; it
-must not be replaced by that padded extent. The Runtime snapshots the live/native pair
-from prepared positions and lengths together. Later AR consumers use their
-current exact end and the frozen start. Query layout, absolute positions,
+must not be replaced by that padded extent. The Runtime snapshots the live/native
+pair from prepared positions and lengths together, except for unfinished Full
+prefills without Draft placeholders: their standard sampler rejects no tokens,
+so the native exact snapshot is already the live end. Later AR consumers use
+their current exact end and the frozen start. Query layout, absolute positions,
 Full block writes and Target metadata retain their original semantics.
 
 ### Ordinary preparation and reader ownership
 
-One proposal scope owns preparation, per-group metadata and the final reader
-completion event. A single callback modifies fresh common metadata before the
-existing Ascend builder. Host/native projections bind their read tables and
-exact lengths. Dense preparation instead attaches its slot/mask read state,
-clears Common CPU exact fields and exposes only workspace capacity to the
-builder. Query/write operands remain unchanged. Enabled Eagle metadata is not
+One proposal scope retains preparation and per-group metadata through their
+readers. A single callback modifies fresh common metadata before the existing
+Ascend builder. Host/native projections bind their read tables and exact
+lengths. Dense preparation attaches its slot/mask read state and supplies
+exact visible CPU lengths to the normal builder; scratch capacity bounds
+allocation only. Query/write operands remain unchanged. Enabled Eagle metadata is not
 subsequently overwritten by the baseline Full-length AR update. Window OFF
 keeps the original path.
 
@@ -197,9 +199,8 @@ zero, whereas upper1152 would incorrectly start at128.
 
 The existing parallel selector can reuse the exact CPU list attached by the
 Window preparation, avoiding a duplicate conversion. Ordinary MLA still uses
-its original builder and read consumer; its mutable decode RoPE scratch is
-copied before forward and retained with the proposal. This synchronization
-and allocation cost remains visible in same-mode OFF/ON measurements. Async
+its original builder and read consumer. The exact CPU-copy cost remains
+visible in same-mode OFF/ON measurements. Async
 scheduling is not disabled, and this implementation does not claim zero D2H
 or complete preparation/decode overlap.
 
@@ -221,18 +222,17 @@ streams or concurrent consumers. The extra scratch and conversion cost is
 part of the implementation, not an implied performance benefit.
 
 Copy sources, pinned DMA sources, destinations and derived metadata remain
-strongly held before possible submission. At pool capacity, completed owners
-are reclaimed or the oldest submitted event is waited for. Free capacity
-requires no global synchronization. Any uncertain preparation, record,
-query or wait failure quarantines the pool and retains its backing. Host
-return is not reader completion; a final event must cover every actual reader.
+strongly held before possible submission. A previous proposal's backing is
+released only after the next blocking exact snapshot completes its earlier
+readers on the same worker stream. Uncertain preparation retains outstanding
+backing and quarantines the runtime. Host return is not reader completion.
 
 ### Graph capture, UPDATE and replay
 
 The existing method managers own capture descriptors, graphs, UPDATE and
 replay. One provider indexes only the geometry supplied by the fixed capture
-callbacks. Each actual consumer owns a persistent read table and CPU/device
-exact lengths. Eagle's merged AR graph needs independent ordinal banks because
+callbacks. Each actual consumer owns a persistent read table and CPU exact
+lengths. Eagle's merged AR graph needs independent ordinal banks because
 multiple consumers are staged before one replay. Those banks stay strongly
 owned even though captured framework resources can be weak references.
 
@@ -241,13 +241,13 @@ request mapping. Preparation validates all readable intervals before modifying
 a bank, zeros inactive rows, and writes directly into the final capture-owned
 buffers. The original metadata builder supplies the baseline metadata;
 shallow private headers preserve layer aliases and leave Target objects untouched.
-Eagle capture binds its owned Full query coordinates and sets `causal=True`. Its native
-first consumer retains the prepared query layout and uses `ChunkedPrefill` with
-the bank's GPU lengths. DFlash preserves its per-group causality and also binds
-those GPU lengths. UPDATE supplies each descriptor's cumulative query lengths.
-
-The existing `ParamSource` resolves each consumer's table and exact-length
-arguments for UPDATE. Bank addresses remain stable. Current/update-stream
+Eagle capture binds its owned Full query coordinates and sets `causal=True`.
+Its native first consumer retains the prepared query layout and uses
+`ChunkedPrefill`. DFlash preserves its per-group causality. Both bind bank CPU
+exact lengths for FIA1 while retaining builder-owned Full GPU/shape fields.
+Captured `GraphUpdateTask` arguments hold the table and cumulative query lengths;
+the existing `ParamSource` supplies only current exact KV lengths for UPDATE.
+Bank addresses remain stable. Current/update-stream
 ordering, ExternalEvent dependencies and the original graph completion
 notification/FIFO protect reuse. UPDATE return, leaving a Host proposal scope
 and HTTP completion are not substitutes for the last reader. An uncertain
@@ -298,7 +298,8 @@ zero-proposal call still completes its actual Full KV writes and ownership;
 no nonexistent Draft attention is demanded. Eager and Graph do not co-own the
 same mutable Window state.
 
-The verified five-layer P2048 Qwen3.8 deployment retains its disclosed capacity
+The verified Qwen3.8 Draft has five attention layers, all native SWA with
+P2048. Its deployment retains the disclosed capacity
 tradeoff: at the same 8GiB/rank KV budget, estimated cache capacity changed
 from179,973 to167,573 tokens (about6.89% lower). Exact capacity depends on the
 engine configuration. Extra W1024 is not currently recommended as a speedup
@@ -333,7 +334,7 @@ service, performance and release approval remain separate conclusions.
 ### Related MRV2 files
 
 - `worker/v2/spec_decode/draft_window_policy.py` and `draft_window_plan.py`: method policy and interval math.
-- `draft_window_runtime.py`, `draft_window_read.py`, `draft_window_dense.py`, `draft_window_mla.py`: ordinary preparation and reads.
+- `draft_window_runtime.py`, `draft_window_read.py`, `draft_window_dense.py`: ordinary preparation and reads.
 - `draft_window.py`, `draft_window_graph.py`, `draft_window_eager.py`: Graph source geometry, banks and proposal inputs.
 - `draft_window_eagle3*` and the existing DFlash/AR managers: method-specific capture/replay integration.
 - `draft_window_backends.py`, `draft_window_native_attention.py`, `draft_graph_review_limits.py`: real consumer inventory and support boundaries.
