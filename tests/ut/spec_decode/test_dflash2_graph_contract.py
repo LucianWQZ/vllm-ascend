@@ -175,14 +175,14 @@ def test_graph_factory_qualifies_the_real_dflash2_owner(monkeypatch, owner):
         vllm_config=owner.vllm_config,
         dflash2_graph_owner=owner,
     )
-    source = draft_window._build_draft_window_source_capability_for_context(**kwargs)
+    source = draft_window.create_draft_window_graph_provider(**kwargs)
     assert source.table is owner.block_tables.input_block_tables[0]
     owner.model.model.layers[0].attention_conv.block_size = 7
     with pytest.raises(ValueError, match="query boundary"):
-        draft_window._build_draft_window_source_capability_for_context(**kwargs)
+        draft_window.create_draft_window_graph_provider(**kwargs)
     kwargs["dflash2_graph_owner"] = None
     with pytest.raises(TypeError, match="actual model owner"):
-        draft_window._build_draft_window_source_capability_for_context(**kwargs)
+        draft_window.create_draft_window_graph_provider(**kwargs)
 
 
 def test_full_only_source_host_contract_does_not_fake_native_model(module, owner):

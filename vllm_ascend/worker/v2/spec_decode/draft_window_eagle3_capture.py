@@ -16,9 +16,6 @@ from typing import Any
 
 import torch
 
-from vllm_ascend.worker.v2.spec_decode.draft_window import (
-    _build_draft_window_source_capability_for_context,
-)
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
     DraftWindowGraphBucket,
 )
@@ -26,20 +23,6 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_graph_metadata import (
     bind_draft_window_read,
     copy_draft_attention_metadata,
 )
-
-
-def build_eagle3_graph_source(owner: Any):
-    """Bind the actual consumer Source after normal Graph configuration."""
-    if owner.method != "eagle3":
-        raise NotImplementedError("Eagle3 Graph requires the normalized Eagle3 method")
-    return _build_draft_window_source_capability_for_context(
-        policy=owner._draft_window_policy,
-        runtime_route="eagle3",
-        attn_groups=owner.attn_groups,
-        block_tables=owner.block_tables,
-        kv_cache_config=owner.kv_cache_config,
-        vllm_config=owner.vllm_config,
-    )
 
 
 class Eagle3GraphSession:
@@ -53,7 +36,7 @@ class Eagle3GraphSession:
             if owner.update_stream is None or manager.update_stream is not owner.update_stream:
                 raise RuntimeError("Eagle3 capture managers must share their owner UPDATE stream")
             q = owner.num_speculative_steps + 1 if first else 1
-            group = self.provider.source.group
+            group = self.provider.group
             for descriptors in manager._capture_descs.values():
                 for desc in descriptors:
                     if desc.cg_mode.name != "FULL":
@@ -71,9 +54,7 @@ class Eagle3GraphSession:
                         # Seed dummy contents before any GLOBAL capture.
                         # Synchronous H2D is forbidden inside the callback.
                         read = capture
-                        capacity = min(
-                            owner.max_model_len, self.provider.source.window_size + group.table_column_span - 1
-                        )
+                        capacity = min(owner.max_model_len, self.provider.window_size + group.table_column_span - 1)
                         read.window_block_table.zero_()
                         read.cpu_window_exact.fill_(capacity)
                         read.device_window_exact.copy_(read.cpu_window_exact)
@@ -111,7 +92,7 @@ class Eagle3GraphSession:
         # No CPU->device copy, fill or reset is allowed in this callback.
         capacity = min(
             self.owner.max_model_len,
-            self.provider.source.window_size + self.provider.source.group.table_column_span - 1,
+            self.provider.window_size + self.provider.group.table_column_span - 1,
         )
         private = copy_draft_attention_metadata(metadata)
         query = self.owner.input_buffers.query_start_loc

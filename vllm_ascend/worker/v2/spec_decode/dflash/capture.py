@@ -69,16 +69,14 @@ def _seed_capture_workspace(
 ) -> int:
     # The actual provider borrows this same canonical BlockTables owner.
     # Capture prepares its Full dummy tables before seeding the private bank.
-    source = provider.source.table[: workspace.descriptor.num_reqs]
+    source = provider.table[: workspace.descriptor.num_reqs]
     destination = workspace.window_block_table
 
     capture_upper = min(
         max_model_len,
-        provider.source.window_size + provider.source.group.table_column_span - 1,
+        provider.window_size + provider.group.table_column_span - 1,
     )
-    valid_num_blocks = (
-        capture_upper + provider.source.group.table_column_span - 1
-    ) // provider.source.group.table_column_span
+    valid_num_blocks = (capture_upper + provider.group.table_column_span - 1) // provider.group.table_column_span
     if valid_num_blocks > source.shape[1] or valid_num_blocks > destination.shape[1]:
         raise RuntimeError("Draft Window capture table cannot cover the Window capacity")
 
@@ -134,7 +132,7 @@ def ascend_prepare_dflash_inputs_to_capture(
     if not state.attn_metadata:
         raise RuntimeError("Draft Window capture builder produced no attention metadata")
     capacity = _seed_capture_workspace(workspace, max_model_len=max_model_len, provider=context)
-    for name in context.source.group.layers:
+    for name in context.group.layers:
         layer = state.attn_metadata[name]
         bind_draft_window_read(layer, workspace, capacity)
         layer.seq_lens_gpu = workspace.device_window_exact

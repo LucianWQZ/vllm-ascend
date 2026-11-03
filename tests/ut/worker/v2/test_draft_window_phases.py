@@ -8,13 +8,11 @@ import numpy as np
 import pytest
 import torch
 
-from vllm_ascend.worker.v2.spec_decode.draft_window import (
-    DraftWindowGraphSource,
-)
 from vllm_ascend.worker.v2.spec_decode.draft_window_backends import (
     DraftWindowGroupRoute,
     DraftWindowProviderStatus,
 )
+from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphBindingProvider
 from vllm_ascend.worker.v2.spec_decode.draft_window_runtime import continuing_prefill_rows
 
 
@@ -76,7 +74,9 @@ def full_source():
     )
     from vllm_ascend.worker.v2.spec_decode.draft_window_policy import resolve_draft_window_policy
 
-    return DraftWindowGraphSource(resolve_draft_window_policy(requested_window_size=8, method="eagle3"), group, owner)
+    return DraftWindowGraphBindingProvider(
+        policy=resolve_draft_window_policy(requested_window_size=8, method="eagle3"), group=group, block_tables=owner
+    )
 
 
 def test_canonical_cpu_counts_keep_mapping_order_padding_and_source(full_source):
@@ -98,15 +98,10 @@ def test_canonical_count_gather_rejects_invalid_mapping(full_source, mapping):
 
 
 def _materialize(full_source, batch, exact, counts, frozen=None):
-    from dataclasses import replace
     from types import SimpleNamespace
 
     from vllm.config.compilation import CUDAGraphMode
     from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
-
-    from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
-        DraftWindowGraphBindingProvider,
-    )
 
     if len(exact) > full_source.table.shape[0]:
         table = torch.cat(
@@ -115,15 +110,15 @@ def _materialize(full_source, batch, exact, counts, frozen=None):
                 full_source.table.new_zeros(len(exact) - full_source.table.shape[0], full_source.table.shape[1]),
             )
         )
-        full_source = replace(
-            full_source,
-            block_tables=SimpleNamespace(
-                input_block_tables=[table], num_blocks=SimpleNamespace(cpu=torch.tensor([counts], dtype=torch.int32))
-            ),
+        block_tables = SimpleNamespace(
+            input_block_tables=[table], num_blocks=SimpleNamespace(cpu=torch.tensor([counts], dtype=torch.int32))
         )
     else:
-        full_source.block_tables.num_blocks.cpu[0] = torch.tensor(counts, dtype=torch.int32)
-    provider = DraftWindowGraphBindingProvider(source=full_source)
+        block_tables = full_source.block_tables
+        block_tables.num_blocks.cpu[0] = torch.tensor(counts, dtype=torch.int32)
+    provider = DraftWindowGraphBindingProvider(
+        policy=full_source.policy, group=full_source.group, block_tables=block_tables
+    )
     descriptor = BatchExecutionDescriptor(CUDAGraphMode.FULL, 4 * len(exact), len(exact), uniform_token_count=4)
     bank = provider.register_capture_identity(descriptor=descriptor)
     provider.proposal = tuple(continuing_prefill_rows(batch, batch.num_reqs))

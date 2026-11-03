@@ -14,7 +14,6 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.input_batch import InputBuffers
 
-from vllm_ascend.worker.v2.spec_decode.draft_window import DraftWindowGraphSource
 from vllm_ascend.worker.v2.spec_decode.draft_window_backends import DraftWindowGroupRoute, DraftWindowProviderStatus
 from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowGraphInputMixin
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphBindingProvider
@@ -38,8 +37,9 @@ def graph_buffers():
         kernel_block_sizes=(4,),
     )
     group = DraftWindowGroupRoute(0, ("draft.layer",), 4, DraftWindowProviderStatus.DIRECT_DENSE)
-    source = DraftWindowGraphSource(resolve_draft_window_policy(requested_window_size=4, method="dflash"), group, owner)
-    provider = DraftWindowGraphBindingProvider(source=source)
+    provider = DraftWindowGraphBindingProvider(
+        policy=resolve_draft_window_policy(requested_window_size=4, method="dflash"), group=group, block_tables=owner
+    )
     desc = BatchExecutionDescriptor(CUDAGraphMode.FULL, 2, 2, uniform_token_count=1)
     capture = provider.register_capture_identity(descriptor=desc)
     buffers = object.__new__(InputBuffers)
@@ -47,8 +47,6 @@ def graph_buffers():
     return SimpleNamespace(
         provider=provider,
         capture=capture,
-        source=source,
-        projection=source,
         owner=owner,
         input_buffers=buffers,
         mapping=torch.tensor([0, 1]),
@@ -77,7 +75,7 @@ def _resolve(provider, count=1):
     from vllm_ascend.attention.attention_v1 import FIAParamProvider
     from vllm_ascend.compilation.updatable_graph import GraphUpdateTask, UpdatableGraph
 
-    p = FIAParamProvider(provider.source.group.layers[0], None, is_draft_model=True)
+    p = FIAParamProvider(provider.group.layers[0], None, is_draft_model=True)
     tasks = [GraphUpdateTask(object(), {}, p, i, object(), object()) for i in range(count)]
     graph = SimpleNamespace(provider_sizes={p: count}, tasks=tasks)
     return graph, UpdatableGraph.resolve_tasks(graph, provider)
@@ -127,7 +125,7 @@ def test_bad_live_request_mapping_is_rejected_before_any_bank_write(graph_buffer
 def test_real_scope_reuses_addresses_clears_tail_and_preserves_full_and_target(graph_buffers):
     c = graph_buffers
     addresses = [t.data_ptr() for t in _tensors(c.capture)]
-    full, slots = c.source.table.clone(), c.owner.slot_mappings.clone()
+    full, slots = c.provider.table.clone(), c.owner.slot_mappings.clone()
     previous = None
     for ends in ((11, 14), (3,)):
         context = _proposal(len(ends))
@@ -148,7 +146,7 @@ def test_real_scope_reuses_addresses_clears_tail_and_preserves_full_and_target(g
             assert c.provider._active_bank is bank  # Host UPDATE is not reader completion.
         assert c.provider.proposal is None and c.provider._active_bank is None
     assert [t.data_ptr() for t in _tensors(c.capture)] == addresses
-    assert torch.equal(c.source.table, full) and torch.equal(c.owner.slot_mappings, slots)
+    assert torch.equal(c.provider.table, full) and torch.equal(c.owner.slot_mappings, slots)
     assert c.target_metadata["target.layer"].seq_lens_list == [91, 92]
 
 
@@ -172,7 +170,7 @@ def test_actual_scope_quarantines_partial_or_uncertain_submission(graph_buffers,
 
 def test_prepare_and_publish_reject_unbound_pending_wrong_descriptor_and_foreign_bank(graph_buffers):
     c = graph_buffers
-    other = DraftWindowGraphBindingProvider(source=c.source)
+    other = DraftWindowGraphBindingProvider(policy=c.provider.policy, group=c.provider.group, block_tables=c.owner)
     foreign = other.register_capture_identity(descriptor=c.capture.descriptor)
     with c.provider.proposal_scope(_proposal()):
         before = c.capture.window_block_table.clone()
@@ -196,7 +194,7 @@ def test_prepare_and_publish_reject_unbound_pending_wrong_descriptor_and_foreign
 
 def test_actual_scope_rejects_nesting_and_stream_changes_before_bank_writes(graph_buffers, monkeypatch):
     c = graph_buffers
-    c.provider._source = SimpleNamespace(table=SimpleNamespace(device=SimpleNamespace(type="npu")))
+    c.owner.input_block_tables[0] = SimpleNamespace(device=SimpleNamespace(type="npu"))
     current = SimpleNamespace(npu_stream=17)
     monkeypatch.setattr(torch.npu, "current_stream", lambda: current)
     with c.provider.proposal_scope(_proposal()):
@@ -247,7 +245,9 @@ def test_capture_geometry_and_ordinal_are_unique_and_bounded(graph_buffers):
 def test_eagle_keeps_distinct_ordinals_and_one_frozen_anchor(graph_buffers):
     c = graph_buffers
     provider = DraftWindowGraphBindingProvider(
-        source=replace(c.source, policy=resolve_draft_window_policy(requested_window_size=4, method="eagle3"))
+        policy=resolve_draft_window_policy(requested_window_size=4, method="eagle3"),
+        group=c.provider.group,
+        block_tables=c.owner,
     )
     desc = BatchExecutionDescriptor(CUDAGraphMode.FULL, 2, 2, uniform_token_count=1)
     banks = [provider.register_capture_identity(descriptor=desc, consumer_ordinal=i) for i in range(2)]
@@ -285,9 +285,9 @@ def test_bank_projects_only_initialized_columns_across_boundaries(span, boundary
     )
     group = DraftWindowGroupRoute(0, ("draft",), span, DraftWindowProviderStatus.DIRECT_DENSE)
     provider = DraftWindowGraphBindingProvider(
-        source=DraftWindowGraphSource(
-            resolve_draft_window_policy(requested_window_size=boundary, method="dflash"), group, tables
-        )
+        policy=resolve_draft_window_policy(requested_window_size=boundary, method="dflash"),
+        group=group,
+        block_tables=tables,
     )
     desc = BatchExecutionDescriptor(CUDAGraphMode.FULL, 1, 1, uniform_token_count=1)
     bank = provider.register_capture_identity(descriptor=desc)
@@ -322,7 +322,7 @@ def test_parallel_capture_uses_registered_geometry_and_preserves_full_tables(gra
         identity = context.capture_banks_for(num_reqs=2, num_tokens=2)[0]
         read = identity
         assert identity is case.capture
-        full = case.source.table
+        full = case.provider.table
         before = full.clone()
         maximum = _seed_capture_workspace(read, max_model_len=16, provider=case.provider)
         assert maximum == 7 and read.cpu_window_exact.tolist() == [7, 7]
@@ -523,7 +523,7 @@ def test_actual_manager_keeps_resolve_wait_replay_update_order(graph_buffers, mo
         return_value=[
             {
                 "draft.layer": SimpleNamespace(
-                    actual_seq_lengths_q=[1, 2], seq_lens_list=[11, 14], block_tables=c.source.table
+                    actual_seq_lengths_q=[1, 2], seq_lens_list=[11, 14], block_tables=c.provider.table
                 )
             }
         ]
@@ -581,5 +581,5 @@ def test_actual_manager_keeps_resolve_wait_replay_update_order(graph_buffers, mo
     if window:
         assert c.provider.quarantined is fails
         assert bool(c.provider._pending) is (fails and not idle)
-    assert c.source.table.tolist() == [[11, 12, 13, 14], [21, 22, 23, 24]]
+    assert c.provider.table.tolist() == [[11, 12, 13, 14], [21, 22, 23, 24]]
     assert c.owner.slot_mappings.tolist() == [[40, 80]]

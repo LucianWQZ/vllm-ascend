@@ -16,7 +16,7 @@ import torch
 from vllm.v1.worker.gpu.input_batch import InputBatch
 
 from vllm_ascend.worker.v2.spec_decode.draft_window import (
-    _build_draft_window_source_capability_for_context,
+    create_draft_window_graph_provider,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
     DraftWindowGraphBindingProvider,
@@ -55,7 +55,7 @@ class DraftWindowGraphInputMixin:
             raise RuntimeError("draft-window runtime ownership is already initialized")
         if hasattr(self, "_draft_window_runtime"):
             raise RuntimeError("Graph Window cannot replace the typed eager runtime")
-        capability = _build_draft_window_source_capability_for_context(
+        self._draft_window_graph_binding_provider = create_draft_window_graph_provider(
             policy=policy,
             runtime_route=self._speculator_name.lower(),
             attn_groups=self.attn_groups,
@@ -64,7 +64,6 @@ class DraftWindowGraphInputMixin:
             vllm_config=self.vllm_config,
             dflash2_graph_owner=self if self._speculator_name.lower() == "dflash2" else None,
         )
-        self._draft_window_graph_binding_provider = DraftWindowGraphBindingProvider(source=capability)
         self._draft_window_bypass_active = False
         self._draft_window_prefill_bypass_active = False
         self._draft_window_dp_dummy_active = False

@@ -178,8 +178,8 @@ class Eagle3DraftWindowMixin:
                 compute_draft_window_plan(
                     full_exact_end=int(value),
                     future_offset=self.num_speculative_steps,
-                    window_size=provider.source.window_size,
-                    block_span_tokens=provider.source.group.table_column_span,
+                    window_size=provider.window_size,
+                    block_span_tokens=provider.group.table_column_span,
                 )
                 for value in exact[:num_reqs]
             )

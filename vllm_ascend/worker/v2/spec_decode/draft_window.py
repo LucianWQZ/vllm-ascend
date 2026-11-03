@@ -1,66 +1,31 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
-"""Canonical Draft KV source geometry for capture-owned Graph read banks.
+"""Qualify the actual Draft consumer and create its capture-bank owner.
 
 Method policy and interval arithmetic are shared with the ordinary eager
-runtime. This module owns only source geometry and persistent Graph backing;
+runtime. The provider owns source geometry and persistent Graph backing;
 Full write tables and Target state remain owned by the existing runner.
 """
 
 from collections.abc import Sequence
-from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import torch
 from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_ascend.worker.v2.spec_decode.draft_window_backends import (
-    DraftWindowGroupRoute,
     DraftWindowProviderStatus,
     inventory_draft_window_groups,
-)
-from vllm_ascend.worker.v2.spec_decode.draft_window_plan import (
-    window_capacity_tokens,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_policy import (
     DraftWindowPolicyDecision,
     DraftWindowPolicyState,
 )
 
-
-@dataclass(frozen=True, slots=True)
-class DraftWindowGraphSource:
-    """Actual canonical BlockTables owner and one executable Draft group.
-
-    Only capture banks own read operands. Full tables are borrowed at each
-    prepare from BlockTables, whose CPU counts are the source of truth even
-    while its UVA accelerator transport rotates.
-    """
-
-    policy: DraftWindowPolicyDecision
-    group: DraftWindowGroupRoute
-    block_tables: Any = field(repr=False, compare=False)
-
-    def __post_init__(self) -> None:
-        # Fixed BlockTables constructs matching int32 table/count geometry;
-        # inventory already checks its scheduler/kernel spans. Only the new
-        # Window capacity is an additional initialization constraint.
-        if self.table.shape[1] * self.group.table_column_span < window_capacity_tokens(
-            self.window_size, self.group.table_column_span
-        ):
-            raise ValueError("Draft Graph canonical table cannot cover the Window capacity")
-
-    @property
-    def table(self) -> torch.Tensor:
-        return self.block_tables.input_block_tables[self.group.gid]
-
-    @property
-    def window_size(self) -> int:
-        assert self.policy.effective_window_size is not None
-        return self.policy.effective_window_size
+if TYPE_CHECKING:
+    from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphBindingProvider
 
 
-def _build_draft_window_source_capability_for_context(
+def create_draft_window_graph_provider(
     *,
     policy: DraftWindowPolicyDecision,
     runtime_route: str,
@@ -69,7 +34,7 @@ def _build_draft_window_source_capability_for_context(
     kv_cache_config: Any,
     vllm_config: Any,
     dflash2_graph_owner: Any = None,
-) -> DraftWindowGraphSource:
+) -> "DraftWindowGraphBindingProvider":
     """Build source geometry after the caller validates its real Graph executor.
 
     Executor features do not turn a dense Draft cache into a sharded provider.
@@ -109,4 +74,6 @@ def _build_draft_window_source_capability_for_context(
         validate_dflash2_graph_read_source(dflash2_graph_owner, group, window_size=policy.effective_window_size)
     if vllm_config.speculative_config.uses_dynamic_speculative_decoding():
         raise NotImplementedError("Draft Window Graph source requires static speculative decoding")
-    return DraftWindowGraphSource(policy=policy, group=group, block_tables=block_tables)
+    from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphBindingProvider
+
+    return DraftWindowGraphBindingProvider(policy=policy, group=group, block_tables=block_tables)

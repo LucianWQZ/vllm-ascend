@@ -18,9 +18,6 @@ from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.worker.v2.spec_decode.draft_window_eagle3 import (
     Eagle3DraftWindowMixin,
 )
-from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
-    DraftWindowGraphBindingProvider,
-)
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph_metadata import (
     bind_draft_window_read,
     copy_draft_attention_metadata,
@@ -39,10 +36,16 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentA
             return
         if hasattr(self, "_draft_window_graph_binding_provider"):
             raise RuntimeError("draft-window runtime ownership is already initialized")
-        from vllm_ascend.worker.v2.spec_decode.draft_window_eagle3_capture import build_eagle3_graph_source
+        from vllm_ascend.worker.v2.spec_decode.draft_window import create_draft_window_graph_provider
 
-        capability = build_eagle3_graph_source(self)
-        self._draft_window_graph_binding_provider = DraftWindowGraphBindingProvider(source=capability)
+        self._draft_window_graph_binding_provider = create_draft_window_graph_provider(
+            policy=policy,
+            runtime_route=self.method,
+            attn_groups=self.attn_groups,
+            block_tables=self.block_tables,
+            kv_cache_config=self.kv_cache_config,
+            vllm_config=self.vllm_config,
+        )
         self._initialize_eagle3_draft_window_state()
 
     def _configure_decode_metadata_update(self) -> None:

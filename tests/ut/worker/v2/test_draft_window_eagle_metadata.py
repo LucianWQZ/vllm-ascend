@@ -108,7 +108,6 @@ def test_eagle_partial_schedule_is_not_dynamic_k(scheduled):
 def proposal():
     from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 
-    from vllm_ascend.worker.v2.spec_decode.draft_window import DraftWindowGraphSource
     from vllm_ascend.worker.v2.spec_decode.draft_window_backends import DraftWindowGroupRoute, DraftWindowProviderStatus
     from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
         DraftWindowGraphBindingProvider,
@@ -126,10 +125,9 @@ def proposal():
         kernel_block_sizes=(4,),
     )
     group = DraftWindowGroupRoute(0, ("draft.layer",), 4, DraftWindowProviderStatus.DIRECT_DENSE)
-    source = DraftWindowGraphSource(
-        resolve_draft_window_policy(requested_window_size=4, method="eagle3"), group, tables
+    provider = owner._draft_window_graph_binding_provider = DraftWindowGraphBindingProvider(
+        policy=resolve_draft_window_policy(requested_window_size=4, method="eagle3"), group=group, block_tables=tables
     )
-    provider = owner._draft_window_graph_binding_provider = DraftWindowGraphBindingProvider(source=source)
     owner._initialize_eagle3_draft_window_state()
     batch = SimpleNamespace(
         num_reqs=1,
@@ -309,7 +307,7 @@ def test_eagle_startup_rejects_no_usable_capture_buckets():
         prefill_cudagraph_manager=manager,
         decode_cudagraph_manager=manager,
         num_speculative_steps=3,
-        _draft_window_graph_binding_provider=SimpleNamespace(source=SimpleNamespace(group=object()), _carriers={}),
+        _draft_window_graph_binding_provider=SimpleNamespace(group=object(), _carriers={}),
     )
     with pytest.raises(RuntimeError, match="nonempty capture bucket"):
         Eagle3GraphSession(owner)
@@ -353,7 +351,8 @@ def test_eagle_capture_borrows_full_query_write_fields_and_owns_only_reads():
     session: Any = object.__new__(Eagle3GraphSession)
     session.owner = SimpleNamespace(max_model_len=32, input_buffers=SimpleNamespace(query_start_loc=query))
     session.provider = SimpleNamespace(
-        source=SimpleNamespace(window_size=4, group=SimpleNamespace(table_column_span=2)),
+        window_size=4,
+        group=SimpleNamespace(table_column_span=2),
     )
     capture = SimpleNamespace(descriptor=SimpleNamespace(num_reqs=1), **vars(bank))
     session._capture_call = iter((capture,))
@@ -507,7 +506,14 @@ def test_official_nonuniform_prefill_uses_window_first_bank_without_an_eager_own
         params=None,
     )
     capture = object()
-    provider = DraftWindowGraphBindingProvider(source=SimpleNamespace(table=torch.empty(0)))
+    from vllm_ascend.worker.v2.spec_decode.draft_window_backends import DraftWindowGroupRoute, DraftWindowProviderStatus
+    from vllm_ascend.worker.v2.spec_decode.draft_window_policy import resolve_draft_window_policy
+
+    provider = DraftWindowGraphBindingProvider(
+        policy=resolve_draft_window_policy(requested_window_size=4, method="eagle3"),
+        group=DraftWindowGroupRoute(0, ("draft",), 4, DraftWindowProviderStatus.DIRECT_DENSE),
+        block_tables=SimpleNamespace(input_block_tables=[torch.zeros((2, 4), dtype=torch.int32)]),
+    )
 
     def resolve(**kwargs):
         assert kwargs == dict(n=2, tokens=8, ordinal=0)
@@ -632,7 +638,6 @@ def test_dp_synchronized_native_first_without_local_prefill(monkeypatch, mode, f
     from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 
     from vllm_ascend.attention.attention_v1 import AscendAttentionState
-    from vllm_ascend.worker.v2.spec_decode.draft_window import DraftWindowGraphSource
     from vllm_ascend.worker.v2.spec_decode.draft_window_backends import DraftWindowGroupRoute, DraftWindowProviderStatus
     from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
         DraftWindowGraphBindingProvider,
@@ -653,12 +658,11 @@ def test_dp_synchronized_native_first_without_local_prefill(monkeypatch, mode, f
         gather_block_tables=lambda mapping, **kwargs: None,
     )
     group = DraftWindowGroupRoute(0, ("draft",), 128, DraftWindowProviderStatus.DIRECT_DENSE)
-    source = DraftWindowGraphSource(
+    provider = owner._draft_window_graph_binding_provider = DraftWindowGraphBindingProvider(
         policy=resolve_draft_window_policy(requested_window_size=1024, method="eagle3"),
         group=group,
         block_tables=owner.block_tables,
     )
-    provider = owner._draft_window_graph_binding_provider = DraftWindowGraphBindingProvider(source=source)
     capture = provider.register_capture_identity(
         descriptor=BatchExecutionDescriptor(CUDAGraphMode.FULL, 4, 1, uniform_token_count=4),
     )
@@ -818,7 +822,8 @@ def test_capture_scope_selects_banks_once_and_requires_every_real_consumer(consu
         return captures
 
     session.provider = SimpleNamespace(
-        source=SimpleNamespace(window_size=4, group=SimpleNamespace(table_column_span=2)),
+        window_size=4,
+        group=SimpleNamespace(table_column_span=2),
         capture_banks_for=select,
     )
     full = AscendMetadata(slot_mapping=torch.tensor([10]), seq_lens_list=[99], actual_seq_lengths_q=[4])

@@ -21,23 +21,22 @@ def graph_source_initialization(request, monkeypatch):
     method = request.param
     from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowGraphInputMixin
 
-    source, provider = object(), object()
-    build_source, build_provider = Mock(return_value=source), Mock(return_value=provider)
+    provider = object()
+    create_provider = Mock(return_value=provider)
     if method == "eagle3":
-        from vllm_ascend.worker.v2.spec_decode import draft_window_eagle3_adapter, draft_window_eagle3_capture
+        from vllm_ascend.worker.v2.spec_decode import draft_window, draft_window_eagle3_adapter
 
         initialize = draft_window_eagle3_adapter.Eagle3GraphIntegrationMixin._initialize_draft_window_source_capability
-        monkeypatch.setattr(draft_window_eagle3_capture, "build_eagle3_graph_source", build_source)
-        monkeypatch.setattr(draft_window_eagle3_adapter, "DraftWindowGraphBindingProvider", build_provider)
+        monkeypatch.setattr(draft_window, "create_draft_window_graph_provider", create_provider)
     else:
         from vllm_ascend.worker.v2.spec_decode import draft_window_eager
 
         initialize = DraftWindowGraphInputMixin._initialize_draft_window_source_capability
-        monkeypatch.setattr(draft_window_eager, "_build_draft_window_source_capability_for_context", build_source)
-        monkeypatch.setattr(draft_window_eager, "DraftWindowGraphBindingProvider", build_provider)
+        monkeypatch.setattr(draft_window_eager, "create_draft_window_graph_provider", create_provider)
     owner = SimpleNamespace(
         _draft_window_policy=object(),
         _speculator_name=method,
+        method=method,
         attn_groups=object(),
         block_tables=object(),
         kv_cache_config=object(),
@@ -48,9 +47,7 @@ def graph_source_initialization(request, monkeypatch):
     return SimpleNamespace(
         owner=owner,
         initialize=initialize,
-        build_source=build_source,
-        build_provider=build_provider,
-        source=source,
+        create_provider=create_provider,
         provider=provider,
     )
 
@@ -58,8 +55,17 @@ def graph_source_initialization(request, monkeypatch):
 def test_graph_owner_installs_only_its_admitted_source(graph_source_initialization):
     c = graph_source_initialization
     c.initialize(c.owner)
-    c.build_source.assert_called_once()
-    c.build_provider.assert_called_once_with(source=c.source)
+    expected = dict(
+        policy=c.owner._draft_window_policy,
+        runtime_route=c.owner.method,
+        attn_groups=c.owner.attn_groups,
+        block_tables=c.owner.block_tables,
+        kv_cache_config=c.owner.kv_cache_config,
+        vllm_config=c.owner.vllm_config,
+    )
+    if c.owner.method != "eagle3":
+        expected["dflash2_graph_owner"] = c.owner if c.owner.method == "dflash2" else None
+    c.create_provider.assert_called_once_with(**expected)
     assert c.owner._draft_window_graph_binding_provider is c.provider
     assert not hasattr(c.owner, "_draft_window_source_capability")
     assert not hasattr(c.owner, "_draft_window_runtime_state")
@@ -68,7 +74,7 @@ def test_graph_owner_installs_only_its_admitted_source(graph_source_initializati
         assert c.owner._draft_window_bypass_active is False
         assert c.owner._draft_window_prefill_bypass_active is False
         assert c.owner._draft_window_dp_dummy_active is False
-        assert c.build_source.call_args.kwargs["dflash2_graph_owner"] is (
+        assert c.create_provider.call_args.kwargs["dflash2_graph_owner"] is (
             c.owner if c.owner._speculator_name == "dflash2" else None
         )
 
@@ -76,11 +82,10 @@ def test_graph_owner_installs_only_its_admitted_source(graph_source_initializati
 def test_graph_source_rejection_has_no_eager_fallback_or_partial_owner(graph_source_initialization):
     c = graph_source_initialization
     failure = NotImplementedError("unsupported actual Graph source")
-    c.build_source.side_effect = failure
+    c.create_provider.side_effect = failure
     with pytest.raises(NotImplementedError) as seen:
         c.initialize(c.owner)
     assert seen.value is failure
-    c.build_provider.assert_not_called()
     assert not hasattr(c.owner, "_draft_window_graph_binding_provider")
 
 
@@ -89,15 +94,14 @@ def test_graph_owner_reinitialization_rejects_before_source_build(graph_source_i
     c.owner._draft_window_graph_binding_provider = c.provider
     with pytest.raises(RuntimeError, match="already initialized"):
         c.initialize(c.owner)
-    c.build_source.assert_not_called()
+    c.create_provider.assert_not_called()
 
 
 def test_window_off_without_graph_policy_does_not_construct_source(graph_source_initialization):
     c = graph_source_initialization
     del c.owner._draft_window_policy
     c.initialize(c.owner)
-    c.build_source.assert_not_called()
-    c.build_provider.assert_not_called()
+    c.create_provider.assert_not_called()
     assert not hasattr(c.owner, "_draft_window_graph_binding_provider")
 
 

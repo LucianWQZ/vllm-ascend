@@ -19,10 +19,13 @@ import numpy as np
 import torch
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 
-from vllm_ascend.worker.v2.spec_decode.draft_window import (
-    DraftWindowGraphSource,
+from vllm_ascend.worker.v2.spec_decode.draft_window_backends import DraftWindowGroupRoute
+from vllm_ascend.worker.v2.spec_decode.draft_window_plan import (
+    DraftWindowPlan,
+    compute_draft_window_plan,
+    window_capacity_tokens,
 )
-from vllm_ascend.worker.v2.spec_decode.draft_window_plan import DraftWindowPlan, compute_draft_window_plan
+from vllm_ascend.worker.v2.spec_decode.draft_window_policy import DraftWindowPolicyDecision
 
 
 @dataclass(slots=True, eq=False)
@@ -43,13 +46,13 @@ class DraftWindowGraphBucket:
 
     def materialize(
         self,
-        source: DraftWindowGraphSource,
         cpu_full_exact: torch.Tensor,
         idx_mapping_np: np.ndarray,
         frozen_row_plans: tuple[DraftWindowPlan, ...] | None,
     ) -> None:
-        assert self.owner.proposal is not None
-        rows = self.owner.proposal
+        source = self.owner
+        assert source.proposal is not None
+        rows = source.proposal
         # Both method preparation entries construct this completed int32 CPU
         # snapshot; only its current row extent changes between proposals.
         if len(cpu_full_exact) < len(rows) or len(idx_mapping_np) < len(rows):
@@ -98,10 +101,18 @@ class DraftWindowGraphBucket:
 
 
 class DraftWindowGraphBindingProvider:
-    """Own capture banks and the single active proposal's bindings."""
+    """Own canonical source geometry, capture banks and one proposal binding.
 
-    def __init__(self, *, source: DraftWindowGraphSource) -> None:
-        self._source = source
+    Borrow Full tables from the actual BlockTables owner at prepare; its CPU
+    counts remain canonical even while the UVA count transport rotates.
+    """
+
+    def __init__(self, *, policy: DraftWindowPolicyDecision, group: DraftWindowGroupRoute, block_tables: Any) -> None:
+        self.policy, self.group, self.block_tables = policy, group, block_tables
+        if self.table.shape[1] * group.table_column_span < window_capacity_tokens(
+            self.window_size, group.table_column_span
+        ):
+            raise ValueError("Draft Graph canonical table cannot cover the Window capacity")
         self.proposal: tuple[bool, ...] | None = None
         self._active_bank: DraftWindowGraphBucket | None = None
         self._quarantined = False
@@ -109,8 +120,13 @@ class DraftWindowGraphBindingProvider:
         self._pending: list[DraftWindowGraphBucket] = []
 
     @property
-    def source(self) -> DraftWindowGraphSource:
-        return self._source
+    def table(self) -> torch.Tensor:
+        return self.block_tables.input_block_tables[self.group.gid]
+
+    @property
+    def window_size(self) -> int:
+        assert self.policy.effective_window_size is not None
+        return self.policy.effective_window_size
 
     @property
     def quarantined(self) -> bool:
@@ -169,7 +185,7 @@ class DraftWindowGraphBindingProvider:
             raise RuntimeError("Graph consumers belong to different execution buckets")
         capture.params = None
         self._active_bank = capture
-        capture.materialize(self.source, cpu_full_exact, idx_mapping_np, frozen_row_plans)
+        capture.materialize(cpu_full_exact, idx_mapping_np, frozen_row_plans)
         return capture
 
     def complete_native(self) -> None:
@@ -202,7 +218,7 @@ class DraftWindowGraphBindingProvider:
     @property
     def method(self) -> str:
         """Return the policy-normalized method owned by this provider."""
-        return self.source.policy.normalized_method
+        return self.policy.normalized_method
 
     def register_capture_identity(
         self,
@@ -231,10 +247,9 @@ class DraftWindowGraphBindingProvider:
             raise RuntimeError("Draft Window capture descriptor geometry is ambiguous")
         if consumer_ordinal != len(banks):
             raise RuntimeError("capture consumer identity is duplicate or outside serial ordinal order")
-        source = self.source
-        if num_reqs > source.table.shape[0]:
+        if num_reqs > self.table.shape[0]:
             raise RuntimeError("capture request bucket exceeds source capacity")
-        table = source.table
+        table = self.table
         if table.ndim != 2 or table.dtype != torch.int32:
             raise ValueError("Draft capture requires a two-dimensional int32 table")
         bucket = DraftWindowGraphBucket(
@@ -252,7 +267,7 @@ class DraftWindowGraphBindingProvider:
         """Keep every proposal on its established completion stream."""
         if self.quarantined:
             raise RuntimeError("Draft Window bank is quarantined after uncertain submission")
-        source = self.source.table
+        source = self.table
         if source.device.type != "cpu":
             stream = int(torch.npu.current_stream().npu_stream)
             previous = getattr(self, "_owner_stream", stream)
@@ -302,7 +317,7 @@ class DraftWindowGraphBindingProvider:
                     not isinstance(task.provider, FIAParamProvider)
                     or not task.provider.is_draft_model
                     or task.provider.is_non_pa
-                    or task.provider.layer_name not in self.source.group.layers
+                    or task.provider.layer_name not in self.group.layers
                     or task.operation != torch_npu.npu_fused_infer_attention_score.out
                 ):
                     raise RuntimeError("Draft Window Graph requires its supported Draft FIA consumer")
