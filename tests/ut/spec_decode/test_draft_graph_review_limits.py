@@ -1,11 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Shape and ownership guards, independent of the old experiment entry names."""
 
-import ast
 import copy
-import importlib.util
-import sys
-import tempfile
 import unittest
 from contextlib import nullcontext
 from pathlib import Path
@@ -14,13 +10,13 @@ from typing import Any
 from unittest.mock import Mock, patch
 
 import numpy as np
+import torch
 
-MODULE_PATH = Path(__file__).resolve().parents[3] / "vllm_ascend/worker/v2/spec_decode/draft_graph_review_limits.py"
-spec = importlib.util.spec_from_file_location("draft_graph_support_test", MODULE_PATH)
-assert spec is not None and spec.loader is not None
-GUARD = importlib.util.module_from_spec(spec)
-sys.modules[spec.name] = GUARD
-spec.loader.exec_module(GUARD)
+from vllm_ascend.worker.v2.model_runner import NPUModelRunner
+from vllm_ascend.worker.v2.spec_decode import draft_graph_review_limits as GUARD
+from vllm_ascend.worker.v2.spec_decode import draft_window_eagle3_dp as DP
+from vllm_ascend.worker.v2.spec_decode.dflash import speculator as dflash_module
+from vllm_ascend.worker.v2.spec_decode.target_dependent_ar import aclgraph as ar_graph
 
 
 def runner_bounds(owner, batch):
@@ -38,33 +34,11 @@ def runner_bounds(owner, batch):
     return GUARD.draft_graph_request_bounds(owner, state, batch.req_ids, batch.idx_mapping_np)
 
 
-def actual_source_function(path, name, namespace, *, class_name=None):
-    module = ast.parse(path.read_text())
-    nodes = (
-        module.body
-        if class_name is None
-        else next(node for node in module.body if isinstance(node, ast.ClassDef) and node.name == class_name).body
-    )
-    function = next(node for node in nodes if isinstance(node, ast.FunctionDef) and node.name == name)
-    tree = ast.Module(
-        body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), function],
-        type_ignores=[],
-    )
-    exec(compile(ast.fix_missing_locations(tree), str(path), "exec"), namespace)
-    return namespace[name]
-
-
 class DraftGraphSupportTest(unittest.TestCase):
-    def setUp(self):
-        self.directory = tempfile.TemporaryDirectory()
-        self.addCleanup(self.directory.cleanup)
-
     def config(self, *, method="eagle3", rows=1, dp=1, window=True):
         profile = "eagle3" if method == "eagle3" else "dflash_full8"
         model = copy.deepcopy(GUARD._CONSUMER_CONFIGS[profile])
         model["max_position_embeddings"] = 262144
-        directory = Path(self.directory.name) / f"{method}-{rows}-{dp}-{window}"
-        directory.mkdir(exist_ok=True)
         parallel = dict(
             tensor_parallel_size=4,
             data_parallel_size=dp,
@@ -78,7 +52,7 @@ class DraftGraphSupportTest(unittest.TestCase):
         query = 4 if method == "eagle3" else 8
         k = query - 1
         hf = NS(**model)
-        draft = NS(model=str(directory), hf_config=hf, hf_text_config=hf, dtype="torch.bfloat16")
+        draft = NS(model="qualified-draft", hf_config=hf, hf_text_config=hf, dtype="torch.bfloat16")
         return NS(
             speculative_config=NS(
                 method=method,
@@ -481,9 +455,6 @@ class DraftGraphSupportTest(unittest.TestCase):
             runner_bounds(owner, batch)
 
     def test_full8_actual_metadata_boundary_rejects_unqualified_padding_before_materialize(self):
-        import numpy as np
-        import torch
-
         from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowGraphInputMixin
 
         scope = self.resolve(self.config(method="dflash", rows=2))
@@ -543,19 +514,12 @@ class DraftGraphSupportTest(unittest.TestCase):
             seen.append("context-KV-only")
             return nullcontext()
 
-        namespace = {
-            "nullcontext": nullcontext,
-            "_draft_window_context_kv_scope": context_kv_scope,
-        }
-        entry = actual_source_function(
-            MODULE_PATH.with_name("dflash") / "speculator.py", "_draft_window_owner_scope", namespace
-        )
-        with patch.dict(sys.modules, {"vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits": GUARD}):
-            with entry(owner, batch, num_speculative_tokens=0):
+        with patch.object(dflash_module, "_draft_window_context_kv_scope", context_kv_scope):
+            with dflash_module._draft_window_owner_scope(owner, batch, num_speculative_tokens=0):
                 pass
             self.assertEqual(seen, ["context-KV-only"])
             with self.assertRaises(NotImplementedError):
-                entry(owner, batch, num_speculative_tokens=7)
+                dflash_module._draft_window_owner_scope(owner, batch, num_speculative_tokens=7)
             batch.req_ids[0] = "wrong-original-request"
             with self.assertRaises(RuntimeError):
                 GUARD.draft_graph_request_bounds(
@@ -567,7 +531,8 @@ class DraftGraphSupportTest(unittest.TestCase):
         config = self.config(method="dflash")
         scope = self.resolve(config)
         old_batch = object()
-        owner = NS(
+        owner = object.__new__(dflash_module.AscendDFlashSpeculator)
+        owner.__dict__.update(
             _draft_graph_review_limit=scope,
             max_model_len=scope.max_model_len,
             num_query_per_req=8,
@@ -576,23 +541,9 @@ class DraftGraphSupportTest(unittest.TestCase):
             input_batch=old_batch,
         )
         batch = self.batch(rows=2)
-        path = MODULE_PATH.with_name("dflash") / "speculator.py"
-        namespace = {"nullcontext": nullcontext}
-        entry = actual_source_function(path, "_draft_window_owner_scope", namespace)
-        propose = actual_source_function(
-            path, "propose", {"_draft_window_owner_scope": entry}, class_name="AscendDFlashSpeculator"
-        )
-        with (
-            patch.dict(sys.modules, {"vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits": GUARD}),
-            self.assertRaises(NotImplementedError),
-        ):
-            propose(owner, batch, *([None] * 10), num_speculative_tokens=7)
+        with self.assertRaises(NotImplementedError):
+            owner.propose(batch, *([None] * 10), num_speculative_tokens=7)
         self.assertIs(owner.input_batch, old_batch)
-
-
-SOURCE = ROOT = MODULE_PATH.parents[4]
-M = GUARD
-N = NS
 
 
 def _single_owner_batch(prompt=257, output=32, capacity=4096):
@@ -624,18 +575,6 @@ def _pair_owner_batch():
     return owner, batch
 
 
-def actual_ar_replay_method():
-    """Use the real manager entry, replacing no framework/device implementation."""
-    path = SOURCE / "vllm_ascend/worker/v2/spec_decode/target_dependent_ar/aclgraph.py"
-    tree = ast.parse(path.read_text())
-    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "AutoRegressiveAclGraphManager")
-    method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "run_fullgraph")
-    scope = dict(logger=N(info_once=lambda *args: None), use_updatable_graph=lambda backend: False)
-    body = [ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), method]
-    exec(compile(ast.fix_missing_locations(ast.Module(body=body, type_ignores=[])), str(path), "exec"), scope)
-    return scope["run_fullgraph"]
-
-
 class ActualGraphDescriptorControls(unittest.TestCase):
     def manager(self, owner, *, first=False, session=None):
         seen: list[tuple[str, tuple[Any, ...]]] = []
@@ -658,7 +597,8 @@ class ActualGraphDescriptorControls(unittest.TestCase):
         if session is not None:
             owner._eagle3_graph_session = session
             owner._eagle3_window_is_active = lambda: True
-        manager = N(
+        manager = object.__new__(ar_graph.AutoRegressiveAclGraphManager)
+        manager.__dict__.update(
             speculator=owner,
             is_draft_model_prefill=first,
             update_stream=object(),
@@ -668,19 +608,17 @@ class ActualGraphDescriptorControls(unittest.TestCase):
         return manager, seen
 
     def run_actual(self, manager, desc):
-        from unittest.mock import patch
-
-        with patch.dict(sys.modules, {"vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits": M}):
-            return actual_ar_replay_method()(manager, desc)
+        with patch.object(ar_graph, "use_updatable_graph", return_value=False):
+            return manager.run_fullgraph(desc)
 
     def test_off_padded_ar_rejected_before_metadata_and_replay(self):
         owner, _ = _single_owner_batch()
         manager, seen = self.manager(owner)
         for n, tokens in ((4, 4), (1, 4), (2, 2)):
             with self.subTest(n=n, tokens=tokens), self.assertRaisesRegex(NotImplementedError, "padded1"):
-                self.run_actual(manager, N(num_reqs=n, num_tokens=tokens))
+                self.run_actual(manager, NS(num_reqs=n, num_tokens=tokens))
             self.assertEqual(seen, [])
-        self.assertEqual(self.run_actual(manager, N(num_reqs=1, num_tokens=1)), "legacy-result")
+        self.assertEqual(self.run_actual(manager, NS(num_reqs=1, num_tokens=1)), "legacy-result")
         self.assertEqual([v[0] for v in seen], ["metadata", "replay"])
         self.assertFalse(hasattr(owner, "_draft_window_graph_binding_provider"))
         self.assertFalse(hasattr(owner, "_draft_window_runtime"))
@@ -688,44 +626,36 @@ class ActualGraphDescriptorControls(unittest.TestCase):
     def test_first_q4_descriptor_checks_before_replay(self):
         owner, _ = _single_owner_batch()
         manager, seen = self.manager(owner, first=True)
-        self.assertEqual(self.run_actual(manager, N(num_reqs=1, num_tokens=4)), "legacy-result")
+        self.assertEqual(self.run_actual(manager, NS(num_reqs=1, num_tokens=4)), "legacy-result")
         seen.clear()
         with self.assertRaisesRegex(NotImplementedError, "first Q4"):
-            self.run_actual(manager, N(num_reqs=4, num_tokens=4))
+            self.run_actual(manager, NS(num_reqs=4, num_tokens=4))
         self.assertEqual(seen, [])
 
     def test_window_session_keeps_its_actual_materialize_and_binding_path(self):
         owner, _ = _single_owner_batch()
         manager, seen = self.manager(owner, session=object())
-        self.assertEqual(self.run_actual(manager, N(num_reqs=1, num_tokens=1)), "window-result")
+        self.assertEqual(self.run_actual(manager, NS(num_reqs=1, num_tokens=1)), "window-result")
         self.assertEqual([v[0] for v in seen], ["window"])
 
     def test_unscoped_and_real_source_dummy_keep_legacy_behavior(self):
         for owner in (
-            N(),
-            N(
+            NS(),
+            NS(
                 _draft_graph_review_limit=GUARD.DraftGraphSupport(4096, 3, 1, 1, "eagle3", 4),
-                input_batch=N(is_dummy=True),
+                input_batch=NS(is_dummy=True),
             ),
         ):
             manager, seen = self.manager(owner)
-            self.assertEqual(self.run_actual(manager, N(num_reqs=4, num_tokens=4)), "legacy-result")
+            self.assertEqual(self.run_actual(manager, NS(num_reqs=4, num_tokens=4)), "legacy-result")
             self.assertEqual([v[0] for v in seen], ["metadata", "replay"])
         owner, batch = _single_owner_batch()
         batch.is_dummy = False
         batch.num_reqs = 2
         manager, seen = self.manager(owner)
         with self.assertRaises(NotImplementedError):
-            self.run_actual(manager, N(num_reqs=1, num_tokens=1))
+            self.run_actual(manager, NS(num_reqs=1, num_tokens=1))
         self.assertEqual(seen, [])
-
-
-class Vector:
-    def __init__(self, values):
-        self.values = values
-
-    def __getitem__(self, index):
-        return NS(item=lambda: self.values[index])
 
 
 class EagleMixedRequestControls(unittest.TestCase):
@@ -734,28 +664,13 @@ class EagleMixedRequestControls(unittest.TestCase):
         # long prompt 1537: 1152 computed + 128 scheduled = 1280; short prompt
         # 513: 384 + 129 = 513. These are Source-reconstructed lengths, not a
         # saved device/guard exact snapshot. Execute the actual Ascend CPU
-        # length constructor on that state, without importing the model runner.
-        path = ROOT / "vllm_ascend/worker/v2/model_runner.py"
-        module = ast.parse(path.read_text())
-        runner_class = next(
-            node for node in module.body if isinstance(node, ast.ClassDef) and node.name == "NPUModelRunner"
-        )
-        function = next(
-            node
-            for node in runner_class.body
-            if isinstance(node, ast.FunctionDef) and node.name == "_update_seq_lens_cpu"
-        )
-        namespace: dict[str, Any] = {}
-        code = ast.Module(
-            body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), function],
-            type_ignores=[],
-        )
-        exec(compile(ast.fix_missing_locations(code), str(path), "exec"), namespace)
+        # length constructor on that state through the actual runner class.
         owner, batch = _pair_owner_batch()
         ids = batch.req_ids
         cpu_lengths = [0, 0]
         snapshots = {7: 1152, 3: 384}
-        runner = NS(
+        runner = object.__new__(NPUModelRunner)
+        runner.__dict__.update(
             speculator=object(),
             sync_spec_pp_cpu_counts=False,
             _can_skip_spec_cpu_length_sync=lambda: False,
@@ -769,26 +684,31 @@ class EagleMixedRequestControls(unittest.TestCase):
             num_scheduled_tokens={ids[1]: 129, ids[0]: 128},
             scheduled_cached_reqs=NS(req_ids=ids),
         )
-        namespace["_update_seq_lens_cpu"](runner, scheduler, ids)
+        runner._update_seq_lens_cpu(scheduler, ids)
         self.assertEqual(cpu_lengths, [1280, 513])
         batch.num_computed_prefill_tokens_np = np.array([1152, 384], dtype=np.int32)
         batch.num_scheduled_tokens = np.array([128, 129], dtype=np.int32)
         batch.prefill_len_np = np.asarray(batch.prefill_len_np, dtype=np.int32)
         owner._draft_window_graph_binding_provider = NS(proposal=(True, False))
         for step in (0, 1, 2):
-            M.validate_eagle_single_request_review_exact(
-                owner, batch, Vector([1280 + step, 513 + step]), num_reqs=2, padded=2, step=step
+            GUARD.validate_eagle_single_request_review_exact(
+                owner,
+                batch,
+                torch.tensor([1280 + step, 513 + step], dtype=torch.int32),
+                num_reqs=2,
+                padded=2,
+                step=step,
             )
             for values in ([1279 + step, 513 + step], [1281 + step, 513 + step], [1280 + step, 512]):
                 with self.subTest(step=step, values=values), self.assertRaises(NotImplementedError):
-                    M.validate_eagle_single_request_review_exact(
-                        owner, batch, Vector(values), num_reqs=2, padded=2, step=step
+                    GUARD.validate_eagle_single_request_review_exact(
+                        owner, batch, torch.tensor(values, dtype=torch.int32), num_reqs=2, padded=2, step=step
                     )
         # Absent/changed phase cannot relabel a terminal/decode row as continuing.
         owner._draft_window_graph_binding_provider.proposal = (False, False)
         with self.assertRaises(NotImplementedError):
-            M.validate_eagle_single_request_review_exact(
-                owner, batch, Vector(cpu_lengths), num_reqs=2, padded=2, step=0
+            GUARD.validate_eagle_single_request_review_exact(
+                owner, batch, torch.tensor(cpu_lengths, dtype=torch.int32), num_reqs=2, padded=2, step=0
             )
         from vllm_ascend.worker.v2.spec_decode.draft_window_runtime import continuing_prefill_rows
 
@@ -836,16 +756,16 @@ class EagleMixedRequestControls(unittest.TestCase):
                     # Identity is established when the actual runner builds the
                     # batch, not repeatedly reconstructed by each AR reader.
                     state = NS(req_id_to_index={"request-A": 7, "request-B": 3})
-                    M.draft_graph_request_bounds(owner, state, batch.req_ids, batch.idx_mapping_np)
+                    GUARD.draft_graph_request_bounds(owner, state, batch.req_ids, batch.idx_mapping_np)
                 from vllm_ascend.worker.v2.spec_decode.draft_window_runtime import continuing_prefill_rows
 
                 runner_bounds(owner, batch)
                 owner._draft_window_graph_binding_provider = NS(
                     proposal=tuple(continuing_prefill_rows(batch, batch.num_reqs))
                 )
-                M.validate_draft_graph_review_requests(owner, batch)
-                M.validate_eagle_single_request_review_exact(
-                    owner, batch, Vector([1280, 513]), num_reqs=2, padded=2, step=0
+                GUARD.validate_draft_graph_review_requests(owner, batch)
+                GUARD.validate_eagle_single_request_review_exact(
+                    owner, batch, torch.tensor([1280, 513], dtype=torch.int32), num_reqs=2, padded=2, step=0
                 )
 
 
@@ -877,52 +797,44 @@ def idle_owner():
     return owner, batch, session
 
 
-DP_MODULE_PATH = SOURCE / "vllm_ascend/worker/v2/spec_decode/draft_window_eagle3_dp.py"
-dp_spec = importlib.util.spec_from_file_location("draft_graph_idle_test", DP_MODULE_PATH)
-assert dp_spec is not None and dp_spec.loader is not None
-DP = importlib.util.module_from_spec(dp_spec)
-dp_spec.loader.exec_module(DP)
-IDLE = vars(DP)
-
-
 class EagleIdleOwnershipControls(unittest.TestCase):
     def test_actual_idle_uses_full_baseline_and_both_consumer_managers(self):
         owner, batch, session = idle_owner()
-        with IDLE["eagle3_dp_dummy_scope"](owner, batch, dummy_run=True, is_profile=False):
+        with DP.eagle3_dp_dummy_scope(owner, batch, dummy_run=True, is_profile=False):
             self.assertTrue(owner._eagle3_graph_dp_dummy_active)
             for first, tokens, count in ((True, 4, 1), (False, 1, 2)):
                 manager = NS(speculator=owner, update_stream=owner.update_stream, is_draft_model_prefill=first)
                 descriptor = NS(cg_mode=NS(name="FULL"), num_reqs=1, num_tokens=tokens)
-                self.assertTrue(IDLE["validate_eagle_dp_dummy_replay"](owner, manager, descriptor, [{}] * count))
+                self.assertTrue(DP.validate_eagle_dp_dummy_replay(owner, manager, descriptor, [{}] * count))
                 with self.assertRaises(RuntimeError):
-                    IDLE["validate_eagle_dp_dummy_replay"](owner, manager, descriptor, [{}] * (count + 1))
+                    DP.validate_eagle_dp_dummy_replay(owner, manager, descriptor, [{}] * (count + 1))
             self.assertIsNone(owner._draft_window_graph_binding_provider.proposal)
         self.assertFalse(owner._eagle3_graph_dp_dummy_active)
         self.assertFalse(owner._draft_window_graph_binding_provider.quarantined)
         # K0 business first-only is a genuine request, never dummy/idle.
         batch.is_dummy = False
-        with IDLE["eagle3_dp_dummy_scope"](owner, batch, dummy_run=False, is_profile=False):
+        with DP.eagle3_dp_dummy_scope(owner, batch, dummy_run=False, is_profile=False):
             self.assertFalse(owner._eagle3_graph_dp_dummy_active)
 
     def test_idle_failure_or_live_generation_cannot_reuse(self):
         owner, batch, session = idle_owner()
         with (
             self.assertRaisesRegex(RuntimeError, "injected"),
-            IDLE["eagle3_dp_dummy_scope"](owner, batch, dummy_run=True, is_profile=False),
+            DP.eagle3_dp_dummy_scope(owner, batch, dummy_run=True, is_profile=False),
         ):
             raise RuntimeError("injected submission uncertainty")
         self.assertTrue(owner._draft_window_graph_binding_provider.quarantined)
         self.assertFalse(owner._eagle3_graph_dp_dummy_active)
         with (
             self.assertRaisesRegex(RuntimeError, "quarantined"),
-            IDLE["eagle3_dp_dummy_scope"](owner, batch, dummy_run=True, is_profile=False),
+            DP.eagle3_dp_dummy_scope(owner, batch, dummy_run=True, is_profile=False),
         ):
             self.fail("uncertain idle work must reject the next Graph scope")
         owner, batch, session = idle_owner()
         owner._draft_window_graph_binding_provider.proposal = object()
         with (
             self.assertRaises(RuntimeError),
-            IDLE["eagle3_dp_dummy_scope"](owner, batch, dummy_run=True, is_profile=False),
+            DP.eagle3_dp_dummy_scope(owner, batch, dummy_run=True, is_profile=False),
         ):
             self.fail("live business generation entered dummy replay")
         self.assertTrue(owner._draft_window_graph_binding_provider.quarantined)
@@ -930,11 +842,11 @@ class EagleIdleOwnershipControls(unittest.TestCase):
         owner._draft_window_graph_binding_provider._active_bank = object()
         with (
             self.assertRaises(RuntimeError),
-            IDLE["eagle3_dp_dummy_scope"](owner, batch, dummy_run=True, is_profile=False),
+            DP.eagle3_dp_dummy_scope(owner, batch, dummy_run=True, is_profile=False),
         ):
             self.fail("live scratch entered dummy replay")
         owner, batch, session = idle_owner()
-        with IDLE["eagle3_dp_dummy_scope"](owner, batch, dummy_run=True, is_profile=True):
+        with DP.eagle3_dp_dummy_scope(owner, batch, dummy_run=True, is_profile=True):
             self.assertFalse(getattr(owner, "_eagle3_graph_dp_dummy_active", False))
 
 
