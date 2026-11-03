@@ -129,24 +129,7 @@ class DraftWindowRuntime:
                 gid: declared[gid] if isinstance(declared, dict) else declared for gid in native_gids
             }
             routes = tuple(route for route in routes if route.gid not in self.native_swa_causal)
-        if (
-            routes
-            and self.method in ("eagle3", "dflash", "dspark")
-            and all(route.status is DraftWindowProviderStatus.DIRECT_DENSE for route in routes)
-        ):
-            from vllm_ascend.attention.attention_v1 import AscendAttentionBackendImpl
-
-            specs = [speculator.kv_cache_config.kv_cache_groups[route.gid].kv_cache_spec for route in routes]
-            specs = [item for spec in specs for item in getattr(spec, "kv_cache_specs", {"": spec}).values()]
-            context = config.compilation_config.static_forward_context
-            implementations = [getattr(context.get(name), "impl", None) for route in routes for name in route.layers]
-            self._dense_reads = all(spec.dtype in (torch.float16, torch.bfloat16) for spec in specs) and all(
-                type(impl) is AscendAttentionBackendImpl
-                and not impl.use_bnsd_kv_cache
-                and impl.sinks is None
-                and impl.sliding_window is None
-                for impl in implementations
-            )
+        self._dense_reads = bool(routes) and all(route.dense_read for route in routes)
         return all_gids
 
     @contextmanager
