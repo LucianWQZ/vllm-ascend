@@ -332,7 +332,7 @@ def test_factory_error_restores_module_but_quarantines_active_owner(factory_cont
     contract.ascend.side_effect = backend
     callbacks = {} if stage == "backend" else {stage: fail}
     with pytest.raises(RuntimeError, match="partial-submit host error"), pool.operation() as owner:
-        pool.retain(owner, payload)
+        owner.retained.append(payload)
         # Entered proposal lifetime; no native operation is claimed here.
         with contract.wrapper(), contract.factory([0], 1, False, **callbacks):
             contract.module.build_attn_metadata()

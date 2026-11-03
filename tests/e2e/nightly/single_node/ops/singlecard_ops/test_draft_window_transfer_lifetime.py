@@ -57,7 +57,7 @@ def test_real_private_copy_failure_retains_its_actual_operands(monkeypatch, stag
                 query_width=4,
                 causal=False,
                 full_rows_cpu=full_rows,
-                retain=lambda *items: pool.retain(owner, *items),
+                retain=lambda *items: owner.retained.extend(items),
             )
         assert len(submitted) == 1
         assert pool.poisoned
@@ -80,7 +80,7 @@ def test_real_metadata_fill_keeps_destination_quarantined(monkeypatch):
         torch.zeros(2, 1, 1, 4, dtype=torch.bool, device="npu"),
         4,
         1,
-        lambda *items: pool.retain(owner, *items),
+        lambda *items: owner.retained.extend(items),
     )
     original = torch.Tensor.__setitem__
     events, submitted = [], []
@@ -99,7 +99,7 @@ def test_real_metadata_fill_keeps_destination_quarantined(monkeypatch):
     monkeypatch.setattr(torch.Tensor, "__setitem__", filled)
     try:
         with pytest.raises(RuntimeError, match="after real metadata fill"), pool.operation() as owner:
-            pool.retain(owner, read)
+            owner.retained.append(read)
             read.apply(SimpleNamespace(num_reqs=3))
         assert len(submitted) == 1
         assert pool.poisoned

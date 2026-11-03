@@ -61,7 +61,7 @@ def test_copy_failure_keeps_actual_input_and_output_owned(monkeypatch, stage):
             query_width=4,
             causal=False,
             full_rows_cpu=full_rows,
-            retain=lambda *items: pool.retain(owner, *items),
+            retain=lambda *items: owner.retained.extend(items),
         )
     assert len(submitted) == 1
     assert pool.poisoned
@@ -94,7 +94,7 @@ def test_planning_copy_failure_keeps_prepared_input_owned(monkeypatch):
             upper_cpu=exact + 1,
             query_width=4,
             causal=False,
-            retain=lambda *items: pool.retain(owner, *items),
+            retain=lambda *items: owner.retained.extend(items),
         )
     assert pool.poisoned and any(item is exact for item in owner.retained)
 
@@ -108,7 +108,7 @@ def test_metadata_length_copy_is_owned_before_partial_fill(monkeypatch):
         torch.zeros(2, 1, 1, 4, dtype=torch.bool),
         4,
         1,
-        lambda *items: pool.retain(owner, *items),
+        lambda *items: owner.retained.extend(items),
     )
     submitted = []
 
@@ -122,7 +122,7 @@ def test_metadata_length_copy_is_owned_before_partial_fill(monkeypatch):
 
     monkeypatch.setattr(torch.Tensor, "__setitem__", filled)
     with pytest.raises(RuntimeError, match="after metadata fill"), pool.operation() as owner:
-        pool.retain(owner, read)
+        owner.retained.append(read)
         read.apply(SimpleNamespace(num_reqs=3))
     assert len(submitted) == 1
     assert pool.poisoned

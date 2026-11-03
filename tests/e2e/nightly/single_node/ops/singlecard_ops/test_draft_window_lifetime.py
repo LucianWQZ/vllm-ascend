@@ -62,7 +62,7 @@ def test_private_kernel_outputs_survive_exception_after_real_enqueue(monkeypatch
         torch.npu.stream(stream),
         pool.operation() as owner,
     ):
-        retain = lambda *objects: pool.retain(owner, *objects)
+        retain = lambda *objects: owner.retained.extend(objects)
         if operation == "gather":
             slots = torch.tensor([[1, 2, 3]], dtype=torch.int64, device="npu")
             read = DenseDraftRead(slots, torch.tensor([3]), torch.empty(0), 3, 1, retain)
@@ -110,9 +110,9 @@ def test_native_enqueue_failure_quarantines_backing(monkeypatch, failure):
     monkeypatch.setattr(torch.npu, "Event", FaultEvent)
 
     with pytest.raises((RuntimeError, TypeError)), torch.npu.stream(stream), pool.operation() as owner:
-        pool.retain(owner, payload)
+        owner.retained.append(payload)
         observed = payload.square()
-        pool.retain(owner, observed)
+        owner.retained.append(observed)
         if failure == "host_after_enqueue":
             raise RuntimeError("injected host failure after native enqueue")
     assert pool.poisoned
@@ -132,11 +132,11 @@ def test_native_completion_covers_an_explicit_late_reader_join():
     producer, reader = torch.npu.Stream(), torch.npu.Stream()
     with torch.npu.stream(producer), pool.operation() as owner:
         payload = torch.arange(1024, dtype=torch.float32, device="npu")
-        pool.retain(owner, payload)
+        owner.retained.append(payload)
         reader.wait_stream(producer)
         with torch.npu.stream(reader):
             result = payload * 3
-        pool.retain(owner, result)
+        owner.retained.append(result)
         # The actual executor must provide an equivalent join for every
         # secondary reader before recording its proposal completion.
         producer.wait_stream(reader)
@@ -195,7 +195,7 @@ def pending_native_reader(pool):
                 left = torch.full((matrix_size, matrix_size), 1 / matrix_size, dtype=torch.bfloat16, device="npu")
                 right = torch.eye(matrix_size, dtype=torch.bfloat16, device="npu")
                 scratch = torch.empty_like(left)
-                pool.retain(owner, payload, observed, left, right, scratch)
+                owner.retained.extend((payload, observed, left, right, scratch))
                 for _ in range(delay_operations):
                     torch.mm(left, right, out=scratch)
                     left, scratch = scratch, left
@@ -235,7 +235,7 @@ def test_native_reverse_completion_reclaims_only_the_completed_owner():
             with torch.npu.stream(fast_stream), pool.operation() as fast_owner:
                 fast_payload = torch.ones(1024, device="npu")
                 fast_result = fast_payload + 1
-                pool.retain(fast_owner, fast_payload, fast_result)
+                fast_owner.retained.extend((fast_payload, fast_result))
             fast_owner.completion.synchronize()
             if super(ObservedNativeEvent, slow).query():
                 pytest.skip("device did not exhibit reverse completion of the two native readers")
