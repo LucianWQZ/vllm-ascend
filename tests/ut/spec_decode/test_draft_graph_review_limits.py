@@ -529,10 +529,10 @@ class DraftGraphSupportTest(unittest.TestCase):
                 )
                 with expected:
                     self.assertIsNone(
-                        owner._build_attn_metadata(
-                            actual,
+                        owner._build_uniform_attn_metadata(
                             descriptor,
-                            np.arange(actual + 1, dtype=np.int32) * 8,
+                            actual,
+                            8,
                             torch.zeros(actual, dtype=torch.int32),
                             8,
                         )
