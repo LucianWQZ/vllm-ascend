@@ -143,6 +143,8 @@ def test_native_projection_retains_pinned_actual_length_dma_source(monkeypatch):
         is_prefilling_np=np.array([False, False]),
     )
     speculator = SimpleNamespace(
+        method="dflash",
+        num_speculative_steps=7,
         num_query_per_req=8,
         block_tables=SimpleNamespace(
             block_tables=[SimpleNamespace(gpu=table)],

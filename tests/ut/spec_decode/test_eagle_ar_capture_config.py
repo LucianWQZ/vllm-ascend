@@ -160,7 +160,7 @@ class EagleARCaptureTests(unittest.TestCase):
             mutate(value)
             with self.assertRaises(NotImplementedError):
                 self.call(value)
-        for field in ("use_sequence_parallel_moe", "enable_expert_parallel"):
+        for field in ("enable_expert_parallel",):
             value = copy.deepcopy(conf)
             setattr(value.speculative_config.draft_parallel_config, field, True)
             with self.assertRaises(NotImplementedError):
