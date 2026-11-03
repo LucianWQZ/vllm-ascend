@@ -9,7 +9,6 @@ import torch
 
 torch_npu = pytest.importorskip("torch_npu")
 
-from vllm_ascend.worker.v2.spec_decode.draft_window_policy import resolve_draft_window_policy  # noqa: E402
 from vllm_ascend.worker.v2.spec_decode.draft_window_runtime import DraftWindowRuntime  # noqa: E402
 
 pytestmark = pytest.mark.skipif(not torch.npu.is_available(), reason="requires an Ascend NPU")
@@ -22,6 +21,7 @@ def prepared(monkeypatch):
     monkeypatch.setattr(DraftWindowRuntime, "_validate_route", staticmethod(lambda owner: (0,)))
     table = torch.arange(8, dtype=torch.int32, device="npu").reshape(1, 8)
     spec = SimpleNamespace(
+        method="dflash",
         draft_model_config=SimpleNamespace(enforce_eager=True),
         speculative_config=SimpleNamespace(enforce_eager=None),
         vllm_config=SimpleNamespace(max_concurrent_batches=2),
@@ -30,7 +30,7 @@ def prepared(monkeypatch):
         supports_decode_metadata_update=False,
         block_tables=SimpleNamespace(num_blocks=SimpleNamespace(np=np.array([[8]])), kernel_block_sizes=[4]),
     )
-    runtime = DraftWindowRuntime(spec, resolve_draft_window_policy(requested_window_size=8, method="dflash"))
+    runtime = DraftWindowRuntime(spec, 8)
     batch = SimpleNamespace(
         num_reqs=1,
         req_ids=["one"],

@@ -215,8 +215,8 @@ class DraftWindowRuntime:
 
         Builders receive fresh common metadata in this proposal's batch order.
         Validate that boundary once, before either native Full, projected Host
-        exact, or device-exact reads can mutate it. All three routes retire at
-        the same proposal completion event.
+        exact, or device-exact reads can mutate it. All routes retain operands until
+        the next completed exact-copy boundary.
         """
         if self._bypass:
             return None
