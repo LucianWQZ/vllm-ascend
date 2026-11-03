@@ -263,7 +263,7 @@ def materialize_native_swa_intersection(
     if not isinstance(source, NativeSWASource) or source.native_window <= 0 or query_width <= 0:
         raise ValueError("Native SWA projection requires its typed positive band")
     if exact_cpu.device.type != "cpu" or starts_cpu.device.type != "cpu":
-        raise ValueError("Native SWA planning reuses the completed native builder CPU snapshot")
+        raise ValueError("Native SWA planning requires the completed preparation CPU snapshot")
     if bool((exact_cpu - starts_cpu < query_width).any()):
         raise ValueError("Extra Window must cover every native query")
     return _materialize_canonical_read(
