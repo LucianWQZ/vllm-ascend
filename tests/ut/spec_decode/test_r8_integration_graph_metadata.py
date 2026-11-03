@@ -43,7 +43,6 @@ def graph_source_initialization(request, monkeypatch):
         kv_cache_config=object(),
         _group_causal=False,
         vllm_config=object(),
-        _initialize_draft_window_graph_inputs=Mock(),
         _initialize_eagle3_draft_window_state=Mock(),
     )
     return SimpleNamespace(
@@ -66,6 +65,9 @@ def test_graph_owner_installs_only_its_admitted_source(graph_source_initializati
     assert not hasattr(c.owner, "_draft_window_runtime_state")
     assert not hasattr(c.owner, "_draft_window_runtime")
     if c.owner._speculator_name != "eagle3":
+        assert c.owner._draft_window_bypass_active is False
+        assert c.owner._draft_window_prefill_bypass_active is False
+        assert c.owner._draft_window_dp_dummy_active is False
         assert c.build_source.call_args.kwargs["dflash2_graph_owner"] is (
             c.owner if c.owner._speculator_name == "dflash2" else None
         )
@@ -204,7 +206,13 @@ def test_real_metadata_preparation_selects_the_final_descriptor_once(monkeypatch
     owner.block_tables, owner.num_query_per_req, owner.draft_attn_layer_names = c.owner, 1, {"draft.layer"}
     owner.input_batch = SimpleNamespace(num_reqs=2, idx_mapping_np=np.array([0, 1]))
     snapshot = Mock(return_value=torch.tensor([11, 14], dtype=torch.int32))
-    owner._snapshot_prepared_draft_seq_lens = snapshot
+
+    class Inputs:
+        @property
+        def seq_lens(self):
+            return snapshot()
+
+    owner.input_buffers = Inputs()
     select = Mock(wraps=c.provider.capture_identity_for)
     monkeypatch.setattr(c.provider, "capture_identity_for", select)
     desc = replace(c.capture.descriptor, max_query_len=9) if wrong_descriptor else c.capture.descriptor
@@ -220,6 +228,6 @@ def test_real_metadata_preparation_selects_the_final_descriptor_once(monkeypatch
             assert c.capture.cpu_window_exact.tolist() == [7, 6]
             c.provider.bind_current(desc)
             c.provider.finish_update()
-        snapshot.assert_called_once_with(2)
+        snapshot.assert_called_once_with()
     select.assert_called_once_with(descriptor=desc)
     assert not hasattr(owner, "_draft_window_selected_metadata")

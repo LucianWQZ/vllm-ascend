@@ -1,24 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Host-only native attention inventory; no framework or device imports."""
+"""CPU startup inventory of real attention implementations, without device work."""
 
-import importlib.util
-import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
-ROOT = Path(__file__).resolve().parents[4]
-MODULE = ROOT / "vllm_ascend/worker/v2/spec_decode/draft_window_native_attention.py"
-spec = importlib.util.spec_from_file_location("_native_attention_host_test", MODULE)
-assert spec is not None and spec.loader is not None
-native = importlib.util.module_from_spec(spec)
-sys.modules[spec.name] = native
-spec.loader.exec_module(native)
-
-Dense = type("AscendAttentionBackendImpl", (), {})
-Dense.__module__ = "vllm_ascend.attention.attention_v1"
+from vllm_ascend.attention.attention_v1 import AscendAttentionBackendImpl
+from vllm_ascend.attention.mla_v1 import AscendMLAImpl
+from vllm_ascend.worker.v2.spec_decode import draft_window_native_attention as native
 
 
 def config(*, kinds=None, window=2048, architecture="DFlash2DraftModel", count=2, dflash=None) -> dict[str, Any]:
@@ -35,7 +26,7 @@ def loaded(configuration, windows, *, causal=False, mask=True, order=None):
     names = []
     for index, window in enumerate(windows):
         name = f"draft.model.layers.{64 + index}.self_attn.attn"
-        impl = Dense()
+        impl = object.__new__(AscendAttentionBackendImpl)
         impl.sliding_window = window
         if mask:
             impl._dflash2_native_swa_mask = object()
@@ -43,7 +34,7 @@ def loaded(configuration, windows, *, causal=False, mask=True, order=None):
         names.append(name)
     groups = [SimpleNamespace(layer_names=[names[index]]) for index in (order or range(len(names)))]
     return SimpleNamespace(
-        draft_model_config=SimpleNamespace(hf_config=configuration),
+        draft_model_config=SimpleNamespace(hf_config=SimpleNamespace(**configuration)),
         attn_vllm_config=SimpleNamespace(compilation_config=SimpleNamespace(static_forward_context=context)),
         attn_groups=[groups],
         draft_attn_layer_names=set(names),
@@ -104,6 +95,12 @@ class NativeAttentionTests(unittest.TestCase):
         self.assertEqual(native.inspect_draft_native_attention(loaded(cfg, [None], causal=True)).kind, "FULL")
         self.assertEqual(native.inspect_draft_native_attention(loaded(cfg, [2048], causal=True)).kind, "SWA")
 
+    def test_real_plain_mla_is_full_without_a_native_window_operand(self):
+        owner = loaded(config(architecture="Glm5DSparkForCausalLM"), [None, None])
+        for layer in owner.attn_vllm_config.compilation_config.static_forward_context.values():
+            layer.impl = object.__new__(AscendMLAImpl)
+        self.assertEqual(native.inspect_draft_native_attention(owner).kind, "FULL")
+
     def test_startup_graph_request_uses_draft_flag_not_target_mode(self):
         owner = loaded(config(), [None, None])
         owner.speculative_config = SimpleNamespace(enforce_eager=True)
@@ -154,6 +151,11 @@ class NativeAttentionTests(unittest.TestCase):
             self.assertEqual(native.inspect_draft_native_attention(owner).kind, "UNKNOWN")
         owner = loaded(cfg, [2048, 2048])
         next(iter(owner.attn_vllm_config.compilation_config.static_forward_context.values())).impl = object()
+        self.assertEqual(native.inspect_draft_native_attention(owner).kind, "UNKNOWN")
+        # A same-named class does not acquire the actual implementation's contract.
+        impostor = type(AscendAttentionBackendImpl.__name__, (), {"sliding_window": None})
+        impostor.__module__ = AscendAttentionBackendImpl.__module__
+        next(iter(owner.attn_vllm_config.compilation_config.static_forward_context.values())).impl = impostor()
         self.assertEqual(native.inspect_draft_native_attention(owner).kind, "UNKNOWN")
 
     def test_off_no_runtime_and_unknown_window_graph_fail_closed(self):

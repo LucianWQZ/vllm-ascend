@@ -10,7 +10,6 @@ import torch
 
 from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftWindowGraphSource,
-    gather_valid_num_blocks_cpu,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_backends import (
     DraftWindowGroupRoute,
@@ -67,7 +66,7 @@ def test_phase_snapshot_is_not_recomputed_inside_the_proposal():
 
 @pytest.fixture
 def full_source():
-    group = DraftWindowGroupRoute(0, ("draft.layer",), 4, 4, DraftWindowProviderStatus.DIRECT_DENSE)
+    group = DraftWindowGroupRoute(0, ("draft.layer",), 4, DraftWindowProviderStatus.DIRECT_DENSE)
     counts = torch.tensor([[4, 3]], dtype=torch.int32)
     owner = SimpleNamespace(
         input_block_tables=[torch.arange(8, dtype=torch.int32).reshape(2, 4)],
@@ -82,16 +81,20 @@ def full_source():
 
 def test_canonical_cpu_counts_keep_mapping_order_padding_and_source(full_source):
     before = full_source.block_tables.num_blocks.cpu.clone()
-    actual = gather_valid_num_blocks_cpu(full_source, idx_mapping_np=np.array([1, 0]), num_reqs=2, num_reqs_padded=3)
-    assert actual.tolist() == [3, 4, 0]
-    assert actual.data_ptr() != full_source.block_tables.num_blocks.cpu.data_ptr()
+    batch = _batch([(0, 8, 2), (0, 8, 2)])
+    batch.idx_mapping_np = np.array([1, 0])
+    bank = _materialize(full_source, batch, [10, 14, 0], [4, 3])
+    assert bank.cpu_window_exact.tolist() == [10, 14, 0]
+    assert bank.window_block_table.tolist() == [[0, 1, 2, 0], [4, 5, 6, 7], [0, 0, 0, 0]]
     assert torch.equal(full_source.block_tables.num_blocks.cpu, before)
 
 
 @pytest.mark.parametrize("mapping", [np.array([-1]), np.array([2])])
 def test_canonical_count_gather_rejects_invalid_mapping(full_source, mapping):
+    batch = _batch([(0, 8, 2)])
+    batch.idx_mapping_np = mapping
     with pytest.raises(IndexError):
-        gather_valid_num_blocks_cpu(full_source, idx_mapping_np=mapping, num_reqs=1, num_reqs_padded=1)
+        _materialize(full_source, batch, [2], [4, 3])
 
 
 def _materialize(full_source, batch, exact, counts, frozen=None):
@@ -112,7 +115,14 @@ def _materialize(full_source, batch, exact, counts, frozen=None):
                 full_source.table.new_zeros(len(exact) - full_source.table.shape[0], full_source.table.shape[1]),
             )
         )
-        full_source = replace(full_source, block_tables=SimpleNamespace(input_block_tables=[table]))
+        full_source = replace(
+            full_source,
+            block_tables=SimpleNamespace(
+                input_block_tables=[table], num_blocks=SimpleNamespace(cpu=torch.tensor([counts], dtype=torch.int32))
+            ),
+        )
+    else:
+        full_source.block_tables.num_blocks.cpu[0] = torch.tensor(counts, dtype=torch.int32)
     provider = DraftWindowGraphBindingProvider(source=full_source)
     descriptor = BatchExecutionDescriptor(CUDAGraphMode.FULL, 4 * len(exact), len(exact), uniform_token_count=4)
     bank = provider.register_capture_identity(descriptor=descriptor)
@@ -120,7 +130,7 @@ def _materialize(full_source, batch, exact, counts, frozen=None):
     return provider.prepare(
         bank,
         cpu_full_exact=torch.tensor(exact, dtype=torch.int32),
-        cpu_valid_num_blocks=torch.tensor(counts, dtype=torch.int32),
+        idx_mapping_np=batch.idx_mapping_np,
         frozen_row_plans=frozen,
         step=0,
     )

@@ -22,16 +22,6 @@ _DRAFT_ARCHITECTURES = frozenset(
         "Glm5DSparkForCausalLM",
     }
 )
-_DENSE_IMPLEMENTATIONS = frozenset(
-    {
-        "vllm_ascend.attention.attention_v1.AscendAttentionBackendImpl",
-        "vllm_ascend.attention.mla_v1.AscendMLAImpl",
-    }
-)
-
-
-def _get(value: Any, key: str, default: Any = None) -> Any:
-    return value.get(key, default) if isinstance(value, Mapping) else getattr(value, key, default)
 
 
 def _window(value: Any) -> int | None:
@@ -74,30 +64,33 @@ def inspect_draft_native_attention(speculator: Any) -> DraftNativeAttention:
     come from the executing implementations, never a KV storage spec or a
     second interpretation of the original model config/defaults.
     """
-    normalized = _get(_get(speculator, "draft_model_config"), "hf_config")
-    architectures: Sequence[str] = _get(normalized, "architectures", ()) or ()
-    count = _get(normalized, "num_hidden_layers")
+    from vllm_ascend.attention.attention_v1 import AscendAttentionBackendImpl
+    from vllm_ascend.attention.mla_v1 import AscendMLAImpl
+
+    normalized = speculator.draft_model_config.hf_config
+    architectures: Sequence[str] = getattr(normalized, "architectures", ()) or ()
+    count = getattr(normalized, "num_hidden_layers", None)
     issues = []
     known = len(architectures) == 1 and architectures[0] in _DRAFT_ARCHITECTURES
     if not known or type(count) is not int or count <= 0:
         issues.append("normalized Draft architecture or layer count has no supported implementation contract")
-    config = _get(speculator, "attn_vllm_config")
-    context = _get(_get(config, "compilation_config"), "static_forward_context", {}) or {}
-    groups = _get(speculator, "attn_groups", ()) or ()
+    context = speculator.attn_vllm_config.compilation_config.static_forward_context
+    declared_causal = getattr(speculator, "_group_causal", _MISSING)
     layers: dict[str, int | None] = {}
-    for gid, group_set in enumerate(groups):
+    for gid, group_set in enumerate(speculator.attn_groups):
+        causal = declared_causal.get(gid, _MISSING) if isinstance(declared_causal, Mapping) else declared_causal
         for group in group_set:
-            for name in _get(group, "layer_names", ()):
+            for name in group.layer_names:
                 if name in layers:
                     issues.append(f"Draft consumer {name} is registered more than once")
                     continue
-                impl = _get(context.get(name), "impl")
-                identity = f"{type(impl).__module__}.{type(impl).__qualname__}"
-                if identity not in _DENSE_IMPLEMENTATIONS:
+                impl = getattr(context.get(name), "impl", None)
+                if type(impl) not in (AscendAttentionBackendImpl, AscendMLAImpl):
+                    identity = f"{type(impl).__module__}.{type(impl).__qualname__}"
                     issues.append(f"Draft consumer {name} has unknown native attention implementation {identity}")
                     continue
-                value = _get(impl, "sliding_window", _MISSING)
-                if identity.endswith(".AscendMLAImpl"):
+                value = getattr(impl, "sliding_window", _MISSING)
+                if type(impl) is AscendMLAImpl:
                     # This dense implementation has no native window operand.
                     value = None
                 if value is _MISSING:
@@ -105,21 +98,19 @@ def inspect_draft_native_attention(speculator: Any) -> DraftNativeAttention:
                     continue
                 try:
                     layers[name] = _window(value)
-                    causal = _get(speculator, "_group_causal", _MISSING)
-                    causal = causal.get(gid, _MISSING) if isinstance(causal, Mapping) else causal
                     if layers[name] is not None and type(causal) is not bool:
                         issues.append(f"Draft consumer {name} has no actual native causality descriptor")
                     if (
                         layers[name] is not None
                         and causal is False
-                        and (_get(impl, "_dflash2_native_swa_mask") is None)
+                        and (getattr(impl, "_dflash2_native_swa_mask", None) is None)
                     ):
                         issues.append(f"noncausal Draft consumer {name} has no native-SWA mask binding")
                 except ValueError as error:
                     issues.append(f"Draft consumer {name}: {error}")
     # The loader already identifies the Draft layer set, including any Target
     # layer offset. Use that registration instead of parsing layer-name strings.
-    declared = _get(speculator, "draft_attn_layer_names", ()) or ()
+    declared = speculator.draft_attn_layer_names
     complete = bool(layers) and known and type(count) is int and len(layers) == count
     if not complete or set(layers) != set(declared):
         issues.append("complete supported Draft architecture and actual consumer inventory are required")
@@ -142,7 +133,7 @@ def require_known_draft_native_attention(
     """
     if window_size is None and not graph_requested:
         return
-    if not inventory.actual_complete or inventory.kind == "UNKNOWN":
+    if not inventory.actual_complete:
         raise NotImplementedError(
             "Draft Window/Graph requires a known native attention contract: " + "; ".join(inventory.issues)
         )
@@ -154,12 +145,10 @@ def report_owner_draft_native_attention(owner: Any, logger: Any) -> DraftNativeA
     The fixed loader owns original/normalized configuration. No config file,
     runtime, metadata tensor or completion object is read or allocated here.
     """
-    policies = (_get(owner, "_draft_window_policy"), _get(owner, "draft_window_policy"))
-    window = next((_get(policy, "effective_window_size") for policy in policies if policy is not None), None)
-    speculative = _get(owner, "speculative_config")
-    eager = (
-        _get(speculative, "enforce_eager") is True or _get(_get(owner, "draft_model_config"), "enforce_eager") is True
-    )
+    policies = (getattr(owner, "_draft_window_policy", None), getattr(owner, "draft_window_policy", None))
+    window = next((policy.effective_window_size for policy in policies if policy is not None), None)
+    speculative = owner.speculative_config
+    eager = speculative.enforce_eager is True or getattr(owner.draft_model_config, "enforce_eager", False) is True
     # All real callers run here from set_attn, before the fixed runner calls
     # init_cudagraph_manager. Report the Draft request, not Target Graph mode
     # or a hypothetical already-created manager.
@@ -192,7 +181,7 @@ def report_owner_draft_native_attention(owner: Any, logger: Any) -> DraftNativeA
     # built-in MTP) into a newly rejected configuration. Additional Window
     # owners always need the contract; DFlash2 Graph is itself new admission
     # in this change and needs it even when the additional Window is OFF.
-    architectures = _get(_get(_get(owner, "draft_model_config"), "hf_config"), "architectures", ()) or ()
+    architectures = getattr(owner.draft_model_config.hf_config, "architectures", ()) or ()
     new_dflash2_graph = graph_requested and tuple(architectures) == ("DFlash2DraftModel",)
     require_known_draft_native_attention(inventory, window_size=window, graph_requested=new_dflash2_graph)
     return inventory

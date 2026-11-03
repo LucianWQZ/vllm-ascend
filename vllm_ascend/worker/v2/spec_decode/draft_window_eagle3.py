@@ -9,9 +9,6 @@ from typing import Any
 import numpy as np
 import torch
 
-from vllm_ascend.worker.v2.spec_decode.draft_window import (
-    gather_valid_num_blocks_cpu,
-)
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphBindingProvider
 from vllm_ascend.worker.v2.spec_decode.draft_window_plan import DraftWindowPlan, compute_draft_window_plan
 from vllm_ascend.worker.v2.spec_decode.draft_window_runtime import continuing_prefill_rows
@@ -212,25 +209,15 @@ class Eagle3DraftWindowMixin:
         validate_eagle_single_request_review_exact(
             self, batch, exact, num_reqs=num_reqs, padded=num_reqs_padded, step=step
         )
-        valid = gather_valid_num_blocks_cpu(
-            provider.source,
-            idx_mapping_np=batch.idx_mapping_np,
-            num_reqs=num_reqs,
-            num_reqs_padded=num_reqs_padded,
-        )
         bank = provider.prepare(
             capture,
             frozen_row_plans=proposal,
             cpu_full_exact=exact,
-            cpu_valid_num_blocks=valid,
+            idx_mapping_np=batch.idx_mapping_np,
             step=step,
         )
         self._eagle3_window_proposal_plan = proposal
         return bank
-
-    def _quarantine_eagle3_window(self) -> None:
-        """Keep actual banks alive after an uncertain partial submission."""
-        self._draft_window_graph_binding_provider.quarantine()
 
     def _validate_request_counts(self, num_reqs: int, num_reqs_padded: int) -> None:
         if num_reqs != self.input_batch.num_reqs:

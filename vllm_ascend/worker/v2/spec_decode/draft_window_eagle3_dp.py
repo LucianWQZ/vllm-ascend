@@ -51,7 +51,7 @@ def eagle3_dp_dummy_scope(owner, input_batch, *, dummy_run, is_profile):
         yield
         _validate_eagle_dp_dummy(owner, session)
     except BaseException:
-        owner._quarantine_eagle3_window()
+        session.provider.quarantine()
         raise
     finally:
         owner._eagle3_graph_dp_dummy_active = False

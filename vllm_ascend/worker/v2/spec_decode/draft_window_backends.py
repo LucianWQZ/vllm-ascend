@@ -23,7 +23,6 @@ class DraftWindowProviderStatus(str, Enum):
 class DraftWindowGroupRoute:
     gid: int
     layers: tuple[str, ...]
-    scheduler_block_size: int
     table_column_span: int
     status: DraftWindowProviderStatus
     native_window: int | None = None
@@ -166,7 +165,6 @@ def inventory_draft_window_groups(
                 DraftWindowGroupRoute(
                     gid=gid,
                     layers=tuple(group.layer_names),
-                    scheduler_block_size=scheduler_span,
                     table_column_span=column_span,
                     status=status,
                     native_window=native_window,

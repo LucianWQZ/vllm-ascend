@@ -115,6 +115,7 @@ def owner():
         max_num_reqs=4,
         vocab_size=8,
         _dflash2_full_kv_reference=True,
+        _group_causal={0: False},
         model=model,
         block_tables=SimpleNamespace(
             block_sizes=[128],
@@ -131,23 +132,20 @@ def owner():
     )
 
 
-def route(native=2048, *, scheduler=128):
+def route(native=2048):
     return SimpleNamespace(
         gid=0,
         native_window=native,
-        scheduler_block_size=scheduler,
         table_column_span=128,
         layers=("draft.0",),
     )
 
 
-def validate_source(module, owner, actual_route=None, **kwargs):
+def validate_source(module, owner, actual_route=None, *, window_size=1024):
     return module.validate_dflash2_graph_read_source(
         owner,
         actual_route or route(),
-        causal=kwargs.pop("causal", {0: False}),
-        window_size=kwargs.pop("window_size", 1024),
-        **kwargs,
+        window_size=window_size,
     )
 
 
@@ -174,7 +172,6 @@ def test_graph_factory_qualifies_the_real_dflash2_owner(monkeypatch, owner):
         attn_groups=(),
         block_tables=owner.block_tables,
         kv_cache_config=None,
-        causal=False,
         vllm_config=owner.vllm_config,
         dflash2_graph_owner=owner,
     )
@@ -240,14 +237,18 @@ def test_shared_inventory_native_band_and_actual_layers_are_checked(module, owne
     wrong.layers = ("draft.0", "draft.0")
     with pytest.raises(ValueError, match="layer inventory"):
         validate_source(module, owner, wrong)
-    with pytest.raises(ValueError, match="noncausal"):
-        validate_source(module, owner, causal=True)
+    for declaration in (True, {0: True}, {1: False}):
+        owner._group_causal = declaration
+        with pytest.raises(ValueError, match="noncausal"):
+            validate_source(module, owner)
+    owner._group_causal = False
+    validate_source(module, owner)
 
 
 def test_actual_ascend_expanded_manager_blocks_use_kernel_span(module, owner):
     owner.block_tables.block_sizes = [512]
     owner.block_tables.blocks_per_kv_block = [4]
-    actual_route = route(scheduler=512)
+    actual_route = route()
     module.validate_dflash2_graph_source(owner)
     validate_source(module, owner, actual_route, window_size=1913)
     with pytest.raises(ValueError, match="original noncausal native band"):

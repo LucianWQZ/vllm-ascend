@@ -15,6 +15,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
+import numpy as np
 import torch
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 
@@ -44,23 +45,28 @@ class DraftWindowGraphBucket:
         self,
         source: DraftWindowGraphSource,
         cpu_full_exact: torch.Tensor,
-        cpu_valid_num_blocks: torch.Tensor,
+        idx_mapping_np: np.ndarray,
         frozen_row_plans: tuple[DraftWindowPlan, ...] | None,
     ) -> None:
         assert self.owner.proposal is not None
         rows = self.owner.proposal
-        if any(
-            t.device.type != "cpu" or t.ndim != 1 or len(t) < len(rows) or t.dtype not in (torch.int32, torch.int64)
-            for t in (cpu_full_exact, cpu_valid_num_blocks)
-        ):
-            raise ValueError("current CPU exact lengths and initialized block counts are required")
+        # Both method preparation entries construct this completed int32 CPU
+        # snapshot; only its current row extent changes between proposals.
+        if len(cpu_full_exact) < len(rows) or len(idx_mapping_np) < len(rows):
+            raise ValueError("current CPU exact lengths and request slots are required")
         if frozen_row_plans is not None and len(frozen_row_plans) != len(rows):
             raise ValueError("frozen Window anchors must match active request rows")
+        # BlockTables owns initialized counts in persistent request-slot order.
+        # Gather only real rows here; padding belongs to this bank, not to a
+        # second count tensor passed through every method and provider layer.
+        counts = source.block_tables.num_blocks.cpu[source.group.gid].index_select(
+            0, torch.from_numpy(idx_mapping_np[: len(rows)])
+        )
         source_table, span = source.table, source.group.table_column_span
         intervals = []
         # Validate the whole current preparation before the first tensor write.
         for row, full_read in enumerate(rows):
-            exact, valid = int(cpu_full_exact[row]), int(cpu_valid_num_blocks[row])
+            exact, valid = int(cpu_full_exact[row]), int(counts[row])
             if exact < 0 or not 0 <= valid <= source_table.shape[1]:
                 raise RuntimeError("current exact length or initialized block count is invalid")
             if full_read:
@@ -137,7 +143,7 @@ class DraftWindowGraphBindingProvider:
         capture: DraftWindowGraphBucket,
         *,
         cpu_full_exact: torch.Tensor,
-        cpu_valid_num_blocks: torch.Tensor,
+        idx_mapping_np: np.ndarray,
         step: int,
         frozen_row_plans: tuple[DraftWindowPlan, ...] | None = None,
     ) -> DraftWindowGraphBucket:
@@ -163,11 +169,7 @@ class DraftWindowGraphBindingProvider:
             raise RuntimeError("Graph consumers belong to different execution buckets")
         capture.params = None
         self._active_bank = capture
-        try:
-            capture.materialize(self.source, cpu_full_exact, cpu_valid_num_blocks, frozen_row_plans)
-        except BaseException:
-            self.quarantine()
-            raise
+        capture.materialize(self.source, cpu_full_exact, idx_mapping_np, frozen_row_plans)
         return capture
 
     def complete_native(self) -> None:

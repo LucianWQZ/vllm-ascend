@@ -353,16 +353,11 @@ def validate_eagle_single_request_graph_descriptor(owner, *, first, n, tokens):
     if not _is_eagle_support(scope):
         return
     batch = owner.input_batch
-    rows = _request_bounds(batch)
     if type(first) is not bool or type(n) is not int or type(tokens) is not int:
         raise TypeError("Eagle review requires exact Graph descriptor types")
-    if (
-        not 1 <= n <= scope.max_requests
-        or n != batch.num_reqs
-        or n != batch.num_reqs_after_padding
-        or n != len(rows)
-        or tokens != n * (scope.static_k + 1 if first else 1)
-    ):
+    # Propose already admitted active/padded rows and their request bounds.
+    # Only the selected runtime descriptor can change before this replay.
+    if n != batch.num_reqs or tokens != n * (scope.static_k + 1 if first else 1):
         raise NotImplementedError(
             "Eagle review Graph requires padded1 or explicitly admitted padded2, first Q4 or AR Q1 before replay"
         )

@@ -10,7 +10,6 @@ this module neither clones those algorithms nor creates another Graph owner.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from typing import Any
 
 
@@ -59,12 +58,11 @@ def validate_dflash2_graph_config(vllm_config: Any) -> None:
     )
 
 
-def validate_dflash2_graph_read_source(
-    owner: Any, group: Any, *, causal: bool | Mapping[int, bool], window_size: int
-) -> None:
+def validate_dflash2_graph_read_source(owner: Any, group: Any, *, window_size: int) -> None:
     """Qualify the real owner and its inventory without a second buffer owner."""
     validate_dflash2_graph_source(owner)
     gid, kernel, native = group.gid, group.table_column_span, group.native_window
+    causal = owner._group_causal
     context = owner.vllm_config.compilation_config.static_forward_context
     _require(
         len(group.layers) == len(owner.draft_attn_layer_names)

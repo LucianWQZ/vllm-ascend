@@ -14,7 +14,7 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.input_batch import InputBuffers
 
-from vllm_ascend.worker.v2.spec_decode.draft_window import DraftWindowGraphSource, gather_valid_num_blocks_cpu
+from vllm_ascend.worker.v2.spec_decode.draft_window import DraftWindowGraphSource
 from vllm_ascend.worker.v2.spec_decode.draft_window_backends import DraftWindowGroupRoute, DraftWindowProviderStatus
 from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowGraphInputMixin
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphBindingProvider
@@ -37,7 +37,7 @@ def graph_buffers():
         block_sizes=(4,),
         kernel_block_sizes=(4,),
     )
-    group = DraftWindowGroupRoute(0, ("draft.layer",), 4, 4, DraftWindowProviderStatus.DIRECT_DENSE)
+    group = DraftWindowGroupRoute(0, ("draft.layer",), 4, DraftWindowProviderStatus.DIRECT_DENSE)
     source = DraftWindowGraphSource(resolve_draft_window_policy(requested_window_size=4, method="dflash"), group, owner)
     provider = DraftWindowGraphBindingProvider(source=source)
     desc = BatchExecutionDescriptor(CUDAGraphMode.FULL, 2, 2, uniform_token_count=1)
@@ -58,10 +58,12 @@ def graph_buffers():
 
 def _prepare(case, ends=(11, 14), *, capture=None, step=0, plans=None, valid=None):
     bank = case.capture if capture is None else capture
+    if valid is not None:
+        case.owner.num_blocks.cpu[0, : len(valid)] = torch.tensor(valid)
     return case.provider.prepare(
         bank,
         cpu_full_exact=torch.tensor(ends, dtype=torch.int32),
-        cpu_valid_num_blocks=torch.tensor(valid or [4] * len(ends), dtype=torch.int32),
+        idx_mapping_np=np.arange(len(ends), dtype=np.int64),
         step=step,
         frozen_row_plans=plans,
     )
@@ -82,10 +84,17 @@ def _resolve(provider, count=1):
 
 
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
-def test_parallel_exact_is_an_independent_completed_cpu_snapshot(dtype):
+def test_parallel_exact_is_an_independent_completed_cpu_snapshot(graph_buffers, monkeypatch, dtype):
+    c = graph_buffers
     owner = DraftWindowGraphInputMixin()
+    owner._draft_window_graph_binding_provider = c.provider
     owner.input_buffers = SimpleNamespace(seq_lens=torch.tensor([11, 14], dtype=dtype))
-    exact = owner._snapshot_prepared_draft_seq_lens(2)
+    owner.input_batch = SimpleNamespace(num_reqs=2, idx_mapping_np=np.array([0, 1]))
+    prepared = []
+    monkeypatch.setattr(c.provider, "prepare", lambda capture, **kwargs: prepared.append(kwargs["cpu_full_exact"]))
+    with c.provider.proposal_scope(_proposal()):
+        owner._materialize_draft_window_read_inputs(num_reqs=2, batch_desc=c.capture.descriptor)
+    exact = prepared[0]
     assert exact.device.type == "cpu" and exact.dtype == torch.int32
     owner.input_buffers.seq_lens.zero_()
     assert exact.tolist() == [11, 14]
@@ -93,11 +102,26 @@ def test_parallel_exact_is_an_independent_completed_cpu_snapshot(dtype):
 
 def test_count_gather_uses_request_slots_and_leaves_padding_inert(graph_buffers):
     c = graph_buffers
-    c.owner.num_blocks.cpu[0] = torch.tensor([3, 4])
-    out = gather_valid_num_blocks_cpu(c.source, idx_mapping_np=np.array([1]), num_reqs=1, num_reqs_padded=2)
-    assert out.tolist() == [4, 0]
-    c.owner.num_blocks.cpu.zero_()
-    assert out.tolist() == [4, 0]
+    c.owner.num_blocks.cpu[0] = torch.tensor([1, 4])
+    with c.provider.proposal_scope(_proposal(1)):
+        bank = c.provider.prepare(c.capture, cpu_full_exact=torch.tensor([14]), idx_mapping_np=np.array([1]), step=0)
+        assert bank.cpu_window_exact.tolist() == [6, 0]
+        assert bank.window_block_table.tolist() == [[13, 14, 0, 0], [0, 0, 0, 0]]
+        c.owner.num_blocks.cpu.zero_()
+        assert bank.cpu_window_exact.tolist() == [6, 0]
+        c.provider.bind_current(bank.descriptor)
+        c.provider.finish_update()
+
+
+@pytest.mark.parametrize("mapping", [np.array([-1]), np.array([2]), np.array([], dtype=np.int64)])
+def test_bad_live_request_mapping_is_rejected_before_any_bank_write(graph_buffers, mapping):
+    c = graph_buffers
+    before = [tensor.clone() for tensor in _tensors(c.capture)]
+    with pytest.raises((IndexError, ValueError)), c.provider.proposal_scope(_proposal(1)):
+        c.provider.prepare(c.capture, cpu_full_exact=torch.tensor([14]), idx_mapping_np=mapping, step=0)
+    assert c.provider.quarantined
+    for original, actual in zip(before, _tensors(c.capture)):
+        torch.testing.assert_close(actual, original)
 
 
 def test_real_scope_reuses_addresses_clears_tail_and_preserves_full_and_target(graph_buffers):
@@ -153,9 +177,7 @@ def test_prepare_and_publish_reject_unbound_pending_wrong_descriptor_and_foreign
     with c.provider.proposal_scope(_proposal()):
         before = c.capture.window_block_table.clone()
         with pytest.raises(RuntimeError, match="owning proposal"):
-            c.provider.prepare(
-                foreign, cpu_full_exact=torch.tensor([11, 14]), cpu_valid_num_blocks=torch.tensor([4, 4]), step=0
-            )
+            c.provider.prepare(foreign, cpu_full_exact=torch.tensor([11, 14]), idx_mapping_np=np.array([0, 1]), step=0)
         assert torch.equal(c.capture.window_block_table, before)
         bank = _prepare(c)
         with pytest.raises(RuntimeError, match="still active"):
@@ -261,7 +283,7 @@ def test_bank_projects_only_initialized_columns_across_boundaries(span, boundary
         block_sizes=(span,),
         kernel_block_sizes=(span,),
     )
-    group = DraftWindowGroupRoute(0, ("draft",), span, span, DraftWindowProviderStatus.DIRECT_DENSE)
+    group = DraftWindowGroupRoute(0, ("draft",), span, DraftWindowProviderStatus.DIRECT_DENSE)
     provider = DraftWindowGraphBindingProvider(
         source=DraftWindowGraphSource(
             resolve_draft_window_policy(requested_window_size=boundary, method="dflash"), group, tables
@@ -272,9 +294,7 @@ def test_bank_projects_only_initialized_columns_across_boundaries(span, boundary
     for exact in (boundary - 1, boundary, boundary + 1, 2 * boundary + 1):
         plan = compute_draft_window_plan(full_exact_end=exact, window_size=boundary, block_span_tokens=span)
         with provider.proposal_scope(_proposal(1)):
-            provider.prepare(
-                bank, cpu_full_exact=torch.tensor([exact]), cpu_valid_num_blocks=torch.tensor([64]), step=0
-            )
+            provider.prepare(bank, cpu_full_exact=torch.tensor([exact]), idx_mapping_np=np.array([0]), step=0)
             start = plan.window_start // span
             count = (plan.window_visible_length + span - 1) // span
             assert torch.equal(bank.window_block_table[0, :count], table[0, start : start + count])
@@ -418,7 +438,9 @@ def test_parallel_idle_marker_is_owned_by_real_scope_not_prefill_or_profile(
     case = graph_buffers
     owner = object.__new__(DraftWindowGraphInputMixin)
     owner._draft_window_graph_binding_provider = case.provider
-    owner._initialize_draft_window_graph_inputs()
+    owner._draft_window_bypass_active = False
+    owner._draft_window_prefill_bypass_active = False
+    owner._draft_window_dp_dummy_active = False
     owner.dp_size = dp
     if not captures:
         case.provider._carriers.clear()
@@ -445,7 +467,9 @@ def test_parallel_idle_failure_quarantines_before_next_real_scope(graph_buffers)
 
     owner = object.__new__(DraftWindowGraphInputMixin)
     owner._draft_window_graph_binding_provider = graph_buffers.provider
-    owner._initialize_draft_window_graph_inputs()
+    owner._draft_window_bypass_active = False
+    owner._draft_window_prefill_bypass_active = False
+    owner._draft_window_dp_dummy_active = False
     owner.dp_size = 2
     with (
         pytest.raises(RuntimeError, match="idle UPDATE failed"),
@@ -507,7 +531,9 @@ def test_actual_manager_keeps_resolve_wait_replay_update_order(graph_buffers, mo
     scope = nullcontext()
     if window:
         owner._draft_window_graph_binding_provider = c.provider
-        owner._initialize_draft_window_graph_inputs()
+        owner._draft_window_bypass_active = False
+        owner._draft_window_prefill_bypass_active = False
+        owner._draft_window_dp_dummy_active = False
         if idle:
             owner.dp_size = 2
             scope = owner._draft_window_proposal_scope(object(), dummy_run=True, is_profile=False)

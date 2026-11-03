@@ -125,7 +125,7 @@ def proposal():
         block_sizes=(4,),
         kernel_block_sizes=(4,),
     )
-    group = DraftWindowGroupRoute(0, ("draft.layer",), 4, 4, DraftWindowProviderStatus.DIRECT_DENSE)
+    group = DraftWindowGroupRoute(0, ("draft.layer",), 4, DraftWindowProviderStatus.DIRECT_DENSE)
     source = DraftWindowGraphSource(
         resolve_draft_window_policy(requested_window_size=4, method="eagle3"), group, tables
     )
@@ -652,7 +652,7 @@ def test_dp_synchronized_native_first_without_local_prefill(monkeypatch, mode, f
         kernel_block_sizes=[128],
         gather_block_tables=lambda mapping, **kwargs: None,
     )
-    group = DraftWindowGroupRoute(0, ("draft",), 128, 128, DraftWindowProviderStatus.DIRECT_DENSE)
+    group = DraftWindowGroupRoute(0, ("draft",), 128, DraftWindowProviderStatus.DIRECT_DENSE)
     source = DraftWindowGraphSource(
         policy=resolve_draft_window_policy(requested_window_size=1024, method="eagle3"),
         group=group,
@@ -738,8 +738,6 @@ def test_dp_synchronized_native_first_without_local_prefill(monkeypatch, mode, f
 
 
 def test_terminal_prefill_rejects_a_query_outside_the_frozen_window_before_writing_bank(proposal, monkeypatch):
-    from vllm_ascend.worker.v2.spec_decode import draft_window_eagle3
-
     owner, batch, session, runtime, _ = proposal
     owner.input_batch, owner.max_model_len = batch, 32
     batch.num_computed_prefill_tokens_np = np.array([0])
@@ -747,9 +745,7 @@ def test_terminal_prefill_rejects_a_query_outside_the_frozen_window_before_writi
     batch.is_prefilling_np, batch.has_prefill = np.array([True]), True
     batch.query_start_loc_np = np.array([0, 10], dtype=np.int32)
     monkeypatch.setattr(
-        draft_window_eagle3,
-        "gather_valid_num_blocks_cpu",
-        lambda *args, **kwargs: pytest.fail("unsupported query reached bank materialization"),
+        runtime, "prepare", lambda *args, **kwargs: pytest.fail("unsupported query reached bank materialization")
     )
     with (
         pytest.raises(NotImplementedError, match="query begins before its frozen read window"),
@@ -760,8 +756,6 @@ def test_terminal_prefill_rejects_a_query_outside_the_frozen_window_before_writi
 
 
 def test_mixed_prefill_query_guard_keeps_full_rows_and_checks_only_actual_window_rows(proposal, monkeypatch):
-    from vllm_ascend.worker.v2.spec_decode import draft_window_eagle3
-
     owner, batch, session, runtime, _ = proposal
     owner.input_batch, owner.max_model_len = batch, 32
     batch.num_reqs, batch.req_ids = 2, ["continuing", "terminal"]
@@ -770,9 +764,6 @@ def test_mixed_prefill_query_guard_keeps_full_rows_and_checks_only_actual_window
     batch.prefill_len_np, batch.num_scheduled_tokens = np.array([100, 10]), np.array([10, 2])
     batch.seq_lens_np, batch.query_start_loc_np = np.array([20, 10]), np.array([0, 10, 12], dtype=np.int32)
     batch.is_prefilling_np, batch.has_prefill = np.array([True, True]), True
-    monkeypatch.setattr(
-        draft_window_eagle3, "gather_valid_num_blocks_cpu", lambda *args, **kwargs: torch.tensor([5, 3, 0, 0])
-    )
     calls = []
 
     def prepare(capture, **kwargs):
@@ -793,14 +784,10 @@ def test_mixed_prefill_query_guard_keeps_full_rows_and_checks_only_actual_window
 
 @pytest.mark.parametrize("values", [np.array([10.5]), np.array([-1]), np.array([], dtype=np.int32)])
 def test_eagle_rejects_invalid_canonical_lengths_before_writing_a_bank(proposal, monkeypatch, values):
-    from vllm_ascend.worker.v2.spec_decode import draft_window_eagle3
-
     owner, batch, session, runtime, _ = proposal
     owner.input_batch = batch
     batch.seq_lens_np = values
-    monkeypatch.setattr(
-        draft_window_eagle3, "gather_valid_num_blocks_cpu", lambda *args, **kwargs: pytest.fail("invalid bank write")
-    )
+    monkeypatch.setattr(runtime, "prepare", lambda *args, **kwargs: pytest.fail("invalid bank write"))
     with pytest.raises(ValueError), owner._eagle3_draft_window_proposal_scope(batch, dummy_run=False, is_profile=False):
         owner._materialize_eagle3_step(session.resolve(n=1, tokens=4, ordinal=0), 0)
     assert runtime._active_bank is None

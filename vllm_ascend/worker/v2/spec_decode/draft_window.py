@@ -7,11 +7,10 @@ runtime. This module owns only source geometry and persistent Graph backing;
 Full write tables and Target state remain owned by the existing runner.
 """
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-import numpy as np
 import torch
 from vllm.v1.worker.utils import AttentionGroup
 
@@ -61,23 +60,6 @@ class DraftWindowGraphSource:
         return self.policy.effective_window_size
 
 
-def gather_valid_num_blocks_cpu(
-    source: DraftWindowGraphSource,
-    *,
-    idx_mapping_np: np.ndarray,
-    num_reqs: int,
-    num_reqs_padded: int,
-) -> torch.Tensor:
-    """Gather canonical request-slot counts into the current batch order."""
-    if num_reqs < 0 or num_reqs_padded < num_reqs or len(idx_mapping_np) < num_reqs:
-        raise ValueError("CPU mapping and active/padded request counts disagree")
-    counts = source.block_tables.num_blocks.cpu[source.group.gid]
-    out = torch.zeros(num_reqs_padded, dtype=torch.int32, device="cpu")
-    if num_reqs:
-        torch.index_select(counts, 0, torch.from_numpy(idx_mapping_np[:num_reqs]), out=out[:num_reqs])
-    return out
-
-
 def _build_draft_window_source_capability_for_context(
     *,
     policy: DraftWindowPolicyDecision,
@@ -85,7 +67,6 @@ def _build_draft_window_source_capability_for_context(
     attn_groups: Sequence[Sequence[AttentionGroup]],
     block_tables: Any,
     kv_cache_config: Any,
-    causal: bool | Mapping[int, bool],
     vllm_config: Any,
     dflash2_graph_owner: Any = None,
 ) -> DraftWindowGraphSource:
@@ -125,9 +106,7 @@ def _build_draft_window_source_capability_for_context(
 
         if dflash2_graph_owner is None:
             raise TypeError("DFlash2 Graph requires its actual model owner")
-        validate_dflash2_graph_read_source(
-            dflash2_graph_owner, group, causal=causal, window_size=policy.effective_window_size
-        )
+        validate_dflash2_graph_read_source(dflash2_graph_owner, group, window_size=policy.effective_window_size)
     if vllm_config.speculative_config.uses_dynamic_speculative_decoding():
         raise NotImplementedError("Draft Window Graph source requires static speculative decoding")
     return DraftWindowGraphSource(policy=policy, group=group, block_tables=block_tables)

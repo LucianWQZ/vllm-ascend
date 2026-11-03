@@ -17,7 +17,6 @@ from vllm.v1.worker.gpu.input_batch import InputBatch
 
 from vllm_ascend.worker.v2.spec_decode.draft_window import (
     _build_draft_window_source_capability_for_context,
-    gather_valid_num_blocks_cpu,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
     DraftWindowGraphBindingProvider,
@@ -62,18 +61,10 @@ class DraftWindowGraphInputMixin:
             attn_groups=self.attn_groups,
             block_tables=self.block_tables,
             kv_cache_config=self.kv_cache_config,
-            causal=self._group_causal,
             vllm_config=self.vllm_config,
             dflash2_graph_owner=self if self._speculator_name.lower() == "dflash2" else None,
         )
         self._draft_window_graph_binding_provider = DraftWindowGraphBindingProvider(source=capability)
-        self._initialize_draft_window_graph_inputs()
-
-    def _initialize_draft_window_graph_inputs(self) -> None:
-        if not hasattr(self, "_draft_window_graph_binding_provider"):
-            raise RuntimeError("Draft Window Graph inputs require an initialized Source owner")
-        if hasattr(self, "_draft_window_bypass_active"):
-            raise RuntimeError("Draft Window Graph inputs are already initialized")
         self._draft_window_bypass_active = False
         self._draft_window_prefill_bypass_active = False
         self._draft_window_dp_dummy_active = False
@@ -140,17 +131,6 @@ class DraftWindowGraphInputMixin:
             if provider._active_bank is None:
                 raise RuntimeError("Draft Graph proposal completed without consuming its current inputs")
 
-    def _snapshot_prepared_draft_seq_lens(
-        self,
-        num_reqs_padded: int,
-    ) -> torch.Tensor:
-        """Perform the one controlled D2H already present in the baseline builder."""
-        return self.input_buffers.seq_lens[:num_reqs_padded].to(
-            device="cpu",
-            dtype=torch.int32,
-            copy=True,
-        )
-
     def _materialize_draft_window_read_inputs(
         self,
         *,
@@ -169,18 +149,11 @@ class DraftWindowGraphInputMixin:
             raise ValueError("padded request count must be at least actual requests")
 
         selected = provider.capture_identity_for(descriptor=batch_desc)
-        cpu_full_exact = self._snapshot_prepared_draft_seq_lens(num_reqs_padded)
-        capability = self._draft_window_graph_binding_provider.source
-        valid_num_blocks = gather_valid_num_blocks_cpu(
-            capability,
-            idx_mapping_np=input_batch.idx_mapping_np,
-            num_reqs=num_reqs,
-            num_reqs_padded=num_reqs_padded,
-        )
+        cpu_full_exact = self.input_buffers.seq_lens[:num_reqs_padded].to(device="cpu", dtype=torch.int32, copy=True)
         provider.prepare(
             selected,
             cpu_full_exact=cpu_full_exact,
-            cpu_valid_num_blocks=valid_num_blocks,
+            idx_mapping_np=input_batch.idx_mapping_np,
             step=0,
         )
 

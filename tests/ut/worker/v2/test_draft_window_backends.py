@@ -220,7 +220,6 @@ def test_missing_native_window_is_a_missing_provider_not_an_implicit_full_reader
 
 def test_kernel_column_span_is_not_scheduler_block_size(parallel_config):
     (route,) = inventory(parallel_config)
-    assert route.scheduler_block_size == 256
     assert route.table_column_span == 128
     assert route.status is DraftWindowProviderStatus.DIRECT_DENSE
     require_routes((route,))

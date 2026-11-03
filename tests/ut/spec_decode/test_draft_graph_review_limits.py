@@ -17,6 +17,7 @@ from vllm_ascend.worker.v2.spec_decode import draft_graph_review_limits as GUARD
 from vllm_ascend.worker.v2.spec_decode import draft_window_eagle3_dp as DP
 from vllm_ascend.worker.v2.spec_decode.dflash import speculator as dflash_module
 from vllm_ascend.worker.v2.spec_decode.target_dependent_ar import aclgraph as ar_graph
+from vllm_ascend.worker.v2.spec_decode.target_dependent_ar import speculator as ar_module
 
 
 def runner_bounds(owner, batch):
@@ -611,6 +612,40 @@ class ActualGraphDescriptorControls(unittest.TestCase):
         with patch.object(ar_graph, "use_updatable_graph", return_value=False):
             return manager.run_fullgraph(desc)
 
+    def test_actual_propose_admits_rows_before_owner_change_and_off_replay(self):
+        header, batch = _single_owner_batch()
+        owner = object.__new__(ar_module.AscendTargetDependentARSpeculator)
+        owner.__dict__.update(vars(header), method="eagle3", replicated_pcp=False, pcp_manager=None)
+        old_batch = owner.input_batch = object()
+        manager, seen = self.manager(owner)
+        native_calls = []
+
+        def native_propose(actual, actual_batch, *args, **kwargs):
+            native_calls.append(actual_batch)
+            self.assertIs(actual, owner)
+            return self.run_actual(manager, NS(num_reqs=1, num_tokens=1))
+
+        with patch.object(ar_module.TargetDependentARSpeculator, "propose", native_propose):
+            for damage in ("active", "padded", "missing-bounds", "row-bounds"):
+                invalid = copy.deepcopy(batch)
+                if damage == "active":
+                    invalid.num_reqs = invalid.num_reqs_after_padding = 2
+                elif damage == "padded":
+                    invalid.num_reqs_after_padding = 2
+                elif damage == "missing-bounds":
+                    invalid.draft_graph_request_bounds = None
+                else:
+                    invalid.draft_graph_request_bounds += ((513, 545),)
+                with self.subTest(damage=damage), self.assertRaises((RuntimeError, NotImplementedError)):
+                    owner.propose(invalid, *([None] * 10))
+                self.assertIs(owner.input_batch, old_batch)
+                self.assertEqual(native_calls, [])
+                self.assertEqual(seen, [])
+            self.assertEqual(owner.propose(batch, *([None] * 10)), "legacy-result")
+        self.assertIs(owner.input_batch, batch)
+        self.assertEqual(native_calls, [batch])
+        self.assertEqual([kind for kind, _ in seen], ["metadata", "replay"])
+
     def test_off_padded_ar_rejected_before_metadata_and_replay(self):
         owner, _ = _single_owner_batch()
         manager, seen = self.manager(owner)
@@ -793,7 +828,7 @@ def idle_owner():
             raise RuntimeError("quarantined")
 
     provider.require_reusable = require_reusable
-    owner._quarantine_eagle3_window = lambda: setattr(provider, "quarantined", True)
+    provider.quarantine = lambda: setattr(provider, "quarantined", True)
     return owner, batch, session
 
 

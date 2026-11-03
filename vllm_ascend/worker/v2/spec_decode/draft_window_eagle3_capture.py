@@ -38,7 +38,6 @@ def build_eagle3_graph_source(owner: Any):
         attn_groups=owner.attn_groups,
         block_tables=owner.block_tables,
         kv_cache_config=owner.kv_cache_config,
-        causal=True,
         vllm_config=owner.vllm_config,
     )
 
