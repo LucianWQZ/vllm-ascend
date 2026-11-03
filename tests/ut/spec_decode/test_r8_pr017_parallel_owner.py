@@ -162,7 +162,6 @@ class ParallelOwnerTests(unittest.TestCase):
                 bank,
                 cpu_full_exact=torch.tensor([8], dtype=torch.int32),
                 idx_mapping_np=np.array([0], dtype=np.intp),
-                step=0,
             )
             self.provider.bind_current(descriptor)
             (params,) = self.provider.get(None)

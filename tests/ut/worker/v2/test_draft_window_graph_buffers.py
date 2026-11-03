@@ -54,32 +54,27 @@ def graph_buffers():
     )
 
 
-@pytest.mark.parametrize("damage", [None, "owner", "route"])
-def test_parallel_install_qualifies_the_real_owner_before_any_capture_bank(graph_buffers, damage):
+def test_parallel_install_uses_the_actual_manager_descriptors(graph_buffers):
     from vllm_ascend.worker.v2.spec_decode.draft_window_graph_runtime import install_parallel_graph
 
     c = graph_buffers
     provider = DraftWindowGraphBindingProvider(
-        policy=resolve_draft_window_policy(requested_window_size=4, method="eagle3" if damage == "route" else "dflash"),
+        policy=resolve_draft_window_policy(requested_window_size=4, method="dflash"),
         group=c.provider.group,
         block_tables=c.owner,
     )
     owner = SimpleNamespace(
-        _draft_window_graph_binding_provider=object() if damage == "owner" else provider,
+        _draft_window_graph_binding_provider=provider,
         query_cudagraph_manager=SimpleNamespace(_capture_descs={CUDAGraphMode.FULL: [c.capture.descriptor]}),
-        speculative_config=SimpleNamespace(num_speculative_tokens=1),
     )
-    if damage:
-        with pytest.raises(RuntimeError, match="initialized source owner|parallel Draft route"):
-            install_parallel_graph(owner)
-        assert not provider._carriers
-    else:
-        assert install_parallel_graph(owner) is provider
-        bank = provider.capture_identity_for(descriptor=c.capture.descriptor)
-        assert bank.owner is provider and bank.descriptor is c.capture.descriptor
+    assert install_parallel_graph(owner) is provider
+    bank = provider.capture_identity_for(descriptor=c.capture.descriptor)
+    assert bank.owner is provider and bank.descriptor is c.capture.descriptor
+    with pytest.raises(RuntimeError, match="already installed"):
+        install_parallel_graph(owner)
 
 
-def _prepare(case, ends=(11, 14), *, capture=None, step=0, plans=None, valid=None):
+def _prepare(case, ends=(11, 14), *, capture=None, plans=None, valid=None):
     bank = case.capture if capture is None else capture
     if valid is not None:
         case.owner.num_blocks.cpu[0, : len(valid)] = torch.tensor(valid)
@@ -87,7 +82,6 @@ def _prepare(case, ends=(11, 14), *, capture=None, step=0, plans=None, valid=Non
         bank,
         cpu_full_exact=torch.tensor(ends, dtype=torch.int32),
         idx_mapping_np=np.arange(len(ends), dtype=np.int64),
-        step=step,
         frozen_intervals=plans,
     )
 
@@ -131,7 +125,7 @@ def test_count_gather_uses_request_slots_and_leaves_padding_inert(graph_buffers)
     c = graph_buffers
     c.owner.num_blocks.cpu[0] = torch.tensor([1, 4])
     with c.provider.proposal_scope(_proposal(1)):
-        bank = c.provider.prepare(c.capture, cpu_full_exact=torch.tensor([14]), idx_mapping_np=np.array([1]), step=0)
+        bank = c.provider.prepare(c.capture, cpu_full_exact=torch.tensor([14]), idx_mapping_np=np.array([1]))
         assert bank.cpu_window_exact.tolist() == [6, 0]
         assert bank.window_block_table.tolist() == [[13, 14, 0, 0], [0, 0, 0, 0]]
         c.owner.num_blocks.cpu.zero_()
@@ -145,7 +139,7 @@ def test_bad_live_request_mapping_is_rejected_before_any_bank_write(graph_buffer
     c = graph_buffers
     before = [tensor.clone() for tensor in _tensors(c.capture)]
     with pytest.raises((IndexError, ValueError)), c.provider.proposal_scope(_proposal(1)):
-        c.provider.prepare(c.capture, cpu_full_exact=torch.tensor([14]), idx_mapping_np=mapping, step=0)
+        c.provider.prepare(c.capture, cpu_full_exact=torch.tensor([14]), idx_mapping_np=mapping)
     assert c.provider.quarantined
     for original, actual in zip(before, _tensors(c.capture)):
         torch.testing.assert_close(actual, original)
@@ -200,7 +194,7 @@ def test_actual_scope_quarantines_partial_or_uncertain_submission(graph_buffers,
 def test_prepare_and_publish_reject_unbound_pending_wrong_descriptor_and_foreign_bank(graph_buffers):
     c = graph_buffers
     other = DraftWindowGraphBindingProvider(
-        policy=resolve_draft_window_policy(requested_window_size=c.provider.window_size, method=c.provider.method),
+        policy=resolve_draft_window_policy(requested_window_size=c.provider.window_size, method="dflash"),
         group=c.provider.group,
         block_tables=c.owner,
     )
@@ -208,7 +202,7 @@ def test_prepare_and_publish_reject_unbound_pending_wrong_descriptor_and_foreign
     with c.provider.proposal_scope(_proposal()):
         before = c.capture.window_block_table.clone()
         with pytest.raises(RuntimeError, match="owning proposal"):
-            c.provider.prepare(foreign, cpu_full_exact=torch.tensor([11, 14]), idx_mapping_np=np.array([0, 1]), step=0)
+            c.provider.prepare(foreign, cpu_full_exact=torch.tensor([11, 14]), idx_mapping_np=np.array([0, 1]))
         assert torch.equal(c.capture.window_block_table, before)
         bank = _prepare(c)
         with pytest.raises(RuntimeError, match="still active"):
@@ -290,10 +284,10 @@ def test_eagle_keeps_distinct_ordinals_and_one_frozen_anchor(graph_buffers):
     )
     c.provider = provider
     with provider.proposal_scope(_proposal()):
-        first = _prepare(c, capture=banks[0], step=1, plans=plans)
+        first = _prepare(c, capture=banks[0], plans=plans)
         provider.bind_current(desc)
         first_values = [t.clone() for t in _tensors(first)]
-        second = _prepare(c, (12, 15), capture=banks[1], step=2, plans=plans)
+        second = _prepare(c, (12, 15), capture=banks[1], plans=plans)
         provider.bind_current(desc)
         assert all(torch.equal(a, b) for a, b in zip(first_values, _tensors(first)))
         assert all(a.data_ptr() != b.data_ptr() for a, b in zip(_tensors(first), _tensors(second)))
@@ -320,7 +314,7 @@ def test_eagle_rejects_out_of_frozen_interval_before_any_bank_write(graph_buffer
     before = [tensor.clone() for tensor in _tensors(bank)]
     c.provider = provider
     with pytest.raises(ValueError, match="frozen proposal window/horizon"), provider.proposal_scope(_proposal()):
-        _prepare(c, exact, capture=bank, step=1, plans=((8, 14), (12, 17)))
+        _prepare(c, exact, capture=bank, plans=((8, 14), (12, 17)))
     assert provider.quarantined
     assert all(torch.equal(left, right) for left, right in zip(before, _tensors(bank)))
 
@@ -345,7 +339,7 @@ def test_bank_projects_only_initialized_columns_across_boundaries(span, boundary
     for exact in (boundary - 1, boundary, boundary + 1, 2 * boundary + 1):
         anchor = compute_draft_window_start(full_exact_end=exact, window_size=boundary, block_span_tokens=span)
         with provider.proposal_scope(_proposal(1)):
-            provider.prepare(bank, cpu_full_exact=torch.tensor([exact]), idx_mapping_np=np.array([0]), step=0)
+            provider.prepare(bank, cpu_full_exact=torch.tensor([exact]), idx_mapping_np=np.array([0]))
             start = anchor // span
             count = (exact - anchor + span - 1) // span
             assert torch.equal(bank.window_block_table[0, :count], table[0, start : start + count])

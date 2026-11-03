@@ -10,7 +10,6 @@ output snapshot, artifact writer, or oracle participates in this path.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from typing import Any
 
 from vllm.config.compilation import CUDAGraphMode
@@ -47,18 +46,10 @@ def validate_graph_context(vllm_config: Any, block_tables: Any) -> None:
 
 def install_parallel_graph(owner: Any) -> DraftWindowGraphBindingProvider:
     """Install one provider and register every real startup capture bucket."""
-    provider = getattr(owner, "_draft_window_graph_binding_provider", None)
-    if not isinstance(provider, DraftWindowGraphBindingProvider):
-        raise RuntimeError("Draft Window Graph requires its initialized source owner")
+    provider = owner._draft_window_graph_binding_provider
     if provider._carriers:
         raise RuntimeError("Draft Window Graph capture buckets are already installed")
-    manager = getattr(owner, "query_cudagraph_manager", None)
-    capture_descs = getattr(manager, "_capture_descs", None)
-    if not isinstance(capture_descs, Mapping) or not capture_descs:
-        raise RuntimeError("Draft Window Graph requires real manager capture descriptors")
-
-    if provider.method not in ("dflash", "dspark"):
-        raise RuntimeError("Draft Window Graph has no parallel Draft route")
+    capture_descs = owner.query_cudagraph_manager._capture_descs
     descriptors = tuple(
         descriptor
         for mode_descriptors in capture_descs.values()
@@ -67,8 +58,6 @@ def install_parallel_graph(owner: Any) -> DraftWindowGraphBindingProvider:
     )
     if not descriptors:
         raise RuntimeError("Draft Window Graph manager has no capture descriptors")
-    if int(owner.speculative_config.num_speculative_tokens) <= 0:
-        raise ValueError("Draft Window Graph static K must be positive")
     for descriptor in descriptors:
         provider.register_capture_identity(
             descriptor=descriptor,

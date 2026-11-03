@@ -423,7 +423,7 @@ def test_parallel_metadata_hook_prepares_one_bank_without_a_temporary_metadata_b
         8,
     )
     assert result is None and not hasattr(owner, "_draft_window_live_inputs")
-    assert len(calls) == 1 and calls[0]["step"] == 0
+    assert len(calls) == 1
     assert calls[0]["cpu_full_exact"].tolist() == [16]
     assert owner.input_buffers.seq_lens.tolist() == [16, 777]
     assert calls[0]["idx_mapping_np"] is owner.input_batch.idx_mapping_np

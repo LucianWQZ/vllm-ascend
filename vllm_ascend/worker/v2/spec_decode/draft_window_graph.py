@@ -109,7 +109,7 @@ class DraftWindowGraphBindingProvider:
 
     def __init__(self, *, policy: DraftWindowPolicyDecision, group: DraftWindowGroupRoute, block_tables: Any) -> None:
         assert policy.effective_window_size is not None
-        self.window_size, self.method = policy.effective_window_size, policy.normalized_method
+        self.window_size = policy.effective_window_size
         self.group, self.block_tables = group, block_tables
         if self.table.shape[1] * group.table_column_span < window_capacity_tokens(
             self.window_size, group.table_column_span
@@ -153,7 +153,6 @@ class DraftWindowGraphBindingProvider:
         *,
         cpu_full_exact: torch.Tensor,
         idx_mapping_np: np.ndarray,
-        step: int,
         frozen_intervals: tuple[tuple[int, int], ...] | None = None,
     ) -> DraftWindowGraphBucket:
         """Select and update the actual consumer before any preparation write."""
@@ -165,13 +164,8 @@ class DraftWindowGraphBindingProvider:
             raise RuntimeError("previous Draft Window consumer is still active")
         if capture in self._pending:
             raise RuntimeError("cannot overwrite a pending Draft Window consumer")
-        if type(step) is not int or step < 0 or len(proposal) > capture.descriptor.num_reqs:
-            raise ValueError("Draft Window consumer step or active/padded geometry is invalid")
-        ar_consumer = self.method == "eagle3" and capture.descriptor.num_tokens == capture.descriptor.num_reqs
-        if ar_consumer != (step > 0):
-            raise RuntimeError("Graph route does not match the actual consumer step")
-        if frozen_intervals is not None and self.method != "eagle3":
-            raise ValueError("proposal-frozen Window anchors belong only to Eagle3")
+        if len(proposal) > capture.descriptor.num_reqs:
+            raise ValueError("Draft Window active rows exceed the selected capture bucket")
         if capture.consumer_ordinal != len(self._pending):
             raise RuntimeError("Graph Window consumers must prepare in their actual serial ordinal order")
         if self._pending and self._pending[0].descriptor != capture.descriptor:

@@ -206,7 +206,6 @@ class Eagle3DraftWindowMixin:
             frozen_intervals=proposal,
             cpu_full_exact=exact,
             idx_mapping_np=batch.idx_mapping_np,
-            step=step,
         )
         self._eagle3_window_intervals = proposal
         return bank

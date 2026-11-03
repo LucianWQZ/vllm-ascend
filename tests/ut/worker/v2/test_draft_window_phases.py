@@ -118,7 +118,7 @@ def _materialize(full_source, batch, exact, counts, frozen=None):
         block_tables = full_source.block_tables
         block_tables.num_blocks.cpu[0] = torch.tensor(counts, dtype=torch.int32)
     provider = DraftWindowGraphBindingProvider(
-        policy=resolve_draft_window_policy(requested_window_size=full_source.window_size, method=full_source.method),
+        policy=resolve_draft_window_policy(requested_window_size=full_source.window_size, method="eagle3"),
         group=full_source.group,
         block_tables=block_tables,
     )
@@ -130,7 +130,6 @@ def _materialize(full_source, batch, exact, counts, frozen=None):
         cpu_full_exact=torch.tensor(exact, dtype=torch.int32),
         idx_mapping_np=batch.idx_mapping_np,
         frozen_intervals=frozen,
-        step=0,
     )
 
 
