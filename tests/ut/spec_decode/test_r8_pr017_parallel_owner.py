@@ -162,7 +162,7 @@ class ParallelOwnerTests(unittest.TestCase):
             )
             self.provider.bind_current(descriptor)
             (params,) = self.provider.get(None)
-            self.assertIs(params["block_table"], bank.window_block_table)
+            self.assertEqual(set(params), {"actual_seq_lengths_kv"})
             self.assertEqual(params["actual_seq_lengths_kv"], [4])
             self.assertEqual(int(bank.window_block_table[0, 0]), 1)
             self.provider.finish_update()

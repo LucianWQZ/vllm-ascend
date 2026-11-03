@@ -250,12 +250,7 @@ class DraftWindowGraphBindingProvider:
         bank = self._active_bank
         if self.quarantined or bank is None or bank.descriptor != descriptor:
             raise RuntimeError("Graph replay does not own the current unconsumed preparation")
-        query_width = descriptor.num_tokens // descriptor.num_reqs
-        params = {
-            "actual_seq_lengths": [query_width * (row + 1) for row in range(descriptor.num_reqs)],
-            "actual_seq_lengths_kv": bank.cpu_window_exact.tolist(),
-            "block_table": bank.window_block_table,
-        }
+        params = {"actual_seq_lengths_kv": bank.cpu_window_exact.tolist()}
         self._pending.append((bank, params))
         self._active_bank = None
 
@@ -279,6 +274,9 @@ class DraftWindowGraphBindingProvider:
                 continue
             if not graph.tasks:
                 raise RuntimeError("Draft Window Graph captured no attention consumer")
+            banks = self.capture_banks_for(num_reqs=descriptor.num_reqs, num_tokens=descriptor.num_tokens)
+            q = descriptor.num_tokens // descriptor.num_reqs
+            queries = list(range(q, descriptor.num_tokens + 1, q))
             for task in graph.tasks:
                 if (
                     not isinstance(task.provider, FIAParamProvider)
@@ -288,6 +286,12 @@ class DraftWindowGraphBindingProvider:
                     or task.operation != torch_npu.npu_fused_infer_attention_score.out
                 ):
                     raise RuntimeError("Draft Window Graph requires its supported Draft FIA consumer")
+                # Task kwargs are capture-owned copies; stable banks supply their addresses.
+                if (
+                    task.kwargs["actual_seq_lengths"] != queries
+                    or task.kwargs["block_table"].data_ptr() != banks[task.provider_index].window_block_table.data_ptr()
+                ):
+                    raise RuntimeError("Draft Window capture changed its fixed query or bank address")
 
     def finish_update(self) -> None:
         """Drop staged Host bindings after UPDATE; actual streams still own reuse."""

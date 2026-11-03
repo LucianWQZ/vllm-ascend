@@ -95,7 +95,15 @@ def _resolve(provider, count=1):
     from vllm_ascend.compilation.updatable_graph import GraphUpdateTask, UpdatableGraph
 
     p = FIAParamProvider(provider.group.layers[0], None, is_draft_model=True)
-    tasks = [GraphUpdateTask(object(), {}, p, i, object(), object()) for i in range(count)]
+    tasks = []
+    for i in range(count):
+        bank = provider._pending[i][0]
+        q = bank.descriptor.num_tokens // bank.descriptor.num_reqs
+        captured = {
+            "actual_seq_lengths": list(range(q, bank.descriptor.num_tokens + 1, q)),
+            "block_table": bank.window_block_table,
+        }
+        tasks.append(GraphUpdateTask(object(), captured, p, i, object(), object()))
     graph = SimpleNamespace(provider_sizes={p: count}, tasks=tasks)
     return graph, UpdatableGraph.resolve_tasks(graph, provider)
 
@@ -157,7 +165,7 @@ def test_real_scope_reuses_addresses_clears_tail_and_preserves_full_and_target(g
             assert c.provider.get(None) == ()
             c.provider.bind_current(bank.descriptor)
             (params,) = c.provider.get(None)
-            assert params["block_table"] is bank.window_block_table
+            assert set(params) == {"actual_seq_lengths_kv"}
             assert params["actual_seq_lengths_kv"] == bank.cpu_window_exact.tolist()
             if previous is not None:
                 assert params is not previous
@@ -531,6 +539,49 @@ def test_parallel_idle_failure_quarantines_before_next_real_scope(graph_buffers)
         pytest.fail("an uncertain idle Graph must not be submitted again")
 
 
+@pytest.mark.parametrize("damage", [None, "query", "bank"])
+def test_actual_capture_owns_fixed_queries_and_bank_while_only_kv_lengths_change(graph_buffers, damage):
+    import torch_npu
+
+    from vllm_ascend.attention.attention_v1 import FIAParamProvider
+    from vllm_ascend.compilation.updatable_graph import GraphUpdateTask, UpdatableGraph
+    from vllm_ascend.utils import weak_ref_tensors
+
+    c = graph_buffers
+    original_queries = [1, 2]
+    captured = weak_ref_tensors({"actual_seq_lengths": original_queries, "block_table": c.capture.window_block_table})
+    task = GraphUpdateTask(
+        torch_npu.npu_fused_infer_attention_score.out,
+        captured,
+        FIAParamProvider("draft.layer", None, is_draft_model=True),
+        0,
+        object(),
+        object(),
+    )
+    graph = SimpleNamespace(tasks=[task], provider_sizes={task.provider: 1})
+    original_queries[0] = 91
+    assert captured["actual_seq_lengths"] == [1, 2]
+    if damage == "query":
+        captured["actual_seq_lengths"] = [2, 4]
+    elif damage == "bank":
+        captured["block_table"] = c.capture.window_block_table.clone()
+    if damage is not None:
+        with pytest.raises(RuntimeError, match="fixed query or bank address"):
+            c.provider.validate_captured_graphs({c.capture.descriptor: graph})
+        return
+    c.provider.validate_captured_graphs({c.capture.descriptor: graph})
+    with c.provider.proposal_scope(_proposal()):
+        bank = _prepare(c)
+        c.provider.bind_current(bank.descriptor)
+        (task_params,) = c.provider.get(task.provider)
+        assert set(task_params) == {"actual_seq_lengths_kv"}
+        (resolved,) = UpdatableGraph.resolve_tasks(graph, c.provider)
+        assert resolved.kwargs["actual_seq_lengths"] is captured["actual_seq_lengths"]
+        assert resolved.kwargs["block_table"] is captured["block_table"]
+        assert resolved.kwargs["actual_seq_lengths_kv"] == [7, 6]
+        c.provider.finish_update()
+
+
 @pytest.mark.parametrize("field", ["provider", "operation", "is_non_pa"])
 def test_capture_contract_rejects_an_unsupported_consumer(graph_buffers, field):
     import torch_npu
@@ -584,7 +635,14 @@ def test_actual_manager_keeps_resolve_wait_replay_update_order(graph_buffers, mo
         else:
             scope = c.provider.proposal_scope(_proposal())
     task_provider = FIAParamProvider("draft.layer", None, is_draft_model=True)
-    task = GraphUpdateTask(object(), {}, task_provider, 0, object(), object())
+    task = GraphUpdateTask(
+        object(),
+        {"actual_seq_lengths": [1, 2], "block_table": c.capture.window_block_table},
+        task_provider,
+        0,
+        object(),
+        object(),
+    )
     events, resolved = [], []
 
     class Graph:
