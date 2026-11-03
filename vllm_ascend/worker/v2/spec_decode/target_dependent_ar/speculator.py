@@ -16,6 +16,7 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 #
+import logging
 from collections.abc import Mapping
 from contextlib import contextmanager, nullcontext
 from copy import copy
@@ -26,7 +27,6 @@ import torch
 from vllm.config import VllmConfig, replace, set_current_vllm_config
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed import get_dcp_group
-from vllm.logger import logger
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -67,6 +67,9 @@ from vllm_ascend.worker.v2.spec_decode.target_dependent_ar.sparse_kv_offload imp
 
 if TYPE_CHECKING:
     from vllm_ascend.worker.v2.model_states.default import AscendModelState
+
+
+logger = logging.getLogger(__name__)
 
 
 class AscendTargetDependentARSpeculator(LmheadTPDraftSamplingMixin, TargetDependentARSpeculator):
@@ -427,7 +430,7 @@ class AscendTargetDependentARSpeculator(LmheadTPDraftSamplingMixin, TargetDepend
 
         from vllm_ascend.worker.v2.spec_decode.draft_window_native_attention import report_owner_draft_native_attention
 
-        report_owner_draft_native_attention(self, logger)
+        report_owner_draft_native_attention(self)
         if hasattr(self, "draft_window_policy"):
             from vllm_ascend.worker.v2.spec_decode.draft_window_runtime import DraftWindowRuntime
 

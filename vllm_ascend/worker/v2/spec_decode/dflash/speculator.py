@@ -10,7 +10,6 @@ import numpy as np
 import torch
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.config.compilation import CUDAGraphMode
-from vllm.logger import logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
@@ -163,12 +162,7 @@ def _draft_window_owner_scope(owner, input_batch, dummy_run=False, is_profile=Fa
     runtime = getattr(owner, "_draft_window_runtime", None)
     graph_runtime = getattr(owner, "_draft_window_graph_binding_provider", None)
     limit = getattr(owner, "_draft_graph_review_limit", None)
-    context_only_full8 = (
-        limit is not None
-        and limit.method == "dflash"
-        and type(num_speculative_tokens) is int
-        and num_speculative_tokens == 0
-    )
+    context_kv_only = num_speculative_tokens == 0
     if limit is not None:
         from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import validate_draft_graph_review_requests
 
@@ -180,7 +174,7 @@ def _draft_window_owner_scope(owner, input_batch, dummy_run=False, is_profile=Fa
             input_batch,
             dummy_run=dummy_run,
             is_profile=is_profile,
-            context_kv_only=context_only_full8,
+            context_kv_only=context_kv_only,
         )
     if runtime is not None and graph_runtime is not None:
         raise RuntimeError("Draft Window eager and Graph owners cannot share one proposal")
@@ -192,11 +186,11 @@ def _draft_window_owner_scope(owner, input_batch, dummy_run=False, is_profile=Fa
         ):
             raise RuntimeError("Draft Window Graph cannot change its captured static K")
         effective_dummy = dummy_run or getattr(input_batch, "is_dummy", False)
-        if num_speculative_tokens == 0 and not (effective_dummy or is_profile):
+        if context_kv_only and not (effective_dummy or is_profile):
             return _draft_window_context_kv_scope(owner)
         return owner._draft_window_proposal_scope(input_batch, dummy_run=effective_dummy, is_profile=is_profile)
     if runtime is not None:
-        return runtime.proposal_context(input_batch, dummy_run, is_profile, context_kv_only=num_speculative_tokens == 0)
+        return runtime.proposal_context(input_batch, dummy_run, is_profile, context_kv_only=context_kv_only)
     return nullcontext()
 
 
@@ -318,7 +312,7 @@ class AscendDFlashSpeculator(DraftWindowGraphInputMixin, LmheadTPDraftSamplingMi
 
         # Actual Draft layers/builders now exist. This startup-only inventory
         # creates no eager runtime and does not infer attention from KV storage.
-        report_owner_draft_native_attention(self, logger)
+        report_owner_draft_native_attention(self)
 
         if hasattr(self, "_draft_window_policy"):
             if hasattr(self, "draft_window_policy"):

@@ -23,7 +23,6 @@ import torch
 from vllm.config import VllmConfig, get_layers_from_vllm_config, set_current_vllm_config
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed import get_dcp_group
-from vllm.logger import logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
@@ -273,7 +272,7 @@ class AscendDSparkSpeculator(DraftWindowGraphInputMixin, LmheadTPDraftSamplingMi
 
         from vllm_ascend.worker.v2.spec_decode.draft_window_native_attention import report_owner_draft_native_attention
 
-        report_owner_draft_native_attention(self, logger)
+        report_owner_draft_native_attention(self)
         if hasattr(self, "_draft_window_policy"):
             if hasattr(self, "draft_window_policy"):
                 raise RuntimeError("Draft Window cannot initialize both eager and Graph policies")
