@@ -35,13 +35,7 @@ def eagle3_dp_dummy_scope(owner, input_batch, *, dummy_run, is_profile):
     try:
         provider = session.provider
         provider.require_reusable()
-        if (
-            owner.input_batch.is_dummy is not True
-            or owner._eagle3_window_bypass_active is not True
-            or owner._eagle3_window_continuing_prefill is not False
-            or provider.proposal is not None
-            or provider._active_bank is not None
-        ):
+        if owner.input_batch.is_dummy is not True or provider.proposal != () or provider._active_bank is not None:
             raise RuntimeError("Eagle DP dummy requires its explicit local1 no-business-generation Full scope")
         yield
     except BaseException:

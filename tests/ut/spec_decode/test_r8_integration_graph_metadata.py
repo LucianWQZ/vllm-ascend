@@ -173,7 +173,10 @@ def test_dispatch_keeps_the_original_framework_selection_without_a_bank_mirror(m
     descriptor = SimpleNamespace()
     monkeypatch.setattr(DFlashCudaGraphManager, "dispatch", lambda *args: descriptor)
     manager = object.__new__(DFlashAclGraphManager)
-    for owner in (SimpleNamespace(), SimpleNamespace(_draft_window_graph_binding_provider=object())):
+    for owner in (
+        SimpleNamespace(),
+        SimpleNamespace(_draft_window_graph_binding_provider=SimpleNamespace(proposal=None)),
+    ):
         manager.speculator = owner
         assert manager.dispatch(1, 8, 8, 0) is descriptor
         assert not hasattr(owner, "_draft_window_selected_metadata")

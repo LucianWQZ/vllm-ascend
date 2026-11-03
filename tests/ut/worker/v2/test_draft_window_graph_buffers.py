@@ -720,7 +720,6 @@ def test_parallel_bypass_exception_retains_backing_and_resets_idle_marker(parall
     assert not owner._draft_window_dp_dummy_active and tuple(provider._carriers.values()) == banks
 
 
-
 def test_parallel_baseline_scope_does_not_latch_its_startup_stream(parallel_bypass_scope, monkeypatch):
     owner, batch, dummy, profile = parallel_bypass_scope
     provider = owner._draft_window_graph_binding_provider

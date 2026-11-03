@@ -300,9 +300,9 @@ class AutoRegressiveAclGraphManager(SpeculatorCudaGraphManager):
 
     def dispatch(self, num_reqs, num_tokens, uniform_token_count, num_active_loras, max_query_len=None, num_ubatches=1):
         owner = self.speculator
-        if getattr(owner, "_eagle3_graph_session", None) is not None and getattr(
-            owner, "_eagle3_window_continuing_prefill", False
-        ):
+        provider = getattr(owner, "_draft_window_graph_binding_provider", None)
+        rows = provider.proposal if provider is not None else None
+        if getattr(owner, "_eagle3_graph_session", None) is not None and rows and all(rows):
             # Only the explicit existing nonuniform/continuing-prefill phase.
             # Missing buckets and UPDATE exceptions never enter this branch.
             return BatchExecutionDescriptor(

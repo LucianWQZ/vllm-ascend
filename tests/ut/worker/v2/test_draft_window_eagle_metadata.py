@@ -247,6 +247,40 @@ def test_actual_manager_failure_stays_inside_the_proposal_quarantine(monkeypatch
     assert provider.quarantined and provider._active_bank is None and provider._pending
 
 
+@pytest.mark.parametrize("phase", ["dummy", "profile", "continuing"])
+def test_eagle_baseline_phase_uses_the_single_provider_scope(proposal, phase):
+    owner, batch, session, provider, _ = proposal
+    if phase == "continuing":
+        batch.prefill_len_np = np.array([100])
+    expected = (True,) if phase == "continuing" else ()
+    with owner._eagle3_draft_window_proposal_scope(batch, dummy_run=phase == "dummy", is_profile=phase == "profile"):
+        assert provider.proposal == expected and not owner._eagle3_window_is_active()
+        assert provider._active_bank is None and not provider._pending
+        with (
+            pytest.raises(RuntimeError, match="already active"),
+            owner._eagle3_draft_window_proposal_scope(batch, dummy_run=False, is_profile=False),
+        ):
+            pytest.fail("a baseline phase admitted a nested business proposal")
+    assert provider.proposal is None and not provider.quarantined
+    assert not hasattr(owner, "_eagle3_window_bypass_active")
+    assert not hasattr(owner, "_eagle3_window_continuing_prefill")
+
+
+@pytest.mark.parametrize("phase", ["dummy", "profile", "continuing"])
+def test_eagle_baseline_failure_retains_and_quarantines_the_capture_banks(proposal, phase):
+    owner, batch, session, provider, _ = proposal
+    if phase == "continuing":
+        batch.prefill_len_np = np.array([100])
+    banks = dict(provider._carriers)
+    with (
+        pytest.raises(ValueError, match="baseline failed"),
+        owner._eagle3_draft_window_proposal_scope(batch, dummy_run=phase == "dummy", is_profile=phase == "profile"),
+    ):
+        raise ValueError("baseline failed")
+    assert provider.proposal is None and provider.quarantined
+    assert provider._carriers == banks
+
+
 def test_business_window_proposal_requires_the_real_installed_graph_manager(proposal):
     owner, batch, session, runtime, inputs = proposal
     del owner._eagle3_graph_session

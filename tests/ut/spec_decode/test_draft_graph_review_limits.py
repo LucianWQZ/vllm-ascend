@@ -533,7 +533,6 @@ class DraftGraphSupportTest(unittest.TestCase):
         provider = owner._draft_window_graph_binding_provider = NS(
             proposal=None, capture_identity_for=Mock(), prepare=Mock()
         )
-        owner._draft_window_bypass_active = False
         owner.draft_attn_layer_names = {"draft.layer"}
         owner.num_query_per_req = 8
         owner.block_tables = NS(slot_mappings=torch.zeros((1, 32), dtype=torch.int32))
@@ -908,7 +907,7 @@ class EagleMixedRequestControls(unittest.TestCase):
 
 
 def idle_owner():
-    provider = NS(method="eagle3", _active_bank=None, proposal=None, quarantined=False)
+    provider = NS(method="eagle3", _active_bank=None, proposal=(), quarantined=False)
     session = NS(provider=provider, _capture_call=None)
     batch = NS(is_dummy=True, num_reqs=1, num_reqs_after_padding=1)
     owner = NS(
@@ -921,8 +920,6 @@ def idle_owner():
         _draft_graph_review_limit=True,
         update_stream=object(),
         _eagle3_graph_session=session,
-        _eagle3_window_bypass_active=True,
-        _eagle3_window_continuing_prefill=False,
         _draft_window_graph_binding_provider=provider,
     )
 
@@ -946,7 +943,7 @@ class EagleIdleOwnershipControls(unittest.TestCase):
                 self.assertTrue(DP.validate_eagle_dp_dummy_replay(owner, manager, descriptor, [{}] * count))
                 with self.assertRaises(RuntimeError):
                     DP.validate_eagle_dp_dummy_replay(owner, manager, descriptor, [{}] * (count + 1))
-            self.assertIsNone(owner._draft_window_graph_binding_provider.proposal)
+            self.assertEqual(owner._draft_window_graph_binding_provider.proposal, ())
         self.assertFalse(owner._eagle3_graph_dp_dummy_active)
         self.assertFalse(owner._draft_window_graph_binding_provider.quarantined)
         # K0 business first-only is a genuine request, never dummy/idle.

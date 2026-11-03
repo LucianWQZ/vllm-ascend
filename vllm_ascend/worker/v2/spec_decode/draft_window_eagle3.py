@@ -34,7 +34,6 @@ class Eagle3DraftWindowMixin:
     _draft_window_graph_binding_provider: DraftWindowGraphBindingProvider
     _eagle3_window_intervals: tuple[tuple[int, int], ...] | None
     _eagle3_window_decode_step_one_exact: torch.Tensor | None
-    _eagle3_window_bypass_active: bool
     _eagle3_window_next_step: int
     input_batch: Any
     input_buffers: Any
@@ -47,8 +46,6 @@ class Eagle3DraftWindowMixin:
         """Initialize proposal state after source/configuration validation."""
         self._eagle3_window_intervals = None
         self._eagle3_window_decode_step_one_exact = None
-        self._eagle3_window_bypass_active = False
-        self._eagle3_window_continuing_prefill = False
         self._eagle3_window_next_step = 0
         self._eagle3_window_expected_steps = self.num_speculative_steps
 
@@ -65,34 +62,24 @@ class Eagle3DraftWindowMixin:
         if not hasattr(self, "_draft_window_graph_binding_provider"):
             yield
             return
-        if self._eagle3_window_bypass_active or self._draft_window_graph_binding_provider.proposal is not None:
-            raise RuntimeError("an Eagle3 Draft Window proposal scope is already active")
-
         expected_steps = _eagle3_graph_scheduled_consumers(self.num_speculative_steps, num_speculative_tokens)
         graph_session = getattr(self, "_eagle3_graph_session", None)
         provider = self._draft_window_graph_binding_provider
-        if provider.quarantined:
-            raise RuntimeError("Eagle3 Draft Window backing is quarantined")
-        rows = None
+        rows: tuple[bool, ...] = ()
         if not dummy_run and not is_profile and not bool(getattr(input_batch, "is_dummy", False)):
             rows = tuple(map(bool, continuing_prefill_rows(input_batch, input_batch.num_reqs)))
-        bypass_for_prefill = rows is not None and bool(rows) and all(rows)
-        if dummy_run or is_profile or bool(getattr(input_batch, "is_dummy", False)) or bypass_for_prefill:
-            self._eagle3_window_bypass_active = True
-            self._eagle3_window_continuing_prefill = bypass_for_prefill
-            try:
-                from vllm_ascend.worker.v2.spec_decode.draft_window_eagle3_dp import eagle3_dp_dummy_scope
+        if not rows or all(rows):
+            from vllm_ascend.worker.v2.spec_decode.draft_window_eagle3_dp import eagle3_dp_dummy_scope
 
-                with eagle3_dp_dummy_scope(self, input_batch, dummy_run=dummy_run, is_profile=is_profile):
-                    yield
-            finally:
-                self._eagle3_window_bypass_active = False
-                self._eagle3_window_continuing_prefill = False
+            with (
+                provider.proposal_scope(rows),
+                eagle3_dp_dummy_scope(self, input_batch, dummy_run=dummy_run, is_profile=is_profile),
+            ):
+                yield
             return
 
         if graph_session is None:
             raise RuntimeError("Eagle3 Draft Window business proposals require their installed Graph manager")
-        assert rows is not None
         self._eagle3_window_intervals = None
         self._eagle3_window_decode_step_one_exact = None
         self._eagle3_window_next_step = 0
@@ -113,10 +100,9 @@ class Eagle3DraftWindowMixin:
             self._eagle3_window_expected_steps = self.num_speculative_steps
 
     def _eagle3_window_is_active(self) -> bool:
-        return (
-            hasattr(self, "_draft_window_graph_binding_provider")
-            and self._draft_window_graph_binding_provider.proposal is not None
-        )
+        provider = getattr(self, "_draft_window_graph_binding_provider", None)
+        rows = provider.proposal if provider is not None else None
+        return bool(rows) and not all(rows)
 
     def _snapshot_eagle3_decode_step_one(
         self,
