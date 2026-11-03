@@ -57,6 +57,24 @@ def window_capacity_tokens(window_size: int, block_span_tokens: int) -> int:
     return window_size + block_span_tokens - 1
 
 
+def compute_draft_window_start(
+    *,
+    full_exact_end: int,
+    window_size: int,
+    block_span_tokens: int,
+    future_offset: int = 0,
+) -> int:
+    """Return S=floor(max(E+future-W,0)/B)*B in absolute tokens."""
+    _nonnegative_integer("full_exact_end", full_exact_end)
+    _nonnegative_integer("future_offset", future_offset)
+    _positive_integer("window_size", window_size)
+    _positive_integer("block_span_tokens", block_span_tokens)
+    start = max(full_exact_end + future_offset - window_size, 0) // block_span_tokens * block_span_tokens
+    if start > full_exact_end:
+        raise ValueError("window start exceeds exact end; window is smaller than the proposal horizon requires")
+    return start
+
+
 def compute_draft_window_plan(
     *,
     full_exact_end: int,
@@ -70,15 +88,16 @@ def compute_draft_window_plan(
     group's guessed physical block size. Projection onto other groups must
     preserve this S. Capacity is an allocation bound, never proof of residency.
     """
-    _nonnegative_integer("full_exact_end", full_exact_end)
-    _nonnegative_integer("future_offset", future_offset)
-    _positive_integer("window_size", window_size)
-    _positive_integer("block_span_tokens", block_span_tokens)
-    horizon = full_exact_end + future_offset
-    start = max(horizon - window_size, 0) // block_span_tokens * block_span_tokens
-    if start > full_exact_end:
-        raise ValueError("window start exceeds exact end; window is smaller than the proposal horizon requires")
-    return DraftWindowPlan(full_exact_end, horizon, start)
+    return DraftWindowPlan(
+        full_exact_end,
+        full_exact_end + future_offset,
+        compute_draft_window_start(
+            full_exact_end=full_exact_end,
+            window_size=window_size,
+            block_span_tokens=block_span_tokens,
+            future_offset=future_offset,
+        ),
+    )
 
 
 def freeze_eagle_window_plan(
