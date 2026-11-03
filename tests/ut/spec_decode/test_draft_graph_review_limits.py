@@ -4,6 +4,7 @@
 import copy
 import unittest
 from contextlib import nullcontext
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace as NS
 from typing import Any
@@ -366,18 +367,43 @@ class DraftGraphSupportTest(unittest.TestCase):
             runner_bounds(owner, batch)
 
     def test_preemption_state_is_kept_until_actual_finish(self):
-        scope = self.resolve(self.config())
-        owner = NS(_draft_graph_review_limit=scope, max_model_len=scope.max_model_len)
-        batch = self.batch()
-        GUARD.note_eagle_single_request_review_lifecycle(
-            owner, NS(finished_req_ids=set(), preempted_req_ids={"request-0"})
-        )
-        with self.assertRaises(NotImplementedError):
-            runner_bounds(owner, batch)
-        GUARD.note_eagle_single_request_review_lifecycle(
-            owner, NS(finished_req_ids={"request-0"}, preempted_req_ids=set())
-        )
-        GUARD.validate_draft_graph_review_requests(owner, batch)
+        for method in ("eagle3", "dflash"):
+            with self.subTest(method=method):
+                scope = self.resolve(self.config(method=method))
+                owner = NS(_draft_graph_review_limit=scope, max_model_len=scope.max_model_len)
+                runner = NPUModelRunner.__new__(NPUModelRunner)
+                runner.speculator = owner
+                batch = self.batch()
+
+                def original_finish(output, *, current_owner=owner):
+                    # Our actual runner hook records lifecycle before the
+                    # original runner can update/reuse physical request rows.
+                    self.assertEqual(
+                        current_owner._draft_graph_review_preempted_request_ids,
+                        output.preempted_req_ids - output.finished_req_ids,
+                    )
+
+                with patch.object(NPUModelRunner.__mro__[1], "finish_requests", side_effect=original_finish):
+                    runner.finish_requests(NS(finished_req_ids=set(), preempted_req_ids={"request-0"}))
+                    with self.assertRaises(NotImplementedError):
+                        runner_bounds(owner, batch)
+                    runner.finish_requests(NS(finished_req_ids={"request-0"}, preempted_req_ids=set()))
+                self.assertEqual(runner_bounds(owner, batch), batch.draft_graph_request_bounds)
+                GUARD.validate_draft_graph_review_requests(owner, batch)
+
+    def test_lifecycle_ignores_absent_foreign_and_unknown_method_scopes(self):
+        unknown = replace(self.resolve(self.config()), method="unknown")
+        for owner in (
+            NS(),
+            NS(_draft_graph_review_limit=None),
+            NS(_draft_graph_review_limit=object()),
+            NS(_draft_graph_review_limit=NS(method="dflash", max_requests=1)),
+            NS(_draft_graph_review_limit=unknown),
+        ):
+            with self.subTest(owner=owner):
+                # No scheduler fields may be read for an unrelated route.
+                GUARD.note_eagle_single_request_review_lifecycle(owner, object())
+                self.assertFalse(hasattr(owner, "_draft_graph_review_preempted_request_ids"))
 
     def test_bounds_use_runner_order_and_reject_changed_or_resumed_requests(self):
         import numpy as np

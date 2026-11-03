@@ -144,10 +144,6 @@ def _consumer_profile(speculative):
     return profile
 
 
-def full8_graph_review_max_requests(limit):
-    return limit.max_requests if isinstance(limit, DraftGraphSupport) and limit.method == "dflash" else None
-
-
 def _is_eagle_support(limit: object) -> TypeGuard[DraftGraphSupport]:
     return isinstance(limit, DraftGraphSupport) and limit.method == "eagle3"
 
@@ -272,7 +268,7 @@ def note_eagle_single_request_review_lifecycle(owner, scheduler_output):
     that case. No scheduler, request state, or device object is modified.
     """
     limit = getattr(owner, "_draft_graph_review_limit", None)
-    if not _is_eagle_support(limit) and full8_graph_review_max_requests(limit) is None:
+    if not isinstance(limit, DraftGraphSupport) or limit.method not in ("dflash", "eagle3"):
         return
     blocked = getattr(owner, "_draft_graph_review_preempted_request_ids", None)
     if blocked is None:
