@@ -138,19 +138,18 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
             # Length preparation and FlashAttn tiling run inside the graph,
             # reading the draft's persistent device buffers on every replay.
             return super().run_fullgraph(desc)
-        if window_provider is not None:
-            window_provider.bind_current(desc)
         if window_provider is None:
             draft_attn_metadatas = self.speculator.build_draft_attn_metadatas(
                 desc.num_reqs,
                 self.speculator.input_batch.seq_lens_cpu_upper_bound,
             )
         else:
+            window_provider.bind_current(desc)
             draft_attn_metadatas = None
         if use_updatable_graph(attn_backend):
             ret = self._updatable_graph_replay(
                 desc,
-                draft_attn_metadatas if window_provider is None else None,
+                draft_attn_metadatas,
                 window_source=window_provider,
             )
             if window_provider is not None:
