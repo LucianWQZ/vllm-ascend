@@ -82,7 +82,6 @@ def _seed_capture_workspace(
 
     destination.zero_()
     destination[:, :valid_num_blocks].copy_(source[:, :valid_num_blocks])
-    workspace.device_window_exact.fill_(capture_upper)
     workspace.cpu_window_exact.fill_(capture_upper)
     return capture_upper
 
@@ -126,6 +125,5 @@ def ascend_prepare_dflash_inputs_to_capture(
     for name in workspace.owner.group.layers:
         layer = state.attn_metadata[name]
         bind_draft_window_read(layer, workspace, capacity)
-        layer.seq_lens_gpu = workspace.device_window_exact
         layer.query_start_loc = input_buffers.query_start_loc[: num_reqs + 1]
     return state

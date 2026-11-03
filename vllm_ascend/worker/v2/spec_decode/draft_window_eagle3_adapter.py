@@ -62,7 +62,6 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentA
                             # Seed before GLOBAL capture; no H2D belongs in its callback.
                             bank.window_block_table.zero_()
                             bank.cpu_window_exact.fill_(capacity)
-                            bank.device_window_exact.copy_(bank.cpu_window_exact)
             if not provider._carriers:
                 raise RuntimeError("Eagle3 Window requires a nonempty capture bucket inventory")
         return result
@@ -153,7 +152,6 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentA
             for layer in attn_metadata.values():
                 if layer is not None:
                     bind_draft_window_read(layer, bank, max_seq_len)
-                    layer.seq_lens_gpu = bank.device_window_exact
                     layer.attn_state = AscendAttentionState.ChunkedPrefill
         output = super()._run_model(
             num_tokens,

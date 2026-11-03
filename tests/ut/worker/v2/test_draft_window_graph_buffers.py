@@ -87,7 +87,7 @@ def _prepare(case, ends=(11, 14), *, capture=None, plans=None, valid=None):
 
 
 def _tensors(bank):
-    return bank.window_block_table, bank.device_window_exact, bank.cpu_window_exact
+    return bank.window_block_table, bank.cpu_window_exact
 
 
 def _resolve(provider, count=1):
@@ -383,7 +383,6 @@ def test_parallel_capture_uses_registered_geometry_and_preserves_full_tables(gra
         before = full.clone()
         maximum = _seed_capture_workspace(read, max_model_len=16)
         assert maximum == 7 and read.cpu_window_exact.tolist() == [7, 7]
-        assert read.device_window_exact.tolist() == [7, 7]
         assert torch.equal(full, before)
         assert torch.equal(read.window_block_table[:, :2], full[:, :2])
         with pytest.raises(RuntimeError, match="no captured consumer for this geometry"):
@@ -430,7 +429,15 @@ def test_window_capture_delegates_original_dummy_preparation_then_only_rebinds_r
     buffers.query_start_loc = torch.tensor([0, 1, 2], dtype=torch.int32)
     owner = SimpleNamespace(input_buffers=buffers, _draft_window_graph_binding_provider=case.provider)
     slots, state_marker = object(), object()
-    layer = SimpleNamespace(slot_mapping=slots, actual_seq_lengths_q=[1, 2], attn_state=state_marker, causal=False)
+    original_full_lengths = torch.tensor([16, 16], dtype=torch.int32)
+    layer = SimpleNamespace(
+        slot_mapping=slots,
+        actual_seq_lengths_q=[1, 2],
+        attn_state=state_marker,
+        causal=False,
+        seq_lens=original_full_lengths,
+        seq_lens_gpu=original_full_lengths,
+    )
     state = AttentionState({"draft.layer": layer}, {"draft.layer": slots})
     calls = []
 
@@ -447,7 +454,7 @@ def test_window_capture_delegates_original_dummy_preparation_then_only_rebinds_r
     assert result is state and len(calls) == 1
     bank = case.capture
     assert layer.block_tables is bank.window_block_table
-    assert layer.seq_lens is layer.seq_lens_gpu is bank.device_window_exact
+    assert layer.seq_lens is layer.seq_lens_gpu is original_full_lengths
     assert layer.seq_lens_cpu is bank.cpu_window_exact
     assert layer.seq_lens_list == [7, 7] and layer.max_seq_len == 7
     assert layer.query_start_loc.data_ptr() == buffers.query_start_loc.data_ptr()

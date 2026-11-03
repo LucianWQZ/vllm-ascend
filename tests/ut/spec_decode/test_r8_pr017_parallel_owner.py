@@ -91,7 +91,7 @@ class ParallelOwnerTests(unittest.TestCase):
         full_slots = owner.block_tables.slot_mappings.clone()
         descriptor = BatchExecutionDescriptor(CUDAGraphMode.FULL, num_tokens=8, num_reqs=1, uniform_token_count=8)
         bank = self.provider.register_capture_identity(descriptor=descriptor)
-        bank_tensors = (bank.window_block_table, bank.device_window_exact, bank.cpu_window_exact)
+        bank_tensors = (bank.window_block_table, bank.cpu_window_exact)
         empty_bank = [value.clone() for value in bank_tensors]
         addresses = tuple(value.data_ptr() for value in (owner.hidden_states, owner.context_positions, *bank_tensors))
         canonical_kv = torch.zeros((16, 4))

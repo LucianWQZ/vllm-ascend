@@ -361,10 +361,10 @@ def test_real_owner_initializes_one_first_and_independent_ar_banks(proposal, mon
     assert len(first) == 1 and len(ar) == 2 and owner._eagle3_capture_call is None
     banks = (*first, *ar)
     assert len({bank.window_block_table.data_ptr() for bank in banks}) == 3
-    assert len({bank.device_window_exact.data_ptr() for bank in banks}) == 3
+    assert len({bank.cpu_window_exact.data_ptr() for bank in banks}) == 3
     for bank in banks:
         assert not bool(bank.window_block_table.any())
-        assert bank.cpu_window_exact.tolist() == bank.device_window_exact.tolist() == [7]
+        assert bank.cpu_window_exact.tolist() == [7]
     torch.testing.assert_close(provider.table, full)
 
 
@@ -414,12 +414,17 @@ def test_eagle_capture_borrows_full_query_write_fields_and_owns_only_reads(monke
     query = torch.tensor([0, 4], dtype=torch.int32)
     slots, positions = torch.arange(4), torch.arange(8, 12)
     original = SimpleNamespace(
-        slot_mapping=slots, positions=positions, seq_lens_list=[12], actual_seq_lengths_q=[4], qfa_metadata_cache={}
+        slot_mapping=slots,
+        positions=positions,
+        seq_lens_list=[12],
+        seq_lens=torch.tensor([12]),
+        seq_lens_gpu=torch.tensor([12]),
+        actual_seq_lengths_q=[4],
+        qfa_metadata_cache={},
     )
     metadata = {"layer": original, "shared": original, "empty": None}
     bank = SimpleNamespace(
         window_block_table=torch.tensor([[2, 3]], dtype=torch.int32),
-        device_window_exact=torch.tensor([5], dtype=torch.int32),
         cpu_window_exact=torch.tensor([5], dtype=torch.int32),
     )
     owner: Any = object.__new__(Eagle3GraphIntegrationMixin)
@@ -436,7 +441,8 @@ def test_eagle_capture_borrows_full_query_write_fields_and_owns_only_reads(monke
     layer = result["layer"]
     assert layer is not original and result["empty"] is None
     assert layer.block_tables is bank.window_block_table
-    assert layer.seq_lens is bank.device_window_exact and layer.seq_lens_cpu is bank.cpu_window_exact
+    assert layer.seq_lens is original.seq_lens and layer.seq_lens_gpu is original.seq_lens_gpu
+    assert layer.seq_lens_cpu is bank.cpu_window_exact
     assert layer.seq_lens_list == [5] and original.seq_lens_list == [12]
     assert layer.slot_mapping is slots and layer.positions is positions
     assert layer.query_start_loc.data_ptr() == query.data_ptr()
@@ -590,7 +596,6 @@ def test_official_nonuniform_prefill_uses_window_first_bank_without_an_eager_own
     original_target_table = target_layer.block_tables.clone()
     bank: Any = SimpleNamespace(
         window_block_table=torch.tensor([[1, 2, 0, 0], [5, 6, 7, 8]], dtype=torch.int32),
-        device_window_exact=torch.tensor([5, 11], dtype=torch.int32),
         cpu_window_exact=torch.tensor([5, 11], dtype=torch.int32),
         params=None,
     )
@@ -661,7 +666,7 @@ def test_official_nonuniform_prefill_uses_window_first_bank_without_an_eager_own
         layer = metadata["draft"]
         assert metadata is not target and layer is not target_layer
         assert layer.block_tables is bank.window_block_table
-        assert layer.seq_lens is layer.seq_lens_gpu is bank.device_window_exact
+        assert layer.seq_lens is target_layer.seq_lens and layer.seq_lens_gpu is target_layer.seq_lens_gpu
         assert layer.seq_lens_cpu is bank.cpu_window_exact and layer.seq_lens_list == [5, 11]
         assert layer.attn_state is AscendAttentionState.ChunkedPrefill
         assert layer.slot_mapping is slots and layer.query_start_loc is query and layer.positions is absolute
@@ -807,7 +812,8 @@ def test_dp_synchronized_native_first_without_local_prefill(monkeypatch, mode, f
         assert layer.attn_state is AscendAttentionState.ChunkedPrefill
         assert layer.block_tables is bank.window_block_table
         assert bank.cpu_window_exact.tolist() == [full_end - start]
-        assert bank.device_window_exact.tolist() == [full_end - start]
+        assert layer.seq_lens is target_layer.seq_lens
+        assert layer.seq_lens_list == [full_end - start]
         assert bank.window_block_table[0, :9].tolist() == table[0, start // 128 : valid_blocks].tolist()
         assert owner._eagle3_window_intervals[0][0] == start
         assert owner._eagle3_window_intervals[0][1] == full_end + owner.num_speculative_steps
@@ -899,7 +905,6 @@ def test_capture_scope_selects_banks_once_and_requires_every_real_consumer(monke
         SimpleNamespace(
             descriptor=SimpleNamespace(num_reqs=1),
             window_block_table=torch.tensor([[index, index + 1]], dtype=torch.int32),
-            device_window_exact=torch.tensor([5 + index], dtype=torch.int32),
             cpu_window_exact=torch.tensor([5 + index], dtype=torch.int32),
         )
         for index in range(consumers)

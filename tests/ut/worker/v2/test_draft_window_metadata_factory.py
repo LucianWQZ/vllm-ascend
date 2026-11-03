@@ -143,7 +143,6 @@ def test_real_builder_constructs_private_window_metadata_without_touching_target
     target = AscendAttentionMetadataBuilder.build(builder, 0, common)
     bank = SimpleNamespace(
         window_block_table=torch.tensor([[12, 13], [23, 24]], dtype=torch.int32),
-        device_window_exact=torch.tensor([7, 6], dtype=torch.int32),
         cpu_window_exact=torch.tensor([7, 6], dtype=torch.int32),
     )
     # Native-prefill retains the real builder's query/write/state metadata;
@@ -154,6 +153,15 @@ def test_real_builder_constructs_private_window_metadata_without_touching_target
     assert draft.block_tables.data_ptr() == bank.window_block_table.data_ptr()
     assert draft.block_tables.shape == bank.window_block_table.shape
     assert draft.seq_lens_cpu.data_ptr() == bank.cpu_window_exact.data_ptr()
+    assert draft.seq_lens is target.seq_lens and draft.seq_lens_gpu is target.seq_lens_gpu
+    # The real FIA1 parameter consumer reads exact Host KV lengths, not these Full shape carriers.
+    from vllm_ascend.attention.attention_v1 import AscendAttentionBackendImpl
+
+    impl = object.__new__(AscendAttentionBackendImpl)
+    impl.key_cache, impl.value_cache = torch.empty(1), torch.empty(1)
+    impl._get_kv_cache_view = lambda key, value: (key, value, 128)
+    *_, actual_kv_lengths = impl._get_fia_params(torch.empty(1), torch.empty(1), draft)
+    assert actual_kv_lengths == [7, 6]
     assert draft.seq_lens_list == [7, 6] and draft.seq_lens_list is not target.seq_lens_list
     assert draft.actual_seq_lengths_q is target.actual_seq_lengths_q
     assert draft.slot_mapping.data_ptr() == target.slot_mapping.data_ptr() == slots.data_ptr()

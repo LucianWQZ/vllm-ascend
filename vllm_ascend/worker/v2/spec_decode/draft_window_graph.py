@@ -37,7 +37,6 @@ class DraftWindowGraphBucket:
     descriptor: BatchExecutionDescriptor
     consumer_ordinal: int
     window_block_table: torch.Tensor
-    device_window_exact: torch.Tensor
     cpu_window_exact: torch.Tensor
     owner: DraftWindowGraphBindingProvider
 
@@ -159,7 +158,6 @@ class DraftWindowGraphBindingProvider:
             if required:
                 capture.window_block_table[row, :required].copy_(source_table[row, start : start + required])
             capture.cpu_window_exact[row] = visible
-        capture.device_window_exact.copy_(capture.cpu_window_exact)
 
         return capture
 
@@ -226,7 +224,6 @@ class DraftWindowGraphBindingProvider:
             descriptor,
             consumer_ordinal,
             table.new_zeros((num_reqs, table.shape[1])),
-            torch.zeros(num_reqs, dtype=torch.int32, device=table.device),
             torch.zeros(num_reqs, dtype=torch.int32),
             self,
         )
