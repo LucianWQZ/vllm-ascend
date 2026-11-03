@@ -90,16 +90,13 @@ def test_graph_owner_keeps_normal_prefill_decode_metadata_and_updates(monkeypatc
 
 @pytest.mark.parametrize("step,has_prefill", [(0, True), (0, False), (1, False)])
 def test_graph_owner_rejects_unintended_eager_business_forward(monkeypatch, step, has_prefill):
-    class Owner(Eagle3GraphIntegrationMixin):
-        def _eagle3_window_is_active(self):
-            return True
-
     monkeypatch.setattr(
         AscendTargetDependentARSpeculator,
         "_run_model",
         lambda *args, **kwargs: pytest.fail("business Graph scope reached an ordinary eager forward"),
     )
-    owner: Any = object.__new__(Owner)
+    owner: Any = object.__new__(Eagle3GraphIntegrationMixin)
+    owner._draft_window_graph_binding_provider = SimpleNamespace(proposal=(False,))
     owner._eagle3_capture_call = None
     owner._eagle3_window_next_step = step
     owner.input_batch = SimpleNamespace(has_prefill=has_prefill)
