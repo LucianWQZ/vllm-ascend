@@ -376,7 +376,7 @@ def test_parallel_capture_uses_registered_geometry_and_preserves_full_tables(gra
         _draft_window_graph_binding_provider=case.provider,
         model_state=SimpleNamespace(attn_metadata=case.target_metadata),
     )
-    with draft_window_dflash_capture_scope(owner, buffers) as context:
+    with draft_window_dflash_capture_scope(owner) as context:
         assert context is not None
         identity = context.capture_banks_for(num_reqs=2, num_tokens=2)[0]
         read = identity
@@ -401,7 +401,7 @@ def test_parallel_capture_scope_owns_its_attachment_until_normal_or_error_exit(g
     full_before = case.owner.input_block_tables[0].clone()
     slots_before = case.owner.slot_mappings.clone()
     try:
-        with capture.draft_window_dflash_capture_scope(owner, buffers) as context:
+        with capture.draft_window_dflash_capture_scope(owner) as context:
             assert getattr(buffers, capture._CAPTURE_CONTEXT_ATTRIBUTE) is context
             assert context is not None
             bucket = context.capture_banks_for(num_reqs=2, num_tokens=2)[0]
@@ -409,7 +409,7 @@ def test_parallel_capture_scope_owns_its_attachment_until_normal_or_error_exit(g
             assert bucket is case.capture and bank is case.capture
             with (
                 pytest.raises(RuntimeError, match="already attached"),
-                capture.draft_window_dflash_capture_scope(owner, buffers),
+                capture.draft_window_dflash_capture_scope(owner),
             ):
                 pytest.fail("nested capture must not start")
             if capture_fails:
@@ -449,7 +449,7 @@ def test_window_capture_delegates_original_dummy_preparation_then_only_rebinds_r
 
     monkeypatch.setattr(capture, "_ORIGINAL_PREPARE_DFLASH_INPUTS_TO_CAPTURE", upstream)
     full = case.owner.input_block_tables[0].clone()
-    with capture.draft_window_dflash_capture_scope(owner, buffers):
+    with capture.draft_window_dflash_capture_scope(owner):
         result = capture.ascend_prepare_dflash_inputs_to_capture(
             2, 2, buffers, case.owner, [], object(), 16, False, False
         )

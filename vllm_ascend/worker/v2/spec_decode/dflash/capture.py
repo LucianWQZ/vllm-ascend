@@ -34,9 +34,7 @@ _CAPTURE_CONTEXT_ATTRIBUTE = "_ascend_draft_window_capture_context"
 
 
 @contextmanager
-def draft_window_dflash_capture_scope(
-    owner: Any, input_buffers: InputBuffers
-) -> Iterator[DraftWindowGraphBindingProvider | None]:
+def draft_window_dflash_capture_scope(owner: Any) -> Iterator[DraftWindowGraphBindingProvider | None]:
     """Attach the admitted provider at the actual Draft capture boundary.
 
     Startup registration already validates the manager's full descriptors.
@@ -46,12 +44,9 @@ def draft_window_dflash_capture_scope(
     if provider is None:
         yield None
         return
-    if not isinstance(provider, DraftWindowGraphBindingProvider):
-        raise TypeError("invalid instance-owned Draft Window graph binding provider")
-    if not isinstance(input_buffers, InputBuffers) or owner.input_buffers is not input_buffers:
-        raise RuntimeError("capture must use the speculator-owned Draft input buffers")
-    if getattr(owner, "target_input_buffers", None) is input_buffers:
-        raise RuntimeError("Draft Window capture context cannot use Target input buffers")
+    # The fixed speculator constructs private Draft inputs and passes those
+    # same inputs to its manager; Target inputs remain a separate field.
+    input_buffers = owner.input_buffers
     if hasattr(input_buffers, _CAPTURE_CONTEXT_ATTRIBUTE):
         raise RuntimeError("Draft Window capture context is already attached")
     setattr(input_buffers, _CAPTURE_CONTEXT_ATTRIBUTE, provider)

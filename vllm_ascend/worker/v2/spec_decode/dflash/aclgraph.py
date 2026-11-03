@@ -110,7 +110,7 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
         # Keep core544's preparation callback and canonical context slots;
         # it receives both num_reqs and the actual built metadata.
         with (
-            draft_window_dflash_capture_scope(self.speculator, input_buffers) as context,
+            draft_window_dflash_capture_scope(self.speculator) as context,
             communicator_switch(),
             model_capture_wrapper(self.speculator, False),
         ):
