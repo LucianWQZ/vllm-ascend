@@ -438,10 +438,11 @@ def test_window_scope_covers_dflash2_selector_and_candidate_walk(monkeypatch, se
     active = False
 
     @contextmanager
-    def proposal_context(actual, batch, dummy_run, is_profile, *, context_kv_only=False):
+    def proposal_context(batch, dummy_run, is_profile, *, context_kv_only=False):
         assert context_kv_only is False
         nonlocal active
-        assert actual is speculator
+        assert batch is speculator.input_batch
+        assert dummy_run is False and is_profile is False
         active = True
         events.append("proposal")
         try:
