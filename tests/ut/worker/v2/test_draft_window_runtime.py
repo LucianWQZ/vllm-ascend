@@ -715,7 +715,7 @@ def test_real_builder_projects_every_group_and_quarantines_partial_failure(setup
             query_start_loc_cpu=torch.tensor([0, 3, 6], dtype=torch.int32),
             max_query_len=3,
             seq_lens=torch.tensor([12, 27], dtype=torch.int32),
-            seq_lens_cpu=torch.tensor([14, 30], dtype=torch.int32),
+            seq_lens_np=np.array([14, 30], dtype=np.int32),
             max_seq_len=30,
             block_tables=full_tables,
             slot_mappings=full_slots,

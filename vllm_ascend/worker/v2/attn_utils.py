@@ -442,7 +442,6 @@ def build_attn_metadata(
     # extra attributes for ascend npus.
     parallel_config: ParallelConfig | None = None,
     seq_lens_np: np.ndarray | None = None,
-    seq_lens_cpu: torch.Tensor | None = None,
     seq_lens_cpu_upper_bound: torch.Tensor | None = None,
     num_computed_tokens_cpu: torch.Tensor | None = None,
     positions: torch.Tensor | None = None,
@@ -470,24 +469,17 @@ def build_attn_metadata(
     """Build attention metadata for Ascend NPUs."""
     if skip_ring_state_update is None:
         skip_ring_state_update = ring_state_update_skipped()
-    if seq_lens_cpu is None:
-        if seq_lens_np is None:
-            if seq_lens_cpu_upper_bound is not None:
-                # FIA needs a CPU-side seq_lens upper bound for each request when
-                # speculative decoding does not provide exact CPU sequence lengths.
-                seq_lens_np = seq_lens_cpu_upper_bound[:num_reqs].numpy()
-            else:
-                # The batch maximum is a looser bound and can further reduce
-                # FIA accuracy by overstating individual KV sequence lengths.
-                seq_lens_np = np.full(num_reqs, max_seq_len, dtype=np.int32)
-        seq_lens_cpu = torch.from_numpy(seq_lens_np)[:num_reqs]
-    else:
-        if seq_lens_cpu.device.type != "cpu":
-            raise ValueError("explicit seq_lens_cpu must live on CPU")
-        if seq_lens_cpu.dtype != torch.int32:
-            raise TypeError("explicit seq_lens_cpu must use int32")
-        if seq_lens_cpu.ndim != 1 or seq_lens_cpu.shape[0] != num_reqs:
-            raise ValueError("explicit seq_lens_cpu must match num_reqs")
+    if seq_lens_np is None:
+        if seq_lens_cpu_upper_bound is not None:
+            # FIA needs a CPU-side seq_lens upper bound for each request when
+            # speculative decoding does not provide exact CPU sequence lengths.
+            seq_lens_np = seq_lens_cpu_upper_bound[:num_reqs].numpy()
+        else:
+            # The batch maximum is a looser bound and can further reduce
+            # FIA accuracy by overstating individual KV sequence lengths.
+            seq_lens_np = np.full(num_reqs, max_seq_len, dtype=np.int32)
+
+    seq_lens_cpu = torch.from_numpy(seq_lens_np)[:num_reqs]
     if seq_lens_cpu_upper_bound is None:
         # seq_lens_cpu is already an upper bound (possibly exact), so reuse it
         # when no separate CPU upper bound was supplied.
