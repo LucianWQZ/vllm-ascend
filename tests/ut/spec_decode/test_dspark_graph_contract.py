@@ -84,7 +84,7 @@ def test_set_attn_preserves_cache_group_order(monkeypatch):
     speculator = _speculator(vllm_config=vllm_config, draft_attn_layer_names={"draft.2", "draft.0"})
     cache = SimpleNamespace(kv_cache_groups=[SimpleNamespace(layer_names=["draft.2", "target.0", "draft.0"])])
 
-    def summary(actual, logger):
+    def summary(actual):
         assert actual is speculator
         assert list(actual.attn_backends) == ["draft.2", "draft.0"]
         assert actual._context_slot_mappings.dtype == torch.int32
@@ -95,7 +95,7 @@ def test_set_attn_preserves_cache_group_order(monkeypatch):
         "vllm_ascend.worker.v2.spec_decode.draft_window_native_attention.report_owner_draft_native_attention", report
     )
     speculator.set_attn(None, cache, None, None, None)
-    report.assert_called_once_with(speculator, speculator_module.logger)
+    report.assert_called_once_with(speculator)
 
     assert list(speculator.attn_backends) == ["draft.2", "draft.0"]
     assert speculator._context_slot_mappings.dtype == torch.int32

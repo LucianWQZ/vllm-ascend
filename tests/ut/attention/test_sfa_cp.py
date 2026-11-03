@@ -1530,7 +1530,7 @@ def test_sfa_dcp_updates_dsa_cp_local_slot_mapping_with_padding() -> None:
         num_tokens_pad=6,
         local_start=2,
         local_end_with_pad=5,
-        slot_mapping_cp=None,
+        slot_mapping_cp=torch.empty(3, dtype=torch.int32),
     )
     metadata = SimpleNamespace(dsa_cp_context=dsa_cp_context)
 

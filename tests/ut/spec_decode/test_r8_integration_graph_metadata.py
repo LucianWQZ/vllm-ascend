@@ -91,38 +91,26 @@ def test_window_off_without_graph_policy_does_not_construct_source(graph_source_
     assert not hasattr(c.owner, "_draft_window_graph_binding_provider")
 
 
-@pytest.mark.parametrize(
-    "field",
-    [None, "pipeline_parallel_size", "prefill_context_parallel_size", "decode_context_parallel_size", "cp_size"],
-)
-def test_graph_initialization_validates_actual_unsharded_context_once(monkeypatch, field):
-    from vllm_ascend.worker.v2.spec_decode import draft_window_graph_runtime as runtime
+@pytest.mark.parametrize("cp_size", [1, 2])
+def test_graph_source_checks_actual_unsharded_tables_before_inventory(monkeypatch, cp_size):
+    from vllm_ascend.worker.v2.spec_decode import draft_window, draft_window_graph
+    from vllm_ascend.worker.v2.spec_decode.draft_window_backends import DraftWindowProviderStatus
 
-    monkeypatch.setattr(runtime, "draft_window_graph_enabled", lambda: True)
-    monkeypatch.setattr(
-        runtime,
-        "get_current_hardware_profile",
-        lambda: SimpleNamespace(attention_backend_family=runtime.AttentionBackendFamily.STANDARD),
-    )
-    config = SimpleNamespace(
-        compilation_config=SimpleNamespace(cudagraph_mode=SimpleNamespace(name="FULL_DECODE_ONLY")),
-        parallel_config=SimpleNamespace(
-            tensor_parallel_size=16,
-            pipeline_parallel_size=1,
-            prefill_context_parallel_size=1,
-            decode_context_parallel_size=1,
-        ),
-    )
-    tables = SimpleNamespace(cp_size=1)
-    if field == "cp_size":
-        tables.cp_size = 2
-    elif field is not None:
-        setattr(config.parallel_config, field, 2)
-    if field is None:
-        runtime.validate_graph_context(config, tables)
+    group = SimpleNamespace(status=DraftWindowProviderStatus.DIRECT_DENSE, native_window=None)
+    inventory = Mock(return_value=(group,))
+    provider = Mock()
+    monkeypatch.setattr(draft_window, "inventory_draft_window_groups", inventory)
+    monkeypatch.setattr(draft_window_graph, "DraftWindowGraphBindingProvider", provider)
+    owner = SimpleNamespace(_draft_window_policy=128, block_tables=SimpleNamespace(cp_size=cp_size))
+    if cp_size == 2:
+        with pytest.raises(RuntimeError, match="unsharded Draft tables"):
+            draft_window.create_draft_window_graph_provider(owner)
+        inventory.assert_not_called()
+        provider.assert_not_called()
     else:
-        with pytest.raises(RuntimeError, match="PP=PCP=DCP=1"):
-            runtime.validate_graph_context(config, tables)
+        assert draft_window.create_draft_window_graph_provider(owner) is provider.return_value
+        inventory.assert_called_once_with(owner)
+        provider.assert_called_once_with(policy=128, group=group, block_tables=owner.block_tables)
 
 
 @pytest.mark.parametrize("upper", [1153, 1160])

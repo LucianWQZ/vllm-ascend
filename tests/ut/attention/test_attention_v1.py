@@ -305,14 +305,11 @@ class TestAscendAttentionMetadataBuilder(TestBase):
         )
         read = prepare_dense_draft_read(
             *(common.block_table_tensor[list((0,))], (2,), 128),
-            exact_device=common.seq_lens,
             exact_cpu=torch.tensor([129], dtype=torch.int32),
             query_ends_cpu=torch.tensor([129], dtype=torch.int32),
             frozen_starts=torch.zeros(1, dtype=torch.int32),
             full_rows_cpu=torch.zeros(1, dtype=torch.bool),
             upper_cpu=common.seq_lens_cpu_upper_bound,
-            window_size=128,
-            anchor_span=128,
             query_width=9,
             causal=False,
             retain=lambda *objects: None,
@@ -320,10 +317,10 @@ class TestAscendAttentionMetadataBuilder(TestBase):
         read.apply(common)
         result = self.builder.build(0, common)
         arguments = metadata_cls.call_args.kwargs
-        # E=129 remains exact on device. U=130 bounds this allocation to
-        # 160 after alignment, rather than the window-only capacity256.
+        # The Full device exact remains E=129. U=130 only bounds the
+        # aligned scratch allocation; the builder consumes visible E-S.
         assert read.capacity == 160
-        assert arguments["seq_lens_list"] == [160]
+        assert arguments["seq_lens_list"] == [129]
         assert arguments["seq_lens_gpu"].tolist() == [129]
         assert result._draft_window_device_read is read
 

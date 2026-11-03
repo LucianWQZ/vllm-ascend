@@ -580,6 +580,9 @@ def test_set_attn_detects_architecture():
             ),
             patch.object(TargetDependentARSpeculator, "set_attn"),
             patch(
+                "vllm_ascend.worker.v2.spec_decode.draft_window_native_attention.report_owner_draft_native_attention"
+            ),
+            patch(
                 "vllm_ascend.worker.v2.spec_decode.target_dependent_ar.speculator._get_graph_update_backend",
                 return_value=backend,
             ),

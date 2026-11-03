@@ -155,6 +155,10 @@ def initialize_attention(monkeypatch, draft_backend, target_backend=AscendMLABac
         self.attn_groups = draft_groups
 
     monkeypatch.setattr(DSparkSpeculator, "set_attn", set_attn)
+    monkeypatch.setattr(
+        "vllm_ascend.worker.v2.spec_decode.draft_window_native_attention.report_owner_draft_native_attention",
+        lambda owner: None,
+    )
     monkeypatch.setattr(shared, "set_current_vllm_config", lambda _: nullcontext())
 
     def get_layers(config, layer_type, layer_names):

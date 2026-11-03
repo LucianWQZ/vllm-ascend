@@ -1828,7 +1828,8 @@ class TestTopLevelSwitchTypeValidation(TestBase):
 
     @_clean_up
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
-    def test_enable_dsa_cp_model_gate_is_resolved_during_init(self, mock_fix):
+    @patch.object(_VllmConfig, "use_v2_model_runner", new_callable=PropertyMock, return_value=False)
+    def test_enable_dsa_cp_model_gate_is_resolved_during_init(self, mock_runner, mock_fix):
         unsupported_vc = VllmConfig()
         unsupported_vc.additional_config = {"enable_dsa_cp": True}
         self.assertFalse(init_ascend_config(unsupported_vc).enable_dsa_cp)
@@ -1893,7 +1894,8 @@ class TestTopLevelSwitchTypeValidation(TestBase):
 
     @_clean_up
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
-    def test_dsa_cp_enabled_auto_keeps_sp_when_conditions_met(self, mock_fix):
+    @patch.object(_VllmConfig, "use_v2_model_runner", new_callable=PropertyMock, return_value=False)
+    def test_dsa_cp_enabled_auto_keeps_sp_when_conditions_met(self, mock_runner, mock_fix):
         """Case 3: dsa_cp on + SP conditions met (+indexer) -> SP auto-kept, dsa stays on."""
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("VLLM_ASCEND_ENABLE_FLASHCOMM1", None)
@@ -1962,7 +1964,8 @@ class TestTopLevelSwitchTypeValidation(TestBase):
 
     @_clean_up
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
-    def test_dsa_cp_enabled_auto_disabled_when_sp_conditions_not_met(self, mock_fix):
+    @patch.object(_VllmConfig, "use_v2_model_runner", new_callable=PropertyMock, return_value=False)
+    def test_dsa_cp_enabled_auto_disabled_when_sp_conditions_not_met(self, mock_runner, mock_fix):
         """Case 4: dsa_cp on + SP conditions NOT met (tp=1) -> dsa auto-disabled."""
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("VLLM_ASCEND_ENABLE_FLASHCOMM1", None)
