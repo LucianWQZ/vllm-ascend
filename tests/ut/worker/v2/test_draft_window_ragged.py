@@ -23,7 +23,11 @@ def test_ragged_queries_keep_full_row_and_use_device_exact_at_boundary(causal):
         *source,
         exact_cpu=exact,
         query_ends_cpu=exact,
-        frozen_starts=torch.div(torch.clamp(exact - 1024, min=0), 128, rounding_mode="floor") * 128,
+        frozen_starts=torch.where(
+            torch.tensor([False, True]),
+            0,
+            torch.div(torch.clamp(exact - 1024, min=0), 128, rounding_mode="floor") * 128,
+        ),
         upper_cpu=torch.tensor([1152, 1411], dtype=torch.int32),
         query_width=5,
         causal=causal,
@@ -67,7 +71,7 @@ def test_ragged_eagle_native_padding_preserves_frozen_anchor_and_full_continuati
         upper_cpu=torch.tensor([1800, 2180], dtype=torch.int32),
         query_width=257,
         causal=True,
-        frozen_starts=torch.tensor([640, 1024], dtype=torch.int32),
+        frozen_starts=torch.where(torch.tensor([False, True]), 0, torch.tensor([640, 1024], dtype=torch.int32)),
         full_rows_cpu=torch.tensor([False, True]),
         query_start_loc_cpu=offsets,
         query_start_loc_device=offsets.clone(),
@@ -89,10 +93,14 @@ def test_uniform_full_read_rows_keep_original_query_layout():
         *source,
         exact_cpu=torch.tensor([1151, 1287], dtype=torch.int32),
         query_ends_cpu=torch.tensor([1151, 1287], dtype=torch.int32),
-        frozen_starts=torch.div(
-            torch.clamp(torch.tensor([1151, 1287], dtype=torch.int32) - 1024, min=0), 128, rounding_mode="floor"
-        )
-        * 128,
+        frozen_starts=torch.where(
+            torch.tensor([False, True]),
+            0,
+            torch.div(
+                torch.clamp(torch.tensor([1151, 1287], dtype=torch.int32) - 1024, min=0), 128, rounding_mode="floor"
+            )
+            * 128,
+        ),
         upper_cpu=torch.tensor([1152, 1290], dtype=torch.int32),
         query_width=8,
         causal=False,

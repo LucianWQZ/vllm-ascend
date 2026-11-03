@@ -16,7 +16,11 @@ def test_full_prompt_does_not_multiply_decode_scratch_by_full_capacity():
         *(table[list(tuple(range(n)))], (256,) * n, block),
         exact_cpu=ends,
         query_ends_cpu=ends,
-        frozen_starts=torch.div(torch.clamp(ends - 1024, min=0), block, rounding_mode="floor") * block,
+        frozen_starts=torch.where(
+            torch.tensor([False] * (n - 1) + [True]),
+            0,
+            torch.div(torch.clamp(ends - 1024, min=0), block, rounding_mode="floor") * block,
+        ),
         upper_cpu=ends + 1,
         query_width=full_width,
         causal=False,

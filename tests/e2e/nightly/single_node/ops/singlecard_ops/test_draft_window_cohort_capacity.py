@@ -29,7 +29,7 @@ def test_full_row_capacity_cohorts_have_independent_native_operands(decode_exact
         *(table[list(tuple(rows.tolist()))], tuple(((upper + 127) // 128).tolist()), 128),
         exact_cpu=exact,
         query_ends_cpu=exact,
-        frozen_starts=(exact - 1024).clamp(min=0) // 128 * 128,
+        frozen_starts=torch.where(full, 0, (exact - 1024).clamp(min=0) // 128 * 128),
         upper_cpu=upper,
         query_width=8,
         causal=False,

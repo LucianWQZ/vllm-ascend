@@ -56,7 +56,9 @@ def test_copy_failure_keeps_actual_input_and_output_owned(monkeypatch, stage):
             *source,
             exact_cpu=exact,
             query_ends_cpu=exact,
-            frozen_starts=torch.div(torch.clamp(exact - 1024, min=0), 128, rounding_mode="floor") * 128,
+            frozen_starts=torch.where(
+                full_rows, 0, torch.div(torch.clamp(exact - 1024, min=0), 128, rounding_mode="floor") * 128
+            ),
             upper_cpu=exact + 3,
             query_width=4,
             causal=False,

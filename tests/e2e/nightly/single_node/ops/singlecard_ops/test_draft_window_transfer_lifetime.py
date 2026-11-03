@@ -52,7 +52,7 @@ def test_real_private_copy_failure_retains_its_actual_operands(monkeypatch, stag
                 *source,
                 exact_cpu=torch.tensor([1151, 1408], dtype=torch.int32),
                 query_ends_cpu=torch.tensor([1151, 1408], dtype=torch.int32),
-                frozen_starts=torch.tensor([0, 384], dtype=torch.int32),
+                frozen_starts=torch.where(full_rows, 0, torch.tensor([0, 384], dtype=torch.int32)),
                 upper_cpu=torch.tensor([1154, 1411], dtype=torch.int32),
                 query_width=4,
                 causal=False,

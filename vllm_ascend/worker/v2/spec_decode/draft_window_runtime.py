@@ -173,8 +173,16 @@ class DraftWindowRuntime:
             self._build_count = 0
             self._eagle_window = None
             try:
-                # Fixed MRV2 does not change Host prompt progress during propose.
-                self._continuing = continuing_prefill_rows(input_batch, input_batch.num_reqs)
+                # Fixed 544 preserves this Host mapping and prompt progress
+                # throughout propose; validate it once before native preparation.
+                num_reqs = input_batch.num_reqs
+                rows = input_batch.idx_mapping_np[:num_reqs]
+                counts = self.speculator.block_tables.num_blocks.np
+                if len(input_batch.req_ids) != num_reqs:
+                    raise RuntimeError("Draft Window request mapping does not cover the active preparation")
+                if rows.shape != (num_reqs,) or np.any(rows < 0) or np.any(rows >= counts.shape[1]):
+                    raise ValueError("Draft allocation counts require active persistent request slots")
+                self._continuing = continuing_prefill_rows(input_batch, num_reqs)
                 # Preparation and builders enqueue copies/kernels before model
                 # forward. Even a later host error must retain this proposal.
                 yield
@@ -217,16 +225,12 @@ class DraftWindowRuntime:
             raise ValueError("Parallel Draft metadata step must match its actual query width")
         if self.method == "eagle3" and (step != self._build_count or step >= self.static_k):
             raise ValueError("Eagle3 metadata must advance exactly one configured step")
-        # The fixed propose call keeps this InputBatch's CPU request mapping
-        # unchanged through every synchronous first/AR metadata preparation.
-        if batch.num_reqs != num_reqs or len(batch.req_ids) != num_reqs:
+        if batch.num_reqs != num_reqs:
             raise RuntimeError("Draft Window request mapping does not cover the active preparation")
         continuing = self._continuing
         assert continuing is not None
         counts = self.speculator.block_tables.num_blocks.np
         rows = batch.idx_mapping_np[:num_reqs]
-        if rows.shape != (num_reqs,) or np.any(rows < 0) or np.any(rows >= counts.shape[1]):
-            raise ValueError("Draft allocation counts require active persistent request slots")
 
         def retain(*objects: object) -> None:
             if self._owner is not owner:
@@ -450,17 +454,12 @@ class DraftWindowRuntime:
         batch = self._input_batch
         drafts = batch.num_draft_tokens_per_req
         scheduled = batch.num_scheduled_tokens[:num_reqs]
-        boundaries = getattr(batch, "query_start_loc_np", None)
         return bool(
             continuing.all()
-            and batch.is_prefilling_np[:num_reqs].all()
             and not getattr(self.speculator, "replicated_pcp", False)
             and (drafts is None or not drafts[:num_reqs].any())
-            and (scheduled > 0).all()
             and (batch.num_computed_prefill_tokens_np[:num_reqs] + scheduled <= self.speculator.max_model_len).all()
-            and boundaries is not None
-            and len(boundaries) >= num_reqs + 1
-            and np.array_equal(np.diff(boundaries[: num_reqs + 1]), scheduled)
+            and np.array_equal(np.diff(batch.query_start_loc_np[: num_reqs + 1]), scheduled)
         )
 
     def retain_metadata(self, metadata: Any) -> None:

@@ -67,9 +67,13 @@ def test_native_ragged_exact_read_with_full_continuation(dtype, dim, kv_heads, c
         upper_cpu=torch.tensor(ends, dtype=torch.int32) + 1,
         query_width=max(widths),
         causal=eagle,
-        frozen_starts=torch.tensor(frozen, dtype=torch.int32)
-        if frozen is not None
-        else (torch.tensor(ends, dtype=torch.int32) - window).clamp(min=0) // block * block,
+        frozen_starts=torch.where(
+            torch.tensor([False] * len(rows) if case == "decode_ragged" else [False, True] * (len(rows) // 2)),
+            0,
+            torch.tensor(frozen, dtype=torch.int32)
+            if frozen is not None
+            else (torch.tensor(ends, dtype=torch.int32) - window).clamp(min=0) // block * block,
+        ),
         full_rows_cpu=torch.tensor(
             [False] * len(rows) if case == "decode_ragged" else [False, True] * (len(rows) // 2)
         ),

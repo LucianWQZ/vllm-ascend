@@ -1155,6 +1155,7 @@ def test_parallel_prompt_producer_rejects_uncertified_preparation(setup, invalid
     state.query_start_loc_np = np.array([0, 7, 16])
     if invalid == "mixed_decode":
         state.is_prefilling_np[0] = False
+        state.num_computed_prefill_tokens_np[0] = state.prefill_len_np[0]
     elif invalid == "terminal":
         state.prefill_len_np[0] = 1143
     elif invalid == "placeholder":
