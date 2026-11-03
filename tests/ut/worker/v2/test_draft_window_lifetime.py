@@ -53,14 +53,14 @@ class Payload:
 
 def submit(pool, completion, *payloads):
     with patch.object(torch.npu, "Event", return_value=completion), pool.operation() as owner:
-        pool.retain(owner, *payloads)
+        owner.retained.extend(payloads)
     return owner
 
 
 def test_entered_proposal_failure_never_infers_that_no_work_was_submitted():
     pool = DraftWindowOwnerPool(1)
     with pytest.raises(ValueError, match="invalid input"), pool.operation() as owner:
-        pool.retain(owner, Payload())
+        owner.retained.append(Payload())
         raise ValueError("invalid input")
     assert owner.retained and owner.completion is None and pool.poisoned
     with pytest.raises(RuntimeError, match="quarantined"):
@@ -85,7 +85,7 @@ def test_partial_native_submission_then_host_error_retains_and_blocks_reuse():
         pytest.raises(RuntimeError, match="host failed after enqueue"),
         pool.operation() as owner,
     ):
-        pool.retain(owner, payload)
+        owner.retained.append(payload)
         del payload
         # This models entry into a possibly submitted region, not an NPU
         # operation. Host failure does not supply a completion boundary.
@@ -120,7 +120,7 @@ def test_event_construction_or_partial_record_failure_keeps_all_ownership(monkey
 
     monkeypatch.setattr(torch.npu, "Event", make_event)
     with pytest.raises(RuntimeError, match=failure), pool.operation() as owner:
-        pool.retain(owner, payload)
+        owner.retained.append(payload)
     assert pool.poisoned and owner.retained == [payload]
     assert owner.completion is (event if failure == "event recording" else None)
     with pytest.raises(RuntimeError, match="quarantined"):
@@ -190,7 +190,7 @@ def test_all_eagle_steps_and_nested_derived_state_live_until_proposal_completion
             reads, derived = Payload(), Payload()
             read_views.append(weakref.ref(reads))
             derived_views.append(weakref.ref(derived))
-            pool.retain(owner, reads, {"builder": {"local_and_index": derived}})
+            owner.retained.extend((reads, {"builder": {"local_and_index": derived}}))
             del reads, derived
     assert len(owner.retained) == 8
     gc.collect()
@@ -237,25 +237,10 @@ def test_late_reader_requires_all_reader_completion_not_primary_only():
     assert pool.reclaim_completed() == 1
 
 
-def test_stale_or_cross_pool_owner_cannot_mutate_another_generation():
-    pool = DraftWindowOwnerPool(1)
-    other = DraftWindowOwnerPool(1)
-    completion = Completion(complete=True)
-    owner = submit(pool, completion)
-    with pytest.raises(RuntimeError, match="stale or belongs"):
-        other.retain(owner, Payload())
-    assert pool.reclaim_completed() == 1
-    replacement = pool.acquire()
-    assert replacement is not owner
-    with pytest.raises(RuntimeError, match="stale or belongs"):
-        pool.retain(owner, Payload())
-    assert not replacement.retained
-
-
 def test_unsubmitted_pool_pressure_never_waits_or_discards():
     pool = DraftWindowOwnerPool(1)
     owner = pool.acquire()
-    pool.retain(owner, Payload())
+    owner.retained.append(Payload())
     with pytest.raises(RuntimeError, match="unsubmitted proposal"):
         pool.acquire()
     assert owner.retained

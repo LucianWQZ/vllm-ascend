@@ -360,13 +360,62 @@ def test_no_consumption_and_wrong_actual_query_width_are_errors(setup):
     assert runtime.pool.poisoned
 
 
-def test_stale_callback_cannot_modify_next_proposal(setup):
-    runtime, spec, _, _ = setup
+@pytest.mark.parametrize("same_runtime", [False, True])
+def test_stale_callback_cannot_modify_another_proposal(setup, same_runtime):
+    runtime, spec, _, completions = setup
     with runtime.proposal_context(batch()):
         stale = runtime.metadata_callback(3, 2)
         stale(0, common())
-    with pytest.raises(RuntimeError, match="stale proposal"), runtime.proposal_context(batch()):
-        stale(0, common())
+        retired = runtime._owner
+    completions[-1].complete = True
+    assert runtime.pool.reclaim_completed() == 1
+    assert retired.retained == []
+    other = (
+        runtime
+        if same_runtime
+        else DraftWindowRuntime(spec, resolve_draft_window_policy(requested_window_size=8, method="dflash"))
+    )
+    untouched = common()
+    before = untouched.block_table_tensor.clone()
+    with other.proposal_context(batch()):
+        current = other._owner
+        with pytest.raises(RuntimeError, match="stale proposal"):
+            stale(0, untouched)
+        assert retired is not current and not retired.retained and not current.retained
+        torch.testing.assert_close(untouched.block_table_tensor, before, rtol=0, atol=0)
+        other.metadata_callback(3, 2)(0, common())
+    assert current.completion is not None and not other.pool.poisoned
+
+
+def test_retention_uses_only_the_active_runtime_scope_before_event_record(setup, monkeypatch):
+    runtime, _, _, _ = setup
+    payload = object()
+
+    class AtRecord(Completion):
+        def record(self, stream):
+            assert runtime._owner is None
+            before = list(owner.retained)
+            with pytest.raises(RuntimeError, match="no active proposal"):
+                runtime.retain_metadata(object())
+            with pytest.raises(RuntimeError, match="stale proposal"):
+                callback(0, common())
+            assert [id(value) for value in owner.retained] == [id(value) for value in before]
+            super().record(stream)
+
+    completion = AtRecord()
+    monkeypatch.setattr(torch.npu, "Event", lambda: completion)
+    with runtime.proposal_context(batch()):
+        owner = runtime._owner
+        with pytest.raises(RuntimeError, match="already active"), runtime.proposal_context(batch()):
+            pytest.fail("nested runtime must not acquire a second owner")
+        callback = runtime.metadata_callback(3, 2)
+        callback(0, common())
+        runtime.retain_metadata(payload)
+    assert owner.completion is completion and not runtime.pool.poisoned
+    assert any(value is payload for value in owner.retained)
+    assert runtime.pool.reclaim_completed() == 0
+    completion.complete = True
+    assert runtime.pool.reclaim_completed() == 1 and not owner.retained
 
 
 def test_target_only_group_is_not_projected(setup):
@@ -747,7 +796,7 @@ def test_context_only_kv_write_keeps_completion_without_inventing_attention(setu
     with runtime.proposal_context(batch(), context_kv_only=True):
         owner = runtime._owner
         assert owner is not None and owner.completion is None
-        runtime.pool.retain(owner, payload)
+        runtime.retain_metadata(payload)
     assert owner.completion is not None
     assert owner.completion is completions[-1]
     assert any(value is payload for value in owner.retained)
@@ -918,6 +967,7 @@ def test_dense_device_callback_or_exact_fallback_keeps_the_same_window(setup, up
         # CPU exact proves E fits even if the scheduling upper exceeds the
         # source extent; no uninitialized upper-authorized page is read.
         read = metadata._draft_window_device_read
+        owner = runtime._owner
         assert (torch.tensor([20, 27]) - read.seq_lens).tolist() == [12, 16]
         assert metadata.seq_lens_cpu is None
         assert metadata.block_table_tensor is full_table
@@ -927,6 +977,10 @@ def test_dense_device_callback_or_exact_fallback_keeps_the_same_window(setup, up
     assert len(completions) == 1
     with pytest.raises(RuntimeError, match="stale"):
         callback(0, common())
+    retained_before = len(owner.retained)
+    with pytest.raises(RuntimeError, match="stale"):
+        read.retain(object())
+    assert len(owner.retained) == retained_before
 
 
 @pytest.mark.parametrize("drafts", [None, (0, 0)])

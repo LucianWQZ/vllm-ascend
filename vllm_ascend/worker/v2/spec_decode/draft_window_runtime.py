@@ -246,7 +246,12 @@ class DraftWindowRuntime:
         rows = batch.idx_mapping_np[:num_reqs]
         if rows.shape != (num_reqs,) or np.any(rows < 0) or np.any(rows >= counts.shape[1]):
             raise ValueError("Draft allocation counts require active persistent request slots")
-        retain = lambda *objects: self.pool.retain(owner, *objects)
+
+        def retain(*objects: object) -> None:
+            if self._owner is not owner:
+                raise RuntimeError("Draft Window callback belongs to a stale proposal")
+            owner.retained.extend(objects)
+
         full_exact = exact = proposal_exact = starts = None
         dense, native_full = False, False
 
@@ -254,8 +259,6 @@ class DraftWindowRuntime:
             nonlocal full_exact, exact, proposal_exact, starts, dense, native_full
             if gid not in self.gids:
                 return
-            if self._owner is not owner:
-                raise RuntimeError("Draft Window callback belongs to a stale proposal")
             retain(common)
             # The real builder enumerates each KV group once and constructs a
             # fresh Common from this same preparation before invoking us.
@@ -443,16 +446,16 @@ class DraftWindowRuntime:
         if owner is None:
             raise RuntimeError("Eagle3 length snapshot has no active Draft Window proposal")
         indices = indices.to(dtype=torch.int64)
-        self.pool.retain(owner, indices)
+        owner.retained.append(indices)
         last_positions = positions.index_select(0, indices)
-        self.pool.retain(owner, last_positions)
+        owner.retained.append(last_positions)
         live_end = last_positions.to(dtype=torch.int32)
-        self.pool.retain(owner, live_end)
+        owner.retained.append(live_end)
         live_end.add_(1)
         pair = torch.stack((native_extent[:num_reqs], live_end))
-        self.pool.retain(owner, pair)
+        owner.retained.append(pair)
         snapshot = pair.to(device="cpu", dtype=torch.int32, copy=True)
-        self.pool.retain(owner, snapshot)
+        owner.retained.append(snapshot)
         extent_cpu, live_cpu = snapshot[0], snapshot[1]
         if bool(((live_cpu <= 0) | (live_cpu > extent_cpu) | (extent_cpu - live_cpu > self.static_k)).any()):
             raise ValueError("Eagle3 prepared live queries disagree with the current native padding extent")
@@ -486,4 +489,4 @@ class DraftWindowRuntime:
             return
         if self._owner is None:
             raise RuntimeError("Draft Window metadata has no active proposal")
-        self.pool.retain(self._owner, metadata)
+        self._owner.retained.append(metadata)

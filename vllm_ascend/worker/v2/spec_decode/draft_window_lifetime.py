@@ -53,13 +53,6 @@ class DraftWindowOwnerPool:
         self._owners.append(owner)
         return owner
 
-    def retain(self, owner: DraftWindowOwner, *objects: object) -> None:
-        if owner not in self._owners:
-            raise RuntimeError("Draft Window owner is stale or belongs to another pool")
-        if owner.completion is not None or self.poisoned:
-            raise RuntimeError("Draft Window read state is already submitted or quarantined")
-        owner.retained.extend(objects)
-
     def _reclaim(self, owner: DraftWindowOwner, *, wait: bool = False) -> bool:
         try:
             assert owner.completion is not None
