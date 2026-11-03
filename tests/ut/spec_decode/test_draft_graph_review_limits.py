@@ -544,7 +544,7 @@ class DraftGraphSupportTest(unittest.TestCase):
         batch.num_reqs_after_padding = 2
         seen: list[str] = []
 
-        def context_kv_scope(_owner, _batch):
+        def context_kv_scope(_owner):
             seen.append("context-KV-only")
             return nullcontext()
 

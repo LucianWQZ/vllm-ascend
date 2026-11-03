@@ -133,37 +133,26 @@ def prepare_dflash_inputs_factory(
 
 
 @contextmanager
-def _draft_window_context_kv_scope(owner, input_batch):
-    """Protect the upstream zero-draft write without creating a Graph reader.
+def _draft_window_context_kv_scope(owner):
+    """Keep the fixed core's context-only KV writes on its existing stream.
 
-    The fixed core stores context K/V on the current stream and returns before
-    query metadata or Graph dispatch. Reuse the ordinary Source completion
-    contract for these writes; captured Window banks and generations stay idle.
+    Core544 uses persistent input/KV owners and native same-stream temporaries,
+    without preparing a Window bank. No separate read owner or event is needed.
+    A failed canonical write still quarantines later Window proposals.
     """
-    runtime = owner._draft_window_graph_binding_provider
-    if runtime.quarantined:
-        raise RuntimeError("Draft Window backing is quarantined before a context-only KV write")
-    from vllm_ascend.worker.v2.spec_decode.draft_window_lifetime import DraftWindowOwnerPool
-
+    provider = owner._draft_window_graph_binding_provider
+    provider.require_reusable()
     if (
-        runtime.proposal is not None
+        provider.proposal is not None
         or getattr(owner, "_draft_window_bypass_active", False)
         or getattr(owner, "_draft_window_context_kv_active", False)
     ):
         raise RuntimeError("A Draft Window proposal scope is already active")
-    pool = getattr(owner, "_draft_window_context_kv_pool", None)
-    if pool is None:
-        pool = DraftWindowOwnerPool(int(owner.vllm_config.max_concurrent_batches))
-        owner._draft_window_context_kv_pool = pool
     owner._draft_window_context_kv_active = True
     try:
-        with pool.operation() as completion_owner:
-            pool.retain(completion_owner, owner, input_batch)
-            yield
+        yield
     except BaseException:
-        # A partial context write or failed completion record also makes the
-        # canonical state unsafe for a later normal Graph proposal.
-        runtime.quarantine()
+        provider.quarantine()
         raise
     finally:
         owner._draft_window_context_kv_active = False
@@ -204,7 +193,7 @@ def _draft_window_owner_scope(owner, input_batch, dummy_run=False, is_profile=Fa
             raise RuntimeError("Draft Window Graph cannot change its captured static K")
         effective_dummy = dummy_run or getattr(input_batch, "is_dummy", False)
         if num_speculative_tokens == 0 and not (effective_dummy or is_profile):
-            return _draft_window_context_kv_scope(owner, input_batch)
+            return _draft_window_context_kv_scope(owner)
         return owner._draft_window_proposal_scope(input_batch, dummy_run=effective_dummy, is_profile=is_profile)
     if runtime is not None:
         return runtime.proposal_context(input_batch, dummy_run, is_profile, context_kv_only=num_speculative_tokens == 0)

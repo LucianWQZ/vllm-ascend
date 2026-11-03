@@ -1,61 +1,59 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""CPU protocol checks for the fixed 544 parallel-drafter ownership seam.
+"""Actual provider and fixed544 K0 dispatch boundaries, without device execution.
 
-The real lifetime pool is used. Only the device completion token is a stand-in;
-this does not claim device completion, model correctness or Graph qualification.
+Native preparation/KV computation are isolated only at their device boundary.
+These Host tests do not claim numerical correctness, replay or device completion.
 """
 
 from __future__ import annotations
 
 import unittest
 from contextlib import contextmanager, nullcontext
-from types import MethodType, SimpleNamespace
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock, PropertyMock, patch
 
 import numpy as np
 import torch
+from vllm.config.compilation import CUDAGraphMode
+from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
+from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 
 from vllm_ascend.worker.v2.spec_decode.dflash import aclgraph as dflash_graph
 from vllm_ascend.worker.v2.spec_decode.dflash import speculator as dflash
 from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import DraftGraphSupport
-from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowGraphInputMixin
-from vllm_ascend.worker.v2.spec_decode.draft_window_lifetime import DraftWindowOwnerPool
+from vllm_ascend.worker.v2.spec_decode.draft_window_backends import DraftWindowGroupRoute, DraftWindowProviderStatus
+from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphBindingProvider
+from vllm_ascend.worker.v2.spec_decode.draft_window_policy import resolve_draft_window_policy
 from vllm_ascend.worker.v2.spec_decode.dspark import speculator as dspark
-
-
-class Completion:
-    recorded = 0
-
-    def record(self, _stream):
-        type(self).recorded += 1
-
-    def query(self):
-        return True
-
-    def synchronize(self):
-        return None
 
 
 class ParallelOwnerTests(unittest.TestCase):
     def setUp(self):
-        Completion.recorded = 0
-        completion = patch.object(torch.npu, "Event", Completion)
-        completion.start()
-        self.addCleanup(completion.stop)
-        stream = patch.object(torch.npu, "current_stream", return_value=object())
+        event = patch.object(torch.npu, "Event", side_effect=AssertionError("K0 must not add an Event"))
+        self.events = event.start()
+        self.addCleanup(event.stop)
+        self.stream = SimpleNamespace(npu_stream=17)
+        stream = patch.object(torch.npu, "current_stream", return_value=self.stream)
         stream.start()
         self.addCleanup(stream.stop)
         self.batch = SimpleNamespace(is_dummy=False)
+        tables = SimpleNamespace(
+            input_block_tables=[torch.arange(8, dtype=torch.int32).reshape(2, 4)],
+            num_blocks=SimpleNamespace(cpu=torch.full((1, 2), 4, dtype=torch.int32)),
+        )
+        self.provider = DraftWindowGraphBindingProvider(
+            policy=resolve_draft_window_policy(requested_window_size=4, method="dflash"),
+            group=DraftWindowGroupRoute(0, ("draft.layer",), 4, DraftWindowProviderStatus.DIRECT_DENSE),
+            block_tables=tables,
+        )
         self.owner = SimpleNamespace(
-            _draft_window_graph_binding_provider=SimpleNamespace(quarantined=False, proposal=None),
+            _draft_window_graph_binding_provider=self.provider,
             _draft_window_bypass_active=False,
-            vllm_config=SimpleNamespace(max_concurrent_batches=2),
+            vllm_config=SimpleNamespace(),
             num_speculative_steps=8,
         )
-        provider = self.owner._draft_window_graph_binding_provider
-        provider.quarantine = lambda: setattr(provider, "quarantined", True)
         self.normal: list[tuple[Any, dict[str, Any]]] = []
 
         @contextmanager
@@ -68,35 +66,127 @@ class ParallelOwnerTests(unittest.TestCase):
     def scope(self, tokens, **kwargs):
         return dflash._draft_window_owner_scope(self.owner, self.batch, num_speculative_tokens=tokens, **kwargs)
 
-    def test_zero_uses_real_completion_pool_without_graph_reader(self):
-        with self.scope(0):
-            self.assertTrue(self.owner._draft_window_context_kv_active)
-        self.assertFalse(self.owner._draft_window_context_kv_active)
-        self.assertEqual(Completion.recorded, 1)
-        self.assertEqual(self.normal, [])
-        self.assertIsInstance(self.owner._draft_window_context_kv_pool, DraftWindowOwnerPool)
-        self.assertFalse(self.owner._draft_window_context_kv_pool._poisoned)
-        self.assertFalse(hasattr(self.owner, "_draft_window_runtime"))
-        self.assertIsNone(self.owner._draft_window_graph_binding_provider.proposal)
+    def test_actual_fixed_core_zero_writes_then_normal_binding(self):
+        owner = object.__new__(dflash.AscendDFlashSpeculator)
+        owner._draft_window_graph_binding_provider = self.provider
+        owner._draft_window_bypass_active = False
+        owner.num_speculative_steps, owner.num_query_per_req = 7, 8
+        owner.max_model_len, owner.max_num_reqs, owner.max_num_tokens = 64, 2, 16
+        owner.pcp_manager, owner._layer_group_idx = None, None
+        owner.draft_kv_cache_group_id, owner.draft_kv_cache_group_ids = 0, [0]
+        owner.dcp_size, owner.parallel_drafting_token_id, owner.sample_from_anchor = 1, 42, False
+        owner.input_buffers = InputBuffers(2, 16, torch.device("cpu"))
+        owner.context_positions = torch.zeros(16, dtype=torch.int64)
+        owner._context_slot_mappings = torch.zeros((1, 16), dtype=torch.int32)
+        owner.hidden_states = torch.zeros((16, 4))
+        owner.draft_tokens = torch.full((2, 7), -1, dtype=torch.int64)
+        owner.sample_indices = owner.sample_pos = owner.sample_idx_mapping = torch.zeros(16, dtype=torch.int64)
+        owner.temperature, owner.seeds = torch.ones(2), torch.zeros(2, dtype=torch.int64)
+        owner.block_tables = self.provider.block_tables
+        owner.block_tables.slot_mappings = torch.full((1, 16), -1, dtype=torch.int32)
+        owner.block_tables.block_sizes = [4]
+        owner.block_tables.cp_rank, owner.block_tables.cp_interleave = 0, 1
+        batch = InputBatch.make_dummy(1, 4, owner.input_buffers, is_padding=False)
+        batch.positions.copy_(torch.arange(4))
+        last_hidden = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+        target = {"positions": batch.positions.clone(), "hidden": last_hidden.clone()}
+        full_table = self.provider.table.clone()
+        full_slots = owner.block_tables.slot_mappings.clone()
+        descriptor = BatchExecutionDescriptor(CUDAGraphMode.FULL, num_tokens=8, num_reqs=1, uniform_token_count=8)
+        bank = self.provider.register_capture_identity(descriptor=descriptor)
+        bank_tensors = (bank.window_block_table, bank.device_window_exact, bank.cpu_window_exact)
+        empty_bank = [value.clone() for value in bank_tensors]
+        addresses = tuple(value.data_ptr() for value in (owner.hidden_states, owner.context_positions, *bank_tensors))
+        canonical_kv = torch.zeros((16, 4))
+        writes = []
 
-    def test_zero_original_error_quarantines_and_actual_normal_scope_rejects(self):
-        first = RuntimeError("native context write stand-in")
-        with (
-            self.assertRaises(RuntimeError) as seen,
-            self.scope(0),
-        ):
-            raise first
-        self.assertIs(seen.exception, first)
-        self.assertTrue(self.owner._draft_window_context_kv_pool._poisoned)
-        self.assertTrue(self.owner._draft_window_graph_binding_provider.quarantined)
-        self.owner._draft_window_proposal_scope = MethodType(
-            DraftWindowGraphInputMixin._draft_window_proposal_scope, self.owner
+        def prepare(*args):
+            # Stand in only for the native preparation kernel. The actual
+            # Ascend/core propose, persistent copy and context dispatch execute.
+            self.assertTrue(owner._draft_window_context_kv_active)
+            self.assertIs(args[9], batch)
+            args[2][:4].copy_(batch.positions)
+            args[3][:4].copy_(torch.arange(4, dtype=torch.int32))
+
+        def store(hidden, positions, slots):
+            self.assertEqual(hidden.data_ptr(), owner.hidden_states.data_ptr())
+            self.assertEqual(positions.data_ptr(), owner.context_positions.data_ptr())
+            self.assertEqual(slots.data_ptr(), owner._context_slot_mappings.data_ptr())
+            canonical_kv.index_copy_(0, slots.to(torch.int64), hidden)
+            writes.append(hidden.clone())
+
+        owner.model = SimpleNamespace(precompute_and_store_context_kv=Mock(side_effect=store))
+        args = (
+            batch,
+            {},
+            {},
+            last_hidden,
+            None,
+            *[torch.zeros(2, dtype=torch.int64) for _ in range(4)],
+            torch.ones(2),
+            torch.zeros(2, dtype=torch.int64),
         )
         with (
-            self.assertRaisesRegex(RuntimeError, "quarantined"),
-            self.scope(8),
+            patch.object(dflash.dflash_speculator, "prepare_dflash_inputs", side_effect=prepare) as preparation,
+            patch.object(owner, "_build_uniform_attn_metadata", side_effect=AssertionError("K0 has no query metadata")),
+            patch.object(owner, "_generate_draft", side_effect=AssertionError("K0 has no query forward")),
         ):
-            self.fail("normal Graph body must not execute")
+            for _ in range(2):
+                result = owner.propose(*args, num_speculative_tokens=0)
+                self.assertEqual(result.data_ptr(), owner.draft_tokens.data_ptr())
+                self.assertIs(owner.input_batch, batch)
+                self.assertFalse(owner._draft_window_context_kv_active)
+            self.assertEqual(preparation.call_count, 2)
+        self.assertEqual(len(writes), 2)
+        self.assertTrue(torch.equal(canonical_kv[:4], last_hidden))
+        self.assertTrue(torch.equal(batch.positions, target["positions"]))
+        self.assertTrue(torch.equal(last_hidden, target["hidden"]))
+        self.assertTrue(torch.equal(self.provider.table, full_table))
+        self.assertTrue(torch.equal(owner.block_tables.slot_mappings, full_slots))
+        for actual, before in zip(bank_tensors, empty_bank, strict=True):
+            self.assertTrue(torch.equal(actual, before))
+        self.assertEqual(
+            addresses,
+            tuple(value.data_ptr() for value in (owner.hidden_states, owner.context_positions, *bank_tensors)),
+        )
+        self.assertIsNone(self.provider.proposal)
+        self.assertEqual(self.provider.get(None), ())
+        self.assertFalse(hasattr(owner, "_draft_window_context_kv_pool"))
+        self.assertFalse(hasattr(owner, "_draft_window_runtime"))
+        self.events.assert_not_called()
+
+        # Resume the actual next normal bank preparation and parameter binding.
+        # Host state retirement is checked, not claimed to be device completion.
+        with self.provider.proposal_scope((False,)):
+            self.provider.prepare(
+                bank,
+                cpu_full_exact=torch.tensor([8], dtype=torch.int32),
+                idx_mapping_np=np.array([0], dtype=np.intp),
+                step=0,
+            )
+            self.provider.bind_current(descriptor)
+            (params,) = self.provider.get(None)
+            self.assertIs(params["block_table"], bank.window_block_table)
+            self.assertEqual(params["actual_seq_lengths_kv"], [4])
+            self.assertEqual(int(bank.window_block_table[0, 0]), 1)
+            self.provider.finish_update()
+        self.assertFalse(self.provider.quarantined)
+        self.assertEqual(self.provider.get(None), ())
+        self.assertTrue(torch.equal(self.provider.table, full_table))
+
+        failure = RuntimeError("native context KV write failed")
+        owner.model.precompute_and_store_context_kv.side_effect = failure
+        with (
+            patch.object(dflash.dflash_speculator, "prepare_dflash_inputs", side_effect=prepare),
+            self.assertRaises(RuntimeError) as seen,
+        ):
+            owner.propose(*args, num_speculative_tokens=0)
+        self.assertIs(seen.exception, failure)
+        self.assertTrue(self.provider.quarantined)
+        self.assertFalse(owner._draft_window_context_kv_active)
+        with self.assertRaisesRegex(RuntimeError, "quarantined"):
+            owner.propose(*args, num_speculative_tokens=7)
+        self.events.assert_not_called()
 
     def test_quarantined_refuses_zero_before_native(self):
         self.owner._draft_window_graph_binding_provider.quarantine()
@@ -106,26 +196,21 @@ class ParallelOwnerTests(unittest.TestCase):
         ):
             self.fail("context write must not execute")
         self.assertFalse(hasattr(self.owner, "_draft_window_context_kv_pool"))
-        self.assertEqual(Completion.recorded, 0)
+        self.events.assert_not_called()
 
-    def test_completion_failure_is_original_and_shared_quarantine(self):
-        first = RuntimeError("completion record stand-in")
-
-        class BrokenCompletion:
-            def record(self, _stream):
-                raise first
-
-        broken = patch.object(torch.npu, "Event", BrokenCompletion)
-        broken.start()
-        self.addCleanup(broken.stop)
-        with (
-            self.assertRaises(RuntimeError) as seen,
-            self.scope(0),
-        ):
-            pass
-        self.assertIs(seen.exception, first)
-        self.assertTrue(self.owner._draft_window_graph_binding_provider.quarantined)
-        self.assertTrue(self.owner._draft_window_context_kv_pool._poisoned)
+    def test_zero_changed_stream_is_rejected_before_native_write(self):
+        # Only the device header/current-stream boundary is stood in for here;
+        # the real provider enforces its established stream before any write.
+        header = SimpleNamespace(device=SimpleNamespace(type="npu"))
+        with patch.object(type(self.provider), "table", new_callable=PropertyMock, return_value=header):
+            with self.scope(0):
+                pass
+            self.stream.npu_stream = 18
+            with self.assertRaisesRegex(RuntimeError, "changed stream"), self.scope(0):
+                self.fail("changed-stream context write must not execute")
+        self.assertFalse(self.owner._draft_window_context_kv_active)
+        self.assertFalse(self.provider.quarantined)
+        self.events.assert_not_called()
 
     def test_zero_and_normal_proposals_cannot_overlap(self):
         with self.scope(0):
@@ -133,8 +218,8 @@ class ParallelOwnerTests(unittest.TestCase):
                 self.scope(8)
             with self.assertRaisesRegex(RuntimeError, "already active"):
                 self.scope(0)
-        self.owner._draft_window_graph_binding_provider.proposal = object()
         with (
+            self.provider.proposal_scope((False,)),
             self.assertRaisesRegex(RuntimeError, "already active"),
             self.scope(0),
         ):
