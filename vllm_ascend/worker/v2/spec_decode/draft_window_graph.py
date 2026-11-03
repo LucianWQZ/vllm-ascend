@@ -42,62 +42,6 @@ class DraftWindowGraphBucket:
     cpu_window_exact: torch.Tensor
     owner: DraftWindowGraphBindingProvider
 
-    def materialize(
-        self,
-        cpu_full_exact: torch.Tensor,
-        idx_mapping_np: np.ndarray,
-        frozen_intervals: tuple[tuple[int, int], ...] | None,
-    ) -> None:
-        source = self.owner
-        assert source.proposal is not None
-        rows = source.proposal
-        # Both method preparation entries construct this completed int32 CPU
-        # snapshot; only its current row extent changes between proposals.
-        if len(cpu_full_exact) < len(rows) or len(idx_mapping_np) < len(rows):
-            raise ValueError("current CPU exact lengths and request slots are required")
-        if frozen_intervals is not None and len(frozen_intervals) != len(rows):
-            raise ValueError("frozen Window anchors must match active request rows")
-        # BlockTables owns initialized counts in persistent request-slot order.
-        # Gather only real rows here; padding belongs to this bank, not to a
-        # second count tensor passed through every method and provider layer.
-        counts = source.block_tables.num_blocks.cpu[source.group.gid].index_select(
-            0, torch.from_numpy(idx_mapping_np[: len(rows)])
-        )
-        source_table, span = source.table, source.group.table_column_span
-        intervals = []
-        # Validate the whole current preparation before the first tensor write.
-        for row, full_read in enumerate(rows):
-            exact, valid = int(cpu_full_exact[row]), int(counts[row])
-            if exact < 0 or not 0 <= valid <= source_table.shape[1]:
-                raise RuntimeError("current exact length or initialized block count is invalid")
-            if full_read:
-                start, required, visible = 0, valid, exact
-            else:
-                if frozen_intervals is None:
-                    start_token = compute_draft_window_start(
-                        full_exact_end=exact, window_size=source.window_size, block_span_tokens=span
-                    )
-                else:
-                    start_token, horizon = frozen_intervals[row]
-                    if not start_token <= exact <= horizon:
-                        raise ValueError("exact end is outside the frozen proposal window/horizon")
-                if start_token % span:
-                    raise NotImplementedError("Draft Graph cannot read an intra-block Window start")
-                start, visible = start_token // span, exact - start_token
-                required = (visible + span - 1) // span
-            if required > self.window_block_table.shape[1]:
-                raise RuntimeError("draft-window table capacity exceeded")
-            if start + required > valid or visible > required * span:
-                raise RuntimeError("draft-window source does not cover the exact readable interval")
-            intervals.append((start, required, visible))
-        self.window_block_table.zero_()
-        self.cpu_window_exact.zero_()
-        for row, (start, required, visible) in enumerate(intervals):
-            if required:
-                self.window_block_table[row, :required].copy_(source_table[row, start : start + required])
-            self.cpu_window_exact[row] = visible
-        self.device_window_exact.copy_(self.cpu_window_exact)
-
 
 class DraftWindowGraphBindingProvider:
     """Own canonical source geometry, capture banks and one proposal binding.
@@ -166,7 +110,53 @@ class DraftWindowGraphBindingProvider:
         if self._pending and self._pending[0][0].descriptor != capture.descriptor:
             raise RuntimeError("Graph consumers belong to different execution buckets")
         self._active_bank = capture
-        capture.materialize(cpu_full_exact, idx_mapping_np, frozen_intervals)
+        # Both method preparation entries construct this completed int32 CPU
+        # snapshot; only its current row extent changes between proposals.
+        if len(cpu_full_exact) < len(proposal) or len(idx_mapping_np) < len(proposal):
+            raise ValueError("current CPU exact lengths and request slots are required")
+        if frozen_intervals is not None and len(frozen_intervals) != len(proposal):
+            raise ValueError("frozen Window anchors must match active request rows")
+        # BlockTables owns initialized counts in persistent request-slot order.
+        # Gather only real rows here; padding belongs to this bank, not to a
+        # second count tensor passed through every method and provider layer.
+        counts = self.block_tables.num_blocks.cpu[self.group.gid].index_select(
+            0, torch.from_numpy(idx_mapping_np[: len(proposal)])
+        )
+        source_table, span = self.table, self.group.table_column_span
+        intervals = []
+        # Validate the whole current preparation before the first tensor write.
+        for row, full_read in enumerate(proposal):
+            exact, valid = int(cpu_full_exact[row]), int(counts[row])
+            if exact < 0 or not 0 <= valid <= source_table.shape[1]:
+                raise RuntimeError("current exact length or initialized block count is invalid")
+            if full_read:
+                start, required, visible = 0, valid, exact
+            else:
+                if frozen_intervals is None:
+                    start_token = compute_draft_window_start(
+                        full_exact_end=exact, window_size=self.window_size, block_span_tokens=span
+                    )
+                else:
+                    start_token, horizon = frozen_intervals[row]
+                    if not start_token <= exact <= horizon:
+                        raise ValueError("exact end is outside the frozen proposal window/horizon")
+                if start_token % span:
+                    raise NotImplementedError("Draft Graph cannot read an intra-block Window start")
+                start, visible = start_token // span, exact - start_token
+                required = (visible + span - 1) // span
+            if required > capture.window_block_table.shape[1]:
+                raise RuntimeError("draft-window table capacity exceeded")
+            if start + required > valid or visible > required * span:
+                raise RuntimeError("draft-window source does not cover the exact readable interval")
+            intervals.append((start, required, visible))
+        capture.window_block_table.zero_()
+        capture.cpu_window_exact.zero_()
+        for row, (start, required, visible) in enumerate(intervals):
+            if required:
+                capture.window_block_table[row, :required].copy_(source_table[row, start : start + required])
+            capture.cpu_window_exact[row] = visible
+        capture.device_window_exact.copy_(capture.cpu_window_exact)
+
         return capture
 
     def complete_native(self) -> None:

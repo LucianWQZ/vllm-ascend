@@ -42,7 +42,6 @@ class Eagle3DraftWindowMixin:
     max_model_len: int
     method: str
     num_speculative_steps: int
-    speculative_config: Any
 
     def _initialize_eagle3_draft_window_state(self) -> None:
         """Initialize proposal state after source/configuration validation."""
@@ -130,7 +129,8 @@ class Eagle3DraftWindowMixin:
             raise RuntimeError("decode exact snapshot requires a completed Eagle3 first pass")
         if self._eagle3_window_decode_step_one_exact is not None:
             raise RuntimeError("Eagle3 decode exact state was already snapshotted")
-        self._validate_request_counts(num_reqs, num_reqs_padded)
+        if num_reqs != self.input_batch.num_reqs or num_reqs_padded < num_reqs:
+            raise ValueError("Eagle3 decode snapshot requires actual rows within its selected capture bucket")
         exact = self.input_buffers.seq_lens[:num_reqs].to(device="cpu", dtype=torch.int32, copy=True)
         self._eagle3_window_decode_step_one_exact = exact
         return exact
@@ -209,9 +209,3 @@ class Eagle3DraftWindowMixin:
         )
         self._eagle3_window_intervals = proposal
         return bank
-
-    def _validate_request_counts(self, num_reqs: int, num_reqs_padded: int) -> None:
-        if num_reqs != self.input_batch.num_reqs:
-            raise RuntimeError("Eagle3 metadata request count does not match the proposal")
-        if num_reqs_padded < num_reqs:
-            raise ValueError("padded request count must cover active Eagle3 requests")

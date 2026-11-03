@@ -11,7 +11,6 @@ from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from typing import Any
 
-import numpy as np
 import torch
 from vllm.v1.worker.gpu.input_batch import InputBatch
 
@@ -36,15 +35,11 @@ class DraftWindowGraphInputMixin:
     input_batch: InputBatch
     input_buffers: Any
     block_tables: Any
-    model_state: Any
     vllm_config: Any
     draft_attn_layer_names: set[str] | None
-    arange: torch.Tensor
-    arange_np: np.ndarray
     attn_groups: Any
     kv_cache_config: Any
     num_query_per_req: int
-    max_model_len: int
 
     def _initialize_draft_window_source_capability(self) -> None:
         """Bind the eligible Source and its Graph input owner atomically."""
