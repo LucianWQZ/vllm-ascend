@@ -586,21 +586,23 @@ class DraftGraphSupportTest(unittest.TestCase):
 
     def test_context_only_full8_keeps_request_guards_without_fake_query_shape(self):
         config = self.config(method="dflash")
-        owner = self.qualified_owner(config, _draft_window_graph_binding_provider=object())
+        provider = NS(proposal=None, require_reusable=Mock())
+        owner = self.qualified_owner(config, _draft_window_graph_binding_provider=provider)
         batch = self.batch()
         batch.num_reqs_after_padding = 2
-        seen: list[str] = []
+        seen: list[tuple[bool, ...]] = []
 
-        def context_kv_scope(_owner):
-            seen.append("context-KV-only")
+        def proposal_scope(rows):
+            seen.append(rows)
             return nullcontext()
 
-        with patch.object(dflash_module, "_draft_window_context_kv_scope", context_kv_scope):
-            with dflash_module._draft_window_owner_scope(owner, batch, num_speculative_tokens=0):
-                pass
-            self.assertEqual(seen, ["context-KV-only"])
-            with self.assertRaises(NotImplementedError):
-                dflash_module._draft_window_owner_scope(owner, batch, num_speculative_tokens=7)
+        provider.proposal_scope = proposal_scope
+        with dflash_module._draft_window_owner_scope(owner, batch, num_speculative_tokens=0):
+            pass
+        self.assertEqual(seen, [()])
+        provider.require_reusable.assert_called_once_with()
+        with self.assertRaises(NotImplementedError):
+            dflash_module._draft_window_owner_scope(owner, batch, num_speculative_tokens=7)
         self.assertFalse(hasattr(owner, "_draft_window_runtime"))
 
     def test_actual_propose_rejects_bad_rows_before_replacing_owner(self):

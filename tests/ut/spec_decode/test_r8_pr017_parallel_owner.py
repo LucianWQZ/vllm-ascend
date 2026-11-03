@@ -97,13 +97,17 @@ class ParallelOwnerTests(unittest.TestCase):
         canonical_kv = torch.zeros((16, 4))
         writes = []
 
-        def prepare(*args):
+        def prepare(*native_args):
             # Stand in only for the native preparation kernel. The actual
             # Ascend/core propose, persistent copy and context dispatch execute.
-            self.assertTrue(owner._draft_window_context_kv_active)
-            self.assertIs(args[9], batch)
-            args[2][:4].copy_(batch.positions)
-            args[3][:4].copy_(torch.arange(4, dtype=torch.int32))
+            self.assertEqual(self.provider.proposal, ())
+            before = owner.input_batch
+            with self.assertRaisesRegex(RuntimeError, "already active"):
+                owner.propose(object(), *args[1:], num_speculative_tokens=0)
+            self.assertIs(owner.input_batch, before)
+            self.assertIs(native_args[9], batch)
+            native_args[2][:4].copy_(batch.positions)
+            native_args[3][:4].copy_(torch.arange(4, dtype=torch.int32))
 
         def store(hidden, positions, slots):
             self.assertEqual(hidden.data_ptr(), owner.hidden_states.data_ptr())
@@ -132,7 +136,7 @@ class ParallelOwnerTests(unittest.TestCase):
                 result = owner.propose(*args, num_speculative_tokens=0)
                 self.assertEqual(result.data_ptr(), owner.draft_tokens.data_ptr())
                 self.assertIs(owner.input_batch, batch)
-                self.assertFalse(owner._draft_window_context_kv_active)
+                self.assertIsNone(self.provider.proposal)
             self.assertEqual(preparation.call_count, 2)
         self.assertEqual(len(writes), 2)
         self.assertTrue(torch.equal(canonical_kv[:4], last_hidden))
@@ -179,7 +183,7 @@ class ParallelOwnerTests(unittest.TestCase):
             owner.propose(*args, num_speculative_tokens=0)
         self.assertIs(seen.exception, failure)
         self.assertTrue(self.provider.quarantined)
-        self.assertFalse(owner._draft_window_context_kv_active)
+        self.assertIsNone(self.provider.proposal)
         with self.assertRaisesRegex(RuntimeError, "quarantined"):
             owner.propose(*args, num_speculative_tokens=7)
         self.events.assert_not_called()
@@ -204,7 +208,7 @@ class ParallelOwnerTests(unittest.TestCase):
             self.stream.npu_stream = 18
             with self.assertRaisesRegex(RuntimeError, "changed stream"), self.scope(0):
                 self.fail("changed-stream context write must not execute")
-        self.assertFalse(self.owner._draft_window_context_kv_active)
+        self.assertIsNone(self.provider.proposal)
         self.assertFalse(self.provider.quarantined)
         self.events.assert_not_called()
 

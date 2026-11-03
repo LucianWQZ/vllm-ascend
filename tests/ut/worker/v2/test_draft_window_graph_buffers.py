@@ -757,7 +757,7 @@ def test_parallel_scope_rows_control_the_real_dispatch_phase(parallel_bypass_sco
 
 
 def test_parallel_bypass_scope_cannot_nest_or_enter_context_only(parallel_bypass_scope):
-    from vllm_ascend.worker.v2.spec_decode.dflash.speculator import _draft_window_context_kv_scope
+    from vllm_ascend.worker.v2.spec_decode.dflash.speculator import _draft_window_owner_scope
 
     owner, batch, dummy, profile = parallel_bypass_scope
     provider = owner._draft_window_graph_binding_provider
@@ -768,8 +768,8 @@ def test_parallel_bypass_scope_cannot_nest_or_enter_context_only(parallel_bypass
             owner._draft_window_proposal_scope(batch, dummy_run=dummy, is_profile=profile),
         ):
             pytest.fail("nested bypass overwrote its current phase")
-        with pytest.raises(RuntimeError, match="already active"), _draft_window_context_kv_scope(owner):
-            pytest.fail("context-only write entered an active bypass phase")
+        with pytest.raises(RuntimeError, match="already active"):
+            _draft_window_owner_scope(owner, batch, num_speculative_tokens=0)
         assert provider.proposal is current
     assert provider.proposal is None and not provider.quarantined
 

@@ -3,7 +3,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Callable, Mapping
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 from typing import Any, cast
 
 import numpy as np
@@ -131,28 +131,6 @@ def prepare_dflash_inputs_factory(
     return prepare_with_block_size
 
 
-@contextmanager
-def _draft_window_context_kv_scope(owner):
-    """Keep the fixed core's context-only KV writes on its existing stream.
-
-    Core544 uses persistent input/KV owners and native same-stream temporaries,
-    without preparing a Window bank. No separate read owner or event is needed.
-    A failed canonical write still quarantines later Window proposals.
-    """
-    provider = owner._draft_window_graph_binding_provider
-    provider.require_reusable()
-    if provider.proposal is not None or getattr(owner, "_draft_window_context_kv_active", False):
-        raise RuntimeError("A Draft Window proposal scope is already active")
-    owner._draft_window_context_kv_active = True
-    try:
-        yield
-    except BaseException:
-        provider.quarantine()
-        raise
-    finally:
-        owner._draft_window_context_kv_active = False
-
-
 def _draft_window_owner_scope(owner, input_batch, dummy_run=False, is_profile=False, *, num_speculative_tokens=None):
     """Choose exactly one existing proposal owner at the Ascend boundary."""
     runtime = getattr(owner, "_draft_window_runtime", None)
@@ -175,15 +153,18 @@ def _draft_window_owner_scope(owner, input_batch, dummy_run=False, is_profile=Fa
     if runtime is not None and graph_runtime is not None:
         raise RuntimeError("Draft Window eager and Graph owners cannot share one proposal")
     if graph_runtime is not None:
-        if getattr(owner, "_draft_window_context_kv_active", False):
-            raise RuntimeError("A context-only Draft KV write is already active")
+        if graph_runtime.proposal is not None:
+            raise RuntimeError("A Draft Window proposal scope is already active")
         if num_speculative_tokens is not None and (
             type(num_speculative_tokens) is not int or num_speculative_tokens not in (0, owner.num_speculative_steps)
         ):
             raise RuntimeError("Draft Window Graph cannot change its captured static K")
         effective_dummy = dummy_run or getattr(input_batch, "is_dummy", False)
         if context_kv_only and not (effective_dummy or is_profile):
-            return _draft_window_context_kv_scope(owner)
+            # The fixed K0 branch writes context KV but executes no attention.
+            # Fence its first write; the empty shared scope owns exceptions.
+            graph_runtime.require_reusable()
+            return graph_runtime.proposal_scope(())
         return owner._draft_window_proposal_scope(input_batch, dummy_run=effective_dummy, is_profile=is_profile)
     if runtime is not None:
         return runtime.proposal_context(input_batch, dummy_run, is_profile, context_kv_only=context_kv_only)
