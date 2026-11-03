@@ -138,11 +138,11 @@ def init_speculator(vllm_config: VllmConfig, device: torch.device, req_states: "
         logger.info_once(
             "Draft Graph support: %s, TP4/DP%d, local request capacity %d, static K%d, "
             "model capacity %d; actual request/padded shapes are checked before execution.",
-            review_limit.method,
-            review_limit.data_parallel_size,
-            review_limit.max_requests,
-            review_limit.static_k,
-            review_limit.max_model_len,
+            speculative_config.method,
+            vllm_config.parallel_config.data_parallel_size,
+            vllm_config.scheduler_config.max_num_seqs,
+            speculative_config.num_speculative_tokens,
+            vllm_config.model_config.max_model_len,
         )
     if policy is not None and policy.reason is not None:
         logger.warning(

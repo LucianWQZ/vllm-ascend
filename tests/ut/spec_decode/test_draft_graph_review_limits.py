@@ -85,6 +85,22 @@ class DraftGraphSupportTest(unittest.TestCase):
     def resolve(self, config):
         return GUARD.resolve_draft_graph_review_limit(config, experimental_graph_review=True)
 
+    def qualified_owner(self, config=None, **overrides):
+        config = self.config() if config is None else config
+        self.assertIs(self.resolve(config), True)
+        speculative = config.speculative_config
+        fields = dict(
+            _draft_graph_review_limit=True,
+            method=speculative.method,
+            num_speculative_steps=speculative.num_speculative_tokens,
+            max_num_reqs=config.scheduler_config.max_num_seqs,
+            max_model_len=config.model_config.max_model_len,
+            num_query_per_req=speculative.num_speculative_tokens + 1,
+            vllm_config=config,
+        )
+        fields.update(overrides)
+        return NS(**fields)
+
     def test_capacities_without_experiment_flags(self):
         for method in ("eagle3", "dflash"):
             for dp, rows in ((1, 1), (1, 2), (2, 1)):
@@ -93,10 +109,7 @@ class DraftGraphSupportTest(unittest.TestCase):
                         self.subTest(method=method, dp=dp, rows=rows, window=window),
                         patch.object(Path, "read_text", side_effect=AssertionError("startup must not reload config")),
                     ):
-                        scope = self.resolve(self.config(method=method, dp=dp, rows=rows, window=window))
-                        self.assertEqual(
-                            (scope.method, scope.data_parallel_size, scope.max_requests), (method, dp, rows)
-                        )
+                        self.assertIs(self.resolve(self.config(method=method, dp=dp, rows=rows, window=window)), True)
 
     def test_dp2_local_pair_and_three_requests_stay_blocked(self):
         for method in ("eagle3", "dflash"):
@@ -147,7 +160,7 @@ class DraftGraphSupportTest(unittest.TestCase):
         hf.initializer_range = 0.3
         hf.unused_export_note = "not read by the fixed model"
         with patch.object(Path, "read_text", side_effect=AssertionError("unexpected config IO")):
-            self.assertEqual(self.resolve(config).method, "eagle3")
+            self.assertIs(self.resolve(config), True)
 
     def test_model_loader_settings_do_not_redefine_window_geometry(self):
         for method in ("eagle3", "dflash"):
@@ -181,7 +194,7 @@ class DraftGraphSupportTest(unittest.TestCase):
             wrapped = EAGLEConfig(inner, method=method, model_type="eagle")
             config.speculative_config.draft_model_config.hf_config = wrapped
             self.assertEqual(wrapped.model_type, "eagle")
-            self.assertEqual(self.resolve(config).method, method)
+            self.assertIs(self.resolve(config), True)
             # The model consumes outer effective fields. Unwrapping the whole
             # config would silently ignore this changed projection geometry.
             wrapped.hidden_size += 1
@@ -229,7 +242,7 @@ class DraftGraphSupportTest(unittest.TestCase):
         with self.assertRaisesRegex(NotImplementedError, "hidden_size"):
             self.resolve(config)
 
-    def test_startup_reuses_the_frozen_support_without_reparsing(self):
+    def test_startup_reuses_resolved_qualification_without_reparsing(self):
         from vllm_ascend import envs
         from vllm_ascend.worker.v2.spec_decode import _use_graph_window_owner
         from vllm_ascend.worker.v2.spec_decode import draft_graph_review_limits as actual_guard
@@ -264,7 +277,7 @@ class DraftGraphSupportTest(unittest.TestCase):
         ), self.assertRaisesRegex(NotImplementedError, "STANDARD"):
             validate_draft_window_graph_config(config, support=support)
 
-    def test_real_factory_passes_its_single_frozen_support_to_validation(self):
+    def test_real_factory_passes_its_single_qualification_to_validation(self):
         from vllm_ascend import ascend_config, envs
         from vllm_ascend.worker.v2 import spec_decode as factory
         from vllm_ascend.worker.v2.spec_decode import draft_graph_review_limits as actual_guard
@@ -383,8 +396,7 @@ class DraftGraphSupportTest(unittest.TestCase):
         )
 
     def test_actual_rows_and_request_identity_not_client_concurrency(self):
-        scope = self.resolve(self.config(rows=2))
-        owner = NS(_draft_graph_review_limit=scope, max_model_len=scope.max_model_len)
+        owner = self.qualified_owner(self.config(rows=2))
         batch = self.batch(rows=2)
         GUARD.validate_draft_graph_review_requests(owner, batch)
         batch.num_reqs_after_padding = 4
@@ -394,8 +406,7 @@ class DraftGraphSupportTest(unittest.TestCase):
     def test_preemption_state_is_kept_until_actual_finish(self):
         for method in ("eagle3", "dflash"):
             with self.subTest(method=method):
-                scope = self.resolve(self.config(method=method))
-                owner = NS(_draft_graph_review_limit=scope, max_model_len=scope.max_model_len)
+                owner = self.qualified_owner(self.config(method=method))
                 runner = NPUModelRunner.__new__(NPUModelRunner)
                 runner.speculator = owner
                 batch = self.batch()
@@ -429,8 +440,7 @@ class DraftGraphSupportTest(unittest.TestCase):
     def test_bounds_use_actual_runner_mapping_and_reject_resumed_requests(self):
         import numpy as np
 
-        scope = self.resolve(self.config(rows=2))
-        owner = NS(_draft_graph_review_limit=scope)
+        owner = self.qualified_owner(self.config(rows=2))
         state = NS(
             req_id_to_index={"a": 2, "b": 0},
             prompt_len=NS(np=np.array([513, 0, 1537])),
@@ -479,12 +489,7 @@ class DraftGraphSupportTest(unittest.TestCase):
             def __getitem__(self, index):
                 return NS(item=lambda: self.value)
 
-        scope = self.resolve(self.config())
-        owner = NS(
-            _draft_graph_review_limit=scope,
-            max_model_len=scope.max_model_len,
-            _draft_window_graph_binding_provider=NS(proposal=(True,)),
-        )
+        owner = self.qualified_owner(_draft_window_graph_binding_provider=NS(proposal=(True,)))
         batch = self.batch()
         batch.num_computed_prefill_tokens_np = np.array([512], dtype=np.int32)
         batch.num_scheduled_tokens = np.array([128], dtype=np.int32)
@@ -505,13 +510,7 @@ class DraftGraphSupportTest(unittest.TestCase):
 
     def test_full8_request_lookahead_cannot_exceed_allocated_capacity(self):
         config = self.config(method="dflash")
-        scope = self.resolve(config)
-        owner = NS(
-            _draft_graph_review_limit=scope,
-            max_model_len=scope.max_model_len,
-            num_query_per_req=8,
-            vllm_config=config,
-        )
+        owner = self.qualified_owner(config)
         batch = self.batch()
         GUARD.validate_draft_graph_review_requests(owner, batch)
         batch.draft_graph_request_bounds = ((1021, 40960),)
@@ -529,9 +528,8 @@ class DraftGraphSupportTest(unittest.TestCase):
     def test_full8_actual_metadata_boundary_rejects_unqualified_padding_before_materialize(self):
         from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowGraphInputMixin
 
-        scope = self.resolve(self.config(method="dflash", rows=2))
         owner: Any = object.__new__(DraftWindowGraphInputMixin)
-        owner._draft_graph_review_limit = scope
+        owner.__dict__.update(vars(self.qualified_owner(self.config(method="dflash", rows=2))))
         provider = owner._draft_window_graph_binding_provider = NS(
             proposal=None, capture_identity_for=Mock(), prepare=Mock()
         )
@@ -576,15 +574,7 @@ class DraftGraphSupportTest(unittest.TestCase):
 
     def test_context_only_full8_keeps_request_guards_without_fake_query_shape(self):
         config = self.config(method="dflash")
-        scope = self.resolve(config)
-        owner = NS(
-            _draft_graph_review_limit=scope,
-            max_model_len=scope.max_model_len,
-            num_query_per_req=8,
-            num_speculative_steps=7,
-            vllm_config=config,
-            _draft_window_graph_binding_provider=object(),
-        )
+        owner = self.qualified_owner(config, _draft_window_graph_binding_provider=object())
         batch = self.batch()
         batch.num_reqs_after_padding = 2
         seen: list[str] = []
@@ -603,17 +593,9 @@ class DraftGraphSupportTest(unittest.TestCase):
 
     def test_actual_propose_rejects_bad_rows_before_replacing_owner(self):
         config = self.config(method="dflash")
-        scope = self.resolve(config)
         old_batch = object()
         owner = object.__new__(dflash_module.AscendDFlashSpeculator)
-        owner.__dict__.update(
-            _draft_graph_review_limit=scope,
-            max_model_len=scope.max_model_len,
-            num_query_per_req=8,
-            num_speculative_steps=7,
-            vllm_config=config,
-            input_batch=old_batch,
-        )
+        owner.__dict__.update(vars(self.qualified_owner(config, input_batch=old_batch)))
         batch = self.batch(rows=2)
         unused_tensor = torch.empty(0, device="cpu")
         with self.assertRaises(NotImplementedError):
@@ -635,8 +617,9 @@ class DraftGraphSupportTest(unittest.TestCase):
 
 
 def _single_owner_batch(prompt=257, output=32, capacity=4096):
-    scope = GUARD.DraftGraphSupport(capacity, 3, 1, 1, "eagle3", 4)
-    owner = NS(_draft_graph_review_limit=scope, max_model_len=capacity)
+    owner = NS(
+        _draft_graph_review_limit=True, method="eagle3", max_model_len=capacity, num_speculative_steps=3, max_num_reqs=1
+    )
     batch = NS(
         num_reqs=1,
         num_reqs_after_padding=1,
@@ -650,7 +633,9 @@ def _single_owner_batch(prompt=257, output=32, capacity=4096):
 
 
 def _pair_owner_batch():
-    owner = NS(_draft_graph_review_limit=GUARD.DraftGraphSupport(4096, 3, 2, 1, "eagle3", 4), max_model_len=4096)
+    owner = NS(
+        _draft_graph_review_limit=True, method="eagle3", max_model_len=4096, num_speculative_steps=3, max_num_reqs=2
+    )
     batch = NS(
         num_reqs=2,
         num_reqs_after_padding=2,
@@ -791,7 +776,11 @@ class ActualGraphDescriptorControls(unittest.TestCase):
         for owner in (
             NS(),
             NS(
-                _draft_graph_review_limit=GUARD.DraftGraphSupport(4096, 3, 1, 1, "eagle3", 4),
+                _draft_graph_review_limit=True,
+                method="eagle3",
+                num_speculative_steps=3,
+                max_num_reqs=1,
+                max_model_len=4096,
                 input_batch=NS(is_dummy=True),
             ),
         ):
@@ -929,7 +918,7 @@ def idle_owner():
         max_num_reqs=1,
         input_batch=batch,
         vllm_config=NS(additional_config={}),
-        _draft_graph_review_limit=GUARD.DraftGraphSupport(4096, 3, 1, 2, "eagle3", 4),
+        _draft_graph_review_limit=True,
         update_stream=object(),
         _eagle3_graph_session=session,
         _eagle3_window_bypass_active=True,

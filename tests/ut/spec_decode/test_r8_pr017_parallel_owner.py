@@ -22,7 +22,6 @@ from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 
 from vllm_ascend.worker.v2.spec_decode.dflash import aclgraph as dflash_graph
 from vllm_ascend.worker.v2.spec_decode.dflash import speculator as dflash
-from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import DraftGraphSupport
 from vllm_ascend.worker.v2.spec_decode.draft_window_backends import DraftWindowGroupRoute, DraftWindowProviderStatus
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphBindingProvider
 from vllm_ascend.worker.v2.spec_decode.draft_window_policy import resolve_draft_window_policy
@@ -264,8 +263,10 @@ class ParallelOwnerTests(unittest.TestCase):
         self.assertFalse(hasattr(self.owner, "_draft_window_context_kv_pool"))
 
     def test_full8_target_padding_is_not_a_zero_branch_draft_query(self):
-        # Use the actual immutable support type required by the production guard.
-        self.owner._draft_graph_review_limit = DraftGraphSupport(40960, 7, 1, 1, "dflash", 8)
+        self.owner._draft_graph_review_limit = True
+        self.owner.method = "dflash"
+        self.owner.max_num_reqs = 1
+        self.owner.num_speculative_steps = 7
         self.owner.max_model_len = 40960
         self.owner.num_query_per_req = 8
         self.owner.vllm_config.model_config = SimpleNamespace(max_model_len=40960)
@@ -278,16 +279,16 @@ class ParallelOwnerTests(unittest.TestCase):
         with self.scope(0):
             pass
         self.assertEqual(self.normal, [])
-        for tokens in (None, 8):
+        for tokens in (None, 7):
             with self.assertRaisesRegex(NotImplementedError, "admitted actual rows"):
                 self.scope(tokens)
         self.batch.num_reqs_after_padding = 1
-        with self.scope(8):
+        with self.scope(7):
             pass
         # Context-only skips query padding, never the actual request capacity.
         self.batch.num_reqs = 3
         self.batch.num_reqs_after_padding = 4
-        for tokens in (0, 8):
+        for tokens in (0, 7):
             with self.assertRaisesRegex(NotImplementedError, "admitted actual rows"):
                 self.scope(tokens)
         self.assertEqual(len(self.normal), 1)

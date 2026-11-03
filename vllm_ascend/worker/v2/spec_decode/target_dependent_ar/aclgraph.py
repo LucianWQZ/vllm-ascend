@@ -70,7 +70,7 @@ def _eagle_ar_capture_config(vllm_config: VllmConfig, cudagraph_mode: CUDAGraphM
     # bucket, its capacity and the independent non-SP Draft. Reuse those same
     # request counts for Q1 AR; never renormalize them through Target SP.
     compilation = vllm_config.compilation_config
-    requests = list(range(1, scope.max_requests + 1))
+    requests = list(range(1, vllm_config.scheduler_config.max_num_seqs + 1))
     draft_config = copy(vllm_config)
     draft_config.compilation_config = copy(compilation)
     draft_config.compilation_config.cudagraph_capture_sizes = requests

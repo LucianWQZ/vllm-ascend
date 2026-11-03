@@ -227,6 +227,12 @@ def test_actual_conditional_full_vocab_logits_allocation(monkeypatch, owner, sam
     actual = AscendDFlash2Speculator.__new__(AscendDFlash2Speculator)
     DraftModelSpeculator.__init__(actual, config, torch.device("cpu"))
     assert actual.speculative_config is config.speculative_config
+    assert (actual.method, actual.num_speculative_steps, actual.max_num_reqs, actual.max_model_len) == (
+        "dflash",
+        7,
+        4,
+        128,
+    )
     if sampling == "probabilistic":
         assert actual.draft_logits.shape == (4, 7, 8)
         assert actual.draft_logits.dtype is torch.float32

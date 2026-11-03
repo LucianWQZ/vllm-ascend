@@ -1,25 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """Startup support and runtime shape bounds for qualified Draft Graph consumers.
 
-One frozen contract is shared by config, the speculator and actual request
-checks. It is not a numerical PASS receipt. Window OFF only enters this
-contract when the new experimental Graph owner is explicitly selected.
+Startup qualification is shared by config and the speculator; actual request
+checks use the fixed speculator's existing capacity and method fields. This is
+not a numerical PASS receipt. Window OFF only enters this contract when the
+new experimental Graph owner is explicitly selected.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
-
-@dataclass(frozen=True, slots=True)
-class DraftGraphSupport:
-    max_model_len: int
-    static_k: int
-    max_requests: int
-    data_parallel_size: int
-    method: str
-    query_tokens: int
-
+from typing import Literal
 
 # Keep the qualified attention/projection, auxiliary and position geometry.
 # Model norm/activation/vocabulary settings belong to the actual model loader,
@@ -143,11 +133,12 @@ def _consumer_profile(speculative):
     return profile
 
 
-def resolve_draft_graph_review_limit(vllm_config, *, experimental_graph_review=False):
+def resolve_draft_graph_review_limit(vllm_config, *, experimental_graph_review=False) -> Literal[True] | None:
     """Parse startup support without changing the upstream configuration.
 
-    The speculator owns the returned frozen contract. VllmConfig must contain
-    only declared fields because upstream DFlash loading copies it with replace.
+    Return True only for the protected qualified routes, and None otherwise.
+    Method/capacity facts remain on the actual speculator; VllmConfig receives
+    no undeclared fields because upstream DFlash loading copies it with replace.
     """
     speculative = vllm_config.speculative_config
     if (
@@ -246,7 +237,7 @@ def _validate_qualified_graph_config(vllm_config, profile):
         )
     if not eagle:
         _full8_review_capacity(vllm_config)
-    return DraftGraphSupport(maximum, k, rows, dp, method, query)
+    return True
 
 
 def note_eagle_single_request_review_lifecycle(owner, scheduler_output):
@@ -274,7 +265,7 @@ def draft_graph_request_bounds(owner, req_states, req_ids, idx_mapping_np):
         return None
     bounds = []
     blocked = getattr(owner, "_draft_graph_review_preempted_request_ids", ())
-    lookahead = scope.static_k if scope.method == "eagle3" else scope.query_tokens
+    lookahead = owner.num_speculative_steps if owner.method == "eagle3" else owner.num_query_per_req
     for req_id, raw_index in zip(req_ids, idx_mapping_np, strict=True):
         if req_id in blocked:
             raise NotImplementedError("Draft Graph does not qualify resumption after preemption")
@@ -283,7 +274,7 @@ def draft_graph_request_bounds(owner, req_states, req_ids, idx_mapping_np):
         if int(req_states.prefill_len.np[row]) != prompt:
             raise NotImplementedError("Draft Graph does not qualify resumed request history")
         maximum = int(req_states.max_seq_len[row])
-        if not 0 < prompt < maximum or maximum + lookahead > scope.max_model_len:
+        if not 0 < prompt < maximum or maximum + lookahead > owner.max_model_len:
             raise NotImplementedError("Draft Graph prompt/output budget and query lookahead exceed allocated capacity")
         bounds.append((prompt, maximum))
     return tuple(bounds)
@@ -299,7 +290,7 @@ def _request_bounds(input_batch):
 def validate_eagle_single_request_review_exact(owner, input_batch, exact, *, num_reqs, padded, step):
     """Inspect the existing CPU exact owner, never an upper bound or new D2H."""
     scope = getattr(owner, "_draft_graph_review_limit", None)
-    if scope is None or scope.method != "eagle3":
+    if scope is None or owner.method != "eagle3":
         return
     rows = _request_bounds(input_batch)
     # The real Eagle producer owns CPU int32 storage and validates the step.
@@ -311,7 +302,7 @@ def validate_eagle_single_request_review_exact(owner, input_batch, exact, *, num
     for position, (prompt, maximum) in enumerate(rows):
         value = exact[position].item()
         lower = prompt
-        upper = min(maximum + scope.static_k, scope.max_model_len)
+        upper = min(maximum + owner.num_speculative_steps, owner.max_model_len)
         if continuing_rows and continuing_rows[position]:
             # The proposal epoch already classified and validated this row from
             # canonical InputBatch counters. In a mixed prefill, its first
@@ -320,7 +311,7 @@ def validate_eagle_single_request_review_exact(owner, input_batch, exact, *, num
             end = int(input_batch.num_computed_prefill_tokens_np[position]) + int(
                 input_batch.num_scheduled_tokens[position]
             )
-            lower = upper = min(end + step, scope.max_model_len)
+            lower = upper = min(end + step, owner.max_model_len)
         if not lower <= value <= upper:
             raise NotImplementedError(
                 "Eagle consumer exact length is outside its request and model capacity: "
@@ -331,12 +322,12 @@ def validate_eagle_single_request_review_exact(owner, input_batch, exact, *, num
 def validate_eagle_single_request_graph_descriptor(owner, *, first, n, tokens):
     """Check the executed Graph shape, including Window OFF consumers."""
     scope = getattr(owner, "_draft_graph_review_limit", None)
-    if scope is None or scope.method != "eagle3":
+    if scope is None or owner.method != "eagle3":
         return
     batch = owner.input_batch
     # Propose already admitted active/padded rows and their request bounds.
     # Only the selected runtime descriptor can change before this replay.
-    if n != batch.num_reqs or tokens != n * (scope.static_k + 1 if first else 1):
+    if n != batch.num_reqs or tokens != n * (owner.num_speculative_steps + 1 if first else 1):
         raise NotImplementedError(
             "Eagle review Graph requires padded1 or explicitly admitted padded2, first Q4 or AR Q1 before replay"
         )
@@ -368,13 +359,13 @@ def validate_draft_graph_review_requests(
     scope = getattr(owner, "_draft_graph_review_limit", None)
     if scope is None or dummy_run or is_profile or getattr(input_batch, "is_dummy", False):
         return
-    if scope.method == "dflash" and type(input_batch.num_reqs) is int and input_batch.num_reqs == 0:
+    if owner.method == "dflash" and type(input_batch.num_reqs) is int and input_batch.num_reqs == 0:
         return
     rows = _request_bounds(input_batch)
     active, padded = input_batch.num_reqs, input_batch.num_reqs_after_padding
     if (
         type(active) is not int
-        or not 1 <= active <= scope.max_requests
+        or not 1 <= active <= owner.max_num_reqs
         or (not context_kv_only and (type(padded) is not int or padded != active))
         or len(rows) != active
     ):
