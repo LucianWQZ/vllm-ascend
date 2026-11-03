@@ -414,6 +414,7 @@ def test_parallel_metadata_hook_retains_the_existing_off_and_prefill_path(parall
 
 def test_parallel_metadata_hook_prepares_one_bank_without_a_temporary_metadata_build(parallel_hook):
     owner, desc, inputs, calls = parallel_hook
+    owner.input_buffers.seq_lens[1] = 777  # Transport padding is not a request.
     result = owner._build_attn_metadata(
         1,
         desc,
@@ -424,7 +425,8 @@ def test_parallel_metadata_hook_prepares_one_bank_without_a_temporary_metadata_b
     )
     assert result is None and not hasattr(owner, "_draft_window_live_inputs")
     assert len(calls) == 1 and calls[0]["step"] == 0
-    assert calls[0]["cpu_full_exact"].tolist() == [16, 0]
+    assert calls[0]["cpu_full_exact"].tolist() == [16]
+    assert owner.input_buffers.seq_lens.tolist() == [16, 777]
     assert calls[0]["idx_mapping_np"] is owner.input_batch.idx_mapping_np
 
 
