@@ -207,9 +207,7 @@ def _draft_window_owner_scope(owner, input_batch, dummy_run=False, is_profile=Fa
             return _draft_window_context_kv_scope(owner, input_batch)
         return owner._draft_window_proposal_scope(input_batch, dummy_run=effective_dummy, is_profile=is_profile)
     if runtime is not None:
-        return runtime.proposal_context(
-            owner, input_batch, dummy_run, is_profile, context_kv_only=num_speculative_tokens == 0
-        )
+        return runtime.proposal_context(input_batch, dummy_run, is_profile, context_kv_only=num_speculative_tokens == 0)
     return nullcontext()
 
 

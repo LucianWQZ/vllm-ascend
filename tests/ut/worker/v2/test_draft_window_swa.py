@@ -112,7 +112,7 @@ def test_current_exact_rejection_and_group_geometry(prepared, span, starts):
     runtime, spec, batch, common, canonical, _ = prepared(span)
     target = dict(vars(common))
     before = canonical.clone()
-    with runtime.proposal_context(spec, batch):
+    with runtime.proposal_context(batch):
         owner = runtime._owner
         runtime.metadata_callback(8, 2)(0, common)
         result = build_native(common, spec)
@@ -147,7 +147,7 @@ def test_native_band_read_set_intersection_uses_actual_query_positions():
 def test_continuing_prefill_preserves_native_full_read(prepared, continuing):
     runtime, spec, batch, common, _, _ = prepared(continuing=continuing)
     old_table, old_lengths = common.block_table_tensor, common.seq_lens
-    with runtime.proposal_context(spec, batch):
+    with runtime.proposal_context(batch):
         runtime.metadata_callback(8, 2)(0, common)
         result = build_native(common, spec)
         assert result.seq_lens_list[0] == 1151
@@ -171,7 +171,7 @@ def test_native_metadata_uses_one_actual_snapshot_for_all_groups(prepared, monke
         return original(tensor, *args, **kwargs)
 
     monkeypatch.setattr(torch.Tensor, "to", counted)
-    with runtime.proposal_context(spec, batch):
+    with runtime.proposal_context(batch):
         callback = runtime.metadata_callback(8, 2)
         second = SimpleNamespace(**vars(common))
         for gid, item in enumerate((common, second)):
@@ -196,7 +196,7 @@ def test_native_projection_rejects_wrong_actual_preparation(prepared, changed):
         common.seq_lens = common.seq_lens.long()
     else:
         common.seq_lens = torch.cat((common.seq_lens, torch.zeros(1, dtype=torch.int32)))
-    with pytest.raises(ValueError, match="Native SWA"), runtime.proposal_context(spec, batch):
+    with pytest.raises(ValueError, match="Native SWA"), runtime.proposal_context(batch):
         runtime.metadata_callback(8, 2)(0, common)
     assert runtime.pool.poisoned
 
@@ -205,13 +205,13 @@ def test_native_projection_must_cover_every_query(prepared):
     runtime, spec, batch, common, _, _ = prepared(window=1)
     common.seq_lens = torch.tensor([1025, 1025], dtype=torch.int32)
     common.seq_lens_cpu_upper_bound = common.seq_lens + 1
-    with pytest.raises(ValueError, match="every native query"), runtime.proposal_context(spec, batch):
+    with pytest.raises(ValueError, match="every native query"), runtime.proposal_context(batch):
         runtime.metadata_callback(8, 2)(0, common)
 
 
 def test_next_native_proposal_owns_independent_read_buffers(prepared):
     runtime, spec, batch, common, canonical, completions = prepared()
-    with runtime.proposal_context(spec, batch):
+    with runtime.proposal_context(batch):
         runtime.metadata_callback(8, 2)(0, common)
     first = common.seq_lens.clone(), common.block_table_tensor.clone()
     second = SimpleNamespace(**vars(common))
@@ -219,7 +219,7 @@ def test_next_native_proposal_owns_independent_read_buffers(prepared):
     second.block_table_tensor = canonical[batch.idx_mapping_np.tolist()].clone()
     second.seq_lens_cpu_upper_bound = second.seq_lens + 3
     del second._draft_window_exact_cpu
-    with runtime.proposal_context(spec, batch):
+    with runtime.proposal_context(batch):
         runtime.metadata_callback(8, 2)(0, second)
     torch.testing.assert_close(common.seq_lens, first[0], rtol=0, atol=0)
     torch.testing.assert_close(common.block_table_tensor, first[1], rtol=0, atol=0)
@@ -231,17 +231,17 @@ def test_next_native_proposal_owns_independent_read_buffers(prepared):
 
 def test_native_callback_cannot_cross_proposal_ownership(prepared):
     runtime, spec, batch, common, _, _ = prepared()
-    with runtime.proposal_context(spec, batch):
+    with runtime.proposal_context(batch):
         callback = runtime.metadata_callback(8, 2)
         callback(0, common)
-    with pytest.raises(RuntimeError, match="stale proposal"), runtime.proposal_context(spec, batch):
+    with pytest.raises(RuntimeError, match="stale proposal"), runtime.proposal_context(batch):
         callback(0, common)
 
 
 def test_builder_failure_keeps_projected_read_operands_owned(prepared):
     runtime, spec, batch, common, _, _ = prepared()
     compact = common.block_table_tensor
-    with pytest.raises(RuntimeError, match="builder failed"), runtime.proposal_context(spec, batch):
+    with pytest.raises(RuntimeError, match="builder failed"), runtime.proposal_context(batch):
         owner = runtime._owner
         runtime.metadata_callback(8, 2)(0, common)
         assert any(item is common for item in owner.retained)

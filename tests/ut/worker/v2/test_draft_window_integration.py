@@ -250,8 +250,8 @@ def test_propose_uses_real_upstream_signature_scope_and_dp_rules(contract, enabl
     events = []
 
     @contextmanager
-    def proposal_context(speculator, input_batch, dummy_run, is_profile, **kwargs):
-        assert (speculator, input_batch, dummy_run, is_profile) == (contract.obj, batch, profiling, profiling)
+    def proposal_context(input_batch, dummy_run, is_profile, **kwargs):
+        assert (input_batch, dummy_run, is_profile) == (batch, profiling, profiling)
         expected = (
             {"num_speculative_tokens": num_speculative_tokens}
             if contract.method == "autoregressive"
@@ -571,7 +571,7 @@ def test_dspark_mla_reuses_prepared_exact_cpu_without_another_transfer(contract,
 
     monkeypatch.setattr(torch.Tensor, "to", observe_to)
     monkeypatch.setattr(torch.Tensor, "copy_", observe_copy)
-    with runtime.proposal_context(obj, obj.input_batch):
+    with runtime.proposal_context(obj.input_batch):
         owner = runtime._owner
         result = obj._build_attn_metadata(
             1,

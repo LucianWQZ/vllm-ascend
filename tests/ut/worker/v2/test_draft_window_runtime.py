@@ -180,7 +180,7 @@ def test_callback_reads_canonical_source_and_preserves_write_query_objects(setup
     original_read = metadata.seq_lens
     write, positions, query = metadata.slot_mapping, metadata.positions, metadata.query_start_loc
     full = canonical.clone()
-    with runtime.proposal_context(spec, batch()):
+    with runtime.proposal_context(batch()):
         runtime.metadata_callback(3, 2)(0, metadata)
         runtime.retain_metadata({"layer": metadata})
     # Continuing prefill is Full; decode E=27 W=8 B=4 gives S=16 V=11.
@@ -200,7 +200,7 @@ def test_callback_reads_canonical_source_and_preserves_write_query_objects(setup
 def test_exact_after_rejection_controls_start_not_cpu_upper(setup):
     runtime, spec, canonical, _ = setup
     metadata = common(exact=(12, 15), upper=(14, 30))
-    with runtime.proposal_context(spec, batch()):
+    with runtime.proposal_context(batch()):
         runtime.metadata_callback(3, 2)(0, metadata)
     assert metadata.seq_lens.tolist() == [12, 11, 0]
     assert metadata.block_table_tensor[1, :3].tolist() == canonical[3, 1:4].tolist()
@@ -221,7 +221,7 @@ def test_unprojected_native_group_metadata_is_untouched_while_full_group_windows
     original_native = vars(native_metadata).copy()
     native_values = {name: value.clone() for name, value in original_native.items() if isinstance(value, torch.Tensor)}
     original_slots = full_metadata.slot_mapping
-    with runtime.proposal_context(spec, batch()):
+    with runtime.proposal_context(batch()):
         callback = runtime.metadata_callback(3, 2)
         callback(0, native_metadata)
         callback(1, full_metadata)
@@ -257,7 +257,7 @@ def test_eagle_first_pass_snapshots_current_native_and_live_end_once(setup, monk
         return original_snapshot(*args)
 
     monkeypatch.setattr(runtime, "_eagle_first_pass_lengths", snapshot)
-    with runtime.proposal_context(spec, state):
+    with runtime.proposal_context(state):
         for step, ends, width in [(0, (1159, 1160), 4), (1, (1160, 1160), 1), (2, (1161, 1161), 1)]:
             metadata = common(exact=ends, upper=(1162, 1163))
             metadata.causal = True
@@ -284,7 +284,7 @@ def test_eagle_allocation_upper_cannot_move_the_frozen_first_pass_anchor(setup, 
     spec.last_token_indices = torch.tensor([3, 6])
     state = batch(computed=(1150, 1150), prompt=(1, 1))
     state.idx_mapping = torch.tensor(state.idx_mapping_np, dtype=torch.int64)
-    with runtime.proposal_context(spec, state):
+    with runtime.proposal_context(state):
         for step, ends, width in [(0, (1159, 1160), 4), (1, (1160, 1160), 1), (2, (1161, 1161), 1)]:
             # A later loose workspace bound exceeds initialized columns. The
             # legacy fallback must use retained current first-pass E, not E-W.
@@ -301,14 +301,14 @@ def test_reorder_row_replacement_and_in_place_mapping_refresh_each_proposal(setu
     runtime, spec, canonical, completions = setup
     state = batch()
     first, second = common(), common()
-    with runtime.proposal_context(spec, state):
+    with runtime.proposal_context(state):
         runtime.metadata_callback(3, 2)(0, first)
     saved_first = first.block_table_tensor.clone()
     state.idx_mapping_np[:] = [4, 2]
     state.req_ids[:] = ["replacement", "survivor"]
     canonical[4] += 100
     second.block_table_tensor[:2] = canonical[state.idx_mapping_np.tolist()]
-    with runtime.proposal_context(spec, state):
+    with runtime.proposal_context(state):
         runtime.metadata_callback(3, 2)(0, second)
     assert second.block_table_tensor[0, :3].tolist() == canonical[4, :3].tolist()
     assert second.block_table_tensor[1, :3].tolist() == canonical[2, 4:7].tolist()
@@ -319,7 +319,7 @@ def test_reorder_row_replacement_and_in_place_mapping_refresh_each_proposal(setu
 @pytest.mark.parametrize("phase", ["dummy_run", "is_profile"])
 def test_dummy_and_profile_bypass_projection_and_completion(setup, phase):
     runtime, spec, _, completions = setup
-    with runtime.proposal_context(spec, batch(), **{phase: True}):
+    with runtime.proposal_context(batch(), **{phase: True}):
         assert runtime.metadata_callback(3, 2) is None
         runtime.retain_metadata(object())
     assert not completions
@@ -329,14 +329,14 @@ def test_dummy_and_profile_bypass_projection_and_completion(setup, phase):
 def test_failed_native_proposal_poison_keeps_read_metadata(setup):
     runtime, spec, _, completions = setup
     metadata = common()
-    with pytest.raises(RuntimeError, match="after model enqueue"), runtime.proposal_context(spec, batch()):
+    with pytest.raises(RuntimeError, match="after model enqueue"), runtime.proposal_context(batch()):
         runtime.metadata_callback(3, 2)(0, metadata)
         owner = runtime._owner
         raise RuntimeError("after model enqueue")
     assert runtime.pool.poisoned
     assert metadata in owner.retained
     assert not completions
-    with pytest.raises(RuntimeError, match="quarantined"), runtime.proposal_context(spec, batch()):
+    with pytest.raises(RuntimeError, match="quarantined"), runtime.proposal_context(batch()):
         pytest.fail("must not enter another native proposal")
 
 
@@ -347,7 +347,7 @@ def test_event_failure_after_successful_build_poison_keeps_read_metadata(setup, 
         raise RuntimeError("record failed")
 
     monkeypatch.setattr(torch.npu, "Event", failed_record)
-    with pytest.raises(RuntimeError, match="record failed"), runtime.proposal_context(spec, batch()):
+    with pytest.raises(RuntimeError, match="record failed"), runtime.proposal_context(batch()):
         runtime.metadata_callback(3, 2)(0, common())
         owner = runtime._owner
     assert runtime.pool.poisoned
@@ -356,17 +356,17 @@ def test_event_failure_after_successful_build_poison_keeps_read_metadata(setup, 
 
 def test_no_consumption_and_wrong_actual_query_width_are_errors(setup):
     runtime, spec, _, _ = setup
-    with pytest.raises(ValueError, match="actual query width"), runtime.proposal_context(spec, batch()):
+    with pytest.raises(ValueError, match="actual query width"), runtime.proposal_context(batch()):
         runtime.metadata_callback(8, 2)
     assert runtime.pool.poisoned
 
 
 def test_stale_callback_cannot_modify_next_proposal(setup):
     runtime, spec, _, _ = setup
-    with runtime.proposal_context(spec, batch()):
+    with runtime.proposal_context(batch()):
         stale = runtime.metadata_callback(3, 2)
         stale(0, common())
-    with pytest.raises(RuntimeError, match="stale proposal"), runtime.proposal_context(spec, batch()):
+    with pytest.raises(RuntimeError, match="stale proposal"), runtime.proposal_context(batch()):
         stale(0, common())
 
 
@@ -374,7 +374,7 @@ def test_target_only_group_is_not_projected(setup):
     runtime, spec, _, _ = setup
     target_only = common()
     table = target_only.block_table_tensor
-    with runtime.proposal_context(spec, batch()):
+    with runtime.proposal_context(batch()):
         callback = runtime.metadata_callback(3, 2)
         callback(1, target_only)
         callback(0, common())
@@ -394,7 +394,7 @@ def test_eagle_freezes_anchor_across_rejection_and_retains_all_step_reads(setup)
     runtime = DraftWindowRuntime(spec, policy)
     state = batch()
     outputs = []
-    with runtime.proposal_context(spec, state):
+    with runtime.proposal_context(state):
         for step, exact in enumerate(((12, 27), (13, 25), (14, 26))):
             metadata = common(exact=exact, upper=(16, 31))
             runtime.metadata_callback(step, 2)(0, metadata)
@@ -417,7 +417,7 @@ def test_eagle_scheduled_prefill_and_steps_keep_static_window_geometry(setup, re
     runtime = DraftWindowRuntime(spec, resolve_draft_window_policy(requested_window_size=8, method="eagle3"))
     consumed = 3 if requested is None else max(1, requested)
     outputs = []
-    with runtime.proposal_context(spec, batch(), num_speculative_tokens=requested):
+    with runtime.proposal_context(batch(), num_speculative_tokens=requested):
         for step, exact in enumerate(((12, 27), (13, 25), (14, 26))[:consumed]):
             metadata = common(exact=exact, upper=(16, 31))
             runtime.metadata_callback(step, 2)(0, metadata)
@@ -437,7 +437,7 @@ def test_eagle_invalid_scheduled_count_cannot_enter_a_window_scope(setup, reques
     runtime = DraftWindowRuntime(spec, resolve_draft_window_policy(requested_window_size=8, method="eagle3"))
     with (
         pytest.raises(ValueError, match="configured static K"),
-        runtime.proposal_context(spec, batch(), num_speculative_tokens=requested),
+        runtime.proposal_context(batch(), num_speculative_tokens=requested),
     ):
         pytest.fail("invalid count must fail before proposal ownership")
     assert runtime._owner is None and not completions
@@ -448,7 +448,7 @@ def test_eagle_zero_drafts_still_requires_the_real_prefill_read(setup):
     runtime = DraftWindowRuntime(spec, resolve_draft_window_policy(requested_window_size=8, method="eagle3"))
     with (
         pytest.raises(RuntimeError, match="did not consume a read projection"),
-        runtime.proposal_context(spec, batch(), num_speculative_tokens=0),
+        runtime.proposal_context(batch(), num_speculative_tokens=0),
     ):
         pass
     assert runtime.pool.poisoned
@@ -459,7 +459,7 @@ def test_eagle_partial_proposal_cannot_omit_a_requested_step(setup):
     runtime = DraftWindowRuntime(spec, resolve_draft_window_policy(requested_window_size=8, method="eagle3"))
     with (
         pytest.raises(RuntimeError, match="every configured draft step"),
-        runtime.proposal_context(spec, batch(), num_speculative_tokens=2),
+        runtime.proposal_context(batch(), num_speculative_tokens=2),
     ):
         runtime.metadata_callback(0, 2)(0, common())
     assert runtime.pool.poisoned
@@ -472,7 +472,7 @@ def test_eagle_terminal_prefill_first_pass_stays_full_then_uses_window(setup):
     runtime = DraftWindowRuntime(spec, policy)
     state = batch(computed=(12, 24))
     outputs = []
-    with runtime.proposal_context(spec, state):
+    with runtime.proposal_context(state):
         for step in range(3):
             metadata = common(exact=(16 + step, 27 + step), upper=(20, 31))
             runtime.metadata_callback(step, 2)(0, metadata)
@@ -493,7 +493,7 @@ def test_eagle_first_pass_anchor_uses_live_queries_after_rejection(setup):
     runtime = DraftWindowRuntime(spec, resolve_draft_window_policy(requested_window_size=1035, method="eagle3"))
     state = batch(computed=(1300, 1300), prompt=(1147, 1148), scheduled=(4, 4), drafts=(3, 3))
     outputs = []
-    with runtime.proposal_context(spec, state):
+    with runtime.proposal_context(state):
         for step, exact in enumerate(((1159, 1160), (1160, 1160), (1161, 1161))):
             metadata = common(exact=exact, upper=(1162, 1163))
             runtime.metadata_callback(step, 2)(0, metadata)
@@ -531,7 +531,7 @@ def test_eagle_later_ar_uses_current_device_exact_with_frozen_anchor(setup, monk
     state = batch(computed=(20, 30), prompt=(8, 8))
     state.idx_mapping = torch.from_numpy(state.idx_mapping_np).long()
     full = canonical.clone()
-    with runtime.proposal_context(spec, state):
+    with runtime.proposal_context(state):
         first = common(exact=(10, 27), upper=(14, 30))
         first.query_start_loc_cpu = torch.tensor([0, 4, 8, 8])
         first.causal = True
@@ -560,7 +560,7 @@ def test_eagle_continuing_prefill_later_ar_preserves_full_read(setup, all_contin
     runtime._dense_reads = True
     state = batch(computed=(8, 24), prompt=(100, 100 if all_continuing else 16))
     state.idx_mapping = torch.from_numpy(state.idx_mapping_np).long()
-    with runtime.proposal_context(spec, state):
+    with runtime.proposal_context(state):
         for step, ends in enumerate(((12, 27), (13, 28), (14, 29))):
             metadata = common(exact=ends, upper=(16, 31))
             width = 3 if step == 0 else 1
@@ -591,7 +591,7 @@ def test_eagle_full_continuing_keeps_full_addressing_without_window_snapshot(set
 
     monkeypatch.setattr(runtime_module, "materialize_draft_read", unexpected)
     retained_common = []
-    with runtime.proposal_context(spec, state):
+    with runtime.proposal_context(state):
         owner = runtime._owner
         for step in range(3):
             callback = runtime.metadata_callback(step, 2)
@@ -626,7 +626,7 @@ def test_first_group_metadata_must_cover_the_actual_active_requests(setup):
     runtime, spec, _, _ = setup
     metadata = common()
     metadata.num_reqs = 1
-    with pytest.raises(ValueError, match="active requests"), runtime.proposal_context(spec, batch()):
+    with pytest.raises(ValueError, match="active requests"), runtime.proposal_context(batch()):
         runtime.metadata_callback(3, 2)(0, metadata)
     assert runtime.pool.poisoned
 
@@ -636,7 +636,7 @@ def test_eagle_full_continuing_with_placeholders_keeps_exact_read(setup):
     runtime.method, runtime.static_k, runtime._dense_reads = "eagle3", 3, True
     spec.max_model_len, spec.advance_draft_positions = 4096, True
     state = batch(computed=(8, 24), prompt=(100, 100))
-    with runtime.proposal_context(spec, state):
+    with runtime.proposal_context(state):
         for step in range(3):
             metadata = common(exact=(12 + step, 27 + step))
             runtime.metadata_callback(step, 2)(0, metadata)
@@ -650,7 +650,7 @@ def test_eagle_full_continuing_prompt_snapshot_clamps_at_model_limit(setup):
     spec.max_model_len, spec.advance_draft_positions = 32, True
     state = batch(computed=(8, 24), prompt=(32, 32), scheduled=(4, 7), drafts=None)
     spec.input_buffers.positions = torch.tensor([11, 30])
-    with runtime.proposal_context(spec, state):
+    with runtime.proposal_context(state):
         for step in range(3):
             expected = (12 + step, min(31 + step, 32))
             metadata = common(exact=expected, upper=(16, 32))
@@ -663,7 +663,7 @@ def test_eagle_full_continuing_uses_prepared_exact_not_old_progress_estimate(set
     runtime.method, runtime.static_k, runtime._dense_reads = "eagle3", 3, True
     spec.max_model_len, spec.advance_draft_positions = 4096, True
     state = batch(computed=(8, 24), prompt=(100, 100), scheduled=(4, 3), drafts=None)
-    with runtime.proposal_context(spec, state, num_speculative_tokens=2):
+    with runtime.proposal_context(state, num_speculative_tokens=2):
         first, second = common(), common(exact=(13, 28))
         runtime.metadata_callback(0, 2)(0, first)
         state.num_computed_prefill_tokens_np[0] += 1
@@ -705,7 +705,7 @@ def test_real_builder_projects_every_group_and_quarantines_partial_failure(setup
         return [SimpleNamespace(layer_names=[f"draft{gid}"], get_metadata_builder=lambda lane: builder)]
 
     error = pytest.raises(RuntimeError, match="second builder") if fail_second_builder else nullcontext()
-    with error, runtime.proposal_context(spec, batch()):
+    with error, runtime.proposal_context(batch()):
         owner = runtime._owner
         result = build_attn_metadata(
             attn_groups=[group(0), group(1)],
@@ -745,7 +745,7 @@ def test_context_only_kv_write_keeps_completion_without_inventing_attention(setu
     runtime = DraftWindowRuntime(spec, policy)
     before = canonical.clone()
     payload = torch.ones(8)
-    with runtime.proposal_context(spec, batch(), context_kv_only=True):
+    with runtime.proposal_context(batch(), context_kv_only=True):
         owner = runtime._owner
         assert owner is not None and owner.completion is None
         runtime.pool.retain(owner, payload)
@@ -763,7 +763,7 @@ def test_context_only_scope_cannot_hide_an_actual_draft_read(setup):
     runtime, spec, _, _ = setup
     with (
         pytest.raises(RuntimeError, match="unexpectedly consumed"),
-        runtime.proposal_context(spec, batch(), context_kv_only=True),
+        runtime.proposal_context(batch(), context_kv_only=True),
     ):
         runtime.metadata_callback(spec.num_query_per_req, 2)(0, common())
     assert runtime.pool.poisoned
@@ -775,7 +775,7 @@ def test_eagle_cannot_select_parallel_context_only_scope(setup):
     runtime = DraftWindowRuntime(spec, policy)
     with (
         pytest.raises(ValueError, match="parallel drafter"),
-        runtime.proposal_context(spec, batch(), context_kv_only=True),
+        runtime.proposal_context(batch(), context_kv_only=True),
     ):
         pytest.fail("Eagle3 must not enter a context-only scope")
 
@@ -824,7 +824,7 @@ def test_actual_dense_builder_preserves_sp_padding_after_window_projection(setup
     metadata.is_prefilling = torch.tensor([False, False])
     metadata.causal = False
     slots = metadata.slot_mapping
-    with runtime.proposal_context(spec, batch()):
+    with runtime.proposal_context(batch()):
         runtime.metadata_callback(3, 2)(0, metadata)
         result = builder.build(0, metadata)
         runtime.retain_metadata(result)
@@ -844,7 +844,7 @@ def test_eagle_has_no_parallel_num_query_per_req_attribute(setup):
     runtime.static_k = 1
     del spec.num_query_per_req
     state = batch(computed=(24, 24))
-    with runtime.proposal_context(spec, state):
+    with runtime.proposal_context(state):
         runtime.metadata_callback(0, 2)(0, common())
 
 
@@ -865,7 +865,7 @@ def test_prepared_exact_is_explicit_and_retained_until_completion(setup, monkeyp
 
     monkeypatch.setattr(torch.Tensor, "to", observe_to)
     prepared = {"prepared_exact_cpu": snapshot} if with_prepared_exact else {}
-    with runtime.proposal_context(spec, batch()):
+    with runtime.proposal_context(batch()):
         owner = runtime._owner
         runtime.metadata_callback(3, 2, **prepared)(0, metadata)
     assert len(exact_copies) == (0 if with_prepared_exact else 1)
@@ -889,14 +889,14 @@ def test_prepared_exact_keeps_owner_and_step_guards(setup):
     prepared = {"prepared_exact_cpu": snapshot}
     with pytest.raises(RuntimeError, match="no active proposal"):
         runtime.metadata_callback(3, 2, **prepared)
-    with runtime.proposal_context(spec, batch()):
+    with runtime.proposal_context(batch()):
         with pytest.raises(ValueError, match="actual query width"):
             runtime.metadata_callback(8, 2, **prepared)
         callback = runtime.metadata_callback(3, 2, **prepared)
         callback(0, metadata)
     with pytest.raises(RuntimeError, match="stale proposal"):
         callback(0, common())
-    with pytest.raises(RuntimeError, match="stale proposal"), runtime.proposal_context(spec, batch()):
+    with pytest.raises(RuntimeError, match="stale proposal"), runtime.proposal_context(batch()):
         callback(0, common())
 
 
@@ -911,7 +911,7 @@ def test_dense_device_callback_or_exact_fallback_keeps_the_same_window(setup, up
     metadata.causal = False
     full_table, slots, positions = metadata.block_table_tensor, metadata.slot_mapping, metadata.positions
     original = canonical.clone()
-    with runtime.proposal_context(spec, current_batch):
+    with runtime.proposal_context(current_batch):
         callback = runtime.metadata_callback(3, 2)
         callback(0, metadata)
         runtime.retain_metadata(metadata)
@@ -962,7 +962,7 @@ def test_eagle_prompt_only_terminal_rows_snapshot_each_actual_preparation(
 
     monkeypatch.setattr(torch.Tensor, "to", record_snapshot)
     before = table.clone()
-    with runtime.proposal_context(spec, state):
+    with runtime.proposal_context(state):
         for step in range(3):
             ends = (min(2047 + step, max_len), min(2177 + step, max_len))
             metadata = common(exact=ends, upper=(2050 + step, 2180 + step))
@@ -994,7 +994,7 @@ def test_full_prompt_snapshot_is_cpu_owned_and_new_proposals_rebuild_it(setup):
     for ends in ((12, 27), (13, 28)):
         spec.input_buffers.positions = torch.tensor(ends) - 1
         metadata = common(exact=ends)
-        with runtime.proposal_context(spec, state, num_speculative_tokens=1), torch.device("meta"):
+        with runtime.proposal_context(state, num_speculative_tokens=1), torch.device("meta"):
             runtime.metadata_callback(0, 2)(0, metadata)
             assert metadata.seq_lens_cpu.device.type == "cpu"
             results.append(metadata.seq_lens_cpu)
@@ -1025,7 +1025,7 @@ def test_eagle_mixed_decode_prompt_uses_one_exact_snapshot_per_preparation(setup
 
     monkeypatch.setattr(torch.Tensor, "to", count_snapshot)
     before = table.clone()
-    with runtime.proposal_context(spec, state):
+    with runtime.proposal_context(state):
         for step, ends in enumerate(((1796, 2177), (1796, 2178), (1797, 2179))):
             metadata = common(exact=ends, upper=(1800, 2180))
             boundaries = [0, 4, 261, 261] if step == 0 else [0, 1, 2, 2]
@@ -1072,7 +1072,7 @@ def test_parallel_continuing_prefill_snapshots_actual_exact_without_full_gather(
     monkeypatch.setattr(torch.Tensor, "to", record_snapshot)
     before = table.clone()
     slots, positions = metadata.slot_mapping, metadata.positions
-    with runtime.proposal_context(spec, state):
+    with runtime.proposal_context(state):
         runtime.metadata_callback(8, 2)(0, metadata)
         assert not hasattr(metadata, "_draft_window_device_read"), "Full prompt unexpectedly gathered private FP32 KV"
         expected_table = table[state.idx_mapping_np, :11].clone()
@@ -1103,7 +1103,7 @@ def test_parallel_prompt_producer_rejects_uncertified_preparation(setup, invalid
         state.query_start_loc_np[-1] += 1
     else:
         spec.replicated_pcp = True
-    with pytest.raises(RuntimeError, match="did not consume"), runtime.proposal_context(spec, state):
+    with pytest.raises(RuntimeError, match="did not consume"), runtime.proposal_context(state):
         assert not runtime._parallel_full_prefill(2, continuing_prefill_rows(state, 2))
 
 
@@ -1132,7 +1132,7 @@ def test_mla_partial_rotary_copy_failure_keeps_submitted_operands(setup, monkeyp
 
     monkeypatch.setattr(torch.Tensor, "clone", clone)
     monkeypatch.setattr(torch.Tensor, "copy_", copy)
-    with pytest.raises(RuntimeError, match="MLA second RoPE copy failed"), runtime.proposal_context(spec, batch()):
+    with pytest.raises(RuntimeError, match="MLA second RoPE copy failed"), runtime.proposal_context(batch()):
         owner = runtime._owner
         runtime.retain_metadata(metadata)
     assert runtime.pool.poisoned
@@ -1149,7 +1149,7 @@ def test_eagle_next_preparation_rejects_incorrect_active_extent(setup):
     runtime, spec, _, _ = setup
     runtime.method, runtime.static_k = "eagle3", 3
     state = batch()
-    with pytest.raises(RuntimeError, match="request mapping"), runtime.proposal_context(spec, state):
+    with pytest.raises(RuntimeError, match="request mapping"), runtime.proposal_context(state):
         runtime.metadata_callback(0, 2)(0, common())
         state.num_reqs = 1
         runtime.metadata_callback(1, 2)
@@ -1170,7 +1170,7 @@ def test_exact_snapshot_failure_retains_original_prepared_input(setup, monkeypat
         return original(tensor, *args, **kwargs)
 
     monkeypatch.setattr(torch.Tensor, "to", failed_snapshot)
-    with pytest.raises(RuntimeError, match="snapshot failed"), runtime.proposal_context(spec, batch()):
+    with pytest.raises(RuntimeError, match="snapshot failed"), runtime.proposal_context(batch()):
         owner = runtime._owner
         runtime.metadata_callback(3, 2)(0, metadata)
     assert runtime.pool.poisoned
@@ -1183,7 +1183,7 @@ def test_current_compact_table_is_authoritative_without_a_second_persistent_gath
     full_table = metadata.block_table_tensor
     expected = full_table.clone()
     canonical.fill_(-777)  # Distinguish the prepared consumer table from storage inventory.
-    with runtime.proposal_context(spec, batch()):
+    with runtime.proposal_context(batch()):
         runtime.metadata_callback(3, 2)(0, metadata)
     assert metadata.block_table_tensor[0, :3].tolist() == expected[0, :3].tolist()
     assert metadata.block_table_tensor[1, :3].tolist() == expected[1, 4:7].tolist()
@@ -1196,7 +1196,7 @@ def test_allocation_count_boundary_rejects_inactive_request_slots(setup, rows):
     metadata = common()
     with (
         pytest.raises(ValueError, match="active persistent request slots"),
-        runtime.proposal_context(spec, batch(rows=rows)),
+        runtime.proposal_context(batch(rows=rows)),
     ):
         runtime.metadata_callback(3, 2)(0, metadata)
 
@@ -1210,7 +1210,7 @@ def test_compact_rows_and_persistent_allocation_counts_use_the_same_request_orde
     full_table = metadata.block_table_tensor
     before = full_table.clone(), canonical.clone()
     slots, positions = metadata.slot_mapping, metadata.positions
-    with runtime.proposal_context(spec, state):
+    with runtime.proposal_context(state):
         runtime.metadata_callback(3, 2)(0, metadata)
     assert metadata.block_table_tensor[0, :3].tolist() == canonical[2, :3].tolist()
     assert metadata.block_table_tensor[1, :3].tolist() == canonical[0, 4:7].tolist()

@@ -170,7 +170,7 @@ def test_native_projection_retains_pinned_actual_length_dma_source(monkeypatch):
             copies.append(source)
         return copy(destination, source, *args, **kwargs)
 
-    with runtime.proposal_context(speculator, batch), patch.object(torch.Tensor, "copy_", checked):
+    with runtime.proposal_context(batch), patch.object(torch.Tensor, "copy_", checked):
         owner = runtime._owner
         runtime.metadata_callback(8, 2)(0, common)
     torch.npu.synchronize()

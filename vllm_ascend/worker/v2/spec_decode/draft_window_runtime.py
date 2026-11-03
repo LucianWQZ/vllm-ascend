@@ -158,7 +158,6 @@ class DraftWindowRuntime:
     @contextmanager
     def proposal_context(
         self,
-        speculator: Any,
         input_batch: Any,
         dummy_run: bool = False,
         is_profile: bool = False,
@@ -166,8 +165,6 @@ class DraftWindowRuntime:
         context_kv_only: bool = False,
         num_speculative_tokens: int | None = None,
     ) -> Iterator[None]:
-        if speculator is not self.speculator:
-            raise RuntimeError("Draft Window runtime belongs to another speculator")
         if self._owner is not None or self._bypass:
             raise RuntimeError("Draft Window proposal scope is already active")
         if context_kv_only and self.method not in ("dflash", "dspark"):

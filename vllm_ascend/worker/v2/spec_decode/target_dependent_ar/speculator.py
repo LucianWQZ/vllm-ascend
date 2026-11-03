@@ -358,7 +358,6 @@ class AscendTargetDependentARSpeculator(LmheadTPDraftSamplingMixin, TargetDepend
             )
             if graph_scope is not None
             else runtime.proposal_context(
-                self,
                 input_batch,
                 dummy_run,
                 is_profile,
