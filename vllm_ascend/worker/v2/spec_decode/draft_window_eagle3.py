@@ -9,7 +9,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphBindingProvider
+from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphBindingProvider, DraftWindowGraphBucket
 from vllm_ascend.worker.v2.spec_decode.draft_window_plan import compute_draft_window_start
 from vllm_ascend.worker.v2.spec_decode.draft_window_runtime import continuing_prefill_rows
 
@@ -63,7 +63,6 @@ class Eagle3DraftWindowMixin:
             yield
             return
         expected_steps = _eagle3_graph_scheduled_consumers(self.num_speculative_steps, num_speculative_tokens)
-        graph_session = getattr(self, "_eagle3_graph_session", None)
         provider = self._draft_window_graph_binding_provider
         rows: tuple[bool, ...] = ()
         if not dummy_run and not is_profile and not bool(getattr(input_batch, "is_dummy", False)):
@@ -78,7 +77,7 @@ class Eagle3DraftWindowMixin:
                 yield
             return
 
-        if graph_session is None:
+        if not provider._carriers:
             raise RuntimeError("Eagle3 Draft Window business proposals require their installed Graph manager")
         self._eagle3_window_intervals = None
         self._eagle3_window_decode_step_one_exact = None
@@ -123,9 +122,9 @@ class Eagle3DraftWindowMixin:
 
     def _materialize_eagle3_step(
         self,
-        capture: Any,
+        capture: DraftWindowGraphBucket,
         step: int,
-    ) -> Any:
+    ) -> DraftWindowGraphBucket:
         """Freeze the first anchor, then project each AR end into its own bank."""
         if (
             type(step) is not int

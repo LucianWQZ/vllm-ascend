@@ -17,12 +17,13 @@ def eagle3_dp_dummy_scope(owner, input_batch, *, dummy_run, is_profile):
     profile/capture keeps its existing path and is not runtime idle evidence.
     No device completion is inferred from leaving this Host scope.
     """
-    session = getattr(owner, "_eagle3_graph_session", None)
+    provider = getattr(owner, "_draft_window_graph_binding_provider", None)
     if (
-        session is None
+        provider is None
+        or not provider._carriers
         or getattr(owner, "dp_size", None) != 2
         or is_profile
-        or session._capture_call is not None
+        or getattr(owner, "_eagle3_capture_call", None) is not None
         or not (dummy_run or getattr(input_batch, "is_dummy", False))
     ):
         yield
@@ -33,13 +34,12 @@ def eagle3_dp_dummy_scope(owner, input_batch, *, dummy_run, is_profile):
         raise RuntimeError("Eagle DP dummy Graph scope cannot nest")
     owner._eagle3_graph_dp_dummy_active = True
     try:
-        provider = session.provider
         provider.require_reusable()
         if owner.input_batch.is_dummy is not True or provider.proposal != () or provider._active_bank is not None:
             raise RuntimeError("Eagle DP dummy requires its explicit local1 no-business-generation Full scope")
         yield
     except BaseException:
-        session.provider.quarantine()
+        provider.quarantine()
         raise
     finally:
         owner._eagle3_graph_dp_dummy_active = False
@@ -49,8 +49,7 @@ def validate_eagle_dp_dummy_replay(owner, manager, descriptor, metadata_batch):
     """Attribute both actual managers without changing their baseline operands."""
     if not getattr(owner, "_eagle3_graph_dp_dummy_active", False):
         return False
-    session = owner._eagle3_graph_session
-    session.provider.require_reusable()
+    owner._draft_window_graph_binding_provider.require_reusable()
     first = manager.is_draft_model_prefill
     if (
         getattr(descriptor.cg_mode, "name", None) != "FULL"

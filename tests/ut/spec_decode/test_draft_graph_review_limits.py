@@ -648,7 +648,7 @@ def _pair_owner_batch():
 
 
 class ActualGraphDescriptorControls(unittest.TestCase):
-    def manager(self, owner, *, first=False, session=None):
+    def manager(self, owner, *, first=False, window=False):
         seen: list[tuple[str, tuple[Any, ...]]] = []
 
         def build_metadata(*args):
@@ -659,15 +659,15 @@ class ActualGraphDescriptorControls(unittest.TestCase):
             seen.append(("replay", args))
             return "legacy-result"
 
-        def run_window(*args):
+        def run_window(*args, **kwargs):
             seen.append(("window", args))
             return "window-result"
 
         owner.attn_backend = "actual-test-backend"
         owner.draft_vllm_config = object()
         owner.build_draft_attn_metadatas = build_metadata
-        if session is not None:
-            owner._eagle3_graph_session = session
+        if window:
+            owner._draft_window_graph_binding_provider = NS(finish_update=lambda: None)
             owner._eagle3_window_is_active = lambda: True
         manager = object.__new__(ar_graph.AutoRegressiveAclGraphManager)
         manager.__dict__.update(
@@ -675,7 +675,7 @@ class ActualGraphDescriptorControls(unittest.TestCase):
             is_draft_model_prefill=first,
             update_stream=object(),
             _graph_replay=replay,
-            _run_eagle_window_fullgraph=run_window,
+            _updatable_graph_replay=run_window,
         )
         return manager, seen
 
@@ -767,7 +767,7 @@ class ActualGraphDescriptorControls(unittest.TestCase):
 
     def test_window_session_keeps_its_actual_materialize_and_binding_path(self):
         owner, _ = _single_owner_batch()
-        manager, seen = self.manager(owner, session=object())
+        manager, seen = self.manager(owner, window=True)
         self.assertEqual(self.run_actual(manager, NS(num_reqs=1, num_tokens=1)), "window-result")
         self.assertEqual([v[0] for v in seen], ["window"])
 
@@ -907,8 +907,7 @@ class EagleMixedRequestControls(unittest.TestCase):
 
 
 def idle_owner():
-    provider = NS(method="eagle3", _active_bank=None, proposal=(), quarantined=False)
-    session = NS(provider=provider, _capture_call=None)
+    provider = NS(method="eagle3", _active_bank=None, proposal=(), quarantined=False, _carriers={"ready": object()})
     batch = NS(is_dummy=True, num_reqs=1, num_reqs_after_padding=1)
     owner = NS(
         method="eagle3",
@@ -919,7 +918,7 @@ def idle_owner():
         vllm_config=NS(additional_config={}),
         _draft_graph_review_limit=True,
         update_stream=object(),
-        _eagle3_graph_session=session,
+        _eagle3_capture_call=None,
         _draft_window_graph_binding_provider=provider,
     )
 
@@ -929,7 +928,7 @@ def idle_owner():
 
     provider.require_reusable = require_reusable
     provider.quarantine = lambda: setattr(provider, "quarantined", True)
-    return owner, batch, session
+    return owner, batch, provider
 
 
 class EagleIdleOwnershipControls(unittest.TestCase):

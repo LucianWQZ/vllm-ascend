@@ -185,8 +185,9 @@ def test_window_capture_checks_tasks_only_after_the_actual_manager_capture(first
         assert actual is graphs and events == ["captured"]
         events.append("validated")
 
-    session = SimpleNamespace(provider=SimpleNamespace(validate_captured_graphs=validate))
-    manager.speculator = SimpleNamespace(_eagle3_graph_session=session)
+    manager.speculator = SimpleNamespace(
+        _draft_window_graph_binding_provider=SimpleNamespace(validate_captured_graphs=validate)
+    )
 
     def capture(*args, **kwargs):
         events.append("captured")

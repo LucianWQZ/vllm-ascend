@@ -9,8 +9,11 @@ kernels, model weights, or the upstream autoregressive loop.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 
+import torch
 from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.worker.gpu.spec_decode.eagle.speculator import EagleSpeculator
 
@@ -18,6 +21,7 @@ from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.worker.v2.spec_decode.draft_window_eagle3 import (
     Eagle3DraftWindowMixin,
 )
+from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphBucket
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph_metadata import (
     bind_draft_window_read,
     copy_draft_attention_metadata,
@@ -28,6 +32,7 @@ from vllm_ascend.worker.v2.spec_decode.target_dependent_ar.speculator import Asc
 class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentARSpeculator, EagleSpeculator):
     decode_cudagraph_manager: Any
     _eagle3_window_next_step: int
+    _eagle3_capture_call: Iterator[DraftWindowGraphBucket] | None
 
     def _initialize_draft_window_source_capability(self) -> None:
         """Initialize the validated Graph source and its proposal state."""
@@ -54,11 +59,44 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentA
 
     def init_cudagraph_manager(self, cudagraph_mode):
         result = super().init_cudagraph_manager(cudagraph_mode)
-        if hasattr(self, "_draft_window_graph_binding_provider"):
-            from vllm_ascend.worker.v2.spec_decode.draft_window_eagle3_capture import Eagle3GraphSession
-
-            self._eagle3_graph_session = Eagle3GraphSession(self)
+        provider = getattr(self, "_draft_window_graph_binding_provider", None)
+        if provider is not None:
+            self._eagle3_capture_call = None
+            capacity = min(self.max_model_len, provider.window_size + provider.group.table_column_span - 1)
+            for first, manager in ((True, self.prefill_cudagraph_manager), (False, self.decode_cudagraph_manager)):
+                if self.update_stream is None or manager.update_stream is not self.update_stream:
+                    raise RuntimeError("Eagle3 capture managers must share their owner UPDATE stream")
+                q = self.num_speculative_steps + 1 if first else 1
+                for descriptors in manager._capture_descs.values():
+                    for desc in descriptors:
+                        if desc.cg_mode.name != "FULL":
+                            raise NotImplementedError("Eagle3 Window capture requires an actual FULL descriptor")
+                        n = desc.num_reqs
+                        if n is None or desc.num_tokens != n * q:
+                            raise RuntimeError("Eagle3 startup descriptor does not match its request/query width")
+                        for ordinal in range(1 if first else self.num_speculative_steps - 1):
+                            bank = provider.register_capture_identity(descriptor=desc, consumer_ordinal=ordinal)
+                            # Seed before GLOBAL capture; no H2D belongs in its callback.
+                            bank.window_block_table.zero_()
+                            bank.cpu_window_exact.fill_(capacity)
+                            bank.device_window_exact.copy_(bank.cpu_window_exact)
+            if not provider._carriers:
+                raise RuntimeError("Eagle3 Window requires a nonempty capture bucket inventory")
         return result
+
+    @contextmanager
+    def _eagle3_capture_scope(self, *, n: int, tokens: int):
+        if self._eagle3_capture_call is not None:
+            raise RuntimeError("nested Eagle3 startup capture invocation")
+        self._eagle3_capture_call = iter(
+            self._draft_window_graph_binding_provider.capture_banks_for(num_reqs=n, num_tokens=tokens)
+        )
+        try:
+            yield
+            if next(self._eagle3_capture_call, None) is not None:
+                raise RuntimeError("Eagle3 capture did not visit every actual first-pass/AR model consumer")
+        finally:
+            self._eagle3_capture_call = None
 
     def _prefill(self, *args, **kwargs):
         # DP synchronization may select native first even when this replica
@@ -78,14 +116,29 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentA
         cudagraph_runtime_mode=CUDAGraphMode.NONE,
         mm_inputs=None,
     ):
-        session = getattr(self, "_eagle3_graph_session", None)
         prefill_inputs = None
-        if session is not None and session._capture_call is not None:
-            attn_metadata = session.capture_metadata(attn_metadata)
+        capture_call = getattr(self, "_eagle3_capture_call", None)
+        if capture_call is not None:
+            provider = self._draft_window_graph_binding_provider
+            bank = next(capture_call, None)
+            if bank is None:
+                raise RuntimeError("Eagle3 capture visited more consumers than its real descriptor")
+            n = bank.descriptor.num_reqs
+            capacity = min(self.max_model_len, provider.window_size + provider.group.table_column_span - 1)
+            attn_metadata = copy_draft_attention_metadata(attn_metadata)
+            query = self.input_buffers.query_start_loc
+            if query.dtype != torch.int32 or query.ndim != 1 or query.numel() < n + 1:
+                raise RuntimeError("Eagle3 capture requires its owned int32 Full input query")
+            for layer in attn_metadata.values():
+                if layer is not None:
+                    bind_draft_window_read(layer, bank, capacity)
+                    layer.causal = True
+                    # Use the owned Full query, not a builder's transient GPU copy.
+                    layer.query_start_loc = query[: n + 1]
         elif self._eagle3_window_is_active():
+            provider = self._draft_window_graph_binding_provider
             if (
-                session is None
-                or self._eagle3_window_next_step != 0
+                self._eagle3_window_next_step != 0
                 or not getattr(self, "_eagle3_window_native_prefill_active", False)
                 or cudagraph_runtime_mode not in (CUDAGraphMode.NONE, CUDAGraphMode.PIECEWISE)
             ):
@@ -95,22 +148,21 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentA
             # the same persistent first-reader bank, not a second eager owner.
             n = self.input_batch.num_reqs
             queries = self.input_batch.query_start_loc_np[1 : n + 1].tolist()
-            if any(
-                layer is not None
-                and (
-                    layer.actual_seq_lengths_q != queries
-                    or layer.num_actual_tokens != queries[-1]
-                    or queries[-1] > num_tokens
-                    or layer.block_tables.shape[0] < n
-                    or len(layer.seq_lens_list) < n
-                )
-                for layer in attn_metadata.values()
+            # The AR entry already filters Draft layers; the supported
+            # single-group builder publishes one shared header for them.
+            layer = attn_metadata[self._draft_window_graph_binding_provider.group.layers[0]]
+            if (
+                layer.actual_seq_lengths_q != queries
+                or layer.num_actual_tokens != queries[-1]
+                or queries[-1] > num_tokens
+                or layer.block_tables.shape[0] < n
+                or len(layer.seq_lens_list) < n
             ):
                 raise NotImplementedError(
                     "Eagle3 Window native prefill requires canonical effective query rows; "
                     "additional padding requests are not qualified for this read bank"
                 )
-            capture = session.resolve(n=n, tokens=n * (self.num_speculative_steps + 1), ordinal=0)
+            capture = provider.capture_banks_for(num_reqs=n, num_tokens=n * (self.num_speculative_steps + 1))[0]
             self.block_tables.gather_block_tables(self.input_batch.idx_mapping, num_reqs_padded=n)
             bank = prefill_inputs = self._materialize_eagle3_step(capture, 0)
             attn_metadata = copy_draft_attention_metadata(attn_metadata)
@@ -145,7 +197,7 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentA
         num_speculative_steps=None,
     ):
         if self._eagle3_window_is_active():
-            session = self._eagle3_graph_session
+            provider = self._draft_window_graph_binding_provider
             if (
                 self._eagle3_window_expected_steps == 1
                 or batch_desc.cg_mode != CUDAGraphMode.FULL
@@ -156,8 +208,10 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentA
             padded = batch_desc.num_reqs or num_reqs
             self._snapshot_eagle3_decode_step_one(num_reqs=num_reqs, num_reqs_padded=padded)
             for step in range(1, self.num_speculative_steps):
-                capture = session.resolve(n=padded, tokens=batch_desc.num_tokens, ordinal=step - 1)
-                session.stage(capture, step)
+                capture = provider.capture_banks_for(num_reqs=padded, num_tokens=batch_desc.num_tokens)[step - 1]
+                self._materialize_eagle3_step(capture, step)
+                provider.bind_current(capture.descriptor)
+                self._eagle3_window_next_step = step + 1
         return super()._multi_step_decode(
             num_reqs,
             skip_attn,

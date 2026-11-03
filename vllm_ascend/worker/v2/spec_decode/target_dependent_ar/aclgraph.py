@@ -128,8 +128,8 @@ class AutoRegressiveAclGraphManager(SpeculatorCudaGraphManager):
     ) -> None:
         """Capture ACL graphs for autoregressive speculative decoding."""
 
-        session = getattr(self.speculator, "_eagle3_graph_session", None)
-        if session is not None:
+        provider = getattr(self.speculator, "_draft_window_graph_binding_provider", None)
+        if provider is not None:
             actual_forward = forward_fn
 
             def forward_fn(*args, **kwargs):
@@ -139,7 +139,7 @@ class AutoRegressiveAclGraphManager(SpeculatorCudaGraphManager):
                     desc = args[2]
                     n = desc.num_reqs or min(desc.num_tokens, self.max_num_reqs)
                     tokens = desc.num_tokens
-                with session.capture_call(n=n, tokens=tokens):
+                with self.speculator._eagle3_capture_scope(n=n, tokens=tokens):
                     return actual_forward(*args, **kwargs)
 
         with communicator_switch(), model_capture_wrapper(self.speculator, self.is_draft_model_prefill):
@@ -153,8 +153,8 @@ class AutoRegressiveAclGraphManager(SpeculatorCudaGraphManager):
                     kv_cache_config,
                     progress_bar_desc=progress_bar_desc,
                 )
-                if session is not None:
-                    session.provider.validate_captured_graphs(self.graphs)
+                if provider is not None:
+                    provider.validate_captured_graphs(self.graphs)
                 return
 
             def create_forward_fn(desc: BatchExecutionDescriptor, warmup: bool):
@@ -191,15 +191,22 @@ class AutoRegressiveAclGraphManager(SpeculatorCudaGraphManager):
                 )
 
             CudaGraphManager.capture(self, create_forward_fn, progress_bar_desc=progress_bar_desc)
-            if session is not None:
-                session.provider.validate_captured_graphs(self.graphs)
+            if provider is not None:
+                provider.validate_captured_graphs(self.graphs)
 
     def run_fullgraph(self, desc: BatchExecutionDescriptor) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         """Replay the draft ACL graph and update its attention parameters."""
-        session = getattr(self.speculator, "_eagle3_graph_session", None)
-        if session is not None and self.speculator._eagle3_window_is_active():
-            return self._run_eagle_window_fullgraph(desc, session)
-        # Without a Window session the ordinary graph still needs the finite
+        provider = getattr(self.speculator, "_draft_window_graph_binding_provider", None)
+        if provider is not None and self.speculator._eagle3_window_is_active():
+            if self.is_draft_model_prefill:
+                capture = provider.capture_banks_for(num_reqs=desc.num_reqs, num_tokens=desc.num_tokens)[0]
+                self.speculator._materialize_eagle3_step(capture, 0)
+                provider.bind_current(capture.descriptor)
+                self.speculator._eagle3_window_next_step = 1
+            ret = self._updatable_graph_replay(desc, (), window_source=provider)
+            provider.finish_update()
+            return ret
+        # Without an active Window proposal the ordinary graph still needs the finite
         # admitted consumer shape. Target input padding alone does not
         # constrain the AR graph bucket selected by the fixed core dispatcher.
         # Source-created dummy/profile batches retain their original behavior.
@@ -302,7 +309,7 @@ class AutoRegressiveAclGraphManager(SpeculatorCudaGraphManager):
         owner = self.speculator
         provider = getattr(owner, "_draft_window_graph_binding_provider", None)
         rows = provider.proposal if provider is not None else None
-        if getattr(owner, "_eagle3_graph_session", None) is not None and rows and all(rows):
+        if rows and all(rows):
             # Only the explicit existing nonuniform/continuing-prefill phase.
             # Missing buckets and UPDATE exceptions never enter this branch.
             return BatchExecutionDescriptor(
@@ -315,11 +322,3 @@ class AutoRegressiveAclGraphManager(SpeculatorCudaGraphManager):
         return super().dispatch(
             num_reqs, num_tokens, uniform_token_count, num_active_loras, max_query_len, num_ubatches
         )
-
-    def _run_eagle_window_fullgraph(self, desc, session):
-        if self.is_draft_model_prefill:
-            capture = session.resolve(n=desc.num_reqs, tokens=desc.num_tokens, ordinal=0)
-            session.stage(capture, 0)
-        ret = self._updatable_graph_replay(desc, (), window_source=session.provider)
-        session.provider.finish_update()
-        return ret
