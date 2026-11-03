@@ -16,9 +16,7 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_backends import (
     DraftWindowGroupRoute,
     DraftWindowProviderStatus,
 )
-from vllm_ascend.worker.v2.spec_decode.draft_window_eager import (
-    DraftWindowProposalContext,
-)
+from vllm_ascend.worker.v2.spec_decode.draft_window_runtime import continuing_prefill_rows
 
 
 def _batch(rows):
@@ -55,19 +53,16 @@ def _batch(rows):
 )
 def test_bypass_requires_every_real_row_to_be_continuing(rows, full_rows, bypass):
     batch = _batch(rows)
-    assert DraftWindowProposalContext.from_batch(batch).full_read_rows == full_rows
+    assert tuple(continuing_prefill_rows(batch, batch.num_reqs)) == full_rows
     assert (bool(full_rows) and all(full_rows)) is bypass
 
 
-def test_proposal_rejects_a_different_batch_or_request_count():
+def test_phase_snapshot_is_not_recomputed_inside_the_proposal():
     batch = _batch([(0, 8, 2)])
-    context = DraftWindowProposalContext.from_batch(batch)
-    assert context.full_read_rows == (True,)
-    with pytest.raises(RuntimeError, match="batch|request count"):
-        context.validate(_batch([(0, 8, 2)]))
-    batch.num_reqs = 0
-    with pytest.raises(RuntimeError, match="batch|request count"):
-        context.validate(batch)
+    rows = tuple(continuing_prefill_rows(batch, batch.num_reqs))
+    batch.num_computed_prefill_tokens_np[0] = 8
+    assert rows == (True,)
+    assert tuple(continuing_prefill_rows(batch, batch.num_reqs)) == (False,)
 
 
 @pytest.fixture
@@ -108,7 +103,6 @@ def _materialize(full_source, batch, exact, counts, frozen=None):
 
     from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
         DraftWindowGraphBindingProvider,
-        DraftWindowGraphRoute,
     )
 
     if len(exact) > full_source.table.shape[0]:
@@ -120,9 +114,9 @@ def _materialize(full_source, batch, exact, counts, frozen=None):
         )
         full_source = replace(full_source, block_tables=SimpleNamespace(input_block_tables=[table]))
     provider = DraftWindowGraphBindingProvider(source=full_source)
-    descriptor = BatchExecutionDescriptor(CUDAGraphMode.FULL, len(exact), len(exact), uniform_token_count=1)
-    bank = provider.register_capture_identity(route=DraftWindowGraphRoute.EAGLE3_FIRST_PASS, descriptor=descriptor)
-    provider.proposal = DraftWindowProposalContext.from_batch(batch)
+    descriptor = BatchExecutionDescriptor(CUDAGraphMode.FULL, 4 * len(exact), len(exact), uniform_token_count=4)
+    bank = provider.register_capture_identity(descriptor=descriptor)
+    provider.proposal = tuple(continuing_prefill_rows(batch, batch.num_reqs))
     return provider.prepare(
         bank,
         cpu_full_exact=torch.tensor(exact, dtype=torch.int32),

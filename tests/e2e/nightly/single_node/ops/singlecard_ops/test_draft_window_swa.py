@@ -155,7 +155,6 @@ def test_native_projection_retains_pinned_actual_length_dma_source(monkeypatch):
     )
 
     def native_only(runtime, spec):
-        runtime.native_swa_intersections = {0: 4096}
         runtime.native_swa_causal = {0: True}
         return (0,)
 

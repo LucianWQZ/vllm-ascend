@@ -445,7 +445,7 @@ class DraftGraphSupportTest(unittest.TestCase):
         owner = NS(
             _draft_graph_review_limit=scope,
             max_model_len=scope.max_model_len,
-            _draft_window_graph_binding_provider=NS(proposal=NS(full_read_rows=(True,))),
+            _draft_window_graph_binding_provider=NS(proposal=(True,)),
         )
         batch = self.batch()
         batch.num_computed_prefill_tokens_np = np.array([512], dtype=np.int32)
@@ -461,9 +461,9 @@ class DraftGraphSupportTest(unittest.TestCase):
                     owner, batch, Exact(value), num_reqs=1, padded=1, step=0
                 )
         # The real proposal uses the same placeholder-aware prompt math.
-        from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowProposalContext
+        from vllm_ascend.worker.v2.spec_decode.draft_window_runtime import continuing_prefill_rows
 
-        self.assertEqual(DraftWindowProposalContext.from_batch(batch).full_read_rows, (True,))
+        self.assertEqual(tuple(continuing_prefill_rows(batch, batch.num_reqs)), (True,))
 
     def test_full8_request_lookahead_cannot_exceed_allocated_capacity(self):
         config = self.config(method="dflash")
@@ -774,7 +774,7 @@ class EagleMixedRequestControls(unittest.TestCase):
         batch.num_computed_prefill_tokens_np = np.array([1152, 384], dtype=np.int32)
         batch.num_scheduled_tokens = np.array([128, 129], dtype=np.int32)
         batch.prefill_len_np = np.asarray(batch.prefill_len_np, dtype=np.int32)
-        owner._draft_window_graph_binding_provider = NS(proposal=NS(full_read_rows=(True, False)))
+        owner._draft_window_graph_binding_provider = NS(proposal=(True, False))
         for step in (0, 1, 2):
             M.validate_eagle_single_request_review_exact(
                 owner, batch, Vector([1280 + step, 513 + step]), num_reqs=2, padded=2, step=step
@@ -785,15 +785,15 @@ class EagleMixedRequestControls(unittest.TestCase):
                         owner, batch, Vector(values), num_reqs=2, padded=2, step=step
                     )
         # Absent/changed phase cannot relabel a terminal/decode row as continuing.
-        owner._draft_window_graph_binding_provider.proposal = NS(full_read_rows=(False, False))
+        owner._draft_window_graph_binding_provider.proposal = (False, False)
         with self.assertRaises(NotImplementedError):
             M.validate_eagle_single_request_review_exact(
                 owner, batch, Vector(cpu_lengths), num_reqs=2, padded=2, step=0
             )
-        from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowProposalContext
+        from vllm_ascend.worker.v2.spec_decode.draft_window_runtime import continuing_prefill_rows
 
         batch.num_draft_tokens_per_req = None
-        self.assertEqual(DraftWindowProposalContext.from_batch(batch).full_read_rows, (True, False))
+        self.assertEqual(tuple(continuing_prefill_rows(batch, batch.num_reqs)), (True, False))
 
     def test_continuing_prefill_does_not_relax_identity_capacity_or_counter_contract(self):
         for damage in (
@@ -837,10 +837,12 @@ class EagleMixedRequestControls(unittest.TestCase):
                     # batch, not repeatedly reconstructed by each AR reader.
                     state = NS(req_id_to_index={"request-A": 7, "request-B": 3})
                     M.draft_graph_request_bounds(owner, state, batch.req_ids, batch.idx_mapping_np)
-                from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowProposalContext
+                from vllm_ascend.worker.v2.spec_decode.draft_window_runtime import continuing_prefill_rows
 
                 runner_bounds(owner, batch)
-                owner._draft_window_graph_binding_provider = NS(proposal=DraftWindowProposalContext.from_batch(batch))
+                owner._draft_window_graph_binding_provider = NS(
+                    proposal=tuple(continuing_prefill_rows(batch, batch.num_reqs))
+                )
                 M.validate_draft_graph_review_requests(owner, batch)
                 M.validate_eagle_single_request_review_exact(
                     owner, batch, Vector([1280, 513]), num_reqs=2, padded=2, step=0

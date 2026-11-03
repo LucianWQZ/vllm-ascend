@@ -88,11 +88,13 @@ class EagleARCaptureTests(unittest.TestCase):
         for mutate in (
             lambda c: setattr(c.speculative_config, "method", "deepseek_mtp"),
             lambda c: setattr(c.speculative_config, "enforce_eager", True),
-            lambda c: setattr(c.speculative_config, "num_speculative_tokens", 7),
         ):
             value = copy.deepcopy(conf)
             mutate(value)
             self.assertIs(self.call(value), value)
+        value = self.config()
+        value.speculative_config.draft_model_config.hf_config.architectures = ["UnqualifiedEagle"]
+        self.assertIs(self.call(value), value)
         value = self.config()
         value.parallel_config.tensor_parallel_size = 2
         with self.assertRaises(NotImplementedError):
@@ -114,8 +116,50 @@ class EagleARCaptureTests(unittest.TestCase):
         self.assertIs(actual.speculative_config.draft_parallel_config, conf.speculative_config.draft_parallel_config)
         self.assertEqual(actual.speculative_config.draft_parallel_config.data_parallel_size, 1)
 
+    def test_real_config_constructors_own_integer_schema_before_capture(self):
+        from vllm.config import CompilationConfig, ParallelConfig, SchedulerConfig, SpeculativeConfig
+
+        conf = self.config()
+        conf.parallel_config = ParallelConfig(
+            tensor_parallel_size="4",
+            data_parallel_size="1",
+            enable_expert_parallel=True,
+            all2all_backend="flashinfer_all2allv",
+            distributed_executor_backend="mp",
+        )
+        conf.speculative_config.draft_parallel_config = SpeculativeConfig.create_draft_parallel_config(
+            conf.parallel_config, 4, NS(is_moe=False)
+        )
+        conf.scheduler_config = SchedulerConfig(max_model_len=4096, is_encoder_decoder=False, max_num_seqs=True)
+        conf.compilation_config = CompilationConfig(
+            cudagraph_mode=Mode.FULL_DECODE_ONLY,
+            cudagraph_capture_sizes=[True, "4"],
+            max_cudagraph_capture_size="4",
+        )
+        self.assertIs(type(conf.parallel_config.tensor_parallel_size), int)
+        self.assertIs(type(conf.parallel_config.data_parallel_size), int)
+        self.assertIs(type(conf.scheduler_config.max_num_seqs), int)
+        self.assertTrue(all(type(size) is int for size in conf.compilation_config.cudagraph_capture_sizes))
+        self.assertIs(type(conf.compilation_config.max_cudagraph_capture_size), int)
+        self.assertEqual(self.call(conf).compilation_config.cudagraph_capture_sizes, [1])
+        with self.assertRaises(ValueError):
+            SchedulerConfig(max_model_len=4096, is_encoder_decoder=False, max_num_seqs=1.5)
+        with self.assertRaises(ValueError):
+            CompilationConfig(cudagraph_capture_sizes=["not an integer"])
+
     def test_no_invented_buckets_or_unknown_dense_layout(self):
         conf = self.config()
+        # The public factory already rejects these configurations before
+        # constructing a speculator. Capture uses that same startup contract.
+        for mutate in (
+            lambda c: setattr(c.speculative_config, "num_speculative_tokens", 7),
+            lambda c: setattr(c.speculative_config, "uses_dynamic_speculative_decoding", lambda: True),
+            lambda c: setattr(c.parallel_config, "pipeline_parallel_size", 2),
+        ):
+            value = self.config()
+            mutate(value)
+            with self.assertRaises(NotImplementedError):
+                self.call(value)
         for field in ("use_sequence_parallel_moe", "enable_expert_parallel"):
             value = copy.deepcopy(conf)
             setattr(value.speculative_config.draft_parallel_config, field, True)
@@ -123,13 +167,6 @@ class EagleARCaptureTests(unittest.TestCase):
                 self.call(value)
         conf.compilation_config.cudagraph_capture_sizes = [8, 16]
         with self.assertRaisesRegex(NotImplementedError, "Qualified eagle3"):
-            self.call(conf)
-        conf.compilation_config.cudagraph_capture_sizes = [True, 4]
-        with self.assertRaises(NotImplementedError):
-            self.call(conf)
-        conf.compilation_config.cudagraph_capture_sizes = [4]
-        conf.scheduler_config.max_num_seqs = True
-        with self.assertRaises(NotImplementedError):
             self.call(conf)
         for maximum in (None, True, 0):
             conf = self.config()

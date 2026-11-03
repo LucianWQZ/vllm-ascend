@@ -59,7 +59,6 @@ def prepared(monkeypatch):
         )
 
         def validate(runtime, spec):
-            runtime.native_swa_intersections = dict.fromkeys(groups, 4096)
             runtime.native_swa_causal = dict.fromkeys(groups, causal)
             return groups
 

@@ -13,8 +13,7 @@ from __future__ import annotations
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from enum import Enum
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import torch
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
@@ -23,18 +22,6 @@ from vllm_ascend.worker.v2.spec_decode.draft_window import (
     DraftWindowGraphSource,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_plan import DraftWindowPlan, compute_draft_window_plan
-
-if TYPE_CHECKING:
-    from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowProposalContext
-
-
-class DraftWindowGraphRoute(Enum):
-    """Method-specific graph source route; never a generic support boolean."""
-
-    EAGLE3_FIRST_PASS = "eagle3_first_pass"
-    EAGLE3_AR_STEP = "eagle3_ar_step"
-    DFLASH = "dflash"
-    DSPARK = "dspark"
 
 
 @dataclass(slots=True, eq=False)
@@ -45,7 +32,6 @@ class DraftWindowGraphBucket:
     the same tensors; a proposal updates their contents, never their address.
     """
 
-    route: DraftWindowGraphRoute
     descriptor: BatchExecutionDescriptor
     consumer_ordinal: int
     window_block_table: torch.Tensor
@@ -62,7 +48,7 @@ class DraftWindowGraphBucket:
         frozen_row_plans: tuple[DraftWindowPlan, ...] | None,
     ) -> None:
         assert self.owner.proposal is not None
-        rows = self.owner.proposal.full_read_rows
+        rows = self.owner.proposal
         if any(
             t.device.type != "cpu" or t.ndim != 1 or len(t) < len(rows) or t.dtype not in (torch.int32, torch.int64)
             for t in (cpu_full_exact, cpu_valid_num_blocks)
@@ -105,23 +91,15 @@ class DraftWindowGraphBucket:
         self.device_window_exact.copy_(self.cpu_window_exact)
 
 
-_ROUTE_METHODS = {
-    DraftWindowGraphRoute.EAGLE3_FIRST_PASS: "eagle3",
-    DraftWindowGraphRoute.EAGLE3_AR_STEP: "eagle3",
-    DraftWindowGraphRoute.DFLASH: "dflash",
-    DraftWindowGraphRoute.DSPARK: "dspark",
-}
-
-
 class DraftWindowGraphBindingProvider:
     """Own capture banks and the single active proposal's bindings."""
 
     def __init__(self, *, source: DraftWindowGraphSource) -> None:
         self._source = source
-        self.proposal: DraftWindowProposalContext | None = None
+        self.proposal: tuple[bool, ...] | None = None
         self._active_bank: DraftWindowGraphBucket | None = None
         self._quarantined = False
-        self._carriers: dict[tuple[DraftWindowGraphRoute, int, int], tuple[DraftWindowGraphBucket, ...]] = {}
+        self._carriers: dict[tuple[int, int], tuple[DraftWindowGraphBucket, ...]] = {}
         self._pending: list[DraftWindowGraphBucket] = []
 
     @property
@@ -137,11 +115,11 @@ class DraftWindowGraphBindingProvider:
         self._quarantined = True
 
     @contextmanager
-    def proposal_scope(self, proposal: DraftWindowProposalContext) -> Iterator[None]:
+    def proposal_scope(self, full_read_rows: tuple[bool, ...]) -> Iterator[None]:
         self.require_reusable()
         if self.proposal is not None or self._active_bank is not None or self._pending:
             raise RuntimeError("a Draft Window proposal is already active")
-        self.proposal = proposal
+        self.proposal = full_read_rows
         try:
             yield
             if self._pending or (self._active_bank is not None and self._active_bank.params is None):
@@ -172,16 +150,17 @@ class DraftWindowGraphBindingProvider:
             raise RuntimeError("previous Draft Window consumer is still active")
         if capture in self._pending:
             raise RuntimeError("cannot overwrite a pending Draft Window consumer")
-        if type(step) is not int or step < 0 or len(proposal.full_read_rows) > capture.descriptor.num_reqs:
+        if type(step) is not int or step < 0 or len(proposal) > capture.descriptor.num_reqs:
             raise ValueError("Draft Window consumer step or active/padded geometry is invalid")
-        if (capture.route is DraftWindowGraphRoute.EAGLE3_AR_STEP) != (step > 0):
+        ar_consumer = self.method == "eagle3" and capture.descriptor.num_tokens == capture.descriptor.num_reqs
+        if ar_consumer != (step > 0):
             raise RuntimeError("Graph route does not match the actual consumer step")
         if frozen_row_plans is not None and self.method != "eagle3":
             raise ValueError("proposal-frozen Window anchors belong only to Eagle3")
         if capture.consumer_ordinal != len(self._pending):
             raise RuntimeError("Graph Window consumers must prepare in their actual serial ordinal order")
-        if self._pending and self._pending[0].route is not capture.route:
-            raise RuntimeError("Graph consumers belong to different routes")
+        if self._pending and self._pending[0].descriptor != capture.descriptor:
+            raise RuntimeError("Graph consumers belong to different execution buckets")
         capture.params = None
         self._active_bank = capture
         try:
@@ -201,26 +180,22 @@ class DraftWindowGraphBindingProvider:
             raise RuntimeError("Draft Window has no current native first consumer")
         self._active_bank = None
 
-    def capture_banks_for(
-        self, *, route: DraftWindowGraphRoute, num_reqs: int, num_tokens: int
-    ) -> tuple[DraftWindowGraphBucket, ...]:
+    def capture_banks_for(self, *, num_reqs: int, num_tokens: int) -> tuple[DraftWindowGraphBucket, ...]:
         """The fixed capture callbacks expose geometry, so index it once here."""
         try:
-            return self._carriers[route, num_reqs, num_tokens]
+            return self._carriers[num_reqs, num_tokens]
         except KeyError as error:
             raise RuntimeError("Draft Window has no captured consumer for this geometry") from error
 
     def capture_identity_for(
         self,
         *,
-        route: DraftWindowGraphRoute,
         descriptor: BatchExecutionDescriptor,
-        consumer_ordinal: int = 0,
     ) -> DraftWindowGraphBucket:
-        banks = self.capture_banks_for(route=route, num_reqs=descriptor.num_reqs, num_tokens=descriptor.num_tokens)
-        if banks[0].descriptor != descriptor or not 0 <= consumer_ordinal < len(banks):
+        bank = self.capture_banks_for(num_reqs=descriptor.num_reqs, num_tokens=descriptor.num_tokens)[0]
+        if bank.descriptor != descriptor:
             raise RuntimeError(f"runtime descriptor does not resolve a captured consumer: {descriptor!r}")
-        return banks[consumer_ordinal]
+        return bank
 
     @property
     def method(self) -> str:
@@ -230,13 +205,10 @@ class DraftWindowGraphBindingProvider:
     def register_capture_identity(
         self,
         *,
-        route: DraftWindowGraphRoute,
         descriptor: BatchExecutionDescriptor,
         consumer_ordinal: int = 0,
     ) -> DraftWindowGraphBucket:
         """Bind the manager's exact frozen descriptor to one persistent bank."""
-        if not isinstance(route, DraftWindowGraphRoute) or _ROUTE_METHODS[route] != self.method:
-            raise ValueError("capture route does not match the actual Draft method")
         if type(descriptor) is not BatchExecutionDescriptor:
             raise TypeError("capture requires the actual BatchExecutionDescriptor")
         if descriptor.cg_mode.name != "FULL":
@@ -251,9 +223,7 @@ class DraftWindowGraphBindingProvider:
         query_width = descriptor.num_tokens // num_reqs
         if descriptor.uniform_token_count is not None and descriptor.uniform_token_count != query_width:
             raise ValueError("capture query width differs from the actual descriptor")
-        if route is DraftWindowGraphRoute.EAGLE3_AR_STEP and query_width != 1:
-            raise ValueError("Eagle3 AR capture requires query width 1")
-        key = route, num_reqs, descriptor.num_tokens
+        key = num_reqs, descriptor.num_tokens
         banks = self._carriers.get(key, ())
         if banks and banks[0].descriptor != descriptor:
             raise RuntimeError("Draft Window capture descriptor geometry is ambiguous")
@@ -266,7 +236,6 @@ class DraftWindowGraphBindingProvider:
         if table.ndim != 2 or table.dtype != torch.int32:
             raise ValueError("Draft capture requires a two-dimensional int32 table")
         bucket = DraftWindowGraphBucket(
-            route,
             descriptor,
             consumer_ordinal,
             table.new_zeros((num_reqs, table.shape[1])),
@@ -341,10 +310,10 @@ class DraftWindowGraphBindingProvider:
         self._pending.clear()
 
 
-def resolve_parallel_draft_window_graph_route(
+def parallel_draft_window_graph_provider(
     owner: Any,
-) -> DraftWindowGraphRoute | None:
-    """Resolve DFlash/DSpark from the provider's actual method policy.
+) -> DraftWindowGraphBindingProvider | None:
+    """Select the actual DFlash/DSpark instance-owned provider.
 
     The class-name/debug label on a speculator is not a policy or capability
     source.  When no provider is installed this remains an exact OFF-path
@@ -356,8 +325,6 @@ def resolve_parallel_draft_window_graph_route(
     if not isinstance(provider, DraftWindowGraphBindingProvider):
         raise TypeError("invalid instance-owned Draft Window graph binding provider")
     method = provider.method
-    if method == "dflash":
-        return DraftWindowGraphRoute.DFLASH
-    if method == "dspark":
-        return DraftWindowGraphRoute.DSPARK
+    if method in ("dflash", "dspark"):
+        return provider
     raise RuntimeError(f"parallel Draft Window graph manager cannot consume method {method!r}")

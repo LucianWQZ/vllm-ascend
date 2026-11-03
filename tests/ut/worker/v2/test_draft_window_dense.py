@@ -154,16 +154,17 @@ def test_apply_keeps_full_write_and_absolute_query_operands():
     assert common.seq_lens_cpu_upper_bound.tolist() == [160, 160]
 
 
-def test_allocation_upper_cannot_authorize_uninitialized_columns():
+@pytest.mark.parametrize("end,upper", [(129, 129), (0, 1), (-1, 1), (127, 126), (1, 0)])
+def test_allocation_upper_cannot_authorize_uninitialized_columns(end, upper):
     source = (torch.tensor([[1]], dtype=torch.int32)[list((0,))], (1,), 128)
     with pytest.raises(ValueError, match="exact lengths exceed"):
         prepare_dense_draft_read(
             *source,
-            exact_cpu=torch.tensor([129]),
-            query_ends_cpu=torch.tensor([129]),
-            frozen_starts=torch.div(torch.clamp(torch.tensor([129]) - 128, min=0), 128, rounding_mode="floor") * 128,
-            full_rows_cpu=torch.zeros_like(torch.tensor([129]), dtype=torch.bool, device="cpu"),
-            upper_cpu=torch.tensor([129]),
+            exact_cpu=torch.tensor([end], dtype=torch.int32),
+            query_ends_cpu=torch.tensor([end], dtype=torch.int32),
+            frozen_starts=torch.tensor([0], dtype=torch.int32),
+            full_rows_cpu=torch.zeros(1, dtype=torch.bool),
+            upper_cpu=torch.tensor([upper], dtype=torch.int32),
             query_width=8,
             causal=False,
             retain=lambda *objects: None,

@@ -27,7 +27,7 @@ from vllm_ascend.compilation.updatable_graph import (
 from vllm_ascend.utils import use_updatable_graph
 from vllm_ascend.worker.v2.aclgraph_utils import collect_sorted_captured_token_sizes, model_capture_wrapper
 from vllm_ascend.worker.v2.spec_decode.dflash.capture import draft_window_dflash_capture_scope
-from vllm_ascend.worker.v2.spec_decode.draft_window_graph import resolve_parallel_draft_window_graph_route
+from vllm_ascend.worker.v2.spec_decode.draft_window_graph import parallel_draft_window_graph_provider
 from vllm_ascend.worker.v2.utils import communicator_switch
 
 
@@ -131,17 +131,17 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
         """Override run_fullgraph to update full graph params in run_fullgraph."""
         num_tokens = desc.num_tokens
         dp_dummy = getattr(self.speculator, "_draft_window_dp_dummy_active", False)
-        graph_route = None if dp_dummy else resolve_parallel_draft_window_graph_route(self.speculator)
+        window_provider = None if dp_dummy else parallel_draft_window_graph_provider(self.speculator)
         attn_backend = list(self.speculator.attn_backends.values())[0]
-        if graph_route is not None and not use_updatable_graph(attn_backend):
+        if window_provider is not None and not use_updatable_graph(attn_backend):
             raise NotImplementedError("Draft Window Graph requires the admitted updatable backend binding contract")
         if all(backend is AscendFlashAttentionBackend for backend in self.speculator.attn_backends.values()):
             # Length preparation and FlashAttn tiling run inside the graph,
             # reading the draft's persistent device buffers on every replay.
             return super().run_fullgraph(desc)
-        if graph_route is not None:
-            self.speculator._draft_window_graph_binding_provider.bind_current(desc)
-        if graph_route is None:
+        if window_provider is not None:
+            window_provider.bind_current(desc)
+        if window_provider is None:
             draft_attn_metadatas = self.speculator.build_draft_attn_metadatas(
                 desc.num_reqs,
                 self.speculator.input_batch.seq_lens_cpu_upper_bound,
@@ -151,11 +151,11 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
         if use_updatable_graph(attn_backend):
             ret = self._updatable_graph_replay(
                 desc,
-                draft_attn_metadatas if graph_route is None else None,
-                window_source=None if graph_route is None else self.speculator._draft_window_graph_binding_provider,
+                draft_attn_metadatas if window_provider is None else None,
+                window_source=window_provider,
             )
-            if graph_route is not None:
-                self.speculator._draft_window_graph_binding_provider.finish_update()
+            if window_provider is not None:
+                window_provider.finish_update()
             return ret
         else:
             # Ordinary OFF/eager Target policy keeps the original fallback.

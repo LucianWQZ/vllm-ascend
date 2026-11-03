@@ -13,13 +13,13 @@ from vllm.v1.worker.gpu.spec_decode.eagle.speculator import EagleSpeculator
 from vllm.v1.worker.gpu.spec_decode.target_dependent_ar.speculator import TargetDependentARSpeculator
 
 from vllm_ascend.attention.attention_v1 import AscendAttentionState, AscendMetadata
-from vllm_ascend.worker.v2.spec_decode import draft_window_eager
 from vllm_ascend.worker.v2.spec_decode.draft_window_eagle3 import (
     Eagle3DraftWindowMixin,
     _eagle3_graph_scheduled_consumers,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_eagle3_adapter import Eagle3GraphIntegrationMixin
 from vllm_ascend.worker.v2.spec_decode.draft_window_eagle3_capture import Eagle3GraphSession
+from vllm_ascend.worker.v2.spec_decode.draft_window_runtime import continuing_prefill_rows
 from vllm_ascend.worker.v2.spec_decode.eagle.speculator import AscendEagleSpeculator
 from vllm_ascend.worker.v2.spec_decode.target_dependent_ar.speculator import AscendTargetDependentARSpeculator
 
@@ -112,7 +112,6 @@ def proposal():
     from vllm_ascend.worker.v2.spec_decode.draft_window_backends import DraftWindowGroupRoute, DraftWindowProviderStatus
     from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
         DraftWindowGraphBindingProvider,
-        DraftWindowGraphRoute,
     )
     from vllm_ascend.worker.v2.spec_decode.draft_window_policy import resolve_draft_window_policy
 
@@ -152,15 +151,12 @@ def proposal():
     session = object.__new__(Eagle3GraphSession)
     session.owner, session.provider, session._capture_call = owner, provider, None
     for n in (1, 2, 4):
-        for route, q, count in (
-            (DraftWindowGraphRoute.EAGLE3_FIRST_PASS, 4, 1),
-            (DraftWindowGraphRoute.EAGLE3_AR_STEP, 1, 2),
-        ):
+        for q, count in ((4, 1), (1, 2)):
             if n > 2:
                 continue
             desc = BatchExecutionDescriptor(CUDAGraphMode.FULL, q * n, n, uniform_token_count=q)
             for ordinal in range(count):
-                provider.register_capture_identity(route=route, descriptor=desc, consumer_ordinal=ordinal)
+                provider.register_capture_identity(descriptor=desc, consumer_ordinal=ordinal)
     owner._eagle3_graph_session = session
     owner.model_state, owner.draft_vllm_config = (
         SimpleNamespace(attn_metadata={}),
@@ -173,8 +169,8 @@ def test_real_proposal_zero_uses_first_reader_and_keeps_static_k(proposal):
     owner, batch, session, runtime, inputs = proposal
     with owner._eagle3_draft_window_proposal_scope(batch, dummy_run=False, is_profile=False, num_speculative_tokens=0):
         assert owner._eagle3_window_expected_steps == 1
-        session.stage(session.resolve(first=True, n=1, tokens=4, ordinal=0), 0)
-        assert runtime._active_bank is session.resolve(first=True, n=1, tokens=4, ordinal=0)
+        session.stage(session.resolve(n=1, tokens=4, ordinal=0), 0)
+        assert runtime._active_bank is session.resolve(n=1, tokens=4, ordinal=0)
         runtime.finish_update()
     assert runtime._active_bank is None
     assert owner.num_speculative_steps == owner._eagle3_window_expected_steps == 3
@@ -184,12 +180,12 @@ def test_real_proposal_zero_uses_first_reader_and_keeps_static_k(proposal):
 def test_real_proposal_keeps_each_submitted_consumer_until_update(proposal):
     owner, batch, session, runtime, _ = proposal
     with owner._eagle3_draft_window_proposal_scope(batch, dummy_run=False, is_profile=False):
-        first = session.resolve(first=True, n=1, tokens=4, ordinal=0)
+        first = session.resolve(n=1, tokens=4, ordinal=0)
         session.stage(first, 0)
         assert runtime._active_bank is first and runtime._pending == [first]
         runtime.finish_update()
         owner._snapshot_eagle3_decode_step_one(num_reqs=1, num_reqs_padded=1)
-        ar = [session.resolve(first=False, n=1, tokens=1, ordinal=i) for i in range(2)]
+        ar = [session.resolve(n=1, tokens=1, ordinal=i) for i in range(2)]
         for step, bank in enumerate(ar, 1):
             session.stage(bank, step)
             assert owner._eagle3_window_next_step == step + 1
@@ -205,7 +201,7 @@ def test_update_failure_after_host_retirement_quarantines_the_provider(proposal)
         pytest.raises(RuntimeError) as caught,
         owner._eagle3_draft_window_proposal_scope(batch, dummy_run=False, is_profile=False, num_speculative_tokens=0),
     ):
-        session.stage(session.resolve(first=True, n=1, tokens=4, ordinal=0), 0)
+        session.stage(session.resolve(n=1, tokens=4, ordinal=0), 0)
         assert runtime._active_bank is not None and runtime._pending
         raise original
     assert caught.value is original
@@ -240,12 +236,12 @@ def test_actual_manager_failure_stays_inside_the_proposal_quarantine(proposal, f
         ),
     ):
         if not first:
-            session.stage(session.resolve(first=True, n=1, tokens=4, ordinal=0), 0)
+            session.stage(session.resolve(n=1, tokens=4, ordinal=0), 0)
             provider.finish_update()
             owner._snapshot_eagle3_decode_step_one(num_reqs=1, num_reqs_padded=1)
             for step in (1, 2):
-                session.stage(session.resolve(first=False, n=1, tokens=1, ordinal=step - 1), step)
-        desc = session.resolve(first=first, n=1, tokens=4 if first else 1, ordinal=0).descriptor
+                session.stage(session.resolve(n=1, tokens=1, ordinal=step - 1), step)
+        desc = session.resolve(n=1, tokens=4 if first else 1, ordinal=0).descriptor
         manager._run_eagle_window_fullgraph(desc, session)
     assert caught.value is original
     assert provider.quarantined and provider._active_bank is not None and provider._pending
@@ -263,7 +259,7 @@ def test_business_window_proposal_requires_the_real_installed_graph_manager(prop
     assert runtime._active_bank is None
 
 
-@pytest.mark.parametrize("damage", ["missing_reader", "missing_update", "wrong_batch", "wrong_step"])
+@pytest.mark.parametrize("damage", ["missing_reader", "missing_update", "wrong_count", "wrong_step"])
 def test_real_proposal_rejects_unconsumed_or_misattributed_reader(proposal, damage):
     owner, batch, session, runtime, inputs = proposal
     with (
@@ -271,11 +267,14 @@ def test_real_proposal_rejects_unconsumed_or_misattributed_reader(proposal, dama
         owner._eagle3_draft_window_proposal_scope(batch, dummy_run=False, is_profile=False, num_speculative_tokens=0),
     ):
         if damage != "missing_reader":
-            if damage == "wrong_batch":
+            if damage == "wrong_count":
                 owner.input_batch = SimpleNamespace(**vars(batch))
-            session.stage(session.resolve(first=True, n=1, tokens=4, ordinal=0), 1 if damage == "wrong_step" else 0)
+                owner.input_batch.num_reqs = 0
+            session.stage(session.resolve(n=1, tokens=4, ordinal=0), 1 if damage == "wrong_step" else 0)
     assert runtime.quarantined
     assert runtime.proposal is None
+    if damage != "missing_update":
+        assert runtime._active_bank is None and not runtime._pending
 
 
 @pytest.mark.parametrize("first_padding", [1, 2])
@@ -289,13 +288,13 @@ def test_first_and_ar_share_one_materialization_path_without_moving_the_anchor(p
 
     monkeypatch.setattr(runtime, "prepare", prepare)
     with owner._eagle3_draft_window_proposal_scope(batch, dummy_run=False, is_profile=False):
-        session.stage(session.resolve(first=True, n=first_padding, tokens=4 * first_padding, ordinal=0), 0)
+        session.stage(session.resolve(n=first_padding, tokens=4 * first_padding, ordinal=0), 0)
         frozen = owner._eagle3_window_proposal_plan
         assert frozen[0].window_start == 8
         runtime.finish_update()
         owner._snapshot_eagle3_decode_step_one(num_reqs=1, num_reqs_padded=1)
         for step in (1, 2):
-            session.stage(session.resolve(first=False, n=1, tokens=1, ordinal=step - 1), step)
+            session.stage(session.resolve(n=1, tokens=1, ordinal=step - 1), step)
             assert owner._eagle3_window_proposal_plan is frozen
         runtime.finish_update()
     assert [call["cpu_full_exact"].tolist() for call in calls] == [[10] + [0] * (first_padding - 1), [8], [9]]
@@ -316,31 +315,27 @@ def test_eagle_startup_rejects_no_usable_capture_buckets():
         Eagle3GraphSession(owner)
 
 
-@pytest.mark.parametrize("first,tokens,ordinal", [(True, 4, 0), (False, 1, 0), (False, 1, 1)])
-def test_eagle_capture_lookup_keeps_each_real_shape_and_consumer(first, tokens, ordinal):
-    from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphRoute
-
+@pytest.mark.parametrize("tokens,ordinal", [(4, 0), (1, 0), (1, 1)])
+def test_eagle_capture_lookup_keeps_each_real_shape_and_consumer(tokens, ordinal):
     session: Any = object.__new__(Eagle3GraphSession)
-    first_route = DraftWindowGraphRoute.EAGLE3_FIRST_PASS
-    ar_route = DraftWindowGraphRoute.EAGLE3_AR_STEP
     captures = {
-        (first_route, 1, 4): (object(),),
-        (ar_route, 1, 1): (object(), object()),
+        (1, 4): (object(),),
+        (1, 1): (object(), object()),
     }
 
-    def lookup(*, route, num_reqs, num_tokens):
+    def lookup(*, num_reqs, num_tokens):
         try:
-            return captures[route, num_reqs, num_tokens]
+            return captures[num_reqs, num_tokens]
         except KeyError:
             raise RuntimeError("Eagle3 Window has no exact capture bank") from None
 
     session.provider = SimpleNamespace(capture_banks_for=lookup)
-    expected = captures[(first_route if first else ar_route, 1, tokens)][ordinal]
-    assert session.resolve(first=first, n=1, tokens=tokens, ordinal=ordinal) is expected
+    expected = captures[1, tokens][ordinal]
+    assert session.resolve(n=1, tokens=tokens, ordinal=ordinal) is expected
     with pytest.raises(RuntimeError, match="no exact capture bank"):
-        session.resolve(first=first, n=2, tokens=tokens, ordinal=ordinal)
+        session.resolve(n=2, tokens=tokens, ordinal=ordinal)
     with pytest.raises(RuntimeError, match="no exact capture bank"):
-        session.resolve(first=first, n=1, tokens=tokens + 1, ordinal=ordinal)
+        session.resolve(n=1, tokens=tokens + 1, ordinal=ordinal)
 
 
 def test_eagle_capture_borrows_full_query_write_fields_and_owns_only_reads():
@@ -460,7 +455,7 @@ def test_eagle_stage_uses_the_bank_without_rebuilding_or_reading_target_metadata
         for step in range(1 if scheduled == 0 else scheduled):
             if step == 1:
                 owner._snapshot_eagle3_decode_step_one(num_reqs=1, num_reqs_padded=1)
-            capture = session.resolve(first=step == 0, n=1, tokens=4 if step == 0 else 1, ordinal=max(0, step - 1))
+            capture = session.resolve(n=1, tokens=4 if step == 0 else 1, ordinal=max(0, step - 1))
             session.stage(capture, step)
             assert runtime._active_bank is capture and owner._eagle3_window_next_step == step + 1
             assert owner.model_state is target and owner.draft_vllm_config is draft_config
@@ -515,7 +510,7 @@ def test_official_nonuniform_prefill_uses_window_first_bank_without_an_eager_own
     provider = DraftWindowGraphBindingProvider(source=SimpleNamespace(table=torch.empty(0)))
 
     def resolve(**kwargs):
-        assert kwargs == dict(first=True, n=2, tokens=8, ordinal=0)
+        assert kwargs == dict(n=2, tokens=8, ordinal=0)
         return capture
 
     def materialize(actual, step):
@@ -593,7 +588,7 @@ def test_official_nonuniform_prefill_uses_window_first_bank_without_an_eager_own
 
     owner.sample_draft = sample
     monkeypatch.setattr(AscendTargetDependentARSpeculator, "_run_model", forward)
-    context = draft_window_eager.DraftWindowProposalContext(owner.input_batch, (False, False))
+    context = (False, False)
     if padding == "extra_request":
         with (
             pytest.raises(NotImplementedError, match="additional padding requests"),
@@ -641,7 +636,6 @@ def test_dp_synchronized_native_first_without_local_prefill(monkeypatch, mode, f
     from vllm_ascend.worker.v2.spec_decode.draft_window_backends import DraftWindowGroupRoute, DraftWindowProviderStatus
     from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
         DraftWindowGraphBindingProvider,
-        DraftWindowGraphRoute,
     )
     from vllm_ascend.worker.v2.spec_decode.draft_window_policy import resolve_draft_window_policy
 
@@ -666,7 +660,6 @@ def test_dp_synchronized_native_first_without_local_prefill(monkeypatch, mode, f
     )
     provider = owner._draft_window_graph_binding_provider = DraftWindowGraphBindingProvider(source=source)
     capture = provider.register_capture_identity(
-        route=DraftWindowGraphRoute.EAGLE3_FIRST_PASS,
         descriptor=BatchExecutionDescriptor(CUDAGraphMode.FULL, 4, 1, uniform_token_count=4),
     )
     bank = capture
@@ -731,11 +724,11 @@ def test_dp_synchronized_native_first_without_local_prefill(monkeypatch, mode, f
         return torch.zeros((8, 2)), torch.zeros((8, 2))
 
     monkeypatch.setattr(AscendTargetDependentARSpeculator, "_run_model", forward)
-    context = draft_window_eager.DraftWindowProposalContext.from_batch(owner.input_batch)
+    context = tuple(continuing_prefill_rows(owner.input_batch, owner.input_batch.num_reqs))
     with provider.proposal_scope(context):
         owner._prefill(1, 8, target, {"draft": slots}, None, mode)
     assert len(observed) == 1
-    assert observed[0] is bank and context.full_read_rows == (False,)
+    assert observed[0] is bank and context == (False,)
     assert provider._active_bank is None and not owner._eagle3_window_native_prefill_active
     assert owner._eagle3_window_next_step == 1 and owner.draft_tokens[0, 0] == 23
     assert bank.cpu_window_exact.tolist() == [full_end - start]  # Retirement did not clear live backing.
@@ -762,7 +755,7 @@ def test_terminal_prefill_rejects_a_query_outside_the_frozen_window_before_writi
         pytest.raises(NotImplementedError, match="query begins before its frozen read window"),
         owner._eagle3_draft_window_proposal_scope(batch, dummy_run=False, is_profile=False),
     ):
-        owner._materialize_eagle3_step(session.resolve(first=True, n=1, tokens=4, ordinal=0), 0)
+        owner._materialize_eagle3_step(session.resolve(n=1, tokens=4, ordinal=0), 0)
     assert runtime._active_bank is None
 
 
@@ -787,13 +780,13 @@ def test_mixed_prefill_query_guard_keeps_full_rows_and_checks_only_actual_window
         return capture
 
     monkeypatch.setattr(runtime, "prepare", prepare)
-    context = runtime.proposal = draft_window_eager.DraftWindowProposalContext.from_batch(batch)
+    context = runtime.proposal = tuple(continuing_prefill_rows(batch, batch.num_reqs))
     capture = SimpleNamespace(descriptor=SimpleNamespace(num_reqs=4))
     try:
         owner._materialize_eagle3_step(capture, 0)
     finally:
         runtime.proposal = None
-    assert context.full_read_rows == (True, False)
+    assert context == (True, False)
     assert len(calls) == 1 and calls[0]["cpu_full_exact"].tolist() == [20, 10, 0, 0]
     assert [plan.window_visible_length for plan in calls[0]["frozen_row_plans"]] == [4, 2]
 
@@ -809,15 +802,13 @@ def test_eagle_rejects_invalid_canonical_lengths_before_writing_a_bank(proposal,
         draft_window_eagle3, "gather_valid_num_blocks_cpu", lambda *args, **kwargs: pytest.fail("invalid bank write")
     )
     with pytest.raises(ValueError), owner._eagle3_draft_window_proposal_scope(batch, dummy_run=False, is_profile=False):
-        owner._materialize_eagle3_step(session.resolve(first=True, n=1, tokens=4, ordinal=0), 0)
+        owner._materialize_eagle3_step(session.resolve(n=1, tokens=4, ordinal=0), 0)
     assert runtime._active_bank is None
 
 
 @pytest.mark.parametrize("consumers", [1, 2])
 @pytest.mark.parametrize("visited", [0, 1, 2, 3])
 def test_capture_scope_selects_banks_once_and_requires_every_real_consumer(consumers, visited):
-    from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphRoute
-
     session: Any = object.__new__(Eagle3GraphSession)
     session._capture_call = None
     session.owner = SimpleNamespace(
@@ -846,7 +837,7 @@ def test_capture_scope_selects_banks_once_and_requires_every_real_consumer(consu
     full = AscendMetadata(slot_mapping=torch.tensor([10]), seq_lens_list=[99], actual_seq_lengths_q=[4])
 
     def execute():
-        with session.capture_call(first=consumers == 1, n=1, tokens=4 if consumers == 1 else 1):
+        with session.capture_call(n=1, tokens=4 if consumers == 1 else 1):
             for index in range(visited):
                 private = session.capture_metadata({"layer": full})["layer"]
                 assert private.block_tables is captures[index].window_block_table
@@ -861,7 +852,6 @@ def test_capture_scope_selects_banks_once_and_requires_every_real_consumer(consu
     assert session._capture_call is None
     assert selections == [
         dict(
-            route=DraftWindowGraphRoute.EAGLE3_FIRST_PASS if consumers == 1 else DraftWindowGraphRoute.EAGLE3_AR_STEP,
             num_reqs=1,
             num_tokens=4 if consumers == 1 else 1,
         )

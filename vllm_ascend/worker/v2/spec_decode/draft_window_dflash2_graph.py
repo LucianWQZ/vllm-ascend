@@ -44,8 +44,7 @@ def validate_dflash2_graph_config(vllm_config: Any) -> None:
         "first Graph qualification requires actual Target/Draft TP2, DP1/PP1/PCP1/DCP1",
     )
     _require(
-        type(config.num_speculative_tokens) is int
-        and config.num_speculative_tokens == 7
+        config.num_speculative_tokens == 7
         and not config.uses_dynamic_speculative_decoding()
         and not config.enable_adaptive_verification,
         "first Graph qualification requires static nonadaptive K7/Q8",

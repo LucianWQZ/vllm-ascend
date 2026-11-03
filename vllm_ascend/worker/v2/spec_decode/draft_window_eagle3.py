@@ -12,11 +12,9 @@ import torch
 from vllm_ascend.worker.v2.spec_decode.draft_window import (
     gather_valid_num_blocks_cpu,
 )
-from vllm_ascend.worker.v2.spec_decode.draft_window_eager import (
-    DraftWindowProposalContext,
-)
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphBindingProvider
 from vllm_ascend.worker.v2.spec_decode.draft_window_plan import DraftWindowPlan, compute_draft_window_plan
+from vllm_ascend.worker.v2.spec_decode.draft_window_runtime import continuing_prefill_rows
 
 
 def _eagle3_graph_scheduled_consumers(static_k: int, scheduled: int | None) -> int:
@@ -79,10 +77,10 @@ class Eagle3DraftWindowMixin:
         provider = self._draft_window_graph_binding_provider
         if provider.quarantined:
             raise RuntimeError("Eagle3 Draft Window backing is quarantined")
-        context = None
+        rows = None
         if not dummy_run and not is_profile and not bool(getattr(input_batch, "is_dummy", False)):
-            context = DraftWindowProposalContext.from_batch(input_batch)
-        bypass_for_prefill = context is not None and bool(context.full_read_rows) and all(context.full_read_rows)
+            rows = tuple(map(bool, continuing_prefill_rows(input_batch, input_batch.num_reqs)))
+        bypass_for_prefill = rows is not None and bool(rows) and all(rows)
         if dummy_run or is_profile or bool(getattr(input_batch, "is_dummy", False)) or bypass_for_prefill:
             self._eagle3_window_bypass_active = True
             self._eagle3_window_continuing_prefill = bypass_for_prefill
@@ -98,13 +96,13 @@ class Eagle3DraftWindowMixin:
 
         if graph_session is None:
             raise RuntimeError("Eagle3 Draft Window business proposals require their installed Graph manager")
-        assert context is not None
+        assert rows is not None
         self._eagle3_window_proposal_plan = None
         self._eagle3_window_decode_step_one_exact = None
         self._eagle3_window_next_step = 0
         self._eagle3_window_expected_steps = expected_steps
         try:
-            with provider.proposal_scope(context):
+            with provider.proposal_scope(rows):
                 yield
                 if self._eagle3_window_next_step != expected_steps:
                     raise RuntimeError(
@@ -160,10 +158,14 @@ class Eagle3DraftWindowMixin:
             or step != self._eagle3_window_next_step
         ):
             raise RuntimeError("Eagle3 Window step is stale or its previous reader remains active")
-        context = self._require_eagle3_window_context()
+        provider = self._draft_window_graph_binding_provider
+        rows = provider.proposal
+        if rows is None:
+            raise RuntimeError("Eagle3 Draft Window operation has no active proposal")
         batch = self.input_batch
         num_reqs, num_reqs_padded = batch.num_reqs, capture.descriptor.num_reqs
-        provider = self._draft_window_graph_binding_provider
+        if num_reqs != len(rows):
+            raise RuntimeError("Eagle3 request geometry changed within one proposal")
         proposal = self._eagle3_window_proposal_plan
         if step == 0:
             if proposal is not None:
@@ -187,7 +189,7 @@ class Eagle3DraftWindowMixin:
             if batch.has_prefill:
                 widths = np.diff(batch.query_start_loc_np[: num_reqs + 1])
                 if any(
-                    not context.full_read_rows[row] and query > plan.window_visible_length
+                    not rows[row] and query > plan.window_visible_length
                     for row, (query, plan) in enumerate(zip(widths, proposal))
                 ):
                     raise NotImplementedError(
@@ -216,7 +218,6 @@ class Eagle3DraftWindowMixin:
             num_reqs=num_reqs,
             num_reqs_padded=num_reqs_padded,
         )
-        context.validate(batch)
         bank = provider.prepare(
             capture,
             frozen_row_plans=proposal,
@@ -230,12 +231,6 @@ class Eagle3DraftWindowMixin:
     def _quarantine_eagle3_window(self) -> None:
         """Keep actual banks alive after an uncertain partial submission."""
         self._draft_window_graph_binding_provider.quarantine()
-
-    def _require_eagle3_window_context(self) -> DraftWindowProposalContext:
-        context = self._draft_window_graph_binding_provider.proposal
-        if context is None:
-            raise RuntimeError("Eagle3 Draft Window operation has no active proposal")
-        return context
 
     def _validate_request_counts(self, num_reqs: int, num_reqs_padded: int) -> None:
         if num_reqs != self.input_batch.num_reqs:

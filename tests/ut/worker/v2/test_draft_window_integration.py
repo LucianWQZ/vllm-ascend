@@ -583,6 +583,7 @@ def test_dspark_mla_reuses_prepared_exact_cpu_without_another_transfer(contract,
     assert len(prepared_cpu_copies) == 1  # Existing blocking helper copy remains.
     assert len(window_cpu_copies) == 0  # The feature adds no second exact copy.
     prepared = prepared_cpu_copies[0]
+    assert prepared.tolist() == [21]  # Actual prefix copied by the helper, not padded capacity.
     assert any(isinstance(value, torch.Tensor) and value.data_ptr() == prepared.data_ptr() for value in owner.retained)
     assert owner.completion is not None
     assert owner.completion is completion
@@ -590,5 +591,7 @@ def test_dspark_mla_reuses_prepared_exact_cpu_without_another_transfer(contract,
     assert common.seq_lens_cpu.tolist() == [9] + [0] * (padded_rows - 1)
     assert common.seq_lens.tolist() == [9] + [0] * (padded_rows - 1)
     assert common.slot_mapping.untyped_storage().data_ptr() == contract.slots.untyped_storage().data_ptr()
+    assert common.positions.data_ptr() == contract.positions.data_ptr()
+    assert common.query_start_loc_cpu.tolist() == [0, 3] + [3] * (padded_rows - 1)
     assert obj.input_buffers.seq_lens.tolist() == [21] + [0] * (padded_rows - 1)
     assert contract.table.tolist() == [list(range(8))]

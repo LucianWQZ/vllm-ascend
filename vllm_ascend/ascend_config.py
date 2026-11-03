@@ -61,17 +61,6 @@ def validate_additional_config_bool(value: Any, path: str) -> bool:
         raise ValueError(f"{path} must be a boolean, got {value!r}.") from exc
 
 
-def _eagle3_tp4_graph_review(vllm_config: Any) -> bool:
-    """Use the qualified actual Eagle consumer geometry, not an architecture name."""
-    from vllm_ascend import envs
-    from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import resolve_draft_graph_review_limit
-
-    scope = resolve_draft_graph_review_limit(
-        vllm_config, experimental_graph_review=envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH
-    )
-    return scope is not None and scope.method == "eagle3"
-
-
 def validate_draft_window_graph_config(vllm_config: Any, *, support: Any) -> None:
     """Validate topology after the factory resolves policy and Graph support."""
     speculative = vllm_config.speculative_config
@@ -84,22 +73,12 @@ def validate_draft_window_graph_config(vllm_config: Any, *, support: Any) -> Non
         raise ValueError("Draft Window Graph requires W1024 for this consumer")
     draft_parallel = speculative.draft_parallel_config
     tp = vllm_config.parallel_config.tensor_parallel_size
-    if (
-        type(tp) is not int
-        or tp not in (2, 4, 16)
-        or draft_parallel is None
-        or type(draft_parallel.tensor_parallel_size) is not int
-        or draft_parallel.tensor_parallel_size != tp
-    ):
+    if tp not in (2, 4, 16) or draft_parallel is None or draft_parallel.tensor_parallel_size != tp:
         raise ValueError("replicated TP Graph review requires matching actual Target/Draft TP in (2, 4, 16)")
-    if speculative.method == "eagle3" and (
-        tp != 2
-        or type(getattr(speculative, "num_speculative_tokens", None)) is not int
-        or speculative.num_speculative_tokens != 3
-    ):
+    if speculative.method == "eagle3" and (tp != 2 or speculative.num_speculative_tokens != 3):
         raise ValueError("Eagle3 replicated Graph review requires static K3 and TP2 or the named dense TP4 geometry")
     dp = getattr(vllm_config.parallel_config, "data_parallel_size", 1)
-    if type(dp) is not int or dp not in (1, 2):
+    if dp not in (1, 2):
         raise ValueError("replicated Graph review requires integer DP1 or the explicit DFlash TP4/DP2 route")
     if dp == 2 and (
         speculative.method != "dflash"
@@ -108,7 +87,6 @@ def validate_draft_window_graph_config(vllm_config: Any, *, support: Any) -> Non
         # TP-only model descriptor with DP1. The actual two replicas live
         # in the parent engine/groups, retained by the runtime fingerprint.
         # Requiring descriptor DP2 rejects the official DP2 constructor.
-        or type(getattr(draft_parallel, "data_parallel_size", None)) is not int
         or draft_parallel.data_parallel_size != 1
         or getattr(vllm_config.parallel_config, "enable_expert_parallel", False) is not True
     ):

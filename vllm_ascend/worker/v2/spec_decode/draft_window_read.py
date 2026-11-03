@@ -24,8 +24,8 @@ def materialize_draft_read(
 ) -> None:
     """Copy only initialized [S,E) columns from the current compact Full table.
 
-    The framework has already gathered persistent request slots into batch
-    order. Reusing it avoids another request mapping and device gather. Each
+    Runtime supplies typed CPU snapshots; the fixed builder and BlockTables
+    supply same-device int32 inputs already gathered into batch order. Each
     copied row and the exact-length DMA source belong to this proposal, so a
     later batch or Eagle consumer cannot overwrite an outstanding reader.
     """
@@ -34,19 +34,13 @@ def materialize_draft_read(
     exact_device = common_metadata.seq_lens
     upper_cpu = common_metadata.seq_lens_cpu_upper_bound[:n]
     padded_rows = common_metadata.num_reqs
-    if block_table.ndim != 2 or block_table.dtype != torch.int32 or block_span <= 0:
-        raise ValueError("Invalid compact int32 table geometry")
     if block_table.shape[0] < n or any(count < 0 or count > block_table.shape[1] for count in valid_columns):
         raise ValueError("Invalid initialized compact column extent")
     cpu_values = (exact_cpu, upper_cpu, starts_cpu)
-    if any(t.device.type != "cpu" or t.ndim != 1 or t.numel() != n for t in cpu_values):
-        raise ValueError("Draft read planning requires one CPU value per active request")
-    if any(t.dtype not in (torch.int32, torch.int64) for t in cpu_values):
-        raise ValueError("Draft read lengths and starts must be integers")
-    if padded_rows < n or exact_device.ndim != 1 or exact_device.numel() < n:
+    if any(t.numel() != n for t in cpu_values):
+        raise ValueError("Draft read planning requires one value per active request")
+    if padded_rows < n or exact_device.numel() < n:
         raise ValueError("Missing device exact lengths or padded row extent")
-    if exact_device.device != block_table.device:
-        raise ValueError("Draft source and exact lengths must be on the same device")
     ends, upper, starts = (t.to(torch.int64) for t in cpu_values)
     if bool(((ends < 0) | (upper < ends) | (starts < 0) | (starts > ends)).any()):
         raise ValueError("Invalid exact, upper, or start ordering")

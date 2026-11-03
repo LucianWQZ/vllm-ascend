@@ -109,60 +109,33 @@ def prepare_dense_draft_read(
 ) -> DenseDraftRead | DenseDraftReadBatch:
     """Use completed current exact lengths, not optimistic scheduling bounds.
 
-    Runtime shares one exact snapshot across groups and supplies frozen Eagle
-    starts and native query ends from that same preparation. All read slots
-    lie in [S,E); capacity padding repeats its last initialized token. Query
+    The sole Runtime caller supplies typed CPU snapshots and frozen starts;
+    BlockTables and the normal builder supply the compact int32 read table.
+    Exact lengths are shared across groups from that same preparation. Read
+    slots lie in [S,E); capacity padding repeats its last initialized token. Query
     padding and Full continuing rows retain the method's existing semantics.
     """
     n = len(valid_columns)
-    if block_table.ndim != 2 or block_table.dtype != torch.int32 or block_span <= 0:
-        raise ValueError("Invalid compact dense Draft table geometry")
     if block_table.shape[0] < n or any(count < 0 or count > block_table.shape[1] for count in valid_columns):
         raise ValueError("Invalid initialized compact column extent")
     if n < 1 or query_width < 1:
         raise ValueError("Invalid dense Draft read geometry")
-    if upper_cpu.device.type != "cpu" or upper_cpu.shape != (n,) or upper_cpu.dtype not in (torch.int32, torch.int64):
-        raise ValueError("Missing current preparation allocation upper bounds")
+    if any(t.numel() != n for t in (exact_cpu, query_ends_cpu, upper_cpu, frozen_starts, full_rows_cpu)):
+        raise ValueError("Draft read inputs must cover the current active requests")
     available = torch.tensor(valid_columns, dtype=torch.int64, device="cpu") * block_span
-    if bool((upper_cpu <= 0).any()):
-        raise ValueError("Allocation upper must be positive")
     retain(block_table)
     # The runtime supplies its one current exact snapshot and frozen starts;
     # this reader never derives lengths or synchronizes device values again.
-    if exact_cpu.device.type != "cpu" or exact_cpu.shape != (n,) or exact_cpu.dtype not in (torch.int32, torch.int64):
-        raise ValueError("Dense Draft read requires one completed CPU exact value per request")
     if bool(((exact_cpu <= 0) | (exact_cpu > upper_cpu) | (exact_cpu > available)).any()):
         raise ValueError("Dense Draft exact lengths exceed initialized canonical columns or preparation bounds")
-    if (
-        query_ends_cpu.device.type != "cpu"
-        or query_ends_cpu.shape != (n,)
-        or query_ends_cpu.dtype not in (torch.int32, torch.int64)
-    ):
-        raise ValueError("Native query ends must match current request rows")
     starts = frozen_starts
-    if (
-        starts.device.type != "cpu"
-        or starts.dtype not in (torch.int32, torch.int64)
-        or starts.shape != (n,)
-        or bool(((starts < 0) | (starts >= exact_cpu)).any())
-    ):
+    if bool(((starts < 0) | (starts >= exact_cpu)).any()):
         raise ValueError("Frozen Draft anchors must match current request rows")
     retain(exact_cpu, starts, query_ends_cpu)
-    if full_rows_cpu.device.type != "cpu" or full_rows_cpu.dtype != torch.bool or full_rows_cpu.shape != (n,):
-        raise ValueError("Full-read phase rows require one current CPU boolean per request")
-    if (query_start_loc_cpu is None) != (query_start_loc_device is None):
-        raise ValueError("Packed queries require current CPU and device boundaries")
     widths = None
     if query_start_loc_cpu is not None:
         assert query_start_loc_device is not None
-        if (
-            query_start_loc_cpu.device.type != "cpu"
-            or query_start_loc_cpu.dtype not in (torch.int32, torch.int64)
-            or query_start_loc_cpu.shape != (n + 1,)
-            or query_start_loc_device.shape != (n + 1,)
-            or query_start_loc_device.device != block_table.device
-            or query_start_loc_device.dtype not in (torch.int32, torch.int64)
-        ):
+        if query_start_loc_cpu.numel() != n + 1 or query_start_loc_device.numel() != n + 1:
             raise ValueError("Packed query boundaries must match the active preparation")
         widths = query_start_loc_cpu.diff()
         if int(query_start_loc_cpu[0]) != 0 or bool(((widths <= 0) | (widths > query_width)).any()):

@@ -51,14 +51,11 @@ class TestCanonicalRead(unittest.TestCase):
         )
         return common
 
-    def test_projection_rejects_invalid_compact_geometry(self):
+    def test_projection_rejects_invalid_compact_extent(self):
         for table, counts, span in (
-            (self.table.flatten(), (8, 8), 4),
-            (self.table.float(), (8, 8), 4),
             (self.table[:1], (8, 8), 4),
             (self.table, (9, 8), 4),
             (self.table, (-1, 8), 4),
-            (self.table, (8, 8), 0),
         ):
             with self.subTest(table=table.shape, counts=counts, span=span), self.assertRaises(ValueError):
                 materialize_draft_read(

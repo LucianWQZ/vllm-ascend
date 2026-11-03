@@ -196,7 +196,6 @@ def test_real_metadata_preparation_selects_the_final_descriptor_once(monkeypatch
     from tests.ut.worker.v2.test_draft_window_graph_buffers import graph_buffers
     from vllm_ascend.worker.v2.spec_decode.draft_window_eager import (
         DraftWindowGraphInputMixin,
-        DraftWindowProposalContext,
     )
 
     c = graph_buffers.__wrapped__()
@@ -209,7 +208,7 @@ def test_real_metadata_preparation_selects_the_final_descriptor_once(monkeypatch
     select = Mock(wraps=c.provider.capture_identity_for)
     monkeypatch.setattr(c.provider, "capture_identity_for", select)
     desc = replace(c.capture.descriptor, max_query_len=9) if wrong_descriptor else c.capture.descriptor
-    context = DraftWindowProposalContext(owner.input_batch, (False, False))
+    context = (False, False)
     if wrong_descriptor:
         with pytest.raises(RuntimeError, match="runtime descriptor"), c.provider.proposal_scope(context):
             owner._build_attn_metadata(2, desc, np.array([0, 1, 2]), torch.tensor([99, 99]), 1)
@@ -222,5 +221,5 @@ def test_real_metadata_preparation_selects_the_final_descriptor_once(monkeypatch
             c.provider.bind_current(desc)
             c.provider.finish_update()
         snapshot.assert_called_once_with(2)
-    select.assert_called_once_with(route=c.capture.route, descriptor=desc)
+    select.assert_called_once_with(descriptor=desc)
     assert not hasattr(owner, "_draft_window_selected_metadata")

@@ -27,7 +27,6 @@ from vllm.v1.worker.utils import AttentionGroup
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
     DraftWindowGraphBindingProvider,
     DraftWindowGraphBucket,
-    DraftWindowGraphRoute,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph_metadata import bind_draft_window_read
 
@@ -115,8 +114,7 @@ def ascend_prepare_dflash_inputs_to_capture(
             skip_attn,
             causal,
         )
-    route = DraftWindowGraphRoute.DSPARK if context.method == "dspark" else DraftWindowGraphRoute.DFLASH
-    identity = context.capture_banks_for(route=route, num_reqs=num_reqs, num_tokens=num_tokens)[0]
+    identity = context.capture_banks_for(num_reqs=num_reqs, num_tokens=num_tokens)[0]
     workspace = identity
 
     # Keep dummy InputBatch, Full slots, query geometry and model-specific

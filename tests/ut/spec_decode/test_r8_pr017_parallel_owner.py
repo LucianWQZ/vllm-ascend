@@ -21,7 +21,6 @@ from vllm_ascend.worker.v2.spec_decode.dflash import aclgraph as dflash_graph
 from vllm_ascend.worker.v2.spec_decode.dflash import speculator as dflash
 from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import DraftGraphSupport
 from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowGraphInputMixin
-from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphRoute
 from vllm_ascend.worker.v2.spec_decode.draft_window_lifetime import DraftWindowOwnerPool
 from vllm_ascend.worker.v2.spec_decode.dspark import speculator as dspark
 
@@ -269,9 +268,7 @@ class ParallelOwnerTests(unittest.TestCase):
         self.assertIs(capture.call_args.kwargs["prepare_forward"], callback)
         manager.speculator = SimpleNamespace(attn_backends={"draft": dflash_graph.AscendFlashAttentionBackend})
         with (
-            patch.object(
-                dflash_graph, "resolve_parallel_draft_window_graph_route", return_value=DraftWindowGraphRoute.DFLASH
-            ),
+            patch.object(dflash_graph, "parallel_draft_window_graph_provider", return_value=object()),
             patch.object(dflash_graph, "use_updatable_graph", return_value=False),
             self.assertRaisesRegex(NotImplementedError, "updatable backend"),
         ):

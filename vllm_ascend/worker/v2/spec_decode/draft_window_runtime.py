@@ -75,11 +75,10 @@ class DraftWindowRuntime:
         self.speculator = speculator
         self.window_size = policy.effective_window_size
         self.mla_layer_names: tuple[str, ...] = ()
-        self.native_swa_intersections: dict[int, int] = {}
         self.native_swa_causal: dict[int, bool] = {}
         self._dense_reads = False
         self.gids = self._validate_route(speculator)
-        read_groups = tuple(gid for gid in self.gids if gid not in self.native_swa_intersections) or self.gids
+        read_groups = tuple(gid for gid in self.gids if gid not in self.native_swa_causal) or self.gids
         if not read_groups:
             raise NotImplementedError("Draft Window requires at least one certified read group")
         self.anchor_block_span = int(speculator.block_tables.kernel_block_sizes[read_groups[0]])
@@ -90,7 +89,6 @@ class DraftWindowRuntime:
         self._bypass = False
         self._build_count = 0
         self._eagle_plans: tuple[DraftWindowPlan, ...] | None = None
-        self._next_step = 0
 
     @property
     def reads_active(self) -> bool:
@@ -125,20 +123,15 @@ class DraftWindowRuntime:
         # by the provider inventory rather than a target-global CP switch.
         routes = require_direct_prefix_routes(speculator, window_size=self.window_size)
         all_gids = tuple(dict.fromkeys(route.gid for route in routes))
-        self.native_swa_intersections = {}
-        for route in routes:
-            if route.status is DraftWindowProviderStatus.NATIVE_SWA:
-                if route.native_window is None:
-                    raise ValueError("A native SWA provider must identify its native window")
-                self.native_swa_intersections[route.gid] = route.native_window
-        if self.native_swa_intersections:
+        native_gids = {route.gid for route in routes if route.status is DraftWindowProviderStatus.NATIVE_SWA}
+        if native_gids:
             if self.window_size < speculator.num_query_per_req:
                 raise ValueError("DFlash draft_window_size must cover its query width")
             declared = getattr(speculator, "_group_causal", True)
             self.native_swa_causal = {
-                gid: declared[gid] if isinstance(declared, dict) else declared for gid in self.native_swa_intersections
+                gid: declared[gid] if isinstance(declared, dict) else declared for gid in native_gids
             }
-            routes = tuple(route for route in routes if route.gid not in self.native_swa_intersections)
+            routes = tuple(route for route in routes if route.gid not in self.native_swa_causal)
         if (
             routes
             and self.method in ("eagle3", "dflash", "dspark")
@@ -205,7 +198,6 @@ class DraftWindowRuntime:
             self._input_batch = input_batch
             self._build_count = 0
             self._eagle_plans = None
-            self._next_step = 0
             try:
                 # Fixed MRV2 does not change Host prompt progress during propose.
                 self._continuing = continuing_prefill_rows(input_batch, input_batch.num_reqs)
@@ -220,7 +212,7 @@ class DraftWindowRuntime:
                     raise RuntimeError("Context-only Draft KV update unexpectedly consumed a read projection")
                 if not context_kv_only and not self._build_count:
                     raise RuntimeError("Draft Window proposal did not consume a read projection")
-                if self.method == "eagle3" and self._next_step != expected_eagle_steps:
+                if self.method == "eagle3" and self._build_count != expected_eagle_steps:
                     raise RuntimeError("Eagle3 proposal did not consume every configured draft step")
             finally:
                 self._owner = None
@@ -234,7 +226,6 @@ class DraftWindowRuntime:
         num_reqs: int,
         *,
         prepared_exact_cpu: torch.Tensor | None = None,
-        prepared_exact_device: torch.Tensor | None = None,
     ):
         """Own one metadata build; each group only chooses its read layout.
 
@@ -250,31 +241,12 @@ class DraftWindowRuntime:
             raise RuntimeError("Draft Window metadata has no active proposal")
         if self.method != "eagle3" and step != self.speculator.num_query_per_req:
             raise ValueError("Parallel Draft metadata step must match its actual query width")
-        if self.method == "eagle3" and (step != self._next_step or step >= self.static_k):
+        if self.method == "eagle3" and (step != self._build_count or step >= self.static_k):
             raise ValueError("Eagle3 metadata must advance exactly one configured step")
         # The fixed propose call keeps this InputBatch's CPU request mapping
         # unchanged through every synchronous first/AR metadata preparation.
         if batch.num_reqs != num_reqs or len(batch.req_ids) != num_reqs:
             raise RuntimeError("Draft Window request mapping does not cover the active preparation")
-        if (prepared_exact_cpu is None) != (prepared_exact_device is None):
-            raise ValueError("Prepared exact CPU lengths require their device input")
-        if prepared_exact_cpu is not None:
-            if (
-                prepared_exact_cpu.device.type != "cpu"
-                or prepared_exact_cpu.dtype != torch.int32
-                or prepared_exact_cpu.shape != (num_reqs,)
-                or not prepared_exact_cpu.is_contiguous()
-            ):
-                raise ValueError("Prepared exact CPU lengths must be one contiguous int32 value per request")
-            assert prepared_exact_device is not None
-            if (
-                prepared_exact_device.dtype != torch.int32
-                or prepared_exact_device.ndim != 1
-                or prepared_exact_device.numel() < num_reqs
-                or not prepared_exact_device.is_contiguous()
-            ):
-                raise ValueError("Prepared exact device input must cover the active int32 request prefix")
-            self.pool.retain(owner, prepared_exact_cpu)
         continuing = self._continuing
         assert continuing is not None
         counts = self.speculator.block_tables.num_blocks.np
@@ -303,16 +275,8 @@ class DraftWindowRuntime:
                 if self.method == "eagle3" and step == 0:
                     exact, proposal_exact = self._eagle_first_pass_lengths(full_exact, num_reqs)
                 elif prepared_exact_cpu is not None:
-                    assert prepared_exact_device is not None
-                    if (
-                        full_exact.data_ptr() != prepared_exact_device.data_ptr()
-                        or full_exact.device != prepared_exact_device.device
-                        or full_exact.dtype != prepared_exact_device.dtype
-                        or full_exact.ndim != 1
-                        or full_exact.numel() < num_reqs
-                        or not full_exact.is_contiguous()
-                    ):
-                        raise ValueError("Prepared exact CPU lengths belong to another device input")
+                    # The actual DSpark MLA helper completed this exact copy
+                    # immediately before constructing the group Common inputs.
                     exact = prepared_exact_cpu
                 else:
                     # One exact D2H per build, shared across groups. The explicit
@@ -356,10 +320,8 @@ class DraftWindowRuntime:
                             ).window_start
                             for row in range(num_reqs)
                         ]
-                    starts = torch.tensor(starts_list, dtype=torch.int32)
+                    starts = torch.tensor(starts_list, dtype=torch.int32, device="cpu")
                 self._build_count += 1
-                if self.method == "eagle3":
-                    self._next_step += 1
             assert exact is not None
             if native_full:
                 exact_cpu = torch.zeros(common.num_reqs, dtype=torch.int32, device="cpu")
@@ -373,7 +335,8 @@ class DraftWindowRuntime:
                 # Canonical allocation counts remain indexed by persistent slots.
                 columns = counts[gid, rows].tolist()
                 block_span = int(self.speculator.block_tables.kernel_block_sizes[gid])
-                if gid in self.native_swa_intersections:
+                read_starts = starts
+                if gid in self.native_swa_causal:
                     if (
                         common.num_reqs != num_reqs
                         or common.seq_lens.dtype != torch.int32
@@ -392,20 +355,12 @@ class DraftWindowRuntime:
                         common.seq_lens_cpu = common._seq_lens_cpu = exact
                         common._draft_window_exact_cpu = exact
                         retain(exact)
-                    else:
-                        native_starts = torch.clamp(exact - self.window_size, min=0).to(torch.int64)
-                        native_starts = native_starts // block_span * block_span
-                        native_starts[torch.from_numpy(continuing)] = 0
-                        if bool((exact - native_starts < self.speculator.num_query_per_req).any()):
-                            raise ValueError("Extra Window must cover every native query")
-                        materialize_draft_read(
-                            common,
-                            columns,
-                            block_span,
-                            exact_cpu=exact,
-                            starts_cpu=native_starts,
-                            retain=retain,
-                        )
+                        return
+                    read_starts = torch.clamp(exact - self.window_size, min=0).to(torch.int64)
+                    read_starts = read_starts // block_span * block_span
+                    read_starts[torch.from_numpy(continuing)] = 0
+                    if bool((exact - read_starts < self.speculator.num_query_per_req).any()):
+                        raise ValueError("Extra Window must cover every native query")
                 elif dense:
                     from vllm_ascend.worker.v2.spec_decode.draft_window_dense import prepare_dense_draft_read
 
@@ -433,15 +388,15 @@ class DraftWindowRuntime:
                     )
                     retain(view)
                     view.apply(common)
-                else:
-                    materialize_draft_read(
-                        common,
-                        columns,
-                        block_span,
-                        exact_cpu=exact,
-                        starts_cpu=starts,
-                        retain=retain,
-                    )
+                    return
+                materialize_draft_read(
+                    common,
+                    columns,
+                    block_span,
+                    exact_cpu=exact,
+                    starts_cpu=read_starts,
+                    retain=retain,
+                )
 
         return apply
 

@@ -114,7 +114,7 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentA
                     "Eagle3 Window native prefill requires canonical effective query rows; "
                     "additional padding requests are not qualified for this read bank"
                 )
-            capture = session.resolve(first=True, n=n, tokens=n * (self.num_speculative_steps + 1), ordinal=0)
+            capture = session.resolve(n=n, tokens=n * (self.num_speculative_steps + 1), ordinal=0)
             self.block_tables.gather_block_tables(self.input_batch.idx_mapping, num_reqs_padded=n)
             bank = prefill_inputs = self._materialize_eagle3_step(capture, 0)
             attn_metadata = copy_draft_attention_metadata(attn_metadata)
@@ -160,7 +160,7 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentA
             padded = batch_desc.num_reqs or num_reqs
             self._snapshot_eagle3_decode_step_one(num_reqs=num_reqs, num_reqs_padded=padded)
             for step in range(1, self.num_speculative_steps):
-                capture = session.resolve(first=False, n=padded, tokens=batch_desc.num_tokens, ordinal=step - 1)
+                capture = session.resolve(n=padded, tokens=batch_desc.num_tokens, ordinal=step - 1)
                 session.stage(capture, step)
         return super()._multi_step_decode(
             num_reqs,

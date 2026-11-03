@@ -216,9 +216,7 @@ def _validate_qualified_graph_config(vllm_config, profile):
         or speculative.uses_dynamic_speculative_decoding()
         or speculative.num_speculative_tokens != k
         or speculative.enable_adaptive_verification is not False
-        or type(dp) is not int
         or dp not in (1, 2)
-        or type(rows) is not int
         or rows not in (1, 2)
         or (dp == 2 and rows != 1)
         or parallel.tensor_parallel_size != 4
@@ -243,12 +241,11 @@ def _validate_qualified_graph_config(vllm_config, profile):
         or additional.get("enable_dsa_cp", False) is not False
         or type(additional.get("enable_flashcomm1", False)) is not bool
         or not captures
-        or any(type(size) is not int or size <= 0 for size in captures)
+        or any(size <= 0 for size in captures)
         or not {query * count for count in range(1, rows + 1)}.issubset(captures)
         or (not eagle and captures != [query * count for count in range(1, rows + 1)])
-        or type(compilation.max_cudagraph_capture_size) is not int
+        or compilation.max_cudagraph_capture_size is None
         or compilation.max_cudagraph_capture_size < query * rows
-        or type(maximum) is not int
         or maximum <= k
     ):
         raise NotImplementedError(
@@ -329,8 +326,7 @@ def validate_eagle_single_request_review_exact(owner, input_batch, exact, *, num
     if num_reqs != len(rows) or padded != num_reqs:
         raise RuntimeError("Eagle review lost its exact admitted-row CPU consumer input")
     provider = getattr(owner, "_draft_window_graph_binding_provider", None)
-    context = getattr(provider, "proposal", None)
-    continuing_rows = context.full_read_rows if context is not None else ()
+    continuing_rows = getattr(provider, "proposal", None) or ()
     for position, (prompt, maximum) in enumerate(rows):
         value = exact[position].item()
         lower = prompt
@@ -376,7 +372,7 @@ def _full8_review_capacity(vllm_config):
     """Use the allocated sequence capacity and both actual model ceilings."""
     target = vllm_config.model_config
     draft = vllm_config.speculative_config.draft_model_config
-    capacity = getattr(target, "max_model_len", None)
+    capacity = target.max_model_len
     ceilings: list[int] = []
     for config in (target, draft):
         text = getattr(config, "hf_text_config", None)
@@ -388,7 +384,7 @@ def _full8_review_capacity(vllm_config):
                 "Full8 review requires an exact positive configured capacity within both model position ceilings"
             )
         ceilings.append(ceiling)
-    if type(capacity) is not int or capacity <= _FULL8_QUERY_TOKENS or capacity > min(ceilings):
+    if capacity <= _FULL8_QUERY_TOKENS or capacity > min(ceilings):
         raise NotImplementedError(
             "Full8 review requires an exact positive configured capacity within both model position ceilings"
         )

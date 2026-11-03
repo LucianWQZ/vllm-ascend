@@ -46,8 +46,6 @@ def _select_read_provider(
     from vllm_ascend.attention.mla_v1 import AscendMLABackend, AscendMLAMetadataBuilder
     from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
 
-    status = DraftWindowProviderStatus
-    selected: DraftWindowProviderStatus | None = None
     if not uncompressed:
         raise NotImplementedError("Compressed or packed cache geometry needs a separate read provider")
 
@@ -61,24 +59,15 @@ def _select_read_provider(
     ):
         raise NotImplementedError("DFlash2 requires Full-retention FullAttentionSpec without chunked attention")
 
-    native = matches(AscendAttentionBackend, AscendAttentionMetadataBuilder, SlidingWindowSpec)
     if matches(AscendAttentionBackend, AscendAttentionMetadataBuilder, FullAttentionSpec):
-        if (
-            all(getattr(item, "attention_chunk_size", None) is None for item in specs)
-            and uniform_windows
-            and not (full_retention_dflash2 and all(getattr(item, "sliding_window", None) for item in specs))
-        ):
-            selected = status.DIRECT_DENSE
-        elif full_retention_dflash2:
-            native = True
-        else:
+        if any(getattr(item, "attention_chunk_size", None) is not None for item in specs) or not uniform_windows:
             raise NotImplementedError("Dense chunked or nonuniform native attention needs a separate provider")
-    elif not native:
-        if matches(AscendMLABackend, AscendMLAMetadataBuilder, AscendMLAAttentionSpec):
-            if builder.flashmla_state is not None:
-                raise NotImplementedError("FlashMLA persistent derived state needs a separate provider")
-            selected = status.DIRECT_MLA
-        if selected is status.DIRECT_MLA and any(
+        if not full_retention_dflash2 or native_window is None:
+            return DraftWindowProviderStatus.DIRECT_DENSE
+    elif matches(AscendMLABackend, AscendMLAMetadataBuilder, AscendMLAAttentionSpec):
+        if builder.flashmla_state is not None:
+            raise NotImplementedError("FlashMLA persistent derived state needs a separate provider")
+        if any(
             item.model_version is not None
             or item.cache_sparse_sfa_c8
             or item.cache_sparse_sfa_turboquant
@@ -87,13 +76,12 @@ def _select_read_provider(
             for item in specs
         ):
             raise NotImplementedError("Packed, offloaded, or strided MLA caches need a separate provider")
-    if native:
-        if not uniform_windows or native_window is None or native_window <= 0:
-            raise NotImplementedError("Native SWA group has inconsistent windows")
-        selected = status.NATIVE_SWA
-    if selected is None:
+        return DraftWindowProviderStatus.DIRECT_MLA
+    elif not matches(AscendAttentionBackend, AscendAttentionMetadataBuilder, SlidingWindowSpec):
         raise NotImplementedError(f"No read-view provider for {backend.__name__}/{type(builder).__name__}")
-    return selected
+    if not uniform_windows or native_window is None or native_window <= 0:
+        raise NotImplementedError("Native SWA group has inconsistent windows")
+    return DraftWindowProviderStatus.NATIVE_SWA
 
 
 def inventory_draft_window_groups(

@@ -16,14 +16,14 @@ from vllm.v1.worker.gpu.input_batch import InputBuffers
 
 from vllm_ascend.worker.v2.spec_decode.draft_window import DraftWindowGraphSource, gather_valid_num_blocks_cpu
 from vllm_ascend.worker.v2.spec_decode.draft_window_backends import DraftWindowGroupRoute, DraftWindowProviderStatus
-from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowGraphInputMixin, DraftWindowProposalContext
-from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphBindingProvider, DraftWindowGraphRoute
+from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowGraphInputMixin
+from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphBindingProvider
 from vllm_ascend.worker.v2.spec_decode.draft_window_plan import compute_draft_window_plan
 from vllm_ascend.worker.v2.spec_decode.draft_window_policy import resolve_draft_window_policy
 
 
 def _proposal(n=2):
-    return DraftWindowProposalContext(SimpleNamespace(num_reqs=n), (False,) * n)
+    return (False,) * n
 
 
 @pytest.fixture
@@ -41,7 +41,7 @@ def graph_buffers():
     source = DraftWindowGraphSource(resolve_draft_window_policy(requested_window_size=4, method="dflash"), group, owner)
     provider = DraftWindowGraphBindingProvider(source=source)
     desc = BatchExecutionDescriptor(CUDAGraphMode.FULL, 2, 2, uniform_token_count=1)
-    capture = provider.register_capture_identity(route=DraftWindowGraphRoute.DFLASH, descriptor=desc)
+    capture = provider.register_capture_identity(descriptor=desc)
     buffers = object.__new__(InputBuffers)
     buffers.positions = torch.arange(8)
     return SimpleNamespace(
@@ -149,7 +149,7 @@ def test_actual_scope_quarantines_partial_or_uncertain_submission(graph_buffers,
 def test_prepare_and_publish_reject_unbound_pending_wrong_descriptor_and_foreign_bank(graph_buffers):
     c = graph_buffers
     other = DraftWindowGraphBindingProvider(source=c.source)
-    foreign = other.register_capture_identity(route=c.capture.route, descriptor=c.capture.descriptor)
+    foreign = other.register_capture_identity(descriptor=c.capture.descriptor)
     with c.provider.proposal_scope(_proposal()):
         before = c.capture.window_block_table.clone()
         with pytest.raises(RuntimeError, match="owning proposal"):
@@ -206,24 +206,20 @@ def test_current_geometry_fails_before_first_bank_write(graph_buffers, exact, va
 def test_real_dispatch_requires_the_complete_registered_descriptor(graph_buffers, field, value):
     c = graph_buffers
     with pytest.raises(RuntimeError):
-        c.provider.capture_identity_for(
-            route=c.capture.route, descriptor=replace(c.capture.descriptor, **{field: value})
-        )
+        c.provider.capture_identity_for(descriptor=replace(c.capture.descriptor, **{field: value}))
 
 
 def test_capture_geometry_and_ordinal_are_unique_and_bounded(graph_buffers):
     c = graph_buffers
-    assert c.provider.capture_banks_for(route=c.capture.route, num_reqs=2, num_tokens=2) == (c.capture,)
+    assert c.provider.capture_banks_for(num_reqs=2, num_tokens=2) == (c.capture,)
     with pytest.raises(RuntimeError, match="ambiguous"):
         c.provider.register_capture_identity(
-            route=c.capture.route, descriptor=replace(c.capture.descriptor, max_query_len=9), consumer_ordinal=1
+            descriptor=replace(c.capture.descriptor, max_query_len=9), consumer_ordinal=1
         )
     with pytest.raises(RuntimeError, match="serial ordinal"):
-        c.provider.register_capture_identity(route=c.capture.route, descriptor=c.capture.descriptor, consumer_ordinal=2)
+        c.provider.register_capture_identity(descriptor=c.capture.descriptor, consumer_ordinal=2)
     with pytest.raises((ValueError, NotImplementedError)):
-        c.provider.register_capture_identity(
-            route=c.capture.route, descriptor=replace(c.capture.descriptor, num_active_loras=1)
-        )
+        c.provider.register_capture_identity(descriptor=replace(c.capture.descriptor, num_active_loras=1))
 
 
 def test_eagle_keeps_distinct_ordinals_and_one_frozen_anchor(graph_buffers):
@@ -232,12 +228,7 @@ def test_eagle_keeps_distinct_ordinals_and_one_frozen_anchor(graph_buffers):
         source=replace(c.source, policy=resolve_draft_window_policy(requested_window_size=4, method="eagle3"))
     )
     desc = BatchExecutionDescriptor(CUDAGraphMode.FULL, 2, 2, uniform_token_count=1)
-    banks = [
-        provider.register_capture_identity(
-            route=DraftWindowGraphRoute.EAGLE3_AR_STEP, descriptor=desc, consumer_ordinal=i
-        )
-        for i in range(2)
-    ]
+    banks = [provider.register_capture_identity(descriptor=desc, consumer_ordinal=i) for i in range(2)]
     plans = tuple(
         compute_draft_window_plan(full_exact_end=n, future_offset=3, window_size=4, block_span_tokens=4)
         for n in (11, 14)
@@ -277,7 +268,7 @@ def test_bank_projects_only_initialized_columns_across_boundaries(span, boundary
         )
     )
     desc = BatchExecutionDescriptor(CUDAGraphMode.FULL, 1, 1, uniform_token_count=1)
-    bank = provider.register_capture_identity(route=DraftWindowGraphRoute.DFLASH, descriptor=desc)
+    bank = provider.register_capture_identity(descriptor=desc)
     for exact in (boundary - 1, boundary, boundary + 1, 2 * boundary + 1):
         plan = compute_draft_window_plan(full_exact_end=exact, window_size=boundary, block_span_tokens=span)
         with provider.proposal_scope(_proposal(1)):
@@ -308,7 +299,7 @@ def test_parallel_capture_uses_registered_geometry_and_preserves_full_tables(gra
     )
     with draft_window_dflash_capture_scope(owner, buffers) as context:
         assert context is not None
-        identity = context.capture_banks_for(route=case.capture.route, num_reqs=2, num_tokens=2)[0]
+        identity = context.capture_banks_for(num_reqs=2, num_tokens=2)[0]
         read = identity
         assert identity is case.capture
         full = case.source.table
@@ -319,7 +310,7 @@ def test_parallel_capture_uses_registered_geometry_and_preserves_full_tables(gra
         assert torch.equal(full, before)
         assert torch.equal(read.window_block_table[:, :2], full[:, :2])
         with pytest.raises(RuntimeError, match="no captured consumer for this geometry"):
-            context.capture_banks_for(route=case.capture.route, num_reqs=1, num_tokens=2)
+            context.capture_banks_for(num_reqs=1, num_tokens=2)
 
 
 @pytest.mark.parametrize("capture_fails", [False, True])
@@ -335,7 +326,7 @@ def test_parallel_capture_scope_owns_its_attachment_until_normal_or_error_exit(g
         with capture.draft_window_dflash_capture_scope(owner, buffers) as context:
             assert getattr(buffers, capture._CAPTURE_CONTEXT_ATTRIBUTE) is context
             assert context is not None
-            bucket = context.capture_banks_for(route=case.capture.route, num_reqs=2, num_tokens=2)[0]
+            bucket = context.capture_banks_for(num_reqs=2, num_tokens=2)[0]
             bank = bucket
             assert bucket is case.capture and bank is case.capture
             with (

@@ -50,36 +50,27 @@ def _eagle_ar_capture_config(vllm_config: VllmConfig, cudagraph_mode: CUDAGraphM
     explicitly enabled TP4 Eagle Graph route gets an independent descriptor.
     Target/first-pass configs, topology and computation remain unchanged.
     """
-    speculative = vllm_config.speculative_config
     if (
         decode_query_len != 1
-        or speculative is None
         or not isinstance(cudagraph_mode, CUDAGraphMode)
         or cudagraph_mode.decode_mode() != CUDAGraphMode.FULL
-        or speculative.method != "eagle3"
-        or speculative.enforce_eager
-        or speculative.num_speculative_tokens != 3
-        or speculative.uses_dynamic_speculative_decoding()
-        or any(
-            getattr(vllm_config.parallel_config, name) != 1
-            for name in (
-                "pipeline_parallel_size",
-                "prefill_context_parallel_size",
-                "decode_context_parallel_size",
-            )
-        )
+        or vllm_config.speculative_config is None
+        or vllm_config.speculative_config.method != "eagle3"
     ):
         return vllm_config
     from vllm_ascend import envs
-    from vllm_ascend.ascend_config import _eagle3_tp4_graph_review
+    from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import resolve_draft_graph_review_limit
 
-    if not envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH or not _eagle3_tp4_graph_review(vllm_config):
+    scope = resolve_draft_graph_review_limit(
+        vllm_config, experimental_graph_review=envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH
+    )
+    if scope is None:
         return vllm_config
     # The qualified startup contract already checks every admitted first Q4
     # bucket, its capacity and the independent non-SP Draft. Reuse those same
     # request counts for Q1 AR; never renormalize them through Target SP.
     compilation = vllm_config.compilation_config
-    requests = list(range(1, vllm_config.scheduler_config.max_num_seqs + 1))
+    requests = list(range(1, scope.max_requests + 1))
     draft_config = copy(vllm_config)
     draft_config.compilation_config = copy(compilation)
     draft_config.compilation_config.cudagraph_capture_sizes = requests
@@ -148,7 +139,7 @@ class AutoRegressiveAclGraphManager(SpeculatorCudaGraphManager):
                     desc = args[2]
                     n = desc.num_reqs or min(desc.num_tokens, self.max_num_reqs)
                     tokens = desc.num_tokens
-                with session.capture_call(first=self.is_draft_model_prefill, n=n, tokens=tokens):
+                with session.capture_call(n=n, tokens=tokens):
                     return actual_forward(*args, **kwargs)
 
         with communicator_switch(), model_capture_wrapper(self.speculator, self.is_draft_model_prefill):
@@ -327,7 +318,7 @@ class AutoRegressiveAclGraphManager(SpeculatorCudaGraphManager):
 
     def _run_eagle_window_fullgraph(self, desc, session):
         if self.is_draft_model_prefill:
-            capture = session.resolve(first=True, n=desc.num_reqs, tokens=desc.num_tokens, ordinal=0)
+            capture = session.resolve(n=desc.num_reqs, tokens=desc.num_tokens, ordinal=0)
             session.stage(capture, 0)
         ret = self._updatable_graph_replay(desc, (), window_source=session.provider)
         session.provider.finish_update()

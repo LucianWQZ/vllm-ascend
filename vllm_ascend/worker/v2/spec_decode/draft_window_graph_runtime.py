@@ -19,8 +19,6 @@ import vllm_ascend.envs as envs
 from vllm_ascend.device.hardware_profile import AttentionBackendFamily, get_current_hardware_profile
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
     DraftWindowGraphBindingProvider,
-    DraftWindowGraphRoute,
-    resolve_parallel_draft_window_graph_route,
 )
 
 
@@ -59,8 +57,7 @@ def install_parallel_graph(owner: Any) -> DraftWindowGraphBindingProvider:
     if not isinstance(capture_descs, Mapping) or not capture_descs:
         raise RuntimeError("Draft Window Graph requires real manager capture descriptors")
 
-    route = resolve_parallel_draft_window_graph_route(owner)
-    if route not in (DraftWindowGraphRoute.DFLASH, DraftWindowGraphRoute.DSPARK):
+    if provider.method not in ("dflash", "dspark"):
         raise RuntimeError("Draft Window Graph has no parallel Draft route")
     descriptors = tuple(
         descriptor
@@ -74,7 +71,6 @@ def install_parallel_graph(owner: Any) -> DraftWindowGraphBindingProvider:
         raise ValueError("Draft Window Graph static K must be positive")
     for descriptor in descriptors:
         provider.register_capture_identity(
-            route=route,
             descriptor=descriptor,
         )
     return provider

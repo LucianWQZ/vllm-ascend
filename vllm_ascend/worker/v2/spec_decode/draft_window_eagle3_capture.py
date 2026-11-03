@@ -21,7 +21,6 @@ from vllm_ascend.worker.v2.spec_decode.draft_window import (
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
     DraftWindowGraphBucket,
-    DraftWindowGraphRoute,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph_metadata import (
     bind_draft_window_read,
@@ -54,7 +53,6 @@ class Eagle3GraphSession:
         for first, manager in ((True, owner.prefill_cudagraph_manager), (False, owner.decode_cudagraph_manager)):
             if owner.update_stream is None or manager.update_stream is not owner.update_stream:
                 raise RuntimeError("Eagle3 capture managers must share their owner UPDATE stream")
-            route = DraftWindowGraphRoute.EAGLE3_FIRST_PASS if first else DraftWindowGraphRoute.EAGLE3_AR_STEP
             q = owner.num_speculative_steps + 1 if first else 1
             group = self.provider.source.group
             for descriptors in manager._capture_descs.values():
@@ -67,7 +65,7 @@ class Eagle3GraphSession:
                     if desc.num_tokens != n * q:
                         raise RuntimeError("Eagle3 startup descriptor does not match its method-specific query width")
                     captures = tuple(
-                        self.provider.register_capture_identity(route=route, descriptor=desc, consumer_ordinal=ordinal)
+                        self.provider.register_capture_identity(descriptor=desc, consumer_ordinal=ordinal)
                         for ordinal in range(1 if first else owner.num_speculative_steps - 1)
                     )
                     for capture in captures:
@@ -83,19 +81,17 @@ class Eagle3GraphSession:
         if not self.provider._carriers:
             raise RuntimeError("Eagle3 Window requires a nonempty capture bucket inventory")
 
-    def resolve(self, *, first: bool, n: int, tokens: int, ordinal: int) -> DraftWindowGraphBucket:
-        route = DraftWindowGraphRoute.EAGLE3_FIRST_PASS if first else DraftWindowGraphRoute.EAGLE3_AR_STEP
-        captures = self.provider.capture_banks_for(route=route, num_reqs=n, num_tokens=tokens)
+    def resolve(self, *, n: int, tokens: int, ordinal: int) -> DraftWindowGraphBucket:
+        captures = self.provider.capture_banks_for(num_reqs=n, num_tokens=tokens)
         if not 0 <= ordinal < len(captures):
             raise RuntimeError("Eagle3 Window has no exact capture bank; no eager fallback")
         return captures[ordinal]
 
     @contextmanager
-    def capture_call(self, *, first: bool, n: int, tokens: int):
+    def capture_call(self, *, n: int, tokens: int):
         if self._capture_call is not None:
             raise RuntimeError("nested Eagle3 startup capture invocation")
-        route = DraftWindowGraphRoute.EAGLE3_FIRST_PASS if first else DraftWindowGraphRoute.EAGLE3_AR_STEP
-        self._capture_call = iter(self.provider.capture_banks_for(route=route, num_reqs=n, num_tokens=tokens))
+        self._capture_call = iter(self.provider.capture_banks_for(num_reqs=n, num_tokens=tokens))
         try:
             yield
             if next(self._capture_call, None) is not None:

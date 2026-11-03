@@ -11,16 +11,14 @@ from contextlib import contextmanager
 
 def _validate_eagle_dp_dummy(owner, session):
     session.provider.require_reusable()
-    provider = getattr(owner, "_draft_window_graph_binding_provider", None)
+    provider = session.provider
     if (
         owner.input_batch.is_dummy is not True
         or getattr(owner, "_eagle3_window_bypass_active", False) is not True
         or getattr(owner, "_eagle3_window_continuing_prefill", False) is not False
-        or provider is None
         or provider.proposal is not None
         or provider._active_bank is not None
         or session._capture_call is not None
-        or provider is not session.provider
     ):
         raise RuntimeError("Eagle DP dummy requires its explicit local1 no-business-generation Full scope")
 
@@ -61,19 +59,13 @@ def eagle3_dp_dummy_scope(owner, input_batch, *, dummy_run, is_profile):
 
 def validate_eagle_dp_dummy_replay(owner, manager, descriptor, metadata_batch):
     """Attribute both actual managers without changing their baseline operands."""
-    active = getattr(owner, "_eagle3_graph_dp_dummy_active", False)
-    if active is False:
+    if not getattr(owner, "_eagle3_graph_dp_dummy_active", False):
         return False
-    if active is not True:
-        raise RuntimeError("Eagle DP dummy marker must be an exact boolean")
     session = owner._eagle3_graph_session
     _validate_eagle_dp_dummy(owner, session)
     first = manager.is_draft_model_prefill
     if (
-        type(first) is not bool
-        or manager.speculator is not owner
-        or manager.update_stream is not owner.update_stream
-        or getattr(descriptor.cg_mode, "name", None) != "FULL"
+        getattr(descriptor.cg_mode, "name", None) != "FULL"
         or type(descriptor.num_reqs) is not int
         or descriptor.num_reqs != 1
         or type(descriptor.num_tokens) is not int

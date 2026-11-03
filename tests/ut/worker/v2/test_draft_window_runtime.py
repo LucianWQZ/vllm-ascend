@@ -1,10 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU contract tests at the proposal and metadata callback seams."""
 
-import ast
 import sys
 from contextlib import nullcontext
-from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -165,18 +163,14 @@ def test_shared_phase_rejects_negative_dynamic_counters(field, value):
 
 
 def test_graph_phase_uses_the_same_prompt_progress_as_eager():
-    from vllm_ascend.worker.v2.spec_decode.draft_window_eager import (
-        DraftWindowProposalContext,
-    )
-
     state = batch(computed=(8, 24), prompt=(16, 16), scheduled=(10, 3), drafts=(3, 2))
     state.has_prefill = True
     # Total scheduled tokens cross the prompt boundary, but three are Draft
     # placeholders. The first row must retain Full reads until prompt ends.
-    phases = DraftWindowProposalContext.from_batch(state).full_read_rows
+    phases = tuple(continuing_prefill_rows(state, state.num_reqs))
     assert phases == (True, False)
     state.num_computed_prefill_tokens_np[0] = 9
-    phases = DraftWindowProposalContext.from_batch(state).full_read_rows
+    phases = tuple(continuing_prefill_rows(state, state.num_reqs))
     assert phases == (False, False)
 
 
@@ -394,26 +388,6 @@ def test_off_policy_cannot_construct_runtime_or_inspect_speculator():
         DraftWindowRuntime(object(), policy)
 
 
-def test_callback_runs_after_common_construction_and_before_actual_builder():
-    root = Path(__file__).resolve().parents[4]
-    source = (root / "vllm_ascend/worker/v2/attn_utils.py").read_text()
-    tree = ast.parse(source)
-    build = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "build_attn_metadata")
-    calls = [node for node in ast.walk(build) if isinstance(node, ast.Call)]
-    common_line = next(
-        node.lineno
-        for node in calls
-        if isinstance(node.func, ast.Name) and node.func.id == "AscendCommonAttentionMetadata"
-    )
-    callback_line = next(
-        node.lineno for node in calls if isinstance(node.func, ast.Name) and node.func.id == "common_metadata_callback"
-    )
-    builder_lines = [
-        node.lineno for node in calls if isinstance(node.func, ast.Attribute) and node.func.attr == "build"
-    ]
-    assert common_line < callback_line < min(builder_lines)
-
-
 def test_eagle_freezes_anchor_across_rejection_and_retains_all_step_reads(setup):
     runtime, spec, canonical, completions = setup
     policy = resolve_draft_window_policy(requested_window_size=8, method="eagle3")
@@ -451,7 +425,7 @@ def test_eagle_scheduled_prefill_and_steps_keep_static_window_geometry(setup, re
         owner = runtime._owner
     assert owner is not None and owner.completion is not None
     assert runtime.static_k == 3
-    assert len(completions) == 1 and runtime._next_step == consumed
+    assert len(completions) == 1 and runtime._build_count == consumed
     # The configured three-step horizon still freezes S=20. A scheduled
     # zero/short proposal must not silently change the window formula.
     assert all(metadata.block_table_tensor[1, 0] == canonical[3, 5] for metadata in outputs)
@@ -637,7 +611,7 @@ def test_eagle_full_continuing_keeps_full_addressing_without_window_snapshot(set
                 assert metadata.seq_lens_cpu.tolist() == [12 + step, 27 + step, 0]
                 assert metadata._seq_lens_cpu is metadata.seq_lens_cpu
                 retained_common.append((step, metadata))
-        assert runtime._next_step == 3 and runtime._build_count == 3
+        assert runtime._build_count == 3
         assert runtime._eagle_plans is None
         for step, metadata in retained_common:
             assert any(item is metadata for item in owner.retained)
@@ -718,6 +692,10 @@ def test_real_builder_projects_every_group_and_quarantines_partial_failure(setup
 
     def group(gid):
         def build(common_prefix_len, common_attn_metadata):
+            # Execute the real builder seam: every group sees the projection,
+            # proving callback ordering without inspecting source line numbers.
+            assert common_attn_metadata.seq_lens.tolist() == [12, 11]
+            assert common_attn_metadata._draft_window_exact_cpu is common_attn_metadata.seq_lens_cpu
             observed.append(common_attn_metadata)
             if gid == 1 and fail_second_builder:
                 raise RuntimeError("second builder failed after private reads were prepared")
@@ -871,10 +849,10 @@ def test_eagle_has_no_parallel_num_query_per_req_attribute(setup):
 
 
 @pytest.mark.parametrize("with_prepared_exact", [False, True])
-def test_prepared_exact_pair_is_explicit_and_retained_until_completion(setup, monkeypatch, with_prepared_exact):
+def test_prepared_exact_is_explicit_and_retained_until_completion(setup, monkeypatch, with_prepared_exact):
     runtime, spec, _, completions = setup
     metadata = common()
-    # An available CPU mirror is not a certificate; only the explicit pair is.
+    # Other Common CPU mirrors can be optimistic; use only the explicit exact input.
     metadata.seq_lens_cpu = metadata.seq_lens_cpu_upper_bound
     snapshot = metadata.seq_lens[:2].clone()
     original_to = torch.Tensor.to
@@ -886,10 +864,10 @@ def test_prepared_exact_pair_is_explicit_and_retained_until_completion(setup, mo
         return original_to(tensor, *args, **kwargs)
 
     monkeypatch.setattr(torch.Tensor, "to", observe_to)
-    pair = {"prepared_exact_cpu": snapshot, "prepared_exact_device": metadata.seq_lens} if with_prepared_exact else {}
+    prepared = {"prepared_exact_cpu": snapshot} if with_prepared_exact else {}
     with runtime.proposal_context(spec, batch()):
         owner = runtime._owner
-        runtime.metadata_callback(3, 2, **pair)(0, metadata)
+        runtime.metadata_callback(3, 2, **prepared)(0, metadata)
     assert len(exact_copies) == (0 if with_prepared_exact else 1)
     assert metadata.seq_lens_cpu.tolist() == [12, 11, 0]
     if with_prepared_exact:
@@ -904,62 +882,17 @@ def test_prepared_exact_pair_is_explicit_and_retained_until_completion(setup, mo
     assert owner.retained == []
 
 
-@pytest.mark.parametrize(
-    "invalid",
-    ["unpaired", "float", "int64", "matrix", "short", "padded", "strided", "noncpu", "device-dtype", "device-short"],
-)
-def test_prepared_exact_pair_rejects_invalid_type_shape_or_device_prefix(setup, invalid):
-    runtime, spec, _, _ = setup
-    metadata = common()
-    cpu, device = metadata.seq_lens[:2].clone(), metadata.seq_lens
-    if invalid == "unpaired":
-        device = None
-    elif invalid == "float":
-        cpu = cpu.float()
-    elif invalid == "int64":
-        cpu = cpu.long()
-    elif invalid == "matrix":
-        cpu = cpu.reshape(1, 2)
-    elif invalid == "short":
-        cpu = cpu[:1]
-    elif invalid == "padded":
-        cpu = metadata.seq_lens.clone()
-    elif invalid == "strided":
-        cpu = torch.tensor([12, 0, 27, 0], dtype=torch.int32)[::2]
-    elif invalid == "noncpu":
-        cpu = torch.empty(2, dtype=torch.int32, device="meta")
-    elif invalid == "device-dtype":
-        device = device.long()
-    elif invalid == "device-short":
-        device = device[:1]
-    with pytest.raises(ValueError, match="Prepared exact"), runtime.proposal_context(spec, batch()):
-        runtime.metadata_callback(3, 2, prepared_exact_cpu=cpu, prepared_exact_device=device)
-
-
-def test_prepared_exact_pair_cannot_be_applied_to_another_device_input(setup):
-    runtime, spec, _, _ = setup
-    state, metadata = batch(), common()
-    snapshot = metadata.seq_lens[:2].clone()
-    with pytest.raises(ValueError, match="device input"), runtime.proposal_context(spec, state):
-        owner = runtime._owner
-        callback = runtime.metadata_callback(3, 2, prepared_exact_cpu=snapshot, prepared_exact_device=metadata.seq_lens)
-        metadata.seq_lens = metadata.seq_lens.clone()
-        callback(0, metadata)
-    assert runtime.pool.poisoned
-    assert any(value is snapshot for value in owner.retained)
-
-
-def test_prepared_exact_pair_keeps_owner_and_step_guards(setup):
+def test_prepared_exact_keeps_owner_and_step_guards(setup):
     runtime, spec, _, _ = setup
     metadata = common()
     snapshot = metadata.seq_lens[:2].clone()
-    pair = {"prepared_exact_cpu": snapshot, "prepared_exact_device": metadata.seq_lens}
+    prepared = {"prepared_exact_cpu": snapshot}
     with pytest.raises(RuntimeError, match="no active proposal"):
-        runtime.metadata_callback(3, 2, **pair)
+        runtime.metadata_callback(3, 2, **prepared)
     with runtime.proposal_context(spec, batch()):
         with pytest.raises(ValueError, match="actual query width"):
-            runtime.metadata_callback(8, 2, **pair)
-        callback = runtime.metadata_callback(3, 2, **pair)
+            runtime.metadata_callback(8, 2, **prepared)
+        callback = runtime.metadata_callback(3, 2, **prepared)
         callback(0, metadata)
     with pytest.raises(RuntimeError, match="stale proposal"):
         callback(0, common())

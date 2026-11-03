@@ -379,15 +379,13 @@ class AscendDSparkSpeculator(DraftWindowGraphInputMixin, LmheadTPDraftSamplingMi
         common_metadata_callback = None
         if runtime is not None:
             if not self.use_dcp and self.attn_architecture == "MLA":
-                # This helper completed a fresh CPU copy of the current draft
-                # preparation. Bind it to that exact device input and proposal;
-                # GQA and DCP CPU fields do not provide the same guarantee.
+                # Reuse the helper's completed copy of this draft preparation.
+                # GQA and DCP CPU fields do not provide the same exact lengths.
                 assert seq_lens_cpu is not None
                 common_metadata_callback = runtime.metadata_callback(
                     step,
                     num_reqs,
                     prepared_exact_cpu=seq_lens_cpu[:num_reqs],
-                    prepared_exact_device=self.input_buffers.seq_lens[:num_reqs],
                 )
             else:
                 common_metadata_callback = runtime.metadata_callback(step, num_reqs)
