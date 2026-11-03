@@ -192,10 +192,13 @@ class DraftWindowRuntime:
             if self.speculator.method == "eagle3" and self._build_count != expected_eagle_steps:
                 raise RuntimeError("Eagle3 proposal did not consume every configured draft step")
         except BaseException:
+            self._pending.extend(owner)
             self._poisoned = True
             raise
+        else:
+            if owner:
+                self._pending = owner
         finally:
-            self._pending.extend(owner)
             self._owner = None
             self._input_batch = None
             self._continuing = None

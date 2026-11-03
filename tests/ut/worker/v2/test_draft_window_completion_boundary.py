@@ -20,6 +20,7 @@ def test_previous_operands_survive_host_retirement_until_completed_exact_copy(se
     with runtime.proposal_context(runtime_tests.batch()):
         runtime.metadata_callback(3, 2)(0, runtime_tests.common())
         runtime.retain_metadata(payload)
+        retired = runtime._owner
     assert runtime._owner is None
     assert any(value is payload for value in runtime._pending)
     original = torch.Tensor.to
@@ -35,7 +36,7 @@ def test_previous_operands_survive_host_retirement_until_completed_exact_copy(se
     with runtime.proposal_context(runtime_tests.batch()):
         assert any(value is payload for value in runtime._pending)
         runtime.metadata_callback(3, 2)(0, runtime_tests.common())
-        assert runtime._pending == []
+        assert runtime._pending == [] and retired == []
     assert len(copies) == 1 and not completions
     assert not any(value is payload for value in runtime._pending)
 
