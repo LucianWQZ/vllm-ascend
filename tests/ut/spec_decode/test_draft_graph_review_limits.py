@@ -90,7 +90,10 @@ class DraftGraphSupportTest(unittest.TestCase):
         for method in ("eagle3", "dflash"):
             for dp, rows in ((1, 1), (1, 2), (2, 1)):
                 for window in (False, True):
-                    with self.subTest(method=method, dp=dp, rows=rows, window=window):
+                    with (
+                        self.subTest(method=method, dp=dp, rows=rows, window=window),
+                        patch.object(Path, "read_text", side_effect=AssertionError("startup must not reload config")),
+                    ):
                         scope = self.resolve(self.config(method=method, dp=dp, rows=rows, window=window))
                         self.assertEqual(
                             (scope.method, scope.data_parallel_size, scope.max_requests), (method, dp, rows)
@@ -119,15 +122,6 @@ class DraftGraphSupportTest(unittest.TestCase):
             self.assertEqual(vars(config), fields)
             self.assertEqual(self.resolve(config), scope)
             self.assertEqual(vars(config), fields)
-
-    def test_owner_contract_is_reused_without_file_io(self):
-        for dp in (1, 2):
-            scope = self.resolve(self.config(dp=dp))
-            owner = NS(_draft_graph_review_limit=scope)
-            with patch.object(Path, "read_text", side_effect=AssertionError("capture re-parsed startup config")):
-                self.assertEqual(GUARD.eagle_dp2_graph_review_enabled(owner), dp == 2)
-                self.assertEqual(GUARD.eagle_dp2_graph_review_enabled(owner), dp == 2)
-        self.assertFalse(GUARD.eagle_dp2_graph_review_enabled(NS()))
 
     def test_unscoped_dflash_loading_and_dflash2_super_config_stay_unmodified(self):
         config = self.config(method="dflash")

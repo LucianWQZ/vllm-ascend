@@ -254,12 +254,6 @@ def _validate_qualified_graph_config(vllm_config, profile):
     return DraftGraphSupport(maximum, k, rows, dp, method, query)
 
 
-def eagle_dp2_graph_review_enabled(owner):
-    """Read the actual owner's startup contract; never reparse during capture."""
-    scope = getattr(owner, "_draft_graph_review_limit", None)
-    return _is_eagle_support(scope) and scope.data_parallel_size == 2
-
-
 def note_eagle_single_request_review_lifecycle(owner, scheduler_output):
     """Keep only authoritative preemption IDs until real request completion.
 
@@ -379,7 +373,6 @@ def _full8_review_capacity(vllm_config):
         raise NotImplementedError(
             "Full8 review requires an exact positive configured capacity within both model position ceilings"
         )
-    return capacity
 
 
 def validate_draft_graph_review_requests(
