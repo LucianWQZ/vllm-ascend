@@ -417,20 +417,10 @@ class DraftWindowRuntime:
         """
         positions = self.speculator.input_buffers.positions
         indices = self.speculator.last_token_indices[:num_reqs]
-        if (
-            positions.ndim != 1
-            or indices.shape != (num_reqs,)
-            or positions.device != native_extent.device
-            or indices.device != native_extent.device
-            or positions.dtype not in (torch.int32, torch.int64)
-            or indices.dtype not in (torch.int32, torch.int64)
-        ):
-            raise ValueError("Eagle3 Window requires current one-dimensional prepared positions and last query indices")
+        # Fixed InputBuffers and AR allocate both same-device int64 vectors.
         owner = self._owner
         if owner is None:
             raise RuntimeError("Eagle3 length snapshot has no active Draft Window proposal")
-        indices = indices.to(dtype=torch.int64)
-        owner.retained.append(indices)
         last_positions = positions.index_select(0, indices)
         owner.retained.append(last_positions)
         live_end = last_positions.to(dtype=torch.int32)

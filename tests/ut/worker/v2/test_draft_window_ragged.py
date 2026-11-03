@@ -38,7 +38,6 @@ def test_ragged_queries_keep_full_row_and_use_device_exact_at_boundary(causal):
     )
     assert (exact - read.seq_lens).tolist() == [0, 0]
     assert read.seq_lens.tolist() == [1151, 1408]
-    assert read.capacity == 1408  # Completed exact now bounds the allocation.
     assert read.num_query_tokens == 8
     assert isinstance(read, DenseDraftReadBatch)
     assert [indices.tolist() for indices, _ in read.parts] == [[0, 1, 2], [3, 4, 5, 6, 7]]
@@ -108,9 +107,9 @@ def test_uniform_full_read_rows_keep_original_query_layout():
         retain=lambda *items: None,
     )
     assert (torch.tensor([1151, 1287]) - read.seq_lens).tolist() == [0, 0]
-    assert read.capacity == 1312
     assert read.num_query_tokens == 16
     assert isinstance(read, DenseDraftReadBatch)
+    assert max(part.capacity for _, part in read.parts) == 1312
     assert [indices.tolist() for indices, _ in read.parts] == [list(range(8)), list(range(8, 16))]
     assert all(part.num_query_tokens == indices.numel() for indices, part in read.parts)
 

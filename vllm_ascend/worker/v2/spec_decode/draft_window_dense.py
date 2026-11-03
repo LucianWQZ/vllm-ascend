@@ -69,7 +69,6 @@ class DenseDraftReadBatch:
 
     parts: tuple[tuple[torch.Tensor, DenseDraftRead], ...]
     seq_lens: torch.Tensor  # Completed CPU visible lengths for the normal builder.
-    capacity: int
     num_query_tokens: int
     retain: Callable[..., None]
 
@@ -128,7 +127,8 @@ def prepare_dense_draft_read(
     starts = frozen_starts
     if bool(((starts < 0) | (starts >= exact_cpu)).any()):
         raise ValueError("Frozen Draft anchors must match current request rows")
-    retain(exact_cpu, starts, query_ends_cpu)
+    visible_lengths = exact_cpu - starts
+    retain(exact_cpu, starts, query_ends_cpu, visible_lengths)
     widths = None
     if query_start_loc_cpu is not None:
         assert query_start_loc_device is not None
@@ -139,9 +139,8 @@ def prepare_dense_draft_read(
             raise ValueError("Packed query widths exceed their current allocation bound")
 
     def materialize(host_rows: torch.Tensor, width: int, device_rows: torch.Tensor | None) -> DenseDraftRead:
-        ends = exact_cpu.index_select(0, host_rows)
         origins = starts.index_select(0, host_rows)
-        visible = ends - origins
+        visible = visible_lengths.index_select(0, host_rows)
         capacity_bound = int(visible.max())
         capacity = (capacity_bound + DENSE_KV_ALIGNMENT - 1) // DENSE_KV_ALIGNMENT * DENSE_KV_ALIGNMENT
         columns = torch.arange(capacity, device="cpu", dtype=torch.int64)
@@ -181,8 +180,6 @@ def prepare_dense_draft_read(
     if len(groups) == 1:
         _, width, _ = next(iter(groups))
         return materialize(torch.arange(n, device="cpu"), width, None)
-    visible = torch.empty(n, dtype=exact_cpu.dtype, device="cpu")
-    retain(visible)
     parts = []
     for (_full, width, _capacity), group in groups.items():
         host_rows = torch.tensor(group, dtype=torch.int64, device="cpu")
@@ -195,11 +192,8 @@ def prepare_dense_draft_read(
         queries = (bounds[:, None] + torch.arange(width, device=selected.device)[None, :]).flatten()
         retain(bounds, queries)
         read = materialize(host_rows, width, selected)
-        visible.index_copy_(0, host_rows, read.seq_lens)
         parts.append((queries, read))
-    result = DenseDraftReadBatch(
-        tuple(parts), visible, max(read.capacity for _, read in parts), sum(q.numel() for q, _ in parts), retain
-    )
+    result = DenseDraftReadBatch(tuple(parts), visible_lengths, sum(q.numel() for q, _ in parts), retain)
     retain(result)
     return result
 
@@ -220,11 +214,11 @@ def gather_dense_draft_kv(
         raise ValueError("Dense Draft KV requires unquantized float16/bfloat16 storage")
     if key_cache.device != value_cache.device or read.slots.device != key_cache.device:
         raise ValueError("Dense Draft slots and KV caches must share their device")
-    shape = (read.num_reqs, read.capacity, *key_cache.shape[2:])
+    blocks, block_size, heads, dim = key_cache.shape
+    token_size = heads * dim
+    shape = (read.num_reqs, read.capacity, heads, dim)
     layouts = []
     for cache in (key_cache, value_cache):
-        blocks, block_size, heads, dim = cache.shape
-        token_size = heads * dim
         page_stride = cache.stride(0)
         if (
             cache.stride()[1:] != (token_size, dim, 1)
@@ -233,7 +227,7 @@ def gather_dense_draft_kv(
         ):
             raise ValueError("Dense Draft KV requires contiguous ND token rows and aligned physical pages")
         stride_rows = page_stride // token_size
-        layouts.append((cache, blocks, block_size, heads, dim, token_size, stride_rows))
+        layouts.append((cache, stride_rows))
     if key_cache.device.type == "npu":
         import torch_npu
         from vllm.triton_utils import triton
@@ -253,7 +247,6 @@ def gather_dense_draft_kv(
                 read._attention_workspaces[workspace_key] = buffers
             keys, values = buffers
             read.retain(read.slots, key_cache, value_cache, keys, values)
-            token_size = key_cache.shape[2] * key_cache.shape[3]
             _gather_draft_kv_fp32[(triton.cdiv(read.slots.numel(), GATHER_TOKEN_BLOCK_SIZE),)](
                 read.slots,
                 key_cache,
@@ -272,7 +265,7 @@ def gather_dense_draft_kv(
     slots = read.slots.reshape(-1)
     indices_by_stride = {}
     gathered = []
-    for cache, blocks, block_size, heads, dim, token_size, stride_rows in layouts:
+    for cache, stride_rows in layouts:
         # Preserve the original storage offset, including the V offset in a
         # combined K/V page. This is a view, never a full-cache flatten/copy.
         rows = cache.as_strided(((blocks - 1) * stride_rows + block_size, heads, dim), (token_size, dim, 1))

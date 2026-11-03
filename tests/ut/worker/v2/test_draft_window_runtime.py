@@ -1114,7 +1114,7 @@ def test_eagle_mixed_decode_prompt_uses_one_exact_snapshot_per_preparation(setup
             assert (torch.tensor([1795, 2177] if step == 0 else ends) - read.seq_lens).tolist() == [640, 0]
             assert read.seq_lens.tolist() == [1155 if step == 0 else ends[0] - 640, ends[1]]
             assert read.num_query_tokens == (261 if step == 0 else 2)
-            assert read.capacity == 2208
+            assert max(part.capacity for _, part in read.parts) == 2208
             assert metadata.slot_mapping is slots and metadata.positions is positions
             assert torch.equal(table, before)
 
