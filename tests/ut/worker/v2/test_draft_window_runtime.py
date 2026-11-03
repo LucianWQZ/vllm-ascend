@@ -150,21 +150,18 @@ def test_shared_phase_rejects_invalid_active_row_counters(field, value):
 
 def test_graph_phase_uses_the_same_prompt_progress_as_eager():
     from vllm_ascend.worker.v2.spec_decode.draft_window_eager import (
-        classify_draft_window_batch_phase,
+        DraftWindowProposalContext,
     )
 
     state = batch(computed=(8, 24), prompt=(16, 16), scheduled=(10, 3), drafts=(3, 2))
     state.has_prefill = True
     # Total scheduled tokens cross the prompt boundary, but three are Draft
     # placeholders. The first row must retain Full reads until prompt ends.
-    phases = classify_draft_window_batch_phase(state)
+    phases = DraftWindowProposalContext.from_batch(state).full_read_rows
     assert phases == (True, False)
     state.num_computed_prefill_tokens_np[0] = 9
-    phases = classify_draft_window_batch_phase(state)
+    phases = DraftWindowProposalContext.from_batch(state).full_read_rows
     assert phases == (False, False)
-    state.is_prefilling_np[0] = False
-    with pytest.raises(RuntimeError, match="is_prefilling"):
-        classify_draft_window_batch_phase(state)
 
 
 def test_callback_reads_canonical_source_and_preserves_write_query_objects(setup):

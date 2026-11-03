@@ -10,7 +10,7 @@ by a proposal until its final consumer event completes.
 
 from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import torch
@@ -25,7 +25,13 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_plan import (
     freeze_eagle_window_plan,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_policy import DraftWindowPolicyDecision
-from vllm_ascend.worker.v2.spec_decode.draft_window_read import DirectPrefixSource, materialize_direct_prefix
+from vllm_ascend.worker.v2.spec_decode.draft_window_read import (
+    DirectPrefixSource,
+    DraftReadView,
+    NativeSWASource,
+    materialize_direct_prefix,
+    materialize_native_swa_intersection,
+)
 
 
 class _NPUCompletion:
@@ -100,11 +106,10 @@ class DraftWindowRuntime:
         self.native_swa_causal: dict[int, bool] = {}
         self._dense_reads = False
         self.gids = self._validate_route(speculator)
-        read_groups = self.gids or tuple(self.native_swa_intersections)
+        read_groups = tuple(gid for gid in self.gids if gid not in self.native_swa_intersections) or self.gids
         if not read_groups:
             raise NotImplementedError("Draft Window requires at least one certified read group")
         self.anchor_block_span = int(speculator.block_tables.kernel_block_sizes[read_groups[0]])
-        self._native_swa_built: set[int] = set()
         self.pool = DraftWindowOwnerPool(int(speculator.vllm_config.max_concurrent_batches))
         self._owner: DraftWindowOwner | None = None
         self._input_batch: Any = None
@@ -112,7 +117,7 @@ class DraftWindowRuntime:
         self._build_count = 0
         self._eagle_plans: tuple[DraftWindowPlan, ...] | None = None
         self._next_step = 0
-        self._sources: dict[int, DirectPrefixSource] = {}
+        self._sources: dict[int, DirectPrefixSource | NativeSWASource] = {}
 
     @property
     def reads_active(self) -> bool:
@@ -146,6 +151,7 @@ class DraftWindowRuntime:
         # padding and Full write coordinates; actual CP builders are excluded
         # by the provider inventory rather than a target-global CP switch.
         routes = require_direct_prefix_routes(speculator, window_size=self.window_size)
+        all_gids = tuple(dict.fromkeys(route.gid for route in routes))
         self.native_swa_intersections = {}
         for route in routes:
             if route.status is DraftWindowProviderStatus.NATIVE_SWA:
@@ -181,7 +187,7 @@ class DraftWindowRuntime:
         self.mla_layer_names = tuple(
             name for route in routes if route.status is DraftWindowProviderStatus.DIRECT_MLA for name in route.layers
         )
-        return tuple(dict.fromkeys(route.gid for route in routes))
+        return all_gids
 
     @contextmanager
     def proposal_context(
@@ -231,8 +237,6 @@ class DraftWindowRuntime:
             try:
                 # Preparation and builders enqueue copies/kernels before model
                 # forward. Even a later host error must retain this proposal.
-                if self.native_swa_intersections:
-                    self._native_swa_built.clear()
                 yield
                 # DFlash/DSpark keep context KV current when the scheduler
                 # requests zero drafts. That upstream branch writes KV but
@@ -250,12 +254,17 @@ class DraftWindowRuntime:
                 self._eagle_plans = None
                 self._sources.clear()
 
-    def _source(self, gid: int, num_reqs: int) -> DirectPrefixSource:
+    def _source(self, gid: int, num_reqs: int) -> DirectPrefixSource | NativeSWASource:
         # The runner allocates canonical pages before propose. AR changes KV
         # contents/lengths, not this table owner or its allocated columns.
         if gid not in self._sources:
             rows = self._input_batch.idx_mapping_np[:num_reqs]
-            self._sources[gid] = DirectPrefixSource.from_block_tables(self.speculator.block_tables, gid, rows)
+            tables = self.speculator.block_tables
+            self._sources[gid] = (
+                NativeSWASource.from_block_tables(tables, gid, rows, self.native_swa_intersections[gid])
+                if gid in self.native_swa_intersections
+                else DirectPrefixSource.from_block_tables(tables, gid, rows)
+            )
         return self._sources[gid]
 
     def metadata_callback(
@@ -545,10 +554,52 @@ class DraftWindowRuntime:
         starts = torch.tensor(starts_list, dtype=torch.int32)
 
         def apply(gid: int, common_metadata: Any) -> None:
-            source = self._source(gid, num_reqs)
             retain = lambda *objects: self.pool.retain(owner, *objects)
             view: Any
-            if dense:
+            if gid in self.native_swa_intersections:
+                if (
+                    common_metadata.num_reqs != num_reqs
+                    or common_metadata.seq_lens.dtype != torch.int32
+                    or common_metadata.seq_lens.shape != (num_reqs,)
+                    or common_metadata.causal is not self.native_swa_causal[gid]
+                    or not bool(
+                        (
+                            common_metadata.query_start_loc_cpu[: num_reqs + 1].diff()
+                            == self.speculator.num_query_per_req
+                        ).all()
+                    )
+                ):
+                    raise ValueError("Native SWA Window requires its declared causal mask and actual query width")
+                if continuing.all():
+                    # Keep the native band/table, supplying the same exact CPU
+                    # snapshot so its builder need not read device E again.
+                    view = DraftReadView(
+                        common_metadata.block_table_tensor,
+                        common_metadata.seq_lens,
+                        exact,
+                        common_metadata.seq_lens_cpu_upper_bound,
+                        common_metadata.max_seq_len,
+                        num_reqs,
+                    )
+                else:
+                    source = cast(NativeSWASource, self._source(gid, num_reqs))
+                    native_starts = torch.clamp(exact - self.window_size, min=0).to(torch.int64)
+                    native_starts = native_starts // source.block_span * source.block_span
+                    native_starts[torch.from_numpy(continuing)] = 0
+                    if source.table.device.type == "npu":
+                        native_starts = native_starts.pin_memory()
+                    view = materialize_native_swa_intersection(
+                        source,
+                        exact_cpu=exact,
+                        exact_device=common_metadata.seq_lens,
+                        upper_cpu=common_metadata.seq_lens_cpu_upper_bound,
+                        starts_cpu=native_starts,
+                        padded_rows=num_reqs,
+                        query_width=self.speculator.num_query_per_req,
+                        row_indices=batch.idx_mapping[:num_reqs],
+                        retain=retain,
+                    )
+            elif dense:
                 from vllm_ascend.worker.v2.spec_decode.draft_window_dense import prepare_dense_draft_read
 
                 first = self.method == "eagle3" and step == 0
@@ -557,7 +608,7 @@ class DraftWindowRuntime:
                 query_width = int(widths.max())
                 ragged = not bool((widths == query_width).all())
                 view = prepare_dense_draft_read(
-                    source,
+                    cast(DirectPrefixSource, self._source(gid, num_reqs)),
                     exact_device=common_metadata.seq_lens,
                     exact_cpu=proposal_exact if first else exact,
                     query_ends_cpu=exact,
@@ -577,7 +628,7 @@ class DraftWindowRuntime:
                 )
             else:
                 view = materialize_direct_prefix(
-                    source,
+                    cast(DirectPrefixSource, self._source(gid, num_reqs)),
                     exact_cpu=exact,
                     exact_device=common_metadata.seq_lens,
                     upper_cpu=common_metadata.seq_lens_cpu_upper_bound[:num_reqs],
@@ -590,34 +641,6 @@ class DraftWindowRuntime:
             view.apply(common_metadata)
 
         return apply
-
-    def metadata_builder_callback(self, step: int):
-        """Select a proposal-owned builder at the existing metadata extension point."""
-        if self._bypass or not self.native_swa_intersections:
-            return None
-        owner = self._owner
-        if owner is None:
-            raise RuntimeError("Draft Window builder has no active proposal")
-
-        def select(gid, builder, layer_names):
-            if gid in self.native_swa_intersections:
-                from vllm_ascend.worker.v2.spec_decode.draft_window_swa import NativeSWABuilder
-
-                if self._owner is not owner:
-                    raise RuntimeError("Native SWA builder selection belongs to a stale proposal")
-                owned = NativeSWABuilder(
-                    builder,
-                    self,
-                    owner,
-                    gid,
-                    self.native_swa_intersections[gid],
-                    causal=self.native_swa_causal.get(gid, True),
-                )
-                self.pool.retain(owner, owned)
-                return owned
-            return builder
-
-        return select
 
     def retain_metadata(self, metadata: Any) -> None:
         """Keep the final builder result, including newly allocated derived state."""

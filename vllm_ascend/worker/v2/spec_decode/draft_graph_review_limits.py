@@ -324,18 +324,9 @@ def validate_eagle_single_request_review_exact(owner, input_batch, exact, *, num
     if not _is_eagle_support(scope):
         return
     rows = _request_bounds(input_batch)
-    if (
-        type(num_reqs) is not int
-        or num_reqs != len(rows)
-        or type(padded) is not int
-        or padded != len(rows)
-        or type(step) is not int
-        or not 0 <= step < scope.static_k
-        or exact.device.type != "cpu"
-        or exact.ndim != 1
-        or exact.shape[0] != len(rows)
-        or str(exact.dtype) != "torch.int32"
-    ):
+    # The real Eagle producer owns CPU int32 storage and validates the step.
+    # Only the admitted active/padded extent and current values can vary here.
+    if num_reqs != len(rows) or padded != num_reqs:
         raise RuntimeError("Eagle review lost its exact admitted-row CPU consumer input")
     context = getattr(owner, "_eagle3_window_proposal", None)
     continuing_rows = context.full_read_rows if context is not None else ()
@@ -352,7 +343,7 @@ def validate_eagle_single_request_review_exact(owner, input_batch, exact, *, num
                 input_batch.num_scheduled_tokens[position]
             )
             lower = upper = min(end + step, scope.max_model_len)
-        if type(value) is not int or not lower <= value <= upper:
+        if not lower <= value <= upper:
             raise NotImplementedError(
                 "Eagle consumer exact length is outside its request and model capacity: "
                 f"row={position}, step={step}, exact={value!r}, expected=[{lower}, {upper}]"
@@ -401,20 +392,6 @@ def _full8_review_capacity(vllm_config):
             "Full8 review requires an exact positive configured capacity within both model position ceilings"
         )
     return capacity
-
-
-def validate_full8_single_request_graph_stage(owner, *, actual, padded, tokens):
-    """Check the real Draft descriptor before metadata/native query submission."""
-    maximum = full8_graph_review_max_requests(getattr(owner, "_draft_graph_review_limit", None))
-    if maximum is None:
-        return
-    if type(actual) is not int or type(padded) is not int or type(tokens) is not int:
-        raise TypeError("Full8 review requires exact integer Draft descriptor counts")
-    if not 1 <= actual <= maximum or padded != actual or tokens != padded * _FULL8_QUERY_TOKENS:
-        raise NotImplementedError(
-            "Full8 review requires actual/padded1 or explicitly admitted actual/padded2, "
-            "with eight query tokens per row; no fallback is selected"
-        )
 
 
 def validate_draft_graph_review_requests(

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Isolate mutable Draft metadata and identify the real idle-DP scope."""
+"""Private Draft metadata copies and the shared Window read-field binding."""
 
 from __future__ import annotations
 
@@ -52,32 +52,3 @@ def bind_draft_window_read(layer: Any, bank: Any, max_seq_len: int) -> None:
     layer.seq_lens_cpu = bank.cpu_window_exact
     layer.seq_lens_list = bank.cpu_window_exact.tolist()
     layer.max_seq_len = max_seq_len
-
-
-def is_parallel_graph_dp_dummy(owner: Any) -> bool:
-    """Require the explicit no-generation scope before using baseline operands.
-
-    This is an idle replica's real Graph submission, not an eager fallback,
-    a capture carrier or a reuse of the preceding business generation.
-    """
-    from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphBindingProvider
-
-    active = getattr(owner, "_draft_window_dp_dummy_active", False)
-    if active is False:
-        return False
-    if active is not True:
-        raise RuntimeError("DP dummy Graph scope marker must be an explicit boolean")
-    provider = getattr(owner, "_draft_window_graph_binding_provider", None)
-    dp_size = getattr(owner, "dp_size", None)
-    if (
-        type(dp_size) is not int
-        or dp_size <= 1
-        or getattr(owner, "_draft_window_bypass_active", False) is not True
-        or getattr(owner, "_draft_window_prefill_bypass_active", False) is not False
-        or owner._draft_window_proposal is not None
-        or not isinstance(provider, DraftWindowGraphBindingProvider)
-        or provider._active_inputs is not None
-        or provider.method not in ("dflash", "dspark")
-    ):
-        raise RuntimeError("DP dummy Graph requires its explicit full-read scope without a live Window generation")
-    return True

@@ -141,7 +141,7 @@ def _draft_window_context_kv_scope(owner, input_batch):
     contract for these writes; captured Window banks and generations stay idle.
     """
     runtime = owner._draft_window_graph_binding_provider
-    if runtime.quarantined or getattr(owner, "_draft_window_graph_submission_uncertain", False):
+    if runtime.quarantined:
         raise RuntimeError("Draft Window backing is quarantined before a context-only KV write")
     from vllm_ascend.worker.v2.spec_decode.draft_window_lifetime import DraftWindowOwnerPool
     from vllm_ascend.worker.v2.spec_decode.draft_window_runtime import _NPUCompletion
@@ -164,7 +164,7 @@ def _draft_window_context_kv_scope(owner, input_batch):
     except BaseException:
         # A partial context write or failed completion record also makes the
         # canonical state unsafe for a later normal Graph proposal.
-        owner._draft_window_graph_submission_uncertain = True
+        runtime.quarantine()
         raise
     finally:
         owner._draft_window_context_kv_active = False
@@ -371,7 +371,6 @@ class AscendDFlashSpeculator(DraftWindowGraphInputMixin, LmheadTPDraftSamplingMi
             batch_desc.num_tokens,
             self.draft_is_prefilling,
             common_metadata_callback=runtime.metadata_callback(step, num_reqs),
-            metadata_builder_callback=runtime.metadata_builder_callback(step),
         ):
             metadata = super()._build_attn_metadata(
                 num_reqs,

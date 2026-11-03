@@ -449,9 +449,6 @@ class DraftGraphSupportTest(unittest.TestCase):
 
     def test_exact_lengths_follow_canonical_continuing_prefill_progress(self):
         class Exact:
-            device = NS(type="cpu")
-            ndim, shape, dtype = 1, (1,), "torch.int32"
-
             def __init__(self, value):
                 self.value = value
 
@@ -476,13 +473,10 @@ class DraftGraphSupportTest(unittest.TestCase):
                 GUARD.validate_eagle_single_request_review_exact(
                     owner, batch, Exact(value), num_reqs=1, padded=1, step=0
                 )
-        # Phase inconsistency is rejected once when the real proposal opens,
-        # rather than reinterpreting the same CPU counters in every consumer.
+        # The real proposal uses the same placeholder-aware prompt math.
         from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowProposalContext
 
-        batch.is_prefilling_np, batch.has_prefill = [False], False
-        with self.assertRaises(RuntimeError):
-            DraftWindowProposalContext.from_batch(batch)
+        self.assertEqual(DraftWindowProposalContext.from_batch(batch).full_read_rows, (True,))
 
     def test_full8_request_lookahead_cannot_exceed_allocated_capacity(self):
         config = self.config(method="dflash")
@@ -499,16 +493,50 @@ class DraftGraphSupportTest(unittest.TestCase):
         with self.assertRaises(NotImplementedError):
             runner_bounds(owner, batch)
 
-    def test_full8_descriptor_rejects_unqualified_padding_before_execution(self):
+    def test_full8_actual_metadata_boundary_rejects_unqualified_padding_before_materialize(self):
+        import numpy as np
+        import torch
+
+        from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowGraphInputMixin
+
         scope = self.resolve(self.config(method="dflash", rows=2))
-        owner = NS(_draft_graph_review_limit=scope)
-        GUARD.validate_full8_single_request_graph_stage(owner, actual=1, padded=1, tokens=8)
-        GUARD.validate_full8_single_request_graph_stage(owner, actual=2, padded=2, tokens=16)
-        for shape in ((1, 2, 16), (2, 4, 32), (3, 3, 24)):
-            with self.subTest(shape=shape), self.assertRaises(NotImplementedError):
-                GUARD.validate_full8_single_request_graph_stage(
-                    owner, actual=shape[0], padded=shape[1], tokens=shape[2]
+        owner: Any = object.__new__(DraftWindowGraphInputMixin)
+        owner._draft_graph_review_limit = scope
+        owner._draft_window_graph_binding_provider = object()
+        owner._draft_window_bypass_active = False
+        owner.draft_attn_layer_names = {"draft.layer"}
+        owner.num_query_per_req = 8
+        owner.block_tables = NS(slot_mappings=torch.zeros((1, 32), dtype=torch.int32))
+        owner._materialize_draft_window_read_inputs = Mock()
+        for actual, padded in ((1, 1), (2, 2), (1, 2), (2, 4)):
+            with self.subTest(actual=actual, padded=padded):
+                batch = self.batch(rows=actual)
+                GUARD.validate_draft_graph_review_requests(owner, batch)
+                descriptor = NS(num_reqs=padded, num_tokens=padded * 8, cg_mode=NS(name="FULL"))
+                owner._draft_window_selected_metadata = NS(descriptor=descriptor)
+                owner._materialize_draft_window_read_inputs.reset_mock()
+                expected: Any = (
+                    nullcontext() if actual == padded else self.assertRaisesRegex(RuntimeError, "uniform FULL")
                 )
+                with expected:
+                    self.assertIsNone(
+                        owner._build_attn_metadata(
+                            actual,
+                            descriptor,
+                            np.arange(actual + 1, dtype=np.int32) * 8,
+                            torch.zeros(actual, dtype=torch.int32),
+                            8,
+                        )
+                    )
+                if actual == padded:
+                    owner._materialize_draft_window_read_inputs.assert_called_once_with(
+                        num_reqs=actual, num_reqs_padded=padded
+                    )
+                else:
+                    owner._materialize_draft_window_read_inputs.assert_not_called()
+        # Capacity is checked once before the proposal can change Graph ownership.
+        with self.assertRaises(NotImplementedError):
+            GUARD.validate_draft_graph_review_requests(owner, self.batch(rows=3))
 
     def test_context_only_full8_keeps_request_guards_without_fake_query_shape(self):
         config = self.config(method="dflash")
@@ -709,10 +737,6 @@ class ActualGraphDescriptorControls(unittest.TestCase):
 class Vector:
     def __init__(self, values):
         self.values = values
-        self.ndim = 1
-        self.shape = (len(values),)
-        self.dtype = "torch.int32"
-        self.device = NS(type="cpu")
 
     def __getitem__(self, index):
         return NS(item=lambda: self.values[index])
@@ -782,9 +806,7 @@ class EagleMixedRequestControls(unittest.TestCase):
         from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowProposalContext
 
         batch.num_draft_tokens_per_req = None
-        batch.is_prefilling_np, batch.has_prefill = [False, True], True
-        with self.assertRaises(RuntimeError):
-            DraftWindowProposalContext.from_batch(batch)
+        self.assertEqual(DraftWindowProposalContext.from_batch(batch).full_read_rows, (True, False))
 
     def test_continuing_prefill_does_not_relax_identity_capacity_or_counter_contract(self):
         for damage in (
@@ -841,7 +863,7 @@ class EagleMixedRequestControls(unittest.TestCase):
 
 
 def idle_owner():
-    provider = NS(method="eagle3", _active_inputs=None)
+    provider = NS(method="eagle3", _active_inputs=None, quarantined=False)
     session = NS(provider=provider, _capture_call=None)
     batch = NS(is_dummy=True, num_reqs=1, num_reqs_after_padding=1)
     owner = NS(
@@ -861,11 +883,11 @@ def idle_owner():
     )
 
     def require_reusable():
-        if getattr(owner, "_draft_window_graph_submission_uncertain", False):
+        if provider.quarantined:
             raise RuntimeError("quarantined")
 
-    session.require_reusable = require_reusable
-    owner._quarantine_eagle3_window = lambda: setattr(owner, "_draft_window_graph_submission_uncertain", True)
+    provider.require_reusable = require_reusable
+    owner._quarantine_eagle3_window = lambda: setattr(provider, "quarantined", True)
     return owner, batch, session
 
 
@@ -890,7 +912,7 @@ class EagleIdleOwnershipControls(unittest.TestCase):
                     IDLE["validate_eagle_dp_dummy_replay"](owner, manager, descriptor, [{}] * (count + 1))
             self.assertIsNone(owner._eagle3_window_proposal)
         self.assertFalse(owner._eagle3_graph_dp_dummy_active)
-        self.assertFalse(getattr(owner, "_draft_window_graph_submission_uncertain", False))
+        self.assertFalse(owner._draft_window_graph_binding_provider.quarantined)
         # K0 business first-only is a genuine request, never dummy/idle.
         batch.is_dummy = False
         with IDLE["eagle3_dp_dummy_scope"](owner, batch, dummy_run=False, is_profile=False):
@@ -903,8 +925,13 @@ class EagleIdleOwnershipControls(unittest.TestCase):
             IDLE["eagle3_dp_dummy_scope"](owner, batch, dummy_run=True, is_profile=False),
         ):
             raise RuntimeError("injected submission uncertainty")
-        self.assertTrue(owner._draft_window_graph_submission_uncertain)
+        self.assertTrue(owner._draft_window_graph_binding_provider.quarantined)
         self.assertFalse(owner._eagle3_graph_dp_dummy_active)
+        with (
+            self.assertRaisesRegex(RuntimeError, "quarantined"),
+            IDLE["eagle3_dp_dummy_scope"](owner, batch, dummy_run=True, is_profile=False),
+        ):
+            self.fail("uncertain idle work must reject the next Graph scope")
         owner, batch, session = idle_owner()
         owner._eagle3_window_proposal = object()
         with (
@@ -912,7 +939,7 @@ class EagleIdleOwnershipControls(unittest.TestCase):
             IDLE["eagle3_dp_dummy_scope"](owner, batch, dummy_run=True, is_profile=False),
         ):
             self.fail("live business generation entered dummy replay")
-        self.assertTrue(owner._draft_window_graph_submission_uncertain)
+        self.assertTrue(owner._draft_window_graph_binding_provider.quarantined)
         owner, batch, session = idle_owner()
         owner._draft_window_graph_binding_provider._active_inputs = object()
         with (

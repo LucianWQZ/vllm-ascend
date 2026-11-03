@@ -2,10 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
 """Normal metadata ownership and existing factory contracts; CPU only."""
 
-import ast
-from contextlib import contextmanager
 from dataclasses import dataclass
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -16,7 +13,7 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_lifetime import (
     DraftWindowOwnerPool,
 )
 
-CALLBACK_NAMES = ("common_metadata_callback", "metadata_builder_callback")
+CALLBACK_NAMES = ("common_metadata_callback",)
 
 
 @pytest.fixture
@@ -195,31 +192,25 @@ def test_real_builder_constructs_private_window_metadata_without_touching_target
 
 
 @pytest.fixture
-def factory_contract():
-    """Isolate the patched module and backend, retaining both real context managers."""
-    path = Path(__file__).resolve().parents[4] / "vllm_ascend/worker/v2/attn_utils.py"
-    names = {"build_attn_metadata_factory", "build_attn_metadata_wrapper"}
-    nodes = [node for node in ast.parse(path.read_text()).body if getattr(node, "name", None) in names]
-    assert len(nodes) == len(names)
+def factory_contract(monkeypatch):
+    """Use the real managers, isolating only their module and backend seam."""
+    from vllm_ascend.worker.v2 import attn_utils
+
     original = Mock(side_effect=lambda **kwargs: kwargs)
     ascend = Mock(side_effect=lambda **kwargs: kwargs)
     module = SimpleNamespace(build_attn_metadata=original)
-    scope = {
-        "contextmanager": contextmanager,
-        "_BUILD_ATTN_METADATA_MODULE": module,
-        "build_attn_metadata": ascend,
-    }
-    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), scope)
+    monkeypatch.setattr(attn_utils, "_BUILD_ATTN_METADATA_MODULE", module)
+    monkeypatch.setattr(attn_utils, "build_attn_metadata", ascend)
     return SimpleNamespace(
         module=module,
         original=original,
         ascend=ascend,
-        factory=scope["build_attn_metadata_factory"],
-        wrapper=scope["build_attn_metadata_wrapper"],
+        factory=attn_utils.build_attn_metadata_factory,
+        wrapper=attn_utils.build_attn_metadata_wrapper,
     )
 
 
-@pytest.mark.parametrize("callback_names", [(), CALLBACK_NAMES[:1], CALLBACK_NAMES[1:], CALLBACK_NAMES])
+@pytest.mark.parametrize("callback_names", [(), CALLBACK_NAMES])
 def test_factory_forwards_callbacks_and_baseline_fields_once(factory_contract, callback_names):
     contract = factory_contract
     callbacks = {name: Mock() for name in callback_names}
@@ -317,10 +308,7 @@ def test_factory_restores_patch_when_callback_or_backend_raises(factory_contract
     def backend(**kwargs):
         if stage == "backend":
             fail()
-        if stage == "common_metadata_callback":
-            kwargs[stage](0, object())
-        else:
-            kwargs[stage](0, object(), ["draft.layer"])
+        kwargs[stage](0, object())
 
     contract.ascend.side_effect = backend
     callbacks = {} if stage == "backend" else {stage: fail}
@@ -363,10 +351,7 @@ def test_factory_error_restores_module_but_quarantines_active_owner(factory_cont
     def backend(**kwargs):
         if stage == "backend":
             fail()
-        if stage == "common_metadata_callback":
-            kwargs[stage](0, object())
-        else:
-            kwargs[stage](0, object(), ["draft.layer"])
+        kwargs[stage](0, object())
 
     contract.ascend.side_effect = backend
     callbacks = {} if stage == "backend" else {stage: fail}

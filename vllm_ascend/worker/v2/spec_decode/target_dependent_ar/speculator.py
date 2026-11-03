@@ -670,7 +670,6 @@ class AscendTargetDependentARSpeculator(LmheadTPDraftSamplingMixin, TargetDepend
             parallel_config=self.draft_vllm_config.parallel_config,
             offload_kwargs=offload_kwargs,
             common_metadata_callback=runtime.metadata_callback(step, num_reqs) if runtime is not None else None,
-            metadata_builder_callback=runtime.metadata_builder_callback(step) if runtime is not None else None,
         ):
             attn_metadata = super()._build_attn_metadata(
                 num_reqs,

@@ -18,7 +18,6 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_backends import (
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_eager import (
     DraftWindowProposalContext,
-    classify_draft_window_batch_phase,
 )
 
 
@@ -56,7 +55,7 @@ def _batch(rows):
 )
 def test_bypass_requires_every_real_row_to_be_continuing(rows, full_rows, bypass):
     batch = _batch(rows)
-    assert classify_draft_window_batch_phase(batch) == full_rows
+    assert DraftWindowProposalContext.from_batch(batch).full_read_rows == full_rows
     assert (bool(full_rows) and all(full_rows)) is bypass
 
 

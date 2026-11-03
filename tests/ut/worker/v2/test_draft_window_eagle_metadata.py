@@ -128,7 +128,13 @@ def proposal(monkeypatch):
         runtime.retired, runtime._active_inputs = inputs, None
 
     runtime.retire_generation = retire
-    runtime.quarantine_generation = lambda inputs: setattr(runtime, "quarantined", True)
+    runtime.quarantine = lambda: setattr(runtime, "quarantined", True)
+
+    def require_reusable():
+        if runtime.quarantined:
+            raise RuntimeError("quarantined")
+
+    runtime.require_reusable = require_reusable
 
     def finish():
         if runtime._active_inputs is not None or runtime.pending:
@@ -218,7 +224,27 @@ def test_real_proposal_keeps_each_submitted_consumer_until_update(proposal):
             assert runtime.pending == [current]
             runtime.pending.clear()
     assert not runtime.pending
-    assert not getattr(owner, "_draft_window_graph_submission_uncertain", False)
+    assert not runtime.quarantined
+
+
+def test_update_failure_after_host_retirement_quarantines_the_provider(proposal):
+    owner, batch, session, runtime, inputs = proposal
+    original = RuntimeError("native UPDATE failed after Host retirement")
+    with (
+        pytest.raises(RuntimeError) as caught,
+        owner._eagle3_draft_window_proposal_scope(batch, dummy_run=False, is_profile=False, num_speculative_tokens=0),
+    ):
+        session.stage(session.resolve(first=True, n=1, tokens=4, ordinal=0), 0)
+        assert runtime._active_inputs is None and runtime.pending
+        raise original
+    assert caught.value is original
+    assert runtime.quarantined and runtime.retired is not None and runtime.pending
+    assert owner._eagle3_window_proposal is None
+    with (
+        pytest.raises(RuntimeError, match="quarantined"),
+        owner._eagle3_draft_window_proposal_scope(batch, dummy_run=False, is_profile=False),
+    ):
+        pytest.fail("an UPDATE failure must reject the next proposal before reuse")
 
 
 def test_business_window_proposal_requires_the_real_installed_graph_manager(proposal):
@@ -244,7 +270,7 @@ def test_real_proposal_rejects_unconsumed_or_misattributed_reader(proposal, dama
             if damage == "wrong_batch":
                 owner.input_batch = SimpleNamespace(**vars(batch))
             session.stage(session.resolve(first=True, n=1, tokens=4, ordinal=0), 1 if damage == "wrong_step" else 0)
-    assert owner._draft_window_graph_submission_uncertain
+    assert runtime.quarantined
     assert owner._eagle3_window_proposal is None
 
 

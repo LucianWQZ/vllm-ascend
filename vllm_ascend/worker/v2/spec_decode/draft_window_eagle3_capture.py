@@ -83,11 +83,6 @@ class Eagle3GraphSession:
         if not self.provider._carriers:
             raise RuntimeError("Eagle3 Window requires a nonempty capture bucket inventory")
 
-    def require_reusable(self) -> None:
-        if getattr(self.owner, "_draft_window_graph_submission_uncertain", False):
-            raise RuntimeError("Eagle3 Graph backing is quarantined; process isolation required")
-        self.provider.require_reusable()
-
     def resolve(self, *, first: bool, n: int, tokens: int, ordinal: int) -> DraftWindowGraphBucket:
         route = DraftWindowGraphRoute.EAGLE3_FIRST_PASS if first else DraftWindowGraphRoute.EAGLE3_AR_STEP
         captures = self.provider.capture_banks_for(route=route, num_reqs=n, num_tokens=tokens)
@@ -143,7 +138,7 @@ class Eagle3GraphSession:
         owner = self.owner
         n = capture.descriptor.num_reqs
         try:
-            self.require_reusable()
+            self.provider.require_reusable()
             inputs = owner._materialize_eagle3_step(
                 step=step,
                 num_reqs=owner.input_batch.num_reqs,

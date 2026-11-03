@@ -53,6 +53,8 @@ class ParallelOwnerTests(unittest.TestCase):
             vllm_config=SimpleNamespace(max_concurrent_batches=2),
             num_speculative_steps=8,
         )
+        provider = self.owner._draft_window_graph_binding_provider
+        provider.quarantine = lambda: setattr(provider, "quarantined", True)
         self.normal: list[tuple[Any, dict[str, Any]]] = []
 
         @contextmanager
@@ -85,7 +87,7 @@ class ParallelOwnerTests(unittest.TestCase):
             raise first
         self.assertIs(seen.exception, first)
         self.assertTrue(self.owner._draft_window_context_kv_pool._poisoned)
-        self.assertTrue(self.owner._draft_window_graph_submission_uncertain)
+        self.assertTrue(self.owner._draft_window_graph_binding_provider.quarantined)
         self.owner._draft_window_proposal_scope = MethodType(
             DraftWindowGraphInputMixin._draft_window_proposal_scope, self.owner
         )
@@ -95,17 +97,14 @@ class ParallelOwnerTests(unittest.TestCase):
         ):
             self.fail("normal Graph body must not execute")
 
-    def test_normal_uncertain_or_quarantined_refuses_zero_before_native(self):
-        for quarantined, uncertain in [(True, False), (False, True)]:
-            with self.subTest(uncertain=uncertain):
-                self.owner._draft_window_graph_binding_provider.quarantined = quarantined
-                self.owner._draft_window_graph_submission_uncertain = uncertain
-                with (
-                    self.assertRaisesRegex(RuntimeError, "quarantined"),
-                    self.scope(0),
-                ):
-                    self.fail("context write must not execute")
-                self.assertFalse(hasattr(self.owner, "_draft_window_context_kv_pool"))
+    def test_quarantined_refuses_zero_before_native(self):
+        self.owner._draft_window_graph_binding_provider.quarantine()
+        with (
+            self.assertRaisesRegex(RuntimeError, "quarantined"),
+            self.scope(0),
+        ):
+            self.fail("context write must not execute")
+        self.assertFalse(hasattr(self.owner, "_draft_window_context_kv_pool"))
         self.assertEqual(Completion.recorded, 0)
 
     def test_completion_failure_is_original_and_shared_quarantine(self):
@@ -124,7 +123,7 @@ class ParallelOwnerTests(unittest.TestCase):
         ):
             pass
         self.assertIs(seen.exception, first)
-        self.assertTrue(self.owner._draft_window_graph_submission_uncertain)
+        self.assertTrue(self.owner._draft_window_graph_binding_provider.quarantined)
         self.assertTrue(self.owner._draft_window_context_kv_pool._poisoned)
 
     def test_zero_and_normal_proposals_cannot_overlap(self):

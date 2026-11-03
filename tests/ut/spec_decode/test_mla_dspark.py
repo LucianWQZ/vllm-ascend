@@ -335,9 +335,8 @@ def test_propose_uses_draft_decode_flags_for_dcp(monkeypatch, use_dcp):
         attn_state=None,
         parallel_config=None,
         common_metadata_callback=None,
-        metadata_builder_callback=None,
     ):
-        assert common_metadata_callback is None and metadata_builder_callback is None
+        assert common_metadata_callback is None
         captured.update(is_prefilling=is_prefilling, seq_lens_cpu=seq_lens_cpu)
         yield
 
@@ -382,9 +381,8 @@ def test_replay_metadata_preserves_architecture_behavior(monkeypatch, architectu
         attn_state=None,
         parallel_config=None,
         common_metadata_callback=None,
-        metadata_builder_callback=None,
     ):
-        assert common_metadata_callback is None and metadata_builder_callback is None
+        assert common_metadata_callback is None
         if architecture == "MLA":
             assert seq_lens_cpu.tolist() == [5, 0]
         else:

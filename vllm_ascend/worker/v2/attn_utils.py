@@ -466,7 +466,6 @@ def build_attn_metadata(
     copy_sfa_restore_tails: bool = False,
     draft_layer_names: set[str] | None = None,
     common_metadata_callback=None,
-    metadata_builder_callback=None,
 ) -> dict[str, Any]:
     """Build attention metadata for Ascend NPUs."""
     if skip_ring_state_update is None:
@@ -612,8 +611,6 @@ def build_attn_metadata(
 
         for attn_group in attn_groups[i]:
             attn_metadata_builder = attn_group.get_metadata_builder(0)
-            if metadata_builder_callback is not None:
-                attn_metadata_builder = metadata_builder_callback(i, attn_metadata_builder, attn_group.layer_names)
             is_dsa_builder = isinstance(attn_metadata_builder, (AscendDSAMetadataBuilder, AscendDSACPMetadataBuilder))
             is_v41_builder = isinstance(attn_metadata_builder, AscendDSAV41MetadataBuilder)
             is_sfa_builder = isinstance(attn_metadata_builder, AscendSFAMetadataBuilder)
@@ -2202,7 +2199,6 @@ def build_attn_metadata_factory(
     parallel_config=None,
     offload_kwargs=None,
     common_metadata_callback=None,
-    metadata_builder_callback=None,
 ):
     """Wrap build_attn_metadata with Ascend draft-model context.
 
@@ -2219,8 +2215,8 @@ def build_attn_metadata_factory(
     that restriction. A nested wrapper deliberately starts from the Ascend
     builder again and restores its enclosing factory when it exits.
 
-    Callbacks are forwarded explicitly to the builder, not invoked here. Each
-    callback slot has one owner: a second non-None callback is rejected rather
+    The read callback is forwarded to the builder, not invoked here. Its
+    slot has one owner: a second non-None callback is rejected rather
     than composed, preventing a read projection from being applied twice.
     Existing field and offload-argument precedence is unchanged. An upstream
     instance-level metadata-builder hook would allow this interception to be
@@ -2242,10 +2238,6 @@ def build_attn_metadata_factory(
             if existing_callback is not None:
                 raise ValueError("Multiple draft common metadata callbacks cannot share a build")
             kwargs["common_metadata_callback"] = common_metadata_callback
-        if metadata_builder_callback is not None:
-            if kwargs.get("metadata_builder_callback") is not None:
-                raise ValueError("Multiple draft builder callbacks cannot share a build")
-            kwargs["metadata_builder_callback"] = metadata_builder_callback
         return raw(*args, **kwargs)
 
     try:

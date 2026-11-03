@@ -143,9 +143,7 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
     def run_fullgraph(self, desc: BatchExecutionDescriptor) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         """Override run_fullgraph to update full graph params in run_fullgraph."""
         num_tokens = desc.num_tokens
-        from vllm_ascend.worker.v2.spec_decode.draft_window_graph_metadata import is_parallel_graph_dp_dummy
-
-        dp_dummy = is_parallel_graph_dp_dummy(self.speculator)
+        dp_dummy = getattr(self.speculator, "_draft_window_dp_dummy_active", False)
         graph_route = None if dp_dummy else resolve_parallel_draft_window_graph_route(self.speculator)
         attn_backend = list(self.speculator.attn_backends.values())[0]
         if graph_route is not None and not use_updatable_graph(attn_backend):
@@ -162,17 +160,15 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
                 self.speculator.input_batch.seq_lens_cpu_upper_bound,
             )
         else:
-            draft_attn_metadatas = self.speculator._draft_window_graph_binding_provider.consume_metadata(
-                route=graph_route, expected_consumer_count=1
-            )
+            draft_attn_metadatas = None
         if use_updatable_graph(attn_backend):
             ret = self._updatable_graph_replay(
                 desc,
                 draft_attn_metadatas if graph_route is None else None,
-                window_source=None if graph_route is None else draft_attn_metadatas,
+                window_source=None if graph_route is None else self.speculator._draft_window_graph_binding_provider,
             )
             if graph_route is not None:
-                self.speculator._draft_window_graph_binding_provider.finish_update(route=graph_route)
+                self.speculator._draft_window_graph_binding_provider.finish_update()
             return ret
         else:
             # Ordinary OFF/eager Target policy keeps the original fallback.

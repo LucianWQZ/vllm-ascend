@@ -39,30 +39,11 @@ class DraftWindowProposalContext:
 
     @classmethod
     def from_batch(cls, input_batch: InputBatch | Any) -> "DraftWindowProposalContext":
-        return cls(input_batch, classify_draft_window_batch_phase(input_batch))
+        return cls(input_batch, tuple(map(bool, continuing_prefill_rows(input_batch, input_batch.num_reqs))))
 
     def validate(self, input_batch: InputBatch | Any) -> None:
         if input_batch is not self.input_batch or input_batch.num_reqs != len(self.full_read_rows):
             raise RuntimeError("proposal input batch or request count changed")
-
-
-def classify_draft_window_batch_phase(input_batch: Any) -> tuple[bool, ...]:
-    """Classify every active row from pinned ``InputBatch`` source fields."""
-    num_reqs = int(input_batch.num_reqs)
-    # The common eager/Graph helper checks each real prompt-progress counter,
-    # including speculative placeholders, once before deriving these rows.
-    continuing = continuing_prefill_rows(input_batch, num_reqs)
-    computed = np.asarray(input_batch.num_computed_prefill_tokens_np)[:num_reqs]
-    prefill_len = np.asarray(input_batch.prefill_len_np)[:num_reqs]
-    declared = np.asarray(input_batch.is_prefilling_np)
-    if declared.ndim != 1 or declared.shape[0] < num_reqs:
-        raise ValueError("is_prefilling does not cover active request rows")
-    actual_prefill = computed < prefill_len
-    if not np.array_equal(actual_prefill, declared[:num_reqs].astype(np.bool_, copy=False)):
-        raise RuntimeError("InputBatch is_prefilling rows disagree with computed/prefill lengths")
-    if bool(getattr(input_batch, "has_prefill", False)) != bool(np.any(actual_prefill)):
-        raise RuntimeError("InputBatch has_prefill disagrees with row phase state")
-    return tuple(bool(value) for value in continuing)
 
 
 class DraftWindowGraphInputMixin:
@@ -134,9 +115,7 @@ class DraftWindowGraphInputMixin:
             return
         if self._draft_window_bypass_active or self._draft_window_proposal is not None:
             raise RuntimeError("a draft-window proposal scope is already active")
-        if self._draft_window_graph_binding_provider.quarantined or getattr(
-            self, "_draft_window_graph_submission_uncertain", False
-        ):
+        if self._draft_window_graph_binding_provider.quarantined:
             raise RuntimeError("draft-window backing is quarantined after uncertain Graph submission")
         context = None if dummy_run or is_profile else DraftWindowProposalContext.from_batch(input_batch)
         bypass_for_prefill = context is not None and bool(context.full_read_rows) and all(context.full_read_rows)
@@ -167,7 +146,7 @@ class DraftWindowGraphInputMixin:
                     # Dummy preparation/UPDATE can also partially submit.
                     # Retain owners and refuse the next scope without any
                     # device inspection, reset, drain or attempted recovery.
-                    self._draft_window_graph_submission_uncertain = True
+                    self._draft_window_graph_binding_provider.quarantine()
                 raise
             finally:
                 self._draft_window_bypass_active = False
@@ -177,33 +156,22 @@ class DraftWindowGraphInputMixin:
         assert context is not None
         self._draft_window_proposal = context
         self._draft_window_selected_metadata = None
-        succeeded = False
+        provider = self._draft_window_graph_binding_provider
         try:
             yield
-            succeeded = True
+            live_inputs = provider._active_inputs
+            if live_inputs is None:
+                raise RuntimeError("Draft Graph proposal completed without consuming its current inputs")
+            provider.retire_generation(live_inputs)
+            provider.finish_proposal()
+        except BaseException:
+            # Preparation, context writes or UPDATE may already be submitted.
+            # One provider flag covers both live and Host-retired consumers.
+            provider.quarantine()
+            raise
         finally:
-            if not succeeded:
-                # Native work may have been submitted before a carrier exists.
-                self._draft_window_graph_submission_uncertain = True
-            live_inputs = self._draft_window_graph_binding_provider._active_inputs
-            try:
-                if live_inputs is not None:
-                    if succeeded:
-                        try:
-                            self._draft_window_graph_binding_provider.retire_generation(live_inputs)
-                            self._draft_window_graph_binding_provider.finish_proposal()
-                        except BaseException:
-                            self._draft_window_graph_submission_uncertain = True
-                            succeeded = False
-                            raise
-                    else:
-                        # Retain uncertain backing without device RPC on unwind.
-                        self._draft_window_graph_binding_provider.quarantine_generation(live_inputs)
-                elif succeeded:
-                    raise RuntimeError("Draft Graph proposal completed without consuming its current inputs")
-            finally:
-                self._draft_window_selected_metadata = None
-                self._draft_window_proposal = None
+            self._draft_window_selected_metadata = None
+            self._draft_window_proposal = None
 
     def _snapshot_prepared_draft_seq_lens(
         self,
@@ -287,17 +255,13 @@ class DraftWindowGraphInputMixin:
             step != self.num_query_per_req
             or batch_desc.cg_mode.name != "FULL"
             or tokens != padded * self.num_query_per_req
+            or (getattr(self, "_draft_graph_review_limit", None) is not None and padded != num_reqs)
             or query_start_loc_np.shape != expected_query.shape
             or not np.array_equal(query_start_loc_np, expected_query)
             or self._draft_window_selected_metadata is None
             or self._draft_window_selected_metadata.descriptor != batch_desc
         ):
             raise RuntimeError("Draft Window requires its actual uniform FULL dispatch; no eager fallback")
-        from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import (
-            validate_full8_single_request_graph_stage,
-        )
-
-        validate_full8_single_request_graph_stage(self, actual=num_reqs, padded=padded, tokens=tokens)
         full_slots = self.block_tables.slot_mappings[:, :tokens]
         if slot_mappings is not None and (
             slot_mappings.shape != full_slots.shape

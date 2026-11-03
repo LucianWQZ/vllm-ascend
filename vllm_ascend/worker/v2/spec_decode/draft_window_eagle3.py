@@ -80,7 +80,7 @@ class Eagle3DraftWindowMixin:
         expected_steps = _eagle3_graph_scheduled_consumers(self.num_speculative_steps, num_speculative_tokens)
         graph_session = getattr(self, "_eagle3_graph_session", None)
         if graph_session is not None:
-            graph_session.require_reusable()
+            graph_session.provider.require_reusable()
         context = None
         if not dummy_run and not is_profile and not bool(getattr(input_batch, "is_dummy", False)):
             context = DraftWindowProposalContext.from_batch(input_batch)
@@ -239,10 +239,7 @@ class Eagle3DraftWindowMixin:
 
     def _quarantine_eagle3_window(self) -> None:
         """Keep actual banks alive after an uncertain partial submission."""
-        self._draft_window_graph_submission_uncertain = True
-        runtime = self._draft_window_graph_binding_provider
-        if runtime._active_inputs is not None and not runtime.quarantined:
-            runtime.quarantine_generation(runtime._active_inputs)
+        self._draft_window_graph_binding_provider.quarantine()
 
     def _require_eagle3_window_context(self) -> DraftWindowProposalContext:
         context = self._eagle3_window_proposal

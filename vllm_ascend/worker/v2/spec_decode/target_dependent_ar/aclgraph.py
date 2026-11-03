@@ -38,7 +38,6 @@ from vllm_ascend.worker.v2.aclgraph_utils import (
     collect_sorted_captured_token_sizes,
     model_capture_wrapper,
 )
-from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphRoute
 from vllm_ascend.worker.v2.utils import communicator_switch
 
 
@@ -329,23 +328,13 @@ class AutoRegressiveAclGraphManager(SpeculatorCudaGraphManager):
     def _run_eagle_window_fullgraph(self, desc, session):
         owner = self.speculator
         try:
-            session.require_reusable()
+            session.provider.require_reusable()
             if self.is_draft_model_prefill:
                 capture = session.resolve(first=True, n=desc.num_reqs, tokens=desc.num_tokens, ordinal=0)
                 session.stage(capture, 0)
-            route = (
-                DraftWindowGraphRoute.EAGLE3_FIRST_PASS
-                if self.is_draft_model_prefill
-                else DraftWindowGraphRoute.EAGLE3_AR_STEP
-            )
-            source = session.provider.consume_metadata(
-                route=route,
-                expected_consumer_count=1 if self.is_draft_model_prefill else owner.num_speculative_steps - 1,
-            )
-            ret = self._updatable_graph_replay(desc, (), window_source=source)
-            session.provider.finish_update(route=route)
+            ret = self._updatable_graph_replay(desc, (), window_source=session.provider)
+            session.provider.finish_update()
             return ret
         except BaseException:
             owner._quarantine_eagle3_window()
-            owner._draft_window_graph_submission_uncertain = True
             raise

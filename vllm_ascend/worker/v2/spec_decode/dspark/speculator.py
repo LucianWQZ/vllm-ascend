@@ -372,7 +372,6 @@ class AscendDSparkSpeculator(DraftWindowGraphInputMixin, LmheadTPDraftSamplingMi
                     torch.from_numpy(self.input_batch.is_prefilling_np),
                     parallel_config=self.attn_vllm_config.parallel_config,
                     common_metadata_callback=runtime.metadata_callback(step, num_reqs),
-                    metadata_builder_callback=runtime.metadata_builder_callback(step),
                 )
             with metadata_scope:
                 metadata = super()._build_attn_metadata(
@@ -419,7 +418,6 @@ class AscendDSparkSpeculator(DraftWindowGraphInputMixin, LmheadTPDraftSamplingMi
                 attn_state=AscendAttentionState.ChunkedPrefill,
                 parallel_config=self.attn_vllm_config.parallel_config,
                 common_metadata_callback=common_metadata_callback,
-                metadata_builder_callback=runtime.metadata_builder_callback(step) if runtime is not None else None,
             ),
         ):
             attn_metadata = super()._build_attn_metadata(

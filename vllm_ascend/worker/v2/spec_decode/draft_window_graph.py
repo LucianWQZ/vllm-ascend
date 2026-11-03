@@ -66,7 +66,6 @@ class DraftWindowGraphBindingProvider:
         self._quarantined = False
         self._carriers: dict[tuple[DraftWindowGraphRoute, int, int], tuple[DraftWindowGraphBucket, ...]] = {}
         self._pending: list[DraftWindowGraphBucket] = []
-        self._updating = False
 
     @property
     def source(self) -> DraftWindowGraphSource:
@@ -76,10 +75,8 @@ class DraftWindowGraphBindingProvider:
     def quarantined(self) -> bool:
         return self._quarantined
 
-    def quarantine_generation(self, inputs: DraftMetadataInputs) -> None:
-        """Retain possibly submitted backing; uncertain native work is not reusable."""
-        if self._active_inputs is not inputs:
-            raise RuntimeError("cannot quarantine retired Draft inputs")
+    def quarantine(self) -> None:
+        """Retain all banks after uncertain work, even without active inputs."""
         self._quarantined = True
 
     def materialize(
@@ -162,10 +159,9 @@ class DraftWindowGraphBindingProvider:
         capture_identity: DraftWindowGraphBucket,
     ) -> DraftWindowWorkspace:
         """Return the real persistent bank before any business generation."""
-        carrier = self._require_registered_capture(capture_identity)
-        if carrier in self._pending:
+        if capture_identity in self._pending:
             raise RuntimeError("startup capture carrier is already bound to a runtime generation")
-        return carrier.workspace
+        return capture_identity.workspace
 
     @property
     def method(self) -> str:
@@ -222,11 +218,10 @@ class DraftWindowGraphBindingProvider:
         The existing Graph tail-notify/current-stream dependency orders reuse.
         A successful Host UPDATE is not device completion.
         """
-        carrier = self._require_registered_capture(capture_identity)
         self.require_reusable()
-        if carrier in self._pending:
+        if capture_identity in self._pending:
             raise RuntimeError("cannot overwrite an active Draft Window graph read carrier")
-        return carrier.workspace
+        return capture_identity.workspace
 
     def require_reusable(self) -> None:
         """Keep every proposal on its established completion stream."""
@@ -247,7 +242,7 @@ class DraftWindowGraphBindingProvider:
         inputs: DraftMetadataInputs,
     ) -> DraftWindowGraphBucket:
         """Publish this generation against its selected persistent Graph bank."""
-        carrier = self._require_registered_capture(capture_identity)
+        carrier = capture_identity
         inputs.validate()
         if inputs.params is not None:
             raise RuntimeError("cannot overwrite active draft metadata")
@@ -263,7 +258,7 @@ class DraftWindowGraphBindingProvider:
         if inputs.workspace is not carrier.workspace:
             raise RuntimeError("Graph generation was not materialized into its exact capture bank")
         ordinal = capture_identity.consumer_ordinal
-        if self._updating or ordinal != len(self._pending):
+        if ordinal != len(self._pending):
             raise RuntimeError("Graph Window consumers must bind in their actual serial ordinal order")
         if self._pending:
             previous = self._pending[0]
@@ -287,27 +282,8 @@ class DraftWindowGraphBindingProvider:
         self._pending.append(carrier)
         return carrier
 
-    def consume_metadata(
-        self,
-        *,
-        route: DraftWindowGraphRoute,
-        expected_consumer_count: int,
-    ) -> DraftWindowGraphBindingProvider:
-        """Select the current banks as the fixed UpdatableGraph ParamSource."""
-        if (
-            expected_consumer_count <= 0
-            or len(self._pending) != expected_consumer_count
-            or self._pending[0].route is not route
-            or self._updating
-        ):
-            raise RuntimeError("Graph Window requires its complete unconsumed consumer batch")
-        self._updating = True
-        return self
-
     def get(self, _provider: Any) -> tuple[dict[str, Any], ...]:
         """Resolve one payload per actual layer consumer, in capture order."""
-        if not self._updating:
-            raise RuntimeError("Draft Window UPDATE has no submitted consumer batch")
         result = []
         for carrier in self._pending:
             assert carrier.inputs is not None and carrier.inputs.params is not None
@@ -340,25 +316,9 @@ class DraftWindowGraphBindingProvider:
                 ):
                     raise RuntimeError("Draft Window Graph requires its supported Draft FIA consumer")
 
-    def finish_update(self, *, route: DraftWindowGraphRoute) -> None:
-        """Mark successful Host UPDATE; stream/event order still owns reuse."""
-        if not self._updating or self._pending[0].route is not route:
-            raise RuntimeError("no current Draft Window Graph UPDATE for this route")
+    def finish_update(self) -> None:
+        """Drop staged Host bindings after UPDATE; actual streams still own reuse."""
         self._pending.clear()
-        self._updating = False
-
-    def _require_registered_capture(
-        self,
-        capture_identity: DraftWindowGraphBucket,
-    ) -> DraftWindowGraphBucket:
-        carrier = self.capture_identity_for(
-            route=capture_identity.route,
-            descriptor=capture_identity.descriptor,
-            consumer_ordinal=capture_identity.consumer_ordinal,
-        )
-        if carrier is not capture_identity:
-            raise RuntimeError("capture identity/bucket is not registered by this Draft provider")
-        return carrier
 
 
 def resolve_parallel_draft_window_graph_route(

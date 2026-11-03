@@ -100,6 +100,18 @@ def _bind(case, inputs):
     return case.provider.bind_read_carrier(capture_identity=case.capture, inputs=inputs)
 
 
+def _resolve_update(provider, count):
+    from vllm_ascend.attention.attention_v1 import FIAParamProvider
+    from vllm_ascend.compilation.updatable_graph import GraphUpdateTask, UpdatableGraph
+
+    task_provider = FIAParamProvider(provider.source.group.layers[0], None, is_draft_model=True)
+    graph = SimpleNamespace(
+        provider_sizes={task_provider: count},
+        tasks=[GraphUpdateTask(object(), {}, task_provider, index, object(), object()) for index in range(count)],
+    )
+    return UpdatableGraph.resolve_tasks(graph, provider)
+
+
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
 def test_parallel_exact_snapshot_is_an_independent_cpu_int32_allocation(dtype):
     from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowGraphInputMixin
@@ -175,6 +187,31 @@ def test_retirement_preserves_bank_until_next_generation_then_clears_tail(graph_
         first.validate()
 
 
+@pytest.mark.parametrize("stage", ["no_reader", "host_retired", "updated_then_retired"])
+def test_one_quarantine_retains_banks_and_rejects_reuse_without_active_inputs(graph_buffers, stage):
+    case = graph_buffers
+    bank = case.capture.workspace
+    if stage != "no_reader":
+        inputs = _materialize(case)
+        if stage == "updated_then_retired":
+            _bind(case, inputs)
+            _resolve_update(case.provider, 1)
+            case.provider.finish_update()
+        case.provider.retire_generation(inputs)
+    before = [(value.data_ptr(), value.clone()) for value in _bank_tensors(bank)]
+    assert case.provider._active_inputs is None
+    case.provider.quarantine()
+    assert case.provider.quarantined
+    for value, (pointer, saved) in zip(_bank_tensors(bank), before):
+        assert value.data_ptr() == pointer and torch.equal(value, saved)
+    with pytest.raises(RuntimeError, match="quarantined"):
+        case.provider.prepare_workspace(case.capture)
+    with pytest.raises(RuntimeError, match="quarantined"):
+        case.provider.finish_proposal()
+    with pytest.raises(RuntimeError, match="quarantined"):
+        _materialize(case)
+
+
 def test_active_generation_blocks_reuse_and_preserves_all_backing(graph_buffers):
     case = graph_buffers
     first = _materialize(case)
@@ -200,8 +237,6 @@ def test_old_input_handle_cannot_retire_or_publish_over_new_bank(graph_buffers):
             stale.validate()
         with pytest.raises(RuntimeError, match="retired"):
             case.provider.retire_generation(stale)
-        with pytest.raises(RuntimeError, match="retired"):
-            case.provider.quarantine_generation(stale)
     current.validate()
 
 
@@ -211,7 +246,9 @@ def test_provider_rejects_overwrite_before_bound_consumer_has_finished(graph_buf
     inputs = _materialize(case)
     _bind(case, inputs)
     if submitted:
-        case.provider.consume_metadata(route=DraftWindowGraphRoute.DFLASH, expected_consumer_count=1)
+        _resolve_update(case.provider, 1)
+    with pytest.raises(RuntimeError, match="already bound to a runtime generation"):
+        case.provider.startup_capture_workspace(case.capture)
     with pytest.raises(RuntimeError, match="active Draft Window graph read carrier"):
         case.provider.prepare_workspace(case.capture)
 
@@ -296,10 +333,10 @@ def test_eagle_serialized_steps_own_distinct_banks_and_preserve_previous_consume
         assert all(torch.equal(tensor, snapshot) for tensor, snapshot in zip(_bank_tensors(bank), snapshots))
         retained.append((bank, snapshots))
         if step == 0:
-            provider.consume_metadata(route=route, expected_consumer_count=1)
-            provider.finish_update(route=route)
-    provider.consume_metadata(route=DraftWindowGraphRoute.EAGLE3_AR_STEP, expected_consumer_count=2)
-    provider.finish_update(route=DraftWindowGraphRoute.EAGLE3_AR_STEP)
+            _resolve_update(provider, 1)
+            provider.finish_update()
+    _resolve_update(provider, 2)
+    provider.finish_update()
     assert len(retained) == 3
 
 
@@ -351,14 +388,25 @@ def test_unqualified_descriptor_variants_are_not_opened(graph_buffers, field, va
         )
 
 
-def test_capture_token_cannot_be_forged_or_cross_provider(graph_buffers):
+def test_actual_owner_selection_uses_its_registered_startup_bank_and_rejects_foreign_inputs(graph_buffers):
     case = graph_buffers
-    with pytest.raises(RuntimeError, match="not registered"):
-        case.provider.prepare_workspace(replace(case.capture))
+    selected = case.provider.capture_identity_for(route=case.capture.route, descriptor=case.capture.descriptor)
+    assert selected is case.capture
+    bank = case.provider.startup_capture_workspace(selected)
+    assert case.provider.prepare_workspace(selected) is bank is selected.workspace
+
     other = DraftWindowGraphBindingProvider(source=case.projection)
     foreign = other.register_capture_identity(route=case.capture.route, descriptor=case.capture.descriptor)
-    with pytest.raises(RuntimeError, match="not registered"):
-        case.provider.prepare_workspace(foreign)
+    assert other.capture_identity_for(route=foreign.route, descriptor=foreign.descriptor) is foreign
+    assert other.startup_capture_workspace(foreign) is foreign.workspace
+    for own, distinct in zip(_bank_tensors(bank), _bank_tensors(foreign.workspace)):
+        assert own.data_ptr() != distinct.data_ptr()
+    current = SimpleNamespace(**{**vars(case), "provider": other, "capture": foreign})
+    inputs = _materialize(current)
+    with pytest.raises(RuntimeError, match="do not belong to the provider"):
+        case.provider.bind_read_carrier(capture_identity=selected, inputs=inputs)
+    assert not case.provider._pending and selected.inputs is None
+    assert other._active_inputs is inputs and inputs.params is None
 
 
 @pytest.mark.parametrize("field", ["window_block_table", "device_window_exact", "cpu_window_exact"])
@@ -613,7 +661,7 @@ def typed_update_guard(graph_buffers):
 
     case = graph_buffers
     carrier = _bind(case, _materialize(case))
-    batch = case.provider.consume_metadata(route=case.capture.route, expected_consumer_count=1)
+    batch = case.provider
     provider = FIAParamProvider(layer_name="draft.layer", sliding_window=None, is_draft_model=True)
     task = GraphUpdateTask(torch_npu.npu_fused_infer_attention_score.out, {}, provider, 0, object(), object())
 
@@ -632,6 +680,8 @@ def test_original_task_resolver_binds_current_metadata_without_replacing_capture
     resolved = UpdatableGraph.resolve_tasks(c.graph, c.source)
     assert len(resolved) == 1
     actual = resolved[0]
+    assert set(c.carrier.inputs.params) == {"block_table", "actual_seq_lengths", "actual_seq_lengths_kv"}
+    assert c.carrier.inputs.params["actual_seq_lengths_kv"] == c.carrier.workspace.cpu_window_exact.tolist()
     assert actual.operation is c.task.operation
     assert actual.handle is c.task.handle and actual.event is c.task.event
     assert actual.provider is c.task.provider and actual.provider_index == 0
@@ -640,7 +690,7 @@ def test_original_task_resolver_binds_current_metadata_without_replacing_capture
     assert actual.kwargs["actual_seq_lengths"] is c.carrier.inputs.params["actual_seq_lengths"]
     with pytest.raises(RuntimeError, match="active Draft Window"):
         c.case.provider.prepare_workspace(c.case.capture)
-    c.case.provider.finish_update(route=c.case.capture.route)
+    c.case.provider.finish_update()
     assert c.case.provider.prepare_workspace(c.case.capture) is c.carrier.workspace
 
 
@@ -652,18 +702,22 @@ def test_capture_contract_rejects_an_unsupported_native_consumer(typed_update_gu
         c.case.provider.validate_captured_graphs({c.case.capture.descriptor: c.graph})
 
 
-@pytest.mark.parametrize("window", [False, True])
+@pytest.mark.parametrize("window,idle", [(False, False), (True, False), (True, True)])
 @pytest.mark.parametrize("update_fails", [False, True])
 def test_actual_parallel_manager_updates_after_replay_and_only_then_retires_banks(
-    graph_buffers, monkeypatch, window, update_fails
+    graph_buffers, monkeypatch, window, idle, update_fails
 ):
+    from contextlib import nullcontext
+
     from vllm_ascend.attention.attention_v1 import FIAParamProvider
     from vllm_ascend.compilation.updatable_graph import GraphUpdateTask, UpdatableGraph
     from vllm_ascend.worker.v2.spec_decode.dflash import aclgraph
+    from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowGraphInputMixin
 
     case = graph_buffers
-    inputs = _materialize(case) if window else None
-    owner = SimpleNamespace(
+    inputs = _materialize(case) if window and not idle else None
+    owner = object.__new__(DraftWindowGraphInputMixin)
+    owner.__dict__.update(
         attn_backends={"draft.layer": object()},
         input_batch=SimpleNamespace(seq_lens_cpu_upper_bound=torch.tensor([16, 16])),
         build_draft_attn_metadatas=Mock(
@@ -676,10 +730,16 @@ def test_actual_parallel_manager_updates_after_replay_and_only_then_retires_bank
             ]
         ),
     )
+    scope = nullcontext()
     if window:
         owner._draft_window_graph_binding_provider = case.provider
-        owner._draft_window_proposal = inputs.proposal
-        owner._draft_window_selected_metadata = case.capture
+        if idle:
+            owner._initialize_draft_window_graph_inputs()
+            owner.dp_size = 2
+            scope = owner._draft_window_proposal_scope(object(), dummy_run=True, is_profile=False)
+        else:
+            owner._draft_window_proposal = inputs.proposal
+            owner._draft_window_selected_metadata = case.capture
     provider = FIAParamProvider("draft.layer", None, is_draft_model=True)
     task = GraphUpdateTask(object(), {}, provider, 0, object(), object())
     events, resolved = [], []
@@ -715,25 +775,29 @@ def test_actual_parallel_manager_updates_after_replay_and_only_then_retires_bank
 
     monkeypatch.setattr(aclgraph.DFlashCudaGraphManager, "run_fullgraph", replay)
     if update_fails:
-        with pytest.raises(RuntimeError, match="native UPDATE failed"):
+        with pytest.raises(RuntimeError, match="native UPDATE failed"), scope:
             manager.run_fullgraph(case.capture.descriptor)
     else:
-        assert manager.run_fullgraph(case.capture.descriptor) is output
+        with scope:
+            assert manager.run_fullgraph(case.capture.descriptor) is output
     assert events == ["resolve", "wait", "replay", "update"]
     actual = resolved[0]
     assert actual.handle is task.handle and actual.event is task.event and actual.provider is provider
     assert actual.kwargs["actual_seq_lengths"] == [1, 2]
-    if window:
+    if window and not idle:
         owner.build_draft_attn_metadatas.assert_not_called()
         assert actual.kwargs["actual_seq_lengths_kv"] == [7, 6]
         assert actual.kwargs["block_table"] is case.capture.workspace.window_block_table
-        assert case.provider._updating is update_fails
         assert bool(case.provider._pending) is update_fails
         assert case.capture.inputs is inputs and inputs.params is not None
     else:
         owner.build_draft_attn_metadatas.assert_called_once()
         assert actual.kwargs["actual_seq_lengths_kv"] == [11, 14]
         assert actual.kwargs["block_table"] is case.source.table
+        if idle:
+            assert case.provider._active_inputs is None and not case.provider._pending
+            assert owner._draft_window_proposal is None and owner._draft_window_dp_dummy_active is False
+            assert case.provider.quarantined is update_fails
     assert case.source.table.tolist() == [[11, 12, 13, 14], [21, 22, 23, 24]]
     assert case.owner.slot_mappings.tolist() == [[40, 80]]
     assert case.target_metadata["target.layer"].seq_lens_list == [91, 92]
@@ -773,17 +837,6 @@ def test_parallel_capture_checks_tasks_after_the_original_manager_stores_its_gra
     assert not hasattr(c.case.input_buffers, capture._CAPTURE_CONTEXT_ATTRIBUTE)
 
 
-def test_publication_retains_only_fia_update_operands_and_capture_bank(graph_buffers):
-    case = graph_buffers
-    inputs = _materialize(case)
-    carrier = _bind(case, inputs)
-    assert set(inputs.params) == {"block_table", "actual_seq_lengths", "actual_seq_lengths_kv"}
-    assert inputs.params["block_table"] is carrier.workspace.window_block_table
-    assert inputs.params["actual_seq_lengths_kv"] == carrier.workspace.cpu_window_exact.tolist()
-    with pytest.raises(RuntimeError, match="no submitted consumer batch"):
-        case.provider.get(object())
-
-
 def test_eagle_first_bank_retains_full_table_capacity_for_a_mixed_prefill(graph_buffers):
     case = graph_buffers
     # The shared production factory already retains the canonical Full table
@@ -821,7 +874,68 @@ def test_eagle_first_bank_retains_full_table_capacity_for_a_mixed_prefill(graph_
     assert case.target_metadata["target.layer"].seq_lens_list == [91, 92]
 
 
-@pytest.mark.parametrize("failure", [None, "update", "republish", "prepare"])
+@pytest.mark.parametrize(
+    "dummy,profile,dp,captures,prefill,expected",
+    [
+        (True, False, 2, True, False, True),
+        (True, True, 2, True, False, False),
+        (True, False, 1, True, False, False),
+        (True, False, 2, False, False, False),
+        (False, False, 2, True, True, False),
+    ],
+)
+def test_parallel_idle_marker_is_owned_by_real_scope_not_prefill_or_profile(
+    graph_buffers, dummy, profile, dp, captures, prefill, expected
+):
+    from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowGraphInputMixin
+
+    case = graph_buffers
+    owner = object.__new__(DraftWindowGraphInputMixin)
+    owner._draft_window_graph_binding_provider = case.provider
+    owner._initialize_draft_window_graph_inputs()
+    owner.dp_size = dp
+    if not captures:
+        case.provider._carriers.clear()
+    batch = SimpleNamespace(
+        num_reqs=2,
+        num_computed_prefill_tokens_np=np.array([0, 0]),
+        prefill_len_np=np.array([100, 100]),
+        num_scheduled_tokens=np.array([1, 1]),
+        num_draft_tokens_per_req=None,
+        is_prefilling_np=np.array([True, True]),
+        has_prefill=True,
+    )
+    with owner._draft_window_proposal_scope(batch, dummy_run=dummy, is_profile=profile):
+        assert owner._draft_window_dp_dummy_active is expected
+        assert owner._draft_window_prefill_bypass_active is prefill
+        assert owner._draft_window_proposal is None and case.provider._active_inputs is None
+    assert owner._draft_window_dp_dummy_active is False
+    assert owner._draft_window_prefill_bypass_active is False
+    assert not case.provider.quarantined
+
+
+def test_parallel_idle_failure_quarantines_before_next_real_scope(graph_buffers):
+    from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowGraphInputMixin
+
+    owner = object.__new__(DraftWindowGraphInputMixin)
+    owner._draft_window_graph_binding_provider = graph_buffers.provider
+    owner._initialize_draft_window_graph_inputs()
+    owner.dp_size = 2
+    with (
+        pytest.raises(RuntimeError, match="idle UPDATE failed"),
+        owner._draft_window_proposal_scope(object(), dummy_run=True, is_profile=False),
+    ):
+        assert owner._draft_window_dp_dummy_active is True
+        raise RuntimeError("idle UPDATE failed")
+    assert graph_buffers.provider.quarantined and not owner._draft_window_dp_dummy_active
+    with (
+        pytest.raises(RuntimeError, match="quarantined"),
+        owner._draft_window_proposal_scope(object(), dummy_run=True, is_profile=False),
+    ):
+        pytest.fail("an uncertain idle Graph must not be submitted again")
+
+
+@pytest.mark.parametrize("failure", [None, "resolve", "update", "republish", "prepare"])
 def test_actual_proposal_scope_owns_fresh_inputs_and_preserves_failed_submission(graph_buffers, failure, monkeypatch):
     from contextlib import nullcontext
 
@@ -844,6 +958,7 @@ def test_actual_proposal_scope_owns_fresh_inputs_and_preserves_failed_submission
     )
     owner.input_batch = batch
     errors = {
+        "resolve": (AssertionError, None),
         "update": (RuntimeError, "native UPDATE failed"),
         "republish": (RuntimeError, "overwrite active draft metadata"),
         "prepare": (RuntimeError, "native Window copy failed"),
@@ -884,15 +999,15 @@ def test_actual_proposal_scope_owns_fresh_inputs_and_preserves_failed_submission
         _bind(case, inputs)
         if failure == "republish":
             _bind(case, inputs)
-        case.provider.consume_metadata(route=case.capture.route, expected_consumer_count=1)
+        _resolve_update(case.provider, 2 if failure == "resolve" else 1)
         if failure == "update":
             raise RuntimeError("native UPDATE failed")
-        case.provider.finish_update(route=case.capture.route)
+        case.provider.finish_update()
     assert owner._draft_window_proposal is None
     if failure:
         active = case.provider._active_inputs
         assert case.provider.quarantined and active is not None and active.workspace is case.capture.workspace
-        case.provider.quarantine_generation(active)
+        case.provider.quarantine()
         assert case.provider._active_inputs is active
         if failure == "prepare":
             assert caught.value is preparation_error
@@ -904,33 +1019,22 @@ def test_actual_proposal_scope_owns_fresh_inputs_and_preserves_failed_submission
             inputs.validate()
 
 
-@pytest.mark.parametrize("failure", ["missing", "wrong_route", "before_consume", "twice", "wrong_finish"])
-def test_incomplete_or_wrong_update_cannot_release_the_real_pending_bank(graph_buffers, failure):
-    case = graph_buffers
-    inputs = _materialize(case)
-    bucket = _bind(case, inputs)
-    route = case.capture.route
-    if failure in ("twice", "wrong_finish"):
-        case.provider.consume_metadata(route=route, expected_consumer_count=1)
-    with pytest.raises(RuntimeError):
-        if failure == "missing":
-            case.provider.consume_metadata(route=route, expected_consumer_count=2)
-        elif failure == "wrong_route":
-            case.provider.consume_metadata(route=DraftWindowGraphRoute.EAGLE3_AR_STEP, expected_consumer_count=1)
-        elif failure in ("before_consume", "wrong_finish"):
-            case.provider.finish_update(
-                route=route if failure == "before_consume" else DraftWindowGraphRoute.EAGLE3_AR_STEP
-            )
-        else:
-            case.provider.consume_metadata(route=route, expected_consumer_count=1)
+def test_original_resolver_rejects_incomplete_capture_consumers_and_retains_the_bank(typed_update_guard):
+    from vllm_ascend.compilation.updatable_graph import UpdatableGraph
+
+    c = typed_update_guard
+    # A captured merged AR needs two occurrences of this actual layer. One
+    # staged bank cannot satisfy it: use the fixed framework's size check.
+    c.graph.provider_sizes[c.task.provider] = 2
+    with pytest.raises(AssertionError):
+        UpdatableGraph.resolve_tasks(c.graph, c.case.provider)
+    assert c.case.provider._pending == [c.carrier]
+    assert c.carrier.inputs is not None and c.carrier.inputs.params is not None
     with pytest.raises(RuntimeError, match="active Draft Window"):
-        case.provider.prepare_workspace(case.capture)
-    if failure not in ("twice", "wrong_finish"):
-        case.provider.consume_metadata(route=route, expected_consumer_count=1)
-    case.provider.finish_update(route=route)
-    assert case.provider.prepare_workspace(case.capture) is bucket.workspace
-    # Host UPDATE release does not drop the real CPU metadata/bank owners.
-    assert bucket.inputs is inputs and bucket.inputs.params is not None
+        c.case.provider.prepare_workspace(c.case.capture)
+    c.case.provider.quarantine()
+    with pytest.raises(RuntimeError, match="quarantined"):
+        c.case.provider.prepare_workspace(c.case.capture)
 
 
 def test_pending_eagle_consumers_reject_a_different_proposal_without_releasing_old_bank(graph_buffers):
@@ -958,7 +1062,7 @@ def test_pending_eagle_consumers_reject_a_different_proposal_without_releasing_o
         else:
             with pytest.raises(RuntimeError, match="same actual proposal/route"):
                 _bind(current, inputs)
-            provider.quarantine_generation(inputs)
+            provider.quarantine()
     with pytest.raises(RuntimeError, match="quarantined"):
         provider.prepare_workspace(first)
 
@@ -972,7 +1076,7 @@ def test_captured_consumer_cannot_skip_the_actual_serial_ordinal(graph_buffers):
     inputs = _materialize(current)
     with pytest.raises(RuntimeError, match="serial ordinal order"):
         _bind(current, inputs)
-    case.provider.quarantine_generation(inputs)
+    case.provider.quarantine()
     with pytest.raises(RuntimeError, match="quarantined"):
         case.provider.prepare_workspace(skipped)
 

@@ -10,7 +10,7 @@ from contextlib import contextmanager
 
 
 def _validate_eagle_dp_dummy(owner, session):
-    session.require_reusable()
+    session.provider.require_reusable()
     provider = getattr(owner, "_draft_window_graph_binding_provider", None)
     if (
         owner.input_batch.is_dummy is not True
