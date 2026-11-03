@@ -409,21 +409,18 @@ class AscendTargetDependentARSpeculator(LmheadTPDraftSamplingMixin, TargetDepend
 
             # Use the first executable draft attention layer as the architecture
             # discriminator and cache it for ACL graph parameter updates.
-            backend = _get_graph_update_backend(self.attn_groups)
-            if backend is None:
-                raise ValueError("Draft attention groups have no executable backend")
-            self.attn_backend = backend
+            self.attn_backend = _get_graph_update_backend(self.attn_groups)
         from vllm_ascend.models.qwen4_exp.qsa import AscendQSABackend
 
-        if issubclass(backend, AscendDSABackend):
+        if issubclass(self.attn_backend, AscendDSABackend):
             self.attn_architecture = "DSA"
-        elif issubclass(backend, AscendMLABackend):
+        elif issubclass(self.attn_backend, AscendMLABackend):
             self.attn_architecture = "MLA"
-        elif issubclass(backend, (AscendSFABackend, AscendSFAIndexerBackend)):
+        elif issubclass(self.attn_backend, (AscendSFABackend, AscendSFAIndexerBackend)):
             self.attn_architecture = "SFA"
-        elif issubclass(backend, AscendQSABackend):
+        elif issubclass(self.attn_backend, AscendQSABackend):
             self.attn_architecture = "QSA"
-        elif issubclass(backend, AscendAttentionBackend):
+        elif issubclass(self.attn_backend, AscendAttentionBackend):
             self.attn_architecture = "GQA"
         else:
             raise ValueError(f"Unsupported attention backend: {self.attn_backend}")
