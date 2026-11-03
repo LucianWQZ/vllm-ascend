@@ -81,11 +81,9 @@ class DenseDraftReadBatch:
     apply = _apply_read_metadata
 
 
-def _copy_owned_read_tensor(
-    source: torch.Tensor, retain: Callable[..., None], *, device: torch.device | None = None
-) -> torch.Tensor:
+def _copy_owned_read_tensor(source: torch.Tensor, retain: Callable[..., None], *, device: torch.device) -> torch.Tensor:
     """Own both operands before a copy can partially submit and raise."""
-    destination = torch.empty_like(source, device=source.device if device is None else device)
+    destination = torch.empty_like(source, device=device)
     retain(source, destination)
     destination.copy_(source, non_blocking=True)
     return destination
@@ -244,22 +242,38 @@ def gather_dense_draft_kv(
         layouts.append((cache, blocks, block_size, heads, dim, token_size, stride_rows))
     if key_cache.device.type == "npu":
         import torch_npu
+        from vllm.triton_utils import triton
 
-        from vllm_ascend.ops.triton.v2.spec_decode.draft_window import gather_draft_kv_fp32
+        from vllm_ascend.ops.triton.v2.spec_decode.draft_window import GATHER_TOKEN_BLOCK_SIZE, _gather_draft_kv_fp32
 
         # Raw Triton addresses require an ND physical layout. Other formats
         # retain the existing format-aware PyTorch gather/conversion path.
         if all(torch_npu.get_npu_format(cache) in (0, 2) for cache in (key_cache, value_cache)):
             workspace_key = key_cache.shape[2:]
-            keys, values = gather_draft_kv_fp32(
+            if not read.slots.is_contiguous():
+                raise ValueError("Fused Draft gather requires contiguous private slots")
+            buffers = read._attention_workspaces.get(workspace_key)
+            if buffers is None:
+                keys = torch.empty(shape, dtype=torch.float32, device=key_cache.device)
+                buffers = keys, torch.empty_like(keys)
+                read._attention_workspaces[workspace_key] = buffers
+            keys, values = buffers
+            read.retain(read.slots, key_cache, value_cache, keys, values)
+            token_size = key_cache.shape[2] * key_cache.shape[3]
+            _gather_draft_kv_fp32[(triton.cdiv(read.slots.numel(), GATHER_TOKEN_BLOCK_SIZE),)](
                 read.slots,
                 key_cache,
                 value_cache,
-                retain=read.retain,
-                output_buffers=read._attention_workspaces.get(workspace_key),
+                keys,
+                values,
+                key_cache.stride(0),
+                value_cache.stride(0),
+                key_cache.shape[1],
+                token_size,
+                -read.slots.numel() % GATHER_TOKEN_BLOCK_SIZE,
+                GATHER_TOKEN_BLOCK_SIZE,
+                triton.next_power_of_2(token_size),
             )
-            read._attention_workspaces[workspace_key] = (keys, values)
-            read.retain(keys, values)
             return keys, values
     slots = read.slots.reshape(-1)
     indices_by_stride = {}
@@ -313,7 +327,7 @@ def dense_draft_attention(
     query = query[: read.num_query_tokens]
     query = query.reshape(read.num_reqs, read.query_width, *query.shape[-2:])
     queries_fp32 = query.float().contiguous()
-    read.retain(queries_fp32, keys_fp32, values_fp32)
+    read.retain(queries_fp32)
     outputs = torch_npu.npu_fusion_attention(
         queries_fp32,
         keys_fp32,

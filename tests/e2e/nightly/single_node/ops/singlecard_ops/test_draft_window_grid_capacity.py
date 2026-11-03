@@ -11,22 +11,25 @@ from vllm.triton_utils import triton  # noqa: E402
 
 from vllm_ascend.ops.triton.v2.spec_decode.draft_window import (  # noqa: E402
     _gather_draft_kv_fp32,
-    gather_draft_kv_fp32,
 )
+from vllm_ascend.worker.v2.spec_decode.draft_window_dense import DenseDraftRead, gather_dense_draft_kv  # noqa: E402
 
 pytestmark = pytest.mark.skipif(not torch.npu.is_available(), reason="requires an Ascend NPU")
 
 
 @pytest.mark.parametrize("tokens", [1, 7, 8, 9, 1151, 1152])
 def test_gather_grid_extent_preserves_arbitrary_tail(tokens):
-    source = torch.arange(12 * 128 * 2 * 32, dtype=torch.float32).reshape(12, 128, 2, 32)
+    source = torch.arange(12 * 128 * 2 * 32, dtype=torch.float32).to(torch.bfloat16).reshape(12, 128, 2, 32)
     keys, values = source.to("npu"), (-source).to("npu")
     slots_cpu = torch.arange(tokens - 1, -1, -1, dtype=torch.int64)[None]
     slots = slots_cpu.to("npu")
     retained = []
-    actual_keys, actual_values = gather_draft_kv_fp32(slots, keys, values, retain=lambda *items: retained.extend(items))
+    read = DenseDraftRead(
+        slots, torch.tensor([tokens]), torch.empty(0), tokens, 1, lambda *items: retained.extend(items)
+    )
+    actual_keys, actual_values = gather_dense_draft_kv(read, keys, values)
     torch.npu.synchronize()
-    expected = source.flatten(0, 1)[slots_cpu]
+    expected = source.flatten(0, 1)[slots_cpu].float()
     torch.testing.assert_close(actual_keys.cpu(), expected, atol=0, rtol=0)
     torch.testing.assert_close(actual_values.cpu(), -expected, atol=0, rtol=0)
 
@@ -55,7 +58,10 @@ def test_aligned_capacity_changes_reuse_gather_binary():
     try:
         for capacity in (17216, 17248, 17280):
             slots = torch.arange(capacity, device="npu", dtype=torch.int64)[None]
-            output = gather_draft_kv_fp32(slots, keys, values, retain=lambda *items: retained.extend(items))
+            read = DenseDraftRead(
+                slots, torch.tensor([capacity]), torch.empty(0), capacity, 1, lambda *items: retained.extend(items)
+            )
+            output = gather_dense_draft_kv(read, keys, values)
             torch.npu.synchronize()
             torch.testing.assert_close(output[1].cpu(), torch.ones_like(output[1].cpu()), atol=0, rtol=0)
         assert len(hashes) == 1, "Full capacity still creates separate gather binaries"

@@ -26,6 +26,7 @@ pytestmark = pytest.mark.skipif(
 @pytest.mark.parametrize("operation", ["gather"])
 def test_private_kernel_outputs_survive_exception_after_real_enqueue(monkeypatch, operation):
     from vllm_ascend.ops.triton.v2.spec_decode import draft_window
+    from vllm_ascend.worker.v2.spec_decode.draft_window_dense import DenseDraftRead, gather_dense_draft_kv
 
     pool = DraftWindowOwnerPool(1)
     stream = torch.npu.Stream()
@@ -63,12 +64,14 @@ def test_private_kernel_outputs_survive_exception_after_real_enqueue(monkeypatch
     ):
         retain = lambda *objects: pool.retain(owner, *objects)
         if operation == "gather":
-            draft_window.gather_draft_kv_fp32(
-                torch.tensor([[1, 2, 3]], dtype=torch.int64, device="npu"),
+            slots = torch.tensor([[1, 2, 3]], dtype=torch.int64, device="npu")
+            read = DenseDraftRead(slots, torch.tensor([3]), torch.empty(0), 3, 1, retain)
+            gather_dense_draft_kv(
+                read,
                 torch.arange(64, dtype=torch.bfloat16, device="npu").reshape(2, 4, 1, 8),
                 torch.ones((2, 4, 1, 8), dtype=torch.bfloat16, device="npu"),
-                retain=retain,
             )
+
     assert diagnostic_events and held_outputs
     assert pool.poisoned
     assert all(any(value is output for value in owner.retained) for output in held_outputs)

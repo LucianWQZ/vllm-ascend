@@ -1,10 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
-"""Plan private eager Draft reads from current device lengths."""
+"""Fused ND KV gather and FP32 conversion for ordinary Draft attention."""
 
-from collections.abc import Callable
-
-import torch
 from vllm.triton_utils import tl, triton
 
 GATHER_TOKEN_BLOCK_SIZE = 8
@@ -42,46 +39,3 @@ def _gather_draft_kv_fp32(
     value_offset = (page * VALUE_PAGE_STRIDE + offset * TOKEN_SIZE)[:, None] + channel[None, :]
     value = tl.load(values + value_offset, mask=valid, other=0)
     tl.store(out_values + output_offset, value.to(tl.float32), mask=valid)
-
-
-def gather_draft_kv_fp32(
-    slots: torch.Tensor,
-    keys: torch.Tensor,
-    values: torch.Tensor,
-    *,
-    retain: Callable[..., None],
-    output_buffers: tuple[torch.Tensor, torch.Tensor] | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Gather validated ND token rows directly into private native FP32 operands.
-
-    Tensor pointers preserve their own storage offsets; K/V page strides can
-    differ. The caller validates contiguous token rows and owns both outputs
-    until reader completion. Slots already exclude every uninitialized tail.
-    """
-    if not slots.is_contiguous():
-        raise ValueError("Fused Draft gather requires contiguous private slots")
-    shape = (*slots.shape, *keys.shape[2:])
-    if output_buffers is None:
-        gathered_keys = torch.empty(shape, dtype=torch.float32, device=keys.device)
-        gathered_values = torch.empty_like(gathered_keys)
-    else:
-        # The sole caller owns this private pair by immutable read geometry.
-        # It was allocated above and stays strongly held through completion.
-        gathered_keys, gathered_values = output_buffers
-    retain(slots, keys, values, gathered_keys, gathered_values)
-    token_size = keys.shape[2] * keys.shape[3]
-    _gather_draft_kv_fp32[(triton.cdiv(slots.numel(), GATHER_TOKEN_BLOCK_SIZE),)](
-        slots,
-        keys,
-        values,
-        gathered_keys,
-        gathered_values,
-        keys.stride(0),
-        values.stride(0),
-        keys.shape[1],
-        token_size,
-        -slots.numel() % GATHER_TOKEN_BLOCK_SIZE,
-        GATHER_TOKEN_BLOCK_SIZE,
-        triton.next_power_of_2(token_size),
-    )
-    return gathered_keys, gathered_values

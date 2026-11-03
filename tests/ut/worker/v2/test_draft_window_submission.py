@@ -39,15 +39,33 @@ def operators(monkeypatch):
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    monkeypatch.setitem(sys.modules, "vllm_ascend.ops.triton.v2.spec_decode.draft_window", module)
+    monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace(get_npu_format=lambda cache: 0))
     return module
 
 
-def invoke(operators, operation, retain):
-    if operation == "gather":
-        return operators.gather_draft_kv_fp32(
-            torch.tensor([[1, 2, 3]]), torch.empty(2, 4, 1, 8), torch.empty(2, 4, 1, 8), retain=retain
-        )
-    raise AssertionError(f"Unknown read operation: {operation}")
+def invoke(operators, operation, retain, monkeypatch):
+    from vllm_ascend.worker.v2.spec_decode.draft_window_dense import DenseDraftRead, gather_dense_draft_kv
+
+    if operation != "gather":
+        raise AssertionError(f"Unknown read operation: {operation}")
+    device = SimpleNamespace(type="npu")
+
+    class DeviceTensor:
+        def __init__(self, tensor):
+            self.tensor = tensor
+            self.device = device
+
+        def __getattr__(self, name):
+            return getattr(self.tensor, name)
+
+    native_empty = torch.empty
+    slots = DeviceTensor(torch.tensor([[1, 2, 3]]))
+    key = DeviceTensor(native_empty(2, 4, 1, 8, dtype=torch.bfloat16))
+    value = DeviceTensor(native_empty(2, 4, 1, 8, dtype=torch.bfloat16))
+    monkeypatch.setattr(torch, "empty", lambda *args, device=None, **kwargs: native_empty(*args, **kwargs))
+    read = DenseDraftRead(slots, torch.tensor([3]), torch.zeros(1, 1, 1, 3, dtype=torch.bool), 3, 1, retain)
+    return gather_dense_draft_kv(read, key, value)
 
 
 @pytest.mark.parametrize("operation,outputs", [("gather", 2)])
@@ -69,7 +87,7 @@ def test_outputs_are_retained_before_dispatch_can_raise(monkeypatch, operators, 
     kernel = {"gather": "_gather_draft_kv_fp32"}
     monkeypatch.setattr(operators, kernel[operation], PartialDispatch())
     with pytest.raises(DispatchFailure):
-        invoke(operators, operation, lambda *values: held.extend(values))
+        invoke(operators, operation, lambda *values: held.extend(values), monkeypatch)
     assert len([value for value in held if isinstance(value, torch.Tensor)]) >= outputs
 
 
@@ -88,5 +106,5 @@ def test_retention_failure_prevents_dispatch(monkeypatch, operators, operation):
     kernel = {"gather": "_gather_draft_kv_fp32"}
     monkeypatch.setattr(operators, kernel[operation], Dispatch())
     with pytest.raises(RetentionFailure):
-        invoke(operators, operation, retain)
+        invoke(operators, operation, retain, monkeypatch)
     assert calls == []
