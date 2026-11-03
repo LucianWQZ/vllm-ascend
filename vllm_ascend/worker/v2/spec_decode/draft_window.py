@@ -26,14 +26,11 @@ def create_draft_window_graph_provider(owner: Any) -> "DraftWindowGraphBindingPr
     artificial eager capability decision.
     """
     policy = owner._draft_window_policy
-    vllm_config, block_tables = owner.vllm_config, owner.block_tables
+    block_tables = owner.block_tables
     if getattr(block_tables, "cp_size", 1) != 1:
         raise RuntimeError("Draft Window Graph requires unsharded Draft tables")
-    if not policy.enabled:
+    if policy is None:
         raise ValueError("Graph source requires an eligible Window policy")
-    method = owner.speculative_config.method
-    if method not in {"eagle3", "dflash", "dspark"} or method != policy.normalized_method:
-        raise ValueError("Graph source route differs from the actual method policy")
     dflash2 = getattr(owner, "_speculator_name", None) == "DFlash2"
     groups = inventory_draft_window_groups(owner)
     if len(groups) != 1:
@@ -45,8 +42,6 @@ def create_draft_window_graph_provider(owner: Any) -> "DraftWindowGraphBindingPr
         from vllm_ascend.worker.v2.spec_decode.draft_window_dflash2_graph import validate_dflash2_graph_source
 
         validate_dflash2_graph_source(owner, group)
-    if vllm_config.speculative_config.uses_dynamic_speculative_decoding():
-        raise NotImplementedError("Draft Window Graph source requires static speculative decoding")
     from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphBindingProvider
 
     return DraftWindowGraphBindingProvider(policy=policy, group=group, block_tables=block_tables)

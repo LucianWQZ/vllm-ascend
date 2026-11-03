@@ -24,7 +24,6 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_plan import (
     compute_draft_window_start,
     window_capacity_tokens,
 )
-from vllm_ascend.worker.v2.spec_decode.draft_window_policy import DraftWindowPolicyDecision
 
 
 @dataclass(slots=True, eq=False)
@@ -50,9 +49,9 @@ class DraftWindowGraphBindingProvider:
     counts remain canonical even while the UVA count transport rotates.
     """
 
-    def __init__(self, *, policy: DraftWindowPolicyDecision, group: DraftWindowGroupRoute, block_tables: Any) -> None:
-        assert policy.effective_window_size is not None
-        self.window_size = policy.effective_window_size
+    def __init__(self, *, policy: int | None, group: DraftWindowGroupRoute, block_tables: Any) -> None:
+        assert policy is not None
+        self.window_size = policy
         self.group, self.block_tables = group, block_tables
         if self.table.shape[1] * group.table_column_span < window_capacity_tokens(
             self.window_size, group.table_column_span

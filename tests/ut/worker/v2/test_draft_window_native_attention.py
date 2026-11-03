@@ -176,7 +176,7 @@ class NativeAttentionTests(unittest.TestCase):
         report(owner, log)
         self.assertEqual(log.info[0][0][1], "UNKNOWN")
         for window, eager in ((1024, True), (None, False)):
-            owner.draft_window_policy = SimpleNamespace(effective_window_size=window)
+            owner.draft_window_policy = window
             owner.speculative_config.enforce_eager = eager
             with self.assertRaises(NotImplementedError):
                 report(owner, log)
@@ -195,7 +195,7 @@ class NativeAttentionTests(unittest.TestCase):
         ):
             owner = loaded(config(kinds=["sliding_attention"] * 2), windows)
             owner.speculative_config = SimpleNamespace(enforce_eager=True)
-            owner.draft_window_policy = SimpleNamespace(effective_window_size=window)
+            owner.draft_window_policy = window
             log = Log()
             for _ in range(2):
                 report(owner, log)

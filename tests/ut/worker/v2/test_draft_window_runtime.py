@@ -89,7 +89,7 @@ def test_effective_draft_eager_preserves_target_graph(setup, method, inherited_e
     # and the explicit Draft eager flag additionally forces NONE. False does
     # not enable graphs when the Target supplied NONE.
     if inherited_eager or draft_override:
-        assert DraftWindowRuntime(spec, policy).method == method
+        assert DraftWindowRuntime(spec, policy).speculator.method == method
     else:
         with pytest.raises(ValueError, match="eager Draft"):
             DraftWindowRuntime(spec, policy)
@@ -106,7 +106,7 @@ def test_eagle_window_checks_current_decode_metadata_update_capability(setup, cu
         with pytest.raises(NotImplementedError, match="per-step metadata"):
             DraftWindowRuntime(spec, policy)
     else:
-        assert DraftWindowRuntime(spec, policy).method == "eagle3"
+        assert DraftWindowRuntime(spec, policy).speculator.method == "eagle3"
 
 
 def batch(*, rows=(1, 3), computed=(8, 24), prompt=(16, 16), scheduled=(7, 3), drafts=(3, 2)):
@@ -240,7 +240,7 @@ def test_unprojected_native_group_metadata_is_untouched_while_full_group_windows
 
 def test_eagle_first_pass_snapshots_current_native_and_live_end_once(setup, monkeypatch):
     runtime, spec, _, _ = setup
-    runtime.method, runtime.static_k, runtime.window_size = "eagle3", 3, 1035
+    runtime.speculator.method, runtime.speculator.num_speculative_steps, runtime.window_size = "eagle3", 3, 1035
     runtime.anchor_block_span = 128
     runtime._dense_reads = True
     spec.block_tables.kernel_block_sizes = [128]
@@ -275,7 +275,7 @@ def test_eagle_first_pass_snapshots_current_native_and_live_end_once(setup, monk
 
 def test_eagle_allocation_upper_cannot_move_the_frozen_first_pass_anchor(setup, monkeypatch):
     runtime, spec, _, _ = setup
-    runtime.method, runtime.static_k, runtime.window_size = "eagle3", 3, 1035
+    runtime.speculator.method, runtime.speculator.num_speculative_steps, runtime.window_size = "eagle3", 3, 1035
     runtime.anchor_block_span = 128
     runtime._dense_reads = True
     spec.block_tables.kernel_block_sizes = [128]
@@ -476,7 +476,7 @@ def test_eagle_scheduled_prefill_and_steps_keep_static_window_geometry(setup, re
             outputs.append(metadata)
         owner = runtime._owner
     assert owner is not None and owner.completion is not None
-    assert runtime.static_k == 3
+    assert runtime.speculator.num_speculative_steps == 3
     assert len(completions) == 1 and runtime._build_count == consumed
     # The configured three-step horizon still freezes S=20. A scheduled
     # zero/short proposal must not silently change the window formula.
@@ -638,7 +638,7 @@ def test_eagle_continuing_prefill_later_ar_preserves_full_read(setup, all_contin
 @pytest.mark.parametrize("drafts", [None, (0, 0)])
 def test_eagle_full_continuing_keeps_full_addressing_without_window_snapshot(setup, monkeypatch, groups, drafts):
     runtime, spec, canonical, completions = setup
-    runtime.method, runtime.static_k, runtime._dense_reads = "eagle3", 3, True
+    runtime.speculator.method, runtime.speculator.num_speculative_steps, runtime._dense_reads = "eagle3", 3, True
     runtime.gids = groups
     state = batch(computed=(8, 24), prompt=(100, 100), scheduled=(4, 3), drafts=drafts)
     spec.max_model_len, spec.advance_draft_positions = 4096, True
@@ -693,7 +693,7 @@ def test_first_group_metadata_must_cover_the_actual_active_requests(setup):
 
 def test_eagle_full_continuing_with_placeholders_keeps_exact_read(setup):
     runtime, spec, _, _ = setup
-    runtime.method, runtime.static_k, runtime._dense_reads = "eagle3", 3, True
+    runtime.speculator.method, runtime.speculator.num_speculative_steps, runtime._dense_reads = "eagle3", 3, True
     spec.max_model_len, spec.advance_draft_positions = 4096, True
     state = batch(computed=(8, 24), prompt=(100, 100))
     with runtime.proposal_context(state):
@@ -706,7 +706,7 @@ def test_eagle_full_continuing_with_placeholders_keeps_exact_read(setup):
 
 def test_eagle_full_continuing_prompt_snapshot_clamps_at_model_limit(setup):
     runtime, spec, _, _ = setup
-    runtime.method, runtime.static_k, runtime._dense_reads = "eagle3", 3, True
+    runtime.speculator.method, runtime.speculator.num_speculative_steps, runtime._dense_reads = "eagle3", 3, True
     spec.max_model_len, spec.advance_draft_positions = 32, True
     state = batch(computed=(8, 24), prompt=(32, 32), scheduled=(4, 7), drafts=None)
     spec.input_buffers.positions = torch.tensor([11, 30])
@@ -720,7 +720,7 @@ def test_eagle_full_continuing_prompt_snapshot_clamps_at_model_limit(setup):
 
 def test_eagle_full_continuing_uses_prepared_exact_not_old_progress_estimate(setup):
     runtime, spec, _, _ = setup
-    runtime.method, runtime.static_k, runtime._dense_reads = "eagle3", 3, True
+    runtime.speculator.method, runtime.speculator.num_speculative_steps, runtime._dense_reads = "eagle3", 3, True
     spec.max_model_len, spec.advance_draft_positions = 4096, True
     state = batch(computed=(8, 24), prompt=(100, 100), scheduled=(4, 3), drafts=None)
     with runtime.proposal_context(state, num_speculative_tokens=2):
@@ -910,8 +910,8 @@ def test_actual_dense_builder_preserves_sp_padding_after_window_projection(setup
 
 def test_eagle_has_no_parallel_num_query_per_req_attribute(setup):
     runtime, spec, _, _ = setup
-    runtime.method = "eagle3"
-    runtime.static_k = 1
+    runtime.speculator.method = "eagle3"
+    runtime.speculator.num_speculative_steps = 1
     del spec.num_query_per_req
     state = batch(computed=(24, 24))
     with runtime.proposal_context(state):
@@ -1013,7 +1013,7 @@ def test_eagle_prompt_only_terminal_rows_snapshot_each_actual_preparation(
     setup, monkeypatch, drafts, all_terminal, max_len
 ):
     runtime, spec, _, _ = setup
-    runtime.method, runtime.static_k, runtime._dense_reads = "eagle3", 3, True
+    runtime.speculator.method, runtime.speculator.num_speculative_steps, runtime._dense_reads = "eagle3", 3, True
     runtime.window_size, runtime.anchor_block_span = 1035, 128
     spec.max_model_len, spec.advance_draft_positions = max_len, True
     table = torch.arange(6 * 32, dtype=torch.int32).reshape(6, 32)
@@ -1063,7 +1063,7 @@ def test_eagle_prompt_only_terminal_rows_snapshot_each_actual_preparation(
 
 def test_full_prompt_snapshot_is_cpu_owned_and_new_proposals_rebuild_it(setup):
     runtime, spec, _, _ = setup
-    runtime.method, runtime.static_k, runtime._dense_reads = "eagle3", 3, True
+    runtime.speculator.method, runtime.speculator.num_speculative_steps, runtime._dense_reads = "eagle3", 3, True
     spec.max_model_len, spec.advance_draft_positions = 100, True
     state = batch(computed=(8, 24), prompt=(100, 100), scheduled=(4, 3), drafts=None)
     results = []
@@ -1080,7 +1080,7 @@ def test_full_prompt_snapshot_is_cpu_owned_and_new_proposals_rebuild_it(setup):
 
 def test_eagle_mixed_decode_prompt_uses_one_exact_snapshot_per_preparation(setup, monkeypatch):
     runtime, spec, _, _ = setup
-    runtime.method, runtime.static_k, runtime._dense_reads = "eagle3", 3, True
+    runtime.speculator.method, runtime.speculator.num_speculative_steps, runtime._dense_reads = "eagle3", 3, True
     runtime.window_size, runtime.anchor_block_span = 1035, 128
     spec.max_model_len, spec.advance_draft_positions = 4096, True
     table = torch.arange(6 * 32, dtype=torch.int32).reshape(6, 32)
@@ -1124,7 +1124,7 @@ def test_eagle_mixed_decode_prompt_uses_one_exact_snapshot_per_preparation(setup
 @pytest.mark.parametrize("method", ["dflash", "dspark"])
 def test_parallel_continuing_prefill_snapshots_actual_exact_without_full_gather(setup, monkeypatch, method):
     runtime, spec, _, _ = setup
-    runtime.method, runtime._dense_reads = method, True
+    runtime.speculator.method, runtime._dense_reads = method, True
     runtime.window_size, runtime.anchor_block_span = 1024, 128
     spec.max_model_len, spec.num_query_per_req = 4096, 8
     table = torch.arange(6 * 32, dtype=torch.int32).reshape(6, 32)
@@ -1207,7 +1207,7 @@ def test_mla_final_metadata_is_owned_without_rotary_copies(setup):
 
 def test_eagle_next_preparation_rejects_incorrect_active_extent(setup):
     runtime, spec, _, _ = setup
-    runtime.method, runtime.static_k = "eagle3", 3
+    runtime.speculator.method, runtime.speculator.num_speculative_steps = "eagle3", 3
     state = batch()
     with pytest.raises(RuntimeError, match="request mapping"), runtime.proposal_context(state):
         runtime.metadata_callback(0, 2)(0, common())
@@ -1282,7 +1282,7 @@ def test_compact_rows_and_persistent_allocation_counts_use_the_same_request_orde
 @pytest.mark.parametrize("next_end", [19, 31])
 def test_eagle_ar_cannot_escape_its_actual_frozen_interval(setup, next_end):
     runtime, _, _, _ = setup
-    runtime.method, runtime.static_k = "eagle3", 3
+    runtime.speculator.method, runtime.speculator.num_speculative_steps = "eagle3", 3
     with pytest.raises(ValueError, match="frozen window or proposal horizon"), runtime.proposal_context(batch()):
         runtime.metadata_callback(0, 2)(0, common())
         runtime.metadata_callback(1, 2)(0, common(exact=(12, next_end), upper=(14, 32)))

@@ -17,9 +17,7 @@ def test_config_off_precedes_all_capability_checks(method):
         dynamic_k=True,
         is_dflash2=True,
     )
-    assert result.reason is None
-    assert not result.enabled
-    assert result.effective_window_size is None
+    assert result is None
 
 
 @pytest.mark.parametrize("requested", [0, -1, False, "not a number"])
@@ -32,9 +30,7 @@ def test_forced_off_precedes_invalid_number_and_capability(requested, method, co
         dynamic_k=True,
         is_dflash2=True,
     )
-    assert result.reason == ("mtp" if method.strip().lower() == "mtp" else "builtin_v4_dspark")
-    assert not result.enabled
-    assert result.effective_window_size is None
+    assert result is None
 
 
 @pytest.mark.parametrize("model_type", ["deepseek_v4", "deepseek_v41", "deepseek_v4_external_draft"])
@@ -47,21 +43,18 @@ def test_v4_name_does_not_prove_cotraining(model_type):
         target_model_type=model_type,
         builtin_v4_dspark=False,
     )
-    assert independent.enabled
+    assert independent == 1024
 
 
 @pytest.mark.parametrize("method", [" Eagle3 ", "dflash", "dspark"])
 def test_static_supported_methods(method):
     result = resolve_draft_window_policy(requested_window_size=1024, method=method)
-    assert result.enabled
-    assert result.normalized_method == method.strip().lower()
-    assert result.effective_window_size == 1024
+    assert result == 1024
 
 
 def test_dflash2_uses_the_dflash_policy_without_a_new_method():
     result = resolve_draft_window_policy(requested_window_size=1024, method="dflash", is_dflash2=True)
-    assert result.enabled
-    assert result.normalized_method == "dflash"
+    assert result == 1024
     with pytest.raises(NotImplementedError, match="static"):
         resolve_draft_window_policy(requested_window_size=1024, method="dflash", is_dflash2=True, dynamic_k=True)
 

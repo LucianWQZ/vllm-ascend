@@ -101,7 +101,7 @@ def validate_dflash2_graph_source(owner: Any, group: Any = None) -> None:
         # Inventory owns layer coverage and column geometry. Actual native P
         # above remains an attention fact, separate from Full KV retention.
         if group.native_window is not None:
-            window = owner._draft_window_policy.effective_window_size
+            window = owner._draft_window_policy
             _require(
                 window + group.table_column_span - 1 + owner.num_query_per_req <= group.native_window,
                 "Window + block - 1 + query width exceeds the original noncausal native band",

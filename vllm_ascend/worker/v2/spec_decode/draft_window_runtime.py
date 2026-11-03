@@ -22,7 +22,6 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_lifetime import (
 from vllm_ascend.worker.v2.spec_decode.draft_window_plan import (
     compute_draft_window_start,
 )
-from vllm_ascend.worker.v2.spec_decode.draft_window_policy import DraftWindowPolicyDecision
 from vllm_ascend.worker.v2.spec_decode.draft_window_read import (
     materialize_draft_read,
 )
@@ -56,22 +55,20 @@ def continuing_prefill_rows(input_batch: Any, num_reqs: int) -> np.ndarray:
 class DraftWindowRuntime:
     """One speculator's bounded ownership and fresh metadata projection seam."""
 
-    def __init__(self, speculator: Any, policy: DraftWindowPolicyDecision) -> None:
-        if not policy.enabled or policy.effective_window_size is None:
+    def __init__(self, speculator: Any, policy: int | None) -> None:
+        if policy is None:
             raise ValueError("An OFF Draft Window policy must not allocate a runtime")
-        self.method = policy.normalized_method
-        self.static_k = speculator.num_speculative_steps if self.method == "eagle3" else None
-        if self.static_k is not None and policy.effective_window_size < 2 * self.static_k + 1:
+        self.speculator = speculator
+        if speculator.method == "eagle3" and policy < 2 * speculator.num_speculative_steps + 1:
             raise ValueError("Eagle3 draft_window_size must cover first-pass query width plus the proposal horizon")
-        if self.method == "eagle3" and speculator.supports_decode_metadata_update:
+        if self.speculator.method == "eagle3" and speculator.supports_decode_metadata_update:
             raise NotImplementedError("Eagle3 Draft Window requires per-step metadata preparation")
         # The model config inherits the Target flag. All three Ascend
         # speculators also force their graph managers to NONE for the explicit
         # speculative override, allowing Target Graph with Draft eager.
         if not (speculator.draft_model_config.enforce_eager or speculator.speculative_config.enforce_eager):
             raise ValueError("Draft Window requires an eager Draft model; Target graph mode is independent")
-        self.speculator = speculator
-        self.window_size = policy.effective_window_size
+        self.window_size = policy
         self.native_swa_causal: dict[int, bool] = {}
         self._dense_reads = False
         self.gids = self._validate_route(speculator)
@@ -144,15 +141,14 @@ class DraftWindowRuntime:
     ) -> Iterator[None]:
         if self._owner is not None or self._bypass:
             raise RuntimeError("Draft Window proposal scope is already active")
-        if context_kv_only and self.method not in ("dflash", "dspark"):
+        if context_kv_only and self.speculator.method not in ("dflash", "dspark"):
             raise ValueError("Context-only Draft KV updates require a parallel drafter")
-        expected_eagle_steps = self.static_k
+        expected_eagle_steps = self.speculator.num_speculative_steps
         if num_speculative_tokens is not None:
             if (
-                self.method != "eagle3"
+                self.speculator.method != "eagle3"
                 or type(num_speculative_tokens) is not int
-                or self.static_k is None
-                or not 0 <= num_speculative_tokens <= self.static_k
+                or not 0 <= num_speculative_tokens <= self.speculator.num_speculative_steps
             ):
                 raise ValueError("Eagle3 scheduled draft count must stay within its configured static K")
             # A zero-draft AR proposal still runs prefill attention to update
@@ -194,7 +190,7 @@ class DraftWindowRuntime:
                     raise RuntimeError("Context-only Draft KV update unexpectedly consumed a read projection")
                 if not context_kv_only and not self._build_count:
                     raise RuntimeError("Draft Window proposal did not consume a read projection")
-                if self.method == "eagle3" and self._build_count != expected_eagle_steps:
+                if self.speculator.method == "eagle3" and self._build_count != expected_eagle_steps:
                     raise RuntimeError("Eagle3 proposal did not consume every configured draft step")
             finally:
                 self._owner = None
@@ -221,9 +217,11 @@ class DraftWindowRuntime:
         owner, batch = self._owner, self._input_batch
         if owner is None:
             raise RuntimeError("Draft Window metadata has no active proposal")
-        if self.method != "eagle3" and step != self.speculator.num_query_per_req:
+        if self.speculator.method != "eagle3" and step != self.speculator.num_query_per_req:
             raise ValueError("Parallel Draft metadata step must match its actual query width")
-        if self.method == "eagle3" and (step != self._build_count or step >= self.static_k):
+        if self.speculator.method == "eagle3" and (
+            step != self._build_count or step >= self.speculator.num_speculative_steps
+        ):
             raise ValueError("Eagle3 metadata must advance exactly one configured step")
         if batch.num_reqs != num_reqs:
             raise RuntimeError("Draft Window request mapping does not cover the active preparation")
@@ -253,7 +251,7 @@ class DraftWindowRuntime:
                 full_exact = common.seq_lens
                 retain(full_exact)
                 dense, native_full = self._read_mode(step, num_reqs, common, continuing)
-                if self.method == "eagle3" and step == 0:
+                if self.speculator.method == "eagle3" and step == 0:
                     exact, proposal_exact = self._eagle_first_pass_lengths(full_exact, num_reqs)
                 elif prepared_exact_cpu is not None:
                     # The actual DSpark MLA helper completed this exact copy
@@ -269,7 +267,7 @@ class DraftWindowRuntime:
                     if step == 0 and not torch.equal(exact, proposal_exact):
                         raise ValueError("Full prompt metadata cannot include rejected query padding")
                 else:
-                    if self.method == "eagle3" and self._eagle_window is None:
+                    if self.speculator.method == "eagle3" and self._eagle_window is None:
                         if step > 0:
                             raise RuntimeError("Eagle3 AR metadata has no frozen first-pass plan")
                         assert proposal_exact is not None
@@ -279,15 +277,17 @@ class DraftWindowRuntime:
                                     full_exact_end=int(end),
                                     window_size=self.window_size,
                                     block_span_tokens=self.anchor_block_span,
-                                    future_offset=self.static_k,
+                                    future_offset=self.speculator.num_speculative_steps,
                                 ),
-                                int(end) + self.static_k,
+                                int(end) + self.speculator.num_speculative_steps,
                             )
                             for end in proposal_exact
                         )
                     starts_list = []
                     for row, end in enumerate(exact):
-                        if continuing[row] or (self.method == "eagle3" and step == 0 and batch.is_prefilling_np[row]):
+                        if continuing[row] or (
+                            self.speculator.method == "eagle3" and step == 0 and batch.is_prefilling_np[row]
+                        ):
                             start = 0
                         elif self._eagle_window is not None:
                             start, horizon = self._eagle_window[row]
@@ -342,7 +342,7 @@ class DraftWindowRuntime:
                 elif dense:
                     from vllm_ascend.worker.v2.spec_decode.draft_window_dense import prepare_dense_draft_read
 
-                    first = self.method == "eagle3" and step == 0
+                    first = self.speculator.method == "eagle3" and step == 0
                     boundaries = common.query_start_loc_cpu[: num_reqs + 1]
                     widths = boundaries.diff()
                     query_width = int(widths.max())
@@ -385,7 +385,7 @@ class DraftWindowRuntime:
         continuing: np.ndarray,
     ):
         dense = self._dense_reads
-        if self.method == "eagle3" and continuing.any():
+        if self.speculator.method == "eagle3" and continuing.any():
             drafts = self._input_batch.num_draft_tokens_per_req
             if (
                 dense
@@ -397,14 +397,15 @@ class DraftWindowRuntime:
             dense = dense and not (
                 self._input_batch.is_prefilling_np[:num_reqs].all() or getattr(self.speculator, "replicated_pcp", False)
             )
-        if self.method == "eagle3" and step == 0:
+        if self.speculator.method == "eagle3" and step == 0:
             prefilling = self._input_batch.is_prefilling_np[:num_reqs]
             dense = dense and (
                 not prefilling.all() and not getattr(self.speculator, "replicated_pcp", False)
                 if prefilling.any()
-                else int(common.query_start_loc_cpu[: num_reqs + 1].diff().max()) <= self.static_k + 1
+                else int(common.query_start_loc_cpu[: num_reqs + 1].diff().max())
+                <= self.speculator.num_speculative_steps + 1
             )
-        elif self.method != "eagle3" and dense and self._parallel_full_prefill(num_reqs, continuing):
+        elif self.speculator.method != "eagle3" and dense and self._parallel_full_prefill(num_reqs, continuing):
             dense = False
         return dense, False
 
@@ -431,7 +432,13 @@ class DraftWindowRuntime:
         snapshot = pair.to(device="cpu", dtype=torch.int32, copy=True)
         owner.retained.append(snapshot)
         extent_cpu, live_cpu = snapshot[0], snapshot[1]
-        if bool(((live_cpu <= 0) | (live_cpu > extent_cpu) | (extent_cpu - live_cpu > self.static_k)).any()):
+        if bool(
+            (
+                (live_cpu <= 0)
+                | (live_cpu > extent_cpu)
+                | (extent_cpu - live_cpu > self.speculator.num_speculative_steps)
+            ).any()
+        ):
             raise ValueError("Eagle3 prepared live queries disagree with the current native padding extent")
         return extent_cpu, live_cpu
 

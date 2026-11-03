@@ -4,19 +4,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
-
-@dataclass(frozen=True)
-class DraftWindowPolicyDecision:
-    effective_window_size: int | None
-    normalized_method: str
-    reason: str | None = None
-
-    @property
-    def enabled(self) -> bool:
-        return self.effective_window_size is not None
-
 
 def resolve_draft_window_policy(
     *,
@@ -26,8 +13,8 @@ def resolve_draft_window_policy(
     builtin_v4_dspark: bool | None = None,
     dynamic_k: bool = False,
     is_dflash2: bool = False,
-) -> DraftWindowPolicyDecision:
-    """Return a policy decision without inspecting a backend or allocating state.
+) -> int | None:
+    """Return the resolved window without constructing a runtime or policy object.
 
     ``None`` is CONFIG_OFF. MTP and an explicitly identified co-trained V4
     DSpark route are forced off before number or capability validation. The
@@ -36,18 +23,18 @@ def resolve_draft_window_policy(
     target model type alone does not establish it. ``False`` explicitly
     identifies another draft category; ``None`` leaves that boundary open.
 
-    An enabled decision establishes method policy only. Runtime consumers must
+    A resolved window establishes method policy only. Runtime consumers must
     independently validate their actual backend, geometry and ownership.
     """
     method = method.strip().lower()
     model_type = target_model_type.strip().lower()
 
     if requested_window_size is None:
-        return DraftWindowPolicyDecision(None, method)
+        return None
     if method == "mtp":
-        return DraftWindowPolicyDecision(None, method, "mtp")
+        return None
     if method == "dspark" and builtin_v4_dspark is True:
-        return DraftWindowPolicyDecision(None, method, "builtin_v4_dspark")
+        return None
 
     if method not in {"eagle3", "dflash", "dspark"}:
         raise NotImplementedError(f"draft_window_size is not supported for speculative method {method!r}")
@@ -63,4 +50,4 @@ def resolve_draft_window_policy(
         raise TypeError("draft_window_size must be an integer or None")
     if requested_window_size <= 0:
         raise ValueError("draft_window_size must be greater than zero")
-    return DraftWindowPolicyDecision(requested_window_size, method)
+    return requested_window_size

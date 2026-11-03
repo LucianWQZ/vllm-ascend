@@ -75,8 +75,7 @@ def test_on_attaches_policy_using_effective_config(factory, monkeypatch):
     ctor = _constructor(monkeypatch)
     result = module.init_speculator(config, "cpu")
     assert result is ctor.return_value
-    assert result.draft_window_policy.enabled
-    assert result.draft_window_policy.effective_window_size == 1024
+    assert result.draft_window_policy == 1024
     assert config.compilation_config.mode == "target-graph"
     config.speculative_config.uses_dynamic_speculative_decoding.assert_called_once_with()
 
@@ -186,8 +185,7 @@ def test_dflash2_eager_window_keeps_its_own_constructor_and_target_graph(factory
     ctor = _constructor(monkeypatch, "dflash2", "AscendDFlash2Speculator")
     result = module.init_speculator(config, "cpu")
     assert result is ctor.return_value
-    assert result.draft_window_policy.enabled
-    assert result.draft_window_policy.normalized_method == "dflash"
+    assert result.draft_window_policy == 1024
     assert ctor.call_args.args[0].compilation_config.mode is modes.NONE
     assert config.compilation_config.mode == "target-graph"
 
@@ -241,5 +239,5 @@ def test_recognized_external_qwen_draft_with_v4_target_follows_switch(factory, m
     ctor = _constructor(monkeypatch)
     result = module.init_speculator(config, "cpu")
     assert result is ctor.return_value
-    assert result.draft_window_policy.enabled
+    assert result.draft_window_policy == 1024
     module.logger.warning.assert_not_called()

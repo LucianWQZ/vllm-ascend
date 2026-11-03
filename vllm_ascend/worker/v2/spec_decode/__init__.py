@@ -25,7 +25,6 @@ from vllm.logger import logger
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.worker.v2.spec_decode.draft_window_policy import (
-    DraftWindowPolicyDecision,
     resolve_draft_window_policy,
 )
 
@@ -64,7 +63,7 @@ def _builtin_v4_dspark_identity(speculative_config, target_model_config) -> bool
     return None
 
 
-def _resolve_window_policy(vllm_config: VllmConfig) -> DraftWindowPolicyDecision | None:
+def _resolve_window_policy(vllm_config: VllmConfig) -> int | None:
     requested = get_ascend_config().draft_window_size
     if requested is None:
         return None
@@ -73,17 +72,19 @@ def _resolve_window_policy(vllm_config: VllmConfig) -> DraftWindowPolicyDecision
     # Forced OFF must precede numerical checks and accesses to optional model
     # fields, dynamic-K state, or backend capabilities.
     if method == "mtp":
-        return resolve_draft_window_policy(requested_window_size=requested, method=method)
-    target = vllm_config.model_config
-    target_model_type = target.hf_config.model_type
-    builtin_v4 = _builtin_v4_dspark_identity(speculative_config, target) if method == "dspark" else None
-    if builtin_v4 is True:
-        return resolve_draft_window_policy(
-            requested_window_size=requested,
-            method=method,
-            target_model_type=target_model_type,
-            builtin_v4_dspark=True,
+        forced_off = "MTP"
+    else:
+        target = vllm_config.model_config
+        target_model_type = target.hf_config.model_type
+        builtin_v4 = _builtin_v4_dspark_identity(speculative_config, target) if method == "dspark" else None
+        forced_off = "the built-in DeepSeek V4 DSpark route" if builtin_v4 is True else None
+    if forced_off is not None:
+        logger.warning(
+            "MRV2 draft_window_size is ignored for %s; Draft Sliding Window is disabled. "
+            "The original speculative method is retained.",
+            forced_off,
         )
+        return None
     architectures = speculative_config.draft_model_config.architectures
     if method == "dflash" and (
         not architectures
@@ -104,9 +105,9 @@ def _resolve_window_policy(vllm_config: VllmConfig) -> DraftWindowPolicyDecision
     )
 
 
-def _use_graph_window_owner(vllm_config: VllmConfig, policy: DraftWindowPolicyDecision | None, support: Any) -> bool:
+def _use_graph_window_owner(vllm_config: VllmConfig, policy: int | None, support: Any) -> bool:
     """Keep the ordinary eager runtime and persistent Graph owner exclusive."""
-    if policy is None or not policy.enabled or vllm_config.speculative_config.enforce_eager:
+    if policy is None or vllm_config.speculative_config.enforce_eager:
         return False
     from vllm_ascend import envs
 
@@ -144,13 +145,7 @@ def init_speculator(vllm_config: VllmConfig, device: torch.device, req_states: "
             speculative_config.num_speculative_tokens,
             vllm_config.model_config.max_model_len,
         )
-    if policy is not None and policy.reason is not None:
-        logger.warning(
-            "MRV2 draft_window_size is ignored for %s; Draft Sliding Window is disabled. "
-            "The original speculative method is retained.",
-            "MTP" if policy.reason == "mtp" else "the built-in DeepSeek V4 DSpark route",
-        )
-    if policy is not None and policy.enabled:
+    if policy is not None:
         if use_graph_owner:
             if any(
                 hasattr(speculator, name)

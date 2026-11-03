@@ -249,7 +249,7 @@ class DraftGraphSupportTest(unittest.TestCase):
 
         config = self.config(rows=2)
         support = self.resolve(config)
-        policy = NS(enabled=True)
+        policy = 1024
         with (
             patch.object(envs, "VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH", True),
             patch.object(
@@ -272,9 +272,12 @@ class DraftGraphSupportTest(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "PP=PCP=DCP=1"):
                     validate_draft_window_graph_config(config, support=support)
                 setattr(config.parallel_config, field, 1)
-        with patch.object(
-            hardware_profile, "get_current_hardware_profile", return_value=NS(attention_backend_family=None)
-        ), self.assertRaisesRegex(NotImplementedError, "STANDARD"):
+        with (
+            patch.object(
+                hardware_profile, "get_current_hardware_profile", return_value=NS(attention_backend_family=None)
+            ),
+            self.assertRaisesRegex(NotImplementedError, "STANDARD"),
+        ):
             validate_draft_window_graph_config(config, support=support)
 
     def test_real_factory_passes_its_single_qualification_to_validation(self):
@@ -284,7 +287,7 @@ class DraftGraphSupportTest(unittest.TestCase):
 
         config = self.config(rows=2)
         before = vars(config).copy()
-        policy = NS(enabled=True, reason=None)
+        policy = 1024
         owner = NS(_initialize_draft_window_source_capability=lambda: None)
         with (
             patch.object(envs, "VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH", True),
@@ -312,7 +315,7 @@ class DraftGraphSupportTest(unittest.TestCase):
         from vllm_ascend.worker.v2 import spec_decode as factory
 
         config = self.config()
-        policy = NS(enabled=True, reason=None)
+        policy = 1024
         for field in ("_draft_window_policy", "draft_window_policy", "_draft_window_runtime"):
             owner = NS(_initialize_draft_window_source_capability=lambda: None)
             setattr(owner, field, object())
