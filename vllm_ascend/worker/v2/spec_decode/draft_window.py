@@ -18,7 +18,6 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_backends import (
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_policy import (
     DraftWindowPolicyDecision,
-    DraftWindowPolicyState,
 )
 
 if TYPE_CHECKING:
@@ -44,7 +43,7 @@ def create_draft_window_graph_provider(
     from vllm_ascend.worker.v2.spec_decode.draft_window_graph_runtime import validate_graph_context
 
     validate_graph_context(vllm_config, block_tables)
-    if policy.state is not DraftWindowPolicyState.ELIGIBLE_ON or policy.effective_window_size is None:
+    if not policy.enabled:
         raise ValueError("Graph source requires an eligible Window policy")
     runtime_route = runtime_route.strip().lower()
     expected_method = "dflash" if runtime_route == "dflash2" else runtime_route

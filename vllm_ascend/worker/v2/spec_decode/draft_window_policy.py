@@ -5,25 +5,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import Enum
-
-
-class DraftWindowPolicyState(Enum):
-    CONFIG_OFF = "config_off"
-    FORCED_OFF = "forced_off"
-    ELIGIBLE_ON = "eligible_on"
 
 
 @dataclass(frozen=True)
 class DraftWindowPolicyDecision:
-    state: DraftWindowPolicyState
     effective_window_size: int | None
     normalized_method: str
     reason: str | None = None
 
     @property
     def enabled(self) -> bool:
-        return self.state is DraftWindowPolicyState.ELIGIBLE_ON
+        return self.effective_window_size is not None
 
 
 def resolve_draft_window_policy(
@@ -50,20 +42,12 @@ def resolve_draft_window_policy(
     method = method.strip().lower()
     model_type = target_model_type.strip().lower()
 
-    def decision(state: DraftWindowPolicyState, reason: str | None = None) -> DraftWindowPolicyDecision:
-        return DraftWindowPolicyDecision(
-            state=state,
-            effective_window_size=requested_window_size if state is DraftWindowPolicyState.ELIGIBLE_ON else None,
-            normalized_method=method,
-            reason=reason,
-        )
-
     if requested_window_size is None:
-        return decision(DraftWindowPolicyState.CONFIG_OFF)
+        return DraftWindowPolicyDecision(None, method)
     if method == "mtp":
-        return decision(DraftWindowPolicyState.FORCED_OFF, "mtp")
+        return DraftWindowPolicyDecision(None, method, "mtp")
     if method == "dspark" and builtin_v4_dspark is True:
-        return decision(DraftWindowPolicyState.FORCED_OFF, "builtin_v4_dspark")
+        return DraftWindowPolicyDecision(None, method, "builtin_v4_dspark")
 
     if method not in {"eagle3", "dflash", "dspark"}:
         raise NotImplementedError(f"draft_window_size is not supported for speculative method {method!r}")
@@ -79,4 +63,4 @@ def resolve_draft_window_policy(
         raise TypeError("draft_window_size must be an integer or None")
     if requested_window_size <= 0:
         raise ValueError("draft_window_size must be greater than zero")
-    return decision(DraftWindowPolicyState.ELIGIBLE_ON)
+    return DraftWindowPolicyDecision(requested_window_size, method)

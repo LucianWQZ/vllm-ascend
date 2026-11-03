@@ -26,7 +26,6 @@ from vllm.logger import logger
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.worker.v2.spec_decode.draft_window_policy import (
     DraftWindowPolicyDecision,
-    DraftWindowPolicyState,
     resolve_draft_window_policy,
 )
 
@@ -145,7 +144,7 @@ def init_speculator(vllm_config: VllmConfig, device: torch.device, req_states: "
             review_limit.static_k,
             review_limit.max_model_len,
         )
-    if policy is not None and policy.state is DraftWindowPolicyState.FORCED_OFF:
+    if policy is not None and policy.reason is not None:
         logger.warning(
             "MRV2 draft_window_size is ignored for %s; Draft Sliding Window is disabled. "
             "The original speculative method is retained.",

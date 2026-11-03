@@ -4,7 +4,6 @@
 import pytest
 
 from vllm_ascend.worker.v2.spec_decode.draft_window_policy import (
-    DraftWindowPolicyState,
     resolve_draft_window_policy,
 )
 
@@ -18,7 +17,7 @@ def test_config_off_precedes_all_capability_checks(method):
         dynamic_k=True,
         is_dflash2=True,
     )
-    assert result.state is DraftWindowPolicyState.CONFIG_OFF
+    assert result.reason is None
     assert not result.enabled
     assert result.effective_window_size is None
 
@@ -33,7 +32,8 @@ def test_forced_off_precedes_invalid_number_and_capability(requested, method, co
         dynamic_k=True,
         is_dflash2=True,
     )
-    assert result.state is DraftWindowPolicyState.FORCED_OFF
+    assert result.reason == ("mtp" if method.strip().lower() == "mtp" else "builtin_v4_dspark")
+    assert not result.enabled
     assert result.effective_window_size is None
 
 
