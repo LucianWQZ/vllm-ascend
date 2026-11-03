@@ -29,8 +29,6 @@ class DraftWindowGraphInputMixin:
     _speculator_name: str
     _group_causal: bool | Mapping[int, bool]
     _draft_window_graph_binding_provider: DraftWindowGraphBindingProvider
-    _draft_window_bypass_active: bool
-    _draft_window_prefill_bypass_active: bool
     _draft_window_dp_dummy_active: bool
     input_batch: InputBatch
     input_buffers: Any
@@ -51,8 +49,6 @@ class DraftWindowGraphInputMixin:
         if hasattr(self, "_draft_window_runtime"):
             raise RuntimeError("Graph Window cannot replace the typed eager runtime")
         self._draft_window_graph_binding_provider = create_draft_window_graph_provider(self)
-        self._draft_window_bypass_active = False
-        self._draft_window_prefill_bypass_active = False
         self._draft_window_dp_dummy_active = False
 
     @contextmanager
@@ -63,57 +59,25 @@ class DraftWindowGraphInputMixin:
         dummy_run: bool,
         is_profile: bool,
     ) -> Iterator[None]:
-        if not hasattr(self, "_draft_window_graph_binding_provider"):
+        provider = getattr(self, "_draft_window_graph_binding_provider", None)
+        if provider is None:
             yield
             return
-        if self._draft_window_bypass_active or self._draft_window_graph_binding_provider.proposal is not None:
-            raise RuntimeError("a draft-window proposal scope is already active")
-        if self._draft_window_graph_binding_provider.quarantined:
-            raise RuntimeError("draft-window backing is quarantined after uncertain Graph submission")
         rows = (
-            None
+            ()
             if dummy_run or is_profile
             else tuple(map(bool, continuing_prefill_rows(input_batch, input_batch.num_reqs)))
         )
-        bypass_for_prefill = rows is not None and bool(rows) and all(rows)
-        if dummy_run or is_profile or bypass_for_prefill:
-            self._draft_window_bypass_active = True
-            # Only a real all-continuing prefill may select the established
-            # full-read baseline. Dummy/profile bypasses are not this phase.
-            self._draft_window_prefill_bypass_active = bypass_for_prefill
-            # An idle DP replica still submits the official dummy Graph to
-            # participate in communication. It has no business generation.
-            # Keep this distinct from real prefill and startup profiling.
-            dp_size = getattr(self, "dp_size", 1)
+        with provider.proposal_scope(rows):
+            # Empty rows identify startup/profile/idle; only a real idle DP
+            # replica must replay the canonical dummy communication Graph.
             self._draft_window_dp_dummy_active = (
-                dummy_run
-                and not is_profile
-                and type(dp_size) is int
-                and dp_size > 1
-                and bool(self._draft_window_graph_binding_provider._carriers)
+                dummy_run and not is_profile and getattr(self, "dp_size", 1) > 1 and bool(provider._carriers)
             )
             try:
-                # Startup/profile and pure-prefill proposals exercise the
-                # unmodified upstream metadata path without allocating a
-                # production Window generation. Mixed rows retain the phase
-                # snapshot for their actual per-row Window reads.
                 yield
-            except BaseException:
-                if self._draft_window_dp_dummy_active:
-                    # Dummy preparation/UPDATE can also partially submit.
-                    # Retain owners and refuse the next scope without any
-                    # device inspection, reset, drain or attempted recovery.
-                    self._draft_window_graph_binding_provider.quarantine()
-                raise
             finally:
-                self._draft_window_bypass_active = False
-                self._draft_window_prefill_bypass_active = False
                 self._draft_window_dp_dummy_active = False
-            return
-        assert rows is not None
-        provider = self._draft_window_graph_binding_provider
-        with provider.proposal_scope(rows):
-            yield
 
     def _build_uniform_attn_metadata(
         self,
@@ -125,7 +89,11 @@ class DraftWindowGraphInputMixin:
         causal: bool | Mapping[int, bool] = True,
         dcp_local_seq_lens: torch.Tensor | None = None,
     ) -> dict[str, Any] | None:
-        if not hasattr(self, "_draft_window_graph_binding_provider") or self._draft_window_bypass_active:
+        provider = getattr(self, "_draft_window_graph_binding_provider", None)
+        rows = None if provider is None else provider.proposal
+        if provider is not None and rows is None:
+            raise RuntimeError("Draft Window metadata build has no active proposal")
+        if not rows or all(rows):
             return super()._build_uniform_attn_metadata(  # type: ignore[misc]
                 batch_desc,
                 num_reqs,
@@ -147,11 +115,8 @@ class DraftWindowGraphInputMixin:
             or (getattr(self, "_draft_graph_review_limit", None) is not None and padded != num_reqs)
         ):
             raise RuntimeError("Draft Window requires its actual uniform FULL dispatch; no eager fallback")
-        provider = self._draft_window_graph_binding_provider
-        rows = provider.proposal
+        assert provider is not None
         input_batch = self.input_batch
-        if rows is None:
-            raise RuntimeError("Draft Window metadata build has no active proposal")
         if num_reqs != input_batch.num_reqs or num_reqs != len(rows):
             raise RuntimeError("metadata request count does not match proposal epoch")
         if padded < num_reqs:

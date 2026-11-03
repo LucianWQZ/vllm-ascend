@@ -49,7 +49,6 @@ class ParallelOwnerTests(unittest.TestCase):
         )
         self.owner = SimpleNamespace(
             _draft_window_graph_binding_provider=self.provider,
-            _draft_window_bypass_active=False,
             vllm_config=SimpleNamespace(),
             num_speculative_steps=8,
         )
@@ -68,7 +67,6 @@ class ParallelOwnerTests(unittest.TestCase):
     def test_actual_fixed_core_zero_writes_then_normal_binding(self):
         owner = object.__new__(dflash.AscendDFlashSpeculator)
         owner._draft_window_graph_binding_provider = self.provider
-        owner._draft_window_bypass_active = False
         owner.num_speculative_steps, owner.num_query_per_req = 7, 8
         owner.max_model_len, owner.max_num_reqs, owner.max_num_tokens = 64, 2, 16
         owner.pcp_manager, owner._layer_group_idx = None, None

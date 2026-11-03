@@ -141,11 +141,7 @@ def _draft_window_context_kv_scope(owner):
     """
     provider = owner._draft_window_graph_binding_provider
     provider.require_reusable()
-    if (
-        provider.proposal is not None
-        or getattr(owner, "_draft_window_bypass_active", False)
-        or getattr(owner, "_draft_window_context_kv_active", False)
-    ):
+    if provider.proposal is not None or getattr(owner, "_draft_window_context_kv_active", False):
         raise RuntimeError("A Draft Window proposal scope is already active")
     owner._draft_window_context_kv_active = True
     try:

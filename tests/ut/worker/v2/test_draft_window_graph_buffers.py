@@ -108,7 +108,6 @@ def test_parallel_exact_is_an_independent_completed_cpu_snapshot(graph_buffers, 
     owner._draft_window_graph_binding_provider = c.provider
     owner.input_buffers = SimpleNamespace(seq_lens=torch.tensor([11, 14], dtype=dtype))
     owner.input_batch = SimpleNamespace(num_reqs=active, idx_mapping_np=np.arange(active))
-    owner._draft_window_bypass_active = False
     owner.draft_attn_layer_names, owner.num_query_per_req = {"draft.layer"}, 1
     owner.block_tables = c.owner
     prepared = []
@@ -488,8 +487,6 @@ def test_parallel_idle_marker_is_owned_by_real_scope_not_prefill_or_profile(
     case = graph_buffers
     owner = object.__new__(DraftWindowGraphInputMixin)
     owner._draft_window_graph_binding_provider = case.provider
-    owner._draft_window_bypass_active = False
-    owner._draft_window_prefill_bypass_active = False
     owner._draft_window_dp_dummy_active = False
     owner.dp_size = dp
     if not captures:
@@ -505,10 +502,11 @@ def test_parallel_idle_marker_is_owned_by_real_scope_not_prefill_or_profile(
     )
     with owner._draft_window_proposal_scope(batch, dummy_run=dummy, is_profile=profile):
         assert owner._draft_window_dp_dummy_active is expected
-        assert owner._draft_window_prefill_bypass_active is prefill
-        assert case.provider.proposal is None and case.provider._active_bank is None
+        assert case.provider.proposal == (() if dummy or profile else (True, True))
+        assert (bool(case.provider.proposal) and all(case.provider.proposal)) is prefill
+        assert case.provider._active_bank is None
     assert owner._draft_window_dp_dummy_active is False
-    assert owner._draft_window_prefill_bypass_active is False
+    assert case.provider.proposal is None
     assert not case.provider.quarantined
 
 
@@ -517,8 +515,6 @@ def test_parallel_idle_failure_quarantines_before_next_real_scope(graph_buffers)
 
     owner = object.__new__(DraftWindowGraphInputMixin)
     owner._draft_window_graph_binding_provider = graph_buffers.provider
-    owner._draft_window_bypass_active = False
-    owner._draft_window_prefill_bypass_active = False
     owner._draft_window_dp_dummy_active = False
     owner.dp_size = 2
     with (
@@ -581,8 +577,6 @@ def test_actual_manager_keeps_resolve_wait_replay_update_order(graph_buffers, mo
     scope = nullcontext()
     if window:
         owner._draft_window_graph_binding_provider = c.provider
-        owner._draft_window_bypass_active = False
-        owner._draft_window_prefill_bypass_active = False
         owner._draft_window_dp_dummy_active = False
         if idle:
             owner.dp_size = 2
@@ -653,3 +647,89 @@ def test_actual_parallel_manager_rejects_missing_preparation_before_replay(graph
         manager.run_fullgraph(c.capture.descriptor)
     assert c.provider.quarantined and not c.provider._pending
     assert c.provider.capture_identity_for(descriptor=c.capture.descriptor) is c.capture
+
+
+@pytest.fixture(params=["dummy", "profile", "prefill"])
+def parallel_bypass_scope(graph_buffers, request):
+    c = graph_buffers
+    owner = DraftWindowGraphInputMixin()
+    owner._draft_window_graph_binding_provider = c.provider
+    owner._draft_window_dp_dummy_active, owner.dp_size = False, 2
+    batch = SimpleNamespace(
+        num_reqs=2,
+        num_computed_prefill_tokens_np=np.array([0, 0]),
+        prefill_len_np=np.array([100, 100]),
+        num_scheduled_tokens=np.array([1, 1]),
+        num_draft_tokens_per_req=None,
+        is_prefilling_np=np.array([True, True]),
+        has_prefill=True,
+    )
+    return owner, batch, request.param == "dummy", request.param == "profile"
+
+
+def test_parallel_scope_rows_control_the_real_dispatch_phase(parallel_bypass_scope, monkeypatch):
+    from vllm_ascend.worker.v2.spec_decode.dflash import aclgraph
+
+    owner, batch, dummy, profile = parallel_bypass_scope
+    baseline = object()
+    dispatch = Mock(return_value=baseline)
+    monkeypatch.setattr(aclgraph.DFlashCudaGraphManager, "dispatch", dispatch)
+    manager = object.__new__(aclgraph.DFlashAclGraphManager)
+    manager.speculator = owner
+    manager._resolve_effective_loras = lambda value: value
+    with owner._draft_window_proposal_scope(batch, dummy_run=dummy, is_profile=profile):
+        descriptor = manager.dispatch(2, 16, 8, 0)
+        if dummy or profile:
+            assert descriptor is baseline
+            dispatch.assert_called_once()
+        else:
+            assert descriptor.cg_mode is CUDAGraphMode.NONE
+            assert descriptor.num_reqs == 2 and descriptor.num_tokens == 16
+            dispatch.assert_not_called()
+    assert owner._draft_window_graph_binding_provider.proposal is None
+
+
+def test_parallel_bypass_scope_cannot_nest_or_enter_context_only(parallel_bypass_scope):
+    from vllm_ascend.worker.v2.spec_decode.dflash.speculator import _draft_window_context_kv_scope
+
+    owner, batch, dummy, profile = parallel_bypass_scope
+    provider = owner._draft_window_graph_binding_provider
+    with owner._draft_window_proposal_scope(batch, dummy_run=dummy, is_profile=profile):
+        current = provider.proposal
+        with (
+            pytest.raises(RuntimeError, match="already active"),
+            owner._draft_window_proposal_scope(batch, dummy_run=dummy, is_profile=profile),
+        ):
+            pytest.fail("nested bypass overwrote its current phase")
+        with pytest.raises(RuntimeError, match="already active"), _draft_window_context_kv_scope(owner):
+            pytest.fail("context-only write entered an active bypass phase")
+        assert provider.proposal is current
+    assert provider.proposal is None and not provider.quarantined
+
+
+def test_parallel_bypass_exception_retains_backing_and_resets_idle_marker(parallel_bypass_scope):
+    owner, batch, dummy, profile = parallel_bypass_scope
+    provider = owner._draft_window_graph_binding_provider
+    banks = tuple(provider._carriers.values())
+    with (
+        pytest.raises(RuntimeError, match="uncertain canonical work"),
+        owner._draft_window_proposal_scope(batch, dummy_run=dummy, is_profile=profile),
+    ):
+        raise RuntimeError("uncertain canonical work")
+    assert provider.quarantined and provider.proposal is None
+    assert not owner._draft_window_dp_dummy_active and tuple(provider._carriers.values()) == banks
+
+
+
+def test_parallel_baseline_scope_does_not_latch_its_startup_stream(parallel_bypass_scope, monkeypatch):
+    owner, batch, dummy, profile = parallel_bypass_scope
+    provider = owner._draft_window_graph_binding_provider
+    provider.block_tables.input_block_tables[0] = SimpleNamespace(device=SimpleNamespace(type="npu"))
+    stream = Mock(return_value=SimpleNamespace(npu_stream=17))
+    monkeypatch.setattr(torch.npu, "current_stream", stream)
+    with owner._draft_window_proposal_scope(batch, dummy_run=dummy, is_profile=profile):
+        assert not hasattr(provider, "_owner_stream")
+    stream.assert_not_called()
+    with provider.proposal_scope((False,)):
+        assert provider._owner_stream == 17
+    stream.assert_called_once()

@@ -70,7 +70,9 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
         max_query_len: int | None = None,
         num_ubatches: int = 1,
     ) -> BatchExecutionDescriptor:
-        if getattr(self.speculator, "_draft_window_prefill_bypass_active", False):
+        provider = getattr(self.speculator, "_draft_window_graph_binding_provider", None)
+        rows = None if provider is None else provider.proposal
+        if rows and all(rows):
             # Continuing prefill owns no Window generation. Captured Window
             # operands cannot stand in for its baseline full read. Select the
             # existing eager branch before upstream metadata/padding is built;

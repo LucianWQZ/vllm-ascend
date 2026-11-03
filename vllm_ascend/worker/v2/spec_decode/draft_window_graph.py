@@ -74,7 +74,12 @@ class DraftWindowGraphBindingProvider:
 
     @contextmanager
     def proposal_scope(self, full_read_rows: tuple[bool, ...]) -> Iterator[None]:
-        self.require_reusable()
+        # Baseline phases never touch the Window bank; startup may use a
+        # capture stream that must not become the business reuse stream.
+        if full_read_rows and not all(full_read_rows):
+            self.require_reusable()
+        elif self.quarantined:
+            raise RuntimeError("Draft Window bank is quarantined after uncertain submission")
         if self.proposal is not None or self._active_bank is not None or self._pending:
             raise RuntimeError("a Draft Window proposal is already active")
         self.proposal = full_read_rows

@@ -382,7 +382,6 @@ def parallel_hook():
         pass
 
     owner: Any = Owner()
-    owner._draft_window_bypass_active = False
     owner.draft_attn_layer_names, owner.num_query_per_req = {"draft.layer"}, 8
     owner.block_tables = SimpleNamespace(slot_mappings=torch.arange(32, dtype=torch.int64).reshape(1, 32))
     owner.input_batch = SimpleNamespace(num_reqs=1, idx_mapping_np=np.array([0]))
@@ -400,13 +399,13 @@ def parallel_hook():
     return owner, desc, inputs, calls
 
 
-@pytest.mark.parametrize("bypass", [False, True])
+@pytest.mark.parametrize("bypass", [None, (), (True,)])
 def test_parallel_metadata_hook_retains_the_existing_off_and_prefill_path(parallel_hook, bypass):
     owner, desc, _, calls = parallel_hook
-    if bypass:
-        owner._draft_window_bypass_active = True
-    else:
+    if bypass is None:
         del owner._draft_window_graph_binding_provider
+    else:
+        owner._draft_window_graph_binding_provider.proposal = bypass
     args = (desc, 1, 8, torch.tensor([16]), 8)
     original_args, original_kwargs = owner._build_uniform_attn_metadata(*args)
     assert original_args[:5] == args
