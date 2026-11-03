@@ -286,7 +286,6 @@ class TestAscendAttentionMetadataBuilder(TestBase):
     @patch.object(AscendAttentionMetadataBuilder, "metadata_cls")
     def test_device_read_keeps_capacity_separate_from_exact(self, metadata_cls):
         from vllm_ascend.worker.v2.spec_decode.draft_window_dense import prepare_dense_draft_read
-        from vllm_ascend.worker.v2.spec_decode.draft_window_read import DirectPrefixSource
 
         common = AscendCommonAttentionMetadata(
             query_start_loc=torch.tensor([0, 9], dtype=torch.int32),
@@ -305,9 +304,8 @@ class TestAscendAttentionMetadataBuilder(TestBase):
             attn_state=AscendAttentionState.ChunkedPrefill,
         )
         read = prepare_dense_draft_read(
-            DirectPrefixSource(common.block_table_tensor, (0,), (2,), 128),
+            *(common.block_table_tensor[list((0,))], (2,), 128),
             exact_device=common.seq_lens,
-            row_indices=torch.tensor([0]),
             upper_cpu=common.seq_lens_cpu_upper_bound,
             window_size=128,
             anchor_span=128,

@@ -138,14 +138,13 @@ def test_callback_final_writer_updates_real_common_cpu_mirrors_and_keeps_full_op
     called: list[Any] = []
     read = contract.read
     exact = torch.tensor([21], dtype=torch.int32)
-    view = read.materialize_direct_prefix(
-        read.DirectPrefixSource(contract.table, (0,), (8,), 4),
+    view = read.materialize_draft_read(
+        *(contract.table[list((0,))], (8,), 4),
         exact_cpu=exact,
         exact_device=exact,
         upper_cpu=torch.tensor([25], dtype=torch.int32),
         starts_cpu=torch.tensor([12], dtype=torch.int32),
         padded_rows=1,
-        row_indices=torch.tensor([0]),
         retain=lambda *items: read_retained.extend(items),
     )
 

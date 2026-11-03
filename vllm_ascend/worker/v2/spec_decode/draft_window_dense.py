@@ -9,13 +9,11 @@ directly is unsafe because zero attention weights can still multiply NaNs.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
 import torch
-
-from vllm_ascend.worker.v2.spec_decode.draft_window_read import DirectPrefixSource
 
 DENSE_KV_ALIGNMENT = 32
 
@@ -102,12 +100,13 @@ def _copy_owned_read_tensor(
 
 
 def prepare_dense_draft_read(
-    source: DirectPrefixSource,
+    block_table: torch.Tensor,
+    valid_columns: Sequence[int],
+    block_span: int,
     *,
     exact_device: torch.Tensor,
     exact_cpu: torch.Tensor | None = None,
     query_ends_cpu: torch.Tensor | None = None,
-    row_indices: torch.Tensor,
     upper_cpu: torch.Tensor,
     window_size: int,
     anchor_span: int,
@@ -127,21 +126,25 @@ def prepare_dense_draft_read(
     lie in [S,E); capacity padding repeats its last initialized token. Query
     padding and Full continuing rows retain the method's existing semantics.
     """
-    n = len(source.request_rows)
-    if n < 1 or window_size < 1 or query_width < 1 or anchor_span < 1 or anchor_span % source.block_span:
+    n = len(valid_columns)
+    if block_table.ndim != 2 or block_table.dtype != torch.int32 or block_span <= 0:
+        raise ValueError("Invalid compact dense Draft table geometry")
+    if block_table.shape[0] < n or any(count < 0 or count > block_table.shape[1] for count in valid_columns):
+        raise ValueError("Invalid initialized compact column extent")
+    if n < 1 or window_size < 1 or query_width < 1 or anchor_span < 1 or anchor_span % block_span:
         raise ValueError("Invalid dense Draft read geometry")
     if upper_cpu.device.type != "cpu" or upper_cpu.shape != (n,) or upper_cpu.dtype not in (torch.int32, torch.int64):
         raise ValueError("Missing current preparation allocation upper bounds")
-    available = torch.tensor(source.valid_columns, dtype=torch.int64, device="cpu") * source.block_span
+    available = torch.tensor(valid_columns, dtype=torch.int64, device="cpu") * block_span
     if bool((upper_cpu <= 0).any()):
         raise ValueError("Allocation upper must be positive")
-    if exact_device.ndim != 1 or exact_device.numel() < n or row_indices.shape != (n,):
-        raise ValueError("Missing current device lengths or request mapping")
-    if exact_device.dtype not in (torch.int32, torch.int64) or row_indices.dtype != torch.int64:
-        raise ValueError("Dense read lengths and row mapping must be integer tensors")
-    if exact_device.device != source.table.device or row_indices.device != source.table.device:
+    if exact_device.ndim != 1 or exact_device.numel() < n:
+        raise ValueError("Missing current device lengths")
+    if exact_device.dtype not in (torch.int32, torch.int64):
+        raise ValueError("Dense read lengths must be integer tensors")
+    if exact_device.device != block_table.device:
         raise ValueError("Dense read operands must share their source device")
-    retain(exact_device, row_indices)
+    retain(exact_device, block_table)
     # A single completed snapshot certifies this preparation. The runtime
     # shares it across groups; direct callers may request their own snapshot.
     exact_cpu = exact_device[:n].to(device="cpu", dtype=torch.int32, copy=True) if exact_cpu is None else exact_cpu
@@ -198,28 +201,27 @@ def prepare_dense_draft_read(
         capacity = (capacity_bound + DENSE_KV_ALIGNMENT - 1) // DENSE_KV_ALIGNMENT * DENSE_KV_ALIGNMENT
         columns = torch.arange(capacity, device="cpu", dtype=torch.int64)
         absolute = origins[:, None] + torch.minimum(columns, visible[:, None] - 1)
-        physical_rows = (
-            row_indices
-            if host_rows.numel() == n
-            else row_indices.index_select(0, _copy_owned_read_tensor(host_rows, retain, device=source.table.device))
-        )
-        address = _copy_owned_read_tensor(absolute, retain, device=source.table.device)
-        logical_columns = torch.div(address, source.block_span, rounding_mode="floor")
-        if source.table.is_contiguous():
-            indices = physical_rows[:, None] * source.table.shape[1] + logical_columns
-            blocks = source.table.view(-1).index_select(0, indices.flatten()).reshape_as(address)
+        address = _copy_owned_read_tensor(absolute, retain, device=block_table.device)
+        logical_columns = torch.div(address, block_span, rounding_mode="floor")
+        if host_rows.numel() == n:
+            blocks = block_table[:n].gather(1, logical_columns)
         else:
-            blocks = source.table[physical_rows[:, None], logical_columns]
-        slots = blocks.to(torch.int64) * source.block_span + address % source.block_span
+            physical_rows = _copy_owned_read_tensor(host_rows, retain, device=block_table.device)
+            if block_table.is_contiguous():
+                indices = physical_rows[:, None] * block_table.shape[1] + logical_columns
+                blocks = block_table.view(-1).index_select(0, indices.flatten()).reshape_as(address)
+            else:
+                blocks = block_table[physical_rows[:, None], logical_columns]
+        slots = blocks.to(torch.int64) * block_span + address % block_span
         excluded = (columns[None, None, :] >= visible[:, None, None]).expand(-1, width, -1)
         if causal:
             query_end = query_ends_cpu.index_select(0, host_rows)
             queries = query_end[:, None] - origins[:, None] - width + torch.arange(width, device="cpu")
             excluded = excluded | (columns[None, None, :] > queries[:, :, None])
-        mask = _copy_owned_read_tensor(excluded[:, None].contiguous(), retain, device=source.table.device)
-        lengths = _copy_owned_read_tensor(visible, retain, device=source.table.device)
+        mask = _copy_owned_read_tensor(excluded[:, None].contiguous(), retain, device=block_table.device)
+        lengths = _copy_owned_read_tensor(visible, retain, device=block_table.device)
         read = DenseDraftRead(slots, lengths, mask, capacity, width, retain, causal and window_size < width)
-        retain(read, source.table, address, logical_columns, blocks, slots, lengths, mask)
+        retain(read, block_table, address, logical_columns, blocks, slots, lengths, mask)
         return read
 
     if widths is None and (full_rows_cpu is None or not bool(full_rows_cpu.any())):
@@ -233,12 +235,12 @@ def prepare_dense_draft_read(
     if len(groups) == 1:
         full, width, _ = next(iter(groups))
         return materialize(torch.arange(n, device="cpu"), width, full)
-    visible = torch.empty(n, dtype=exact_cpu.dtype, device=source.table.device)
+    visible = torch.empty(n, dtype=exact_cpu.dtype, device=block_table.device)
     retain(visible)
     parts = []
     for (full, width, _capacity), group in groups.items():
         host_rows = torch.tensor(group, dtype=torch.int64, device="cpu")
-        selected = _copy_owned_read_tensor(host_rows, retain, device=source.table.device)
+        selected = _copy_owned_read_tensor(host_rows, retain, device=block_table.device)
         bounds = (
             selected * query_width
             if query_start_loc_device is None

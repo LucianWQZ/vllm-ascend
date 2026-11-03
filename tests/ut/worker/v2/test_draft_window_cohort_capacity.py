@@ -9,7 +9,6 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_dense import (
     DenseDraftRead,
     prepare_dense_draft_read,
 )
-from vllm_ascend.worker.v2.spec_decode.draft_window_read import DirectPrefixSource
 
 
 @pytest.mark.parametrize("order", [(0, 1, 2), (2, 0, 1), (1, 2, 0)])
@@ -22,9 +21,8 @@ def test_different_full_row_bounds_do_not_multiply_largest_workspace(order):
     original = table.clone()
     held: list[object] = []
     read = prepare_dense_draft_read(
-        DirectPrefixSource(table, tuple(rows.tolist()), tuple(((upper + 127) // 128).tolist()), 128),
+        *(table[list(tuple(rows.tolist()))], tuple(((upper + 127) // 128).tolist()), 128),
         exact_device=exact,
-        row_indices=rows,
         upper_cpu=upper,
         window_size=1024,
         anchor_span=128,
@@ -57,9 +55,8 @@ def test_different_full_row_bounds_do_not_multiply_largest_workspace(order):
 def test_equal_aligned_full_bounds_keep_one_existing_read():
     table = torch.arange(2 * 17, dtype=torch.int32).reshape(2, 17)
     read = prepare_dense_draft_read(
-        DirectPrefixSource(table, (0, 1), (17, 17), 128),
+        *(table[list((0, 1))], (17, 17), 128),
         exact_device=torch.tensor([2055, 2063], dtype=torch.int32),
-        row_indices=torch.tensor([0, 1], dtype=torch.int64),
         upper_cpu=torch.tensor([2064, 2070], dtype=torch.int32),
         window_size=1024,
         anchor_span=128,

@@ -1,85 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
-"""Canonical direct-prefix read projections, independent of query and KV writes.
+"""Own read projections from the framework's current compact Draft tables.
 
-The caller supplies exact CPU lengths from the same preparation as device
-lengths. An upper bound is never used to select a start or to prove residency.
-Each projection owns its read storage; callers retain it until all native
-readers complete. No request mapping or projected table is cached here.
+The ordinary builder receives the already mapped Full table in active request
+order. CPU lengths are exact snapshots of this same preparation, never upper
+bounds. The proposal retains every projection until its final reader completes.
 """
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-import numpy as np
 import torch
-
-
-def _canonical_source_fields(
-    owner: Any, gid: int, request_rows: np.ndarray
-) -> tuple[torch.Tensor, tuple[int, ...], tuple[int, ...], int]:
-    # Canonical num_blocks counts expanded kernel columns, not manager blocks.
-    rows = tuple(int(row) for row in request_rows)
-    table = owner.block_tables[gid].gpu
-    if any(row < 0 or row >= table.shape[0] for row in rows):
-        raise ValueError("Draft read source contains an inactive request row")
-    counts = tuple(int(owner.num_blocks.np[gid, row]) for row in rows)
-    return table, rows, counts, int(owner.kernel_block_sizes[gid])
-
-
-def _validate_canonical_source(source: Any) -> None:
-    """Validate the proposal-owned allocation snapshot before any read."""
-    if source.table.ndim != 2 or source.table.dtype != torch.int32 or source.block_span <= 0:
-        raise ValueError("Invalid canonical int32 table geometry")
-    if len(source.valid_columns) != len(source.request_rows):
-        raise ValueError("Missing canonical valid-column counts")
-    if any(row < 0 or row >= source.table.shape[0] for row in source.request_rows):
-        raise ValueError("Draft read source contains an inactive request row")
-    if any(count < 0 or count > source.table.shape[1] for count in source.valid_columns):
-        raise ValueError("Invalid initialized canonical column extent")
-
-
-@dataclass(frozen=True)
-class DirectPrefixSource:
-    """Borrowed canonical owner and a snapshot of the current request mapping.
-
-    ``valid_columns`` counts kernel-addressed columns, not physical allocator
-    blocks. This provider is only valid for resident, direct-prefix layouts;
-    offloaded, circular, compressed and sharded layouts need their own provider.
-    """
-
-    table: torch.Tensor
-    request_rows: tuple[int, ...]
-    valid_columns: tuple[int, ...]
-    block_span: int
-
-    def __post_init__(self) -> None:
-        _validate_canonical_source(self)
-
-    @classmethod
-    def from_block_tables(cls, owner: Any, gid: int, request_rows: np.ndarray):
-        return cls(*_canonical_source_fields(owner, gid, request_rows))
-
-
-@dataclass(frozen=True)
-class NativeSWASource:
-    """Only the native band is resident; logical extent is not Full residency."""
-
-    table: torch.Tensor
-    request_rows: tuple[int, ...]
-    valid_columns: tuple[int, ...]
-    block_span: int
-    native_window: int
-
-    def __post_init__(self) -> None:
-        _validate_canonical_source(self)
-        if self.native_window <= 0:
-            raise ValueError("Native SWA requires a positive window")
-
-    @classmethod
-    def from_block_tables(cls, owner: Any, gid: int, request_rows: np.ndarray, native_window: int):
-        return cls(*_canonical_source_fields(owner, gid, request_rows), native_window)
 
 
 @dataclass(frozen=True)
@@ -117,162 +49,65 @@ class DraftReadView:
         return self.seq_lens_cpu
 
 
-def _materialize_canonical_read(
-    source: DirectPrefixSource | NativeSWASource,
+def materialize_draft_read(
+    block_table: torch.Tensor,
+    valid_columns: Sequence[int],
+    block_span: int,
     *,
     exact_cpu: torch.Tensor,
     exact_device: torch.Tensor,
     upper_cpu: torch.Tensor,
     starts_cpu: torch.Tensor,
     padded_rows: int,
-    row_indices: torch.Tensor,
     retain: Callable[..., None],
 ) -> DraftReadView:
-    """Gather from canonical rows, validating every column that can be read.
+    """Copy only initialized [S,E) columns from the current compact Full table.
 
-    CPU/device exact and row-mapping coherence is established by the current
-    preparation caller. Reuse its required device row mapping. Transfer
-    S once and derive column bounds on device instead of copying those same
-    values separately. This function performs no device-to-host transfer.
-    Zero padding is only outside the exact readable extent; missing source
-    columns are an error.
-
-    Retain the actual converted CPU start buffer and destination before an
-    asynchronous H2D can submit. The existing proposal owner supplies reader
-    completion; no completion or later CPU read is introduced here.
+    The framework has already gathered persistent request slots into batch
+    order. Reusing it avoids another request mapping and device gather. Each
+    copied row and the exact-length DMA source belong to this proposal, so a
+    later batch or Eagle consumer cannot overwrite an outstanding reader.
     """
-    n = len(source.request_rows)
+    n = len(valid_columns)
+    if block_table.ndim != 2 or block_table.dtype != torch.int32 or block_span <= 0:
+        raise ValueError("Invalid compact int32 table geometry")
+    if block_table.shape[0] < n or any(count < 0 or count > block_table.shape[1] for count in valid_columns):
+        raise ValueError("Invalid initialized compact column extent")
     cpu_values = (exact_cpu, upper_cpu, starts_cpu)
     if any(t.device.type != "cpu" or t.ndim != 1 or t.numel() != n for t in cpu_values):
         raise ValueError("Draft read planning requires one CPU value per active request")
     if any(t.dtype not in (torch.int32, torch.int64) for t in cpu_values):
         raise ValueError("Draft read lengths and starts must be integers")
-    if padded_rows < n:
-        raise ValueError("Invalid padded row extent")
-    if exact_device.ndim != 1 or exact_device.numel() < n:
-        raise ValueError("Missing device exact lengths")
-    if exact_device.device != source.table.device:
+    if padded_rows < n or exact_device.ndim != 1 or exact_device.numel() < n:
+        raise ValueError("Missing device exact lengths or padded row extent")
+    if exact_device.device != block_table.device:
         raise ValueError("Draft source and exact lengths must be on the same device")
-    if row_indices.shape != (n,) or row_indices.dtype != torch.int64 or row_indices.device != source.table.device:
-        raise ValueError("Prepared Draft row mapping must match the source device and request extent")
-    ends = exact_cpu.to(torch.int64)
-    starts = starts_cpu.to(torch.int64)
-    upper = upper_cpu.to(torch.int64)
+    ends, upper, starts = (t.to(torch.int64) for t in cpu_values)
     if bool(((ends < 0) | (upper < ends) | (starts < 0) | (starts > ends)).any()):
         raise ValueError("Invalid exact, upper, or start ordering")
-    if bool((starts % source.block_span != 0).any()):
+    if bool((starts % block_span != 0).any()):
         raise ValueError("This consumer cannot represent an intra-block read start")
-    end_columns = (ends + source.block_span - 1) // source.block_span
-    valid = torch.tensor(source.valid_columns, dtype=torch.int64)
-    if bool((valid < end_columns).any()):
-        raise ValueError("Canonical source does not cover the exact readable extent")
-    counts = end_columns - starts // source.block_span
+    end_columns = (ends + block_span - 1) // block_span
+    if any(count < int(end) for count, end in zip(valid_columns, end_columns)):
+        raise ValueError("Compact source does not cover the exact readable extent")
+    start_columns = starts // block_span
+    counts = end_columns - start_columns
     width = max(1, int(counts.max()) if n else 0)
-    # Retain this exact DMA source, not a clone used only for metadata.
-    # Allocate/retain the destination before copy_ can enqueue then fail.
-    retain(source.table, exact_device, starts, row_indices)
-    starts_device = torch.empty_like(starts, device=exact_device.device)
-    retain(starts_device)
-    starts_device.copy_(starts, non_blocking=True)
-    # Own only the read projection, never clone query/write/Target metadata.
-    table = source.table.new_zeros((padded_rows, width))
-    retain(table)
-    if n and source.table.shape[1]:
-        offsets = torch.arange(width, device=source.table.device)
-        start_columns = starts_device // source.block_span
-        end_columns_device = torch.div(
-            exact_device[:n].to(torch.int64) + source.block_span - 1, source.block_span, rounding_mode="floor"
-        )
-        indices = start_columns[:, None] + offsets
-        mask = offsets[None, :] < (end_columns_device - start_columns)[:, None]
-        # Masked columns are not readable; clamp only their gather address.
-        indices = indices.clamp(max=source.table.shape[1] - 1)
-        if source.table.is_contiguous():
-            # Current CANN lowers advanced indexing to an AICPU path. A flat
-            # index_select reads just the projected columns of this layout.
-            flat_indices = row_indices[:, None] * source.table.shape[1] + indices
-            selected = source.table.view(-1).index_select(0, flat_indices.reshape(-1)).view(n, width)
-        else:
-            # Preserve the original strided-table contract without flattening
-            # or copying the canonical table into contiguous storage.
-            selected = source.table[row_indices[:, None], indices]
-        table[:n] = torch.where(mask, selected, 0)
-    lengths_cpu = torch.zeros(padded_rows, dtype=exact_cpu.dtype)
+    table = block_table.new_zeros((padded_rows, width))
+    retain(block_table, exact_device, table)
+    for row, (start, count) in enumerate(zip(start_columns.tolist(), counts.tolist())):
+        if count:
+            destination, source = table[row, :count], block_table[row, start : start + count]
+            retain(source, destination)
+            destination.copy_(source, non_blocking=True)
+    lengths_cpu = torch.zeros(
+        padded_rows, dtype=exact_cpu.dtype, device="cpu", pin_memory=block_table.device.type == "npu"
+    )
     lengths_cpu[:n] = ends - starts
-    upper_out = torch.zeros(padded_rows, dtype=upper_cpu.dtype)
+    upper_out = torch.zeros(padded_rows, dtype=upper_cpu.dtype, device="cpu")
     upper_out[:n] = upper - starts
-    lengths = exact_device.new_zeros(padded_rows)
-    retain(lengths)
-    lengths[:n] = exact_device[:n] - starts_device
-    return DraftReadView(
-        table,
-        lengths,
-        lengths_cpu,
-        upper_out,
-        int(upper_out.max()) if padded_rows else 0,
-    )
-
-
-def materialize_direct_prefix(
-    source: DirectPrefixSource,
-    *,
-    exact_cpu: torch.Tensor,
-    exact_device: torch.Tensor,
-    upper_cpu: torch.Tensor,
-    starts_cpu: torch.Tensor,
-    padded_rows: int,
-    row_indices: torch.Tensor,
-    retain: Callable[..., None],
-) -> DraftReadView:
-    """Project a resident Full prefix using the existing canonical copy path."""
-    if not isinstance(source, DirectPrefixSource):
-        raise ValueError("Full-prefix projection requires its resident-prefix source")
-    return _materialize_canonical_read(
-        source,
-        exact_cpu=exact_cpu,
-        exact_device=exact_device,
-        upper_cpu=upper_cpu,
-        starts_cpu=starts_cpu,
-        padded_rows=padded_rows,
-        row_indices=row_indices,
-        retain=retain,
-    )
-
-
-def materialize_native_swa_intersection(
-    source: NativeSWASource,
-    *,
-    exact_cpu: torch.Tensor,
-    exact_device: torch.Tensor,
-    upper_cpu: torch.Tensor,
-    starts_cpu: torch.Tensor,
-    padded_rows: int,
-    query_width: int,
-    row_indices: torch.Tensor,
-    retain: Callable[..., None],
-) -> DraftReadView:
-    """Rebase a certified native read interval without claiming its evicted prefix.
-
-    After cropping at S, native right-aligned q coordinates move by -S and
-    native pre_tokens=P is unchanged. Mapping back yields original band
-    intersected with [S,E). Thus no newly required resident key is introduced.
-    The caller must retain its actual mask. An unmasked native consumer must
-    separately certify that every key in [S,E) remains resident; it cannot
-    inherit the causal-band proof above merely from the same KV spec.
-    """
-    if not isinstance(source, NativeSWASource) or source.native_window <= 0 or query_width <= 0:
-        raise ValueError("Native SWA projection requires its typed positive band")
-    if exact_cpu.device.type != "cpu" or starts_cpu.device.type != "cpu":
-        raise ValueError("Native SWA planning requires the completed preparation CPU snapshot")
-    if bool((exact_cpu - starts_cpu < query_width).any()):
-        raise ValueError("Extra Window must cover every native query")
-    return _materialize_canonical_read(
-        source,
-        exact_cpu=exact_cpu,
-        exact_device=exact_device,
-        upper_cpu=upper_cpu,
-        starts_cpu=starts_cpu,
-        padded_rows=padded_rows,
-        row_indices=row_indices,
-        retain=retain,
-    )
+    lengths = exact_device.new_empty(padded_rows)
+    # Retain both actual operands before a copy can partially submit and fail.
+    retain(lengths_cpu, lengths)
+    lengths.copy_(lengths_cpu, non_blocking=True)
+    return DraftReadView(table, lengths, lengths_cpu, upper_out, int(upper_out.max()) if padded_rows else 0)

@@ -17,7 +17,6 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_dense import (  # noqa: E402
     gather_dense_draft_kv,
     prepare_dense_draft_read,
 )
-from vllm_ascend.worker.v2.spec_decode.draft_window_read import DirectPrefixSource  # noqa: E402
 
 pytestmark = pytest.mark.skipif(not torch.npu.is_available(), reason="requires an Ascend NPU")
 TOLERANCE = {"atol": 2**-7, "rtol": 2**-6}
@@ -28,9 +27,8 @@ def make_read(capacity, held):
     blocks = (capacity + block - 1) // block
     table = torch.arange(blocks, dtype=torch.int32, device="npu")[None]
     read = prepare_dense_draft_read(
-        DirectPrefixSource(table, (0,), (blocks,), block),
+        *(table[list((0,))], (blocks,), block),
         exact_device=torch.tensor([capacity], dtype=torch.int32, device="npu"),
-        row_indices=torch.tensor([0], dtype=torch.int64, device="npu"),
         upper_cpu=torch.tensor([capacity], dtype=torch.int32),
         window_size=1024,
         anchor_span=128,

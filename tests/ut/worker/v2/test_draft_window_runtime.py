@@ -58,6 +58,19 @@ def setup(monkeypatch):
     )
     policy = resolve_draft_window_policy(requested_window_size=8, method="dflash")
     runtime = DraftWindowRuntime(spec, policy)
+    make_common = common
+
+    def prepared_common(*args, **kwargs):
+        result = make_common(*args, **kwargs)
+        state = runtime._input_batch if runtime._input_batch is not None else batch()
+        # Match fixed prepare_attn: official input tables are already in batch
+        # order, with zero padding rows. No production request is substituted.
+        full = spec.block_tables.block_tables[0].gpu
+        result.block_table_tensor = full.new_zeros((result.num_reqs, full.shape[1]))
+        result.block_table_tensor[: state.num_reqs] = full[state.idx_mapping_np.tolist()]
+        return result
+
+    monkeypatch.setitem(globals(), "common", prepared_common)
     return runtime, spec, canonical, completions
 
 
@@ -207,6 +220,7 @@ def test_unprojected_native_group_metadata_is_untouched_while_full_group_windows
     # outside the private read projection, rather than sharing/rebinding it.
     runtime.gids = (1,)
     native_metadata, full_metadata = common(), common()
+    full_metadata.block_table_tensor[:2] = other_table[[1, 3]]
     original_native = vars(native_metadata).copy()
     native_values = {name: value.clone() for name, value in original_native.items() if isinstance(value, torch.Tensor)}
     original_slots = full_metadata.slot_mapping
@@ -273,15 +287,6 @@ def test_eagle_allocation_upper_cannot_move_the_frozen_first_pass_anchor(setup, 
     spec.last_token_indices = torch.tensor([3, 6])
     state = batch(computed=(1150, 1150), prompt=(1, 1))
     state.idx_mapping = torch.tensor(state.idx_mapping_np, dtype=torch.int64)
-    source_builds = []
-    make_source = runtime_module.DirectPrefixSource.from_block_tables
-
-    def build_source(*args):
-        source = make_source(*args)
-        source_builds.append(source)
-        return source
-
-    monkeypatch.setattr(runtime_module.DirectPrefixSource, "from_block_tables", build_source)
     with runtime.proposal_context(spec, state):
         for step, ends, width in [(0, (1159, 1160), 4), (1, (1160, 1160), 1), (2, (1161, 1161), 1)]:
             # A later loose workspace bound exceeds initialized columns. The
@@ -293,9 +298,6 @@ def test_eagle_allocation_upper_cannot_move_the_frozen_first_pass_anchor(setup, 
             runtime.metadata_callback(step, 2)(0, metadata)
             assert metadata.seq_lens[:2].tolist() == ([1159, 1159] if step == 0 else list(ends))
         assert runtime._eagle_plans is not None
-    assert len(source_builds) == 1
-    assert source_builds[0].table is spec.block_tables.block_tables[0].gpu
-    assert not runtime._sources
 
 
 def test_reorder_row_replacement_and_in_place_mapping_refresh_each_proposal(setup):
@@ -308,6 +310,7 @@ def test_reorder_row_replacement_and_in_place_mapping_refresh_each_proposal(setu
     state.idx_mapping_np[:] = [4, 2]
     state.req_ids[:] = ["replacement", "survivor"]
     canonical[4] += 100
+    second.block_table_tensor[:2] = canonical[state.idx_mapping_np.tolist()]
     with runtime.proposal_context(spec, state):
         runtime.metadata_callback(3, 2)(0, second)
     assert second.block_table_tensor[0, :3].tolist() == canonical[4, :3].tolist()
@@ -598,7 +601,7 @@ def test_eagle_full_continuing_keeps_full_addressing_without_window_snapshot(set
     def unexpected(*args, **kwargs):
         pytest.fail("Full continuing prefill requested a Window exact snapshot or read projection")
 
-    monkeypatch.setattr(runtime_module, "materialize_direct_prefix", unexpected)
+    monkeypatch.setattr(runtime_module, "materialize_draft_read", unexpected)
     retained_common = []
     with runtime.proposal_context(spec, state):
         owner = runtime._owner
@@ -711,7 +714,9 @@ def test_multiple_groups_project_same_logical_start_with_independent_backing(set
     policy = resolve_draft_window_policy(requested_window_size=8, method="dflash")
     runtime = DraftWindowRuntime(spec, policy)
     first, second = common(), common()
-    # build_attn_metadata slices the same prepared seq_lens for every group.
+    # build_attn_metadata slices each group's compact table, but the same
+    # prepared seq_lens for every group.
+    second.block_table_tensor = torch.cat((other_table[[1, 3]], torch.zeros((1, 16), dtype=torch.int32)))
     second.seq_lens = first.seq_lens
     with runtime.proposal_context(spec, batch()):
         callback = runtime.metadata_callback(3, 2)
@@ -1237,3 +1242,45 @@ def test_exact_snapshot_failure_retains_original_prepared_input(setup, monkeypat
         runtime.metadata_callback(3, 2)(0, metadata)
     assert runtime.pool.poisoned
     assert any(value is prepared for value in owner.retained)
+
+
+def test_current_compact_table_is_authoritative_without_a_second_persistent_gather(setup):
+    runtime, spec, canonical, _ = setup
+    metadata = common()
+    full_table = metadata.block_table_tensor
+    expected = full_table.clone()
+    canonical.fill_(-777)  # Distinguish the prepared consumer table from storage inventory.
+    with runtime.proposal_context(spec, batch()):
+        runtime.metadata_callback(3, 2)(0, metadata)
+    assert metadata.block_table_tensor[0, :3].tolist() == expected[0, :3].tolist()
+    assert metadata.block_table_tensor[1, :3].tolist() == expected[1, 4:7].tolist()
+    assert torch.equal(full_table, expected)
+
+
+@pytest.mark.parametrize("rows", [(-1, 3), (6, 3)])
+def test_allocation_count_boundary_rejects_inactive_request_slots(setup, rows):
+    runtime, spec, _, _ = setup
+    metadata = common()
+    with (
+        pytest.raises(ValueError, match="active persistent request slots"),
+        runtime.proposal_context(spec, batch(rows=rows)),
+    ):
+        runtime.metadata_callback(3, 2)(0, metadata)
+
+
+def test_compact_rows_and_persistent_allocation_counts_use_the_same_request_order(setup):
+    runtime, spec, canonical, _ = setup
+    state = batch(rows=(2, 0))
+    spec.block_tables.num_blocks.np[0] = [7, 8, 3, 8, 8, 8]
+    metadata = common()
+    metadata.block_table_tensor[:2] = canonical[[2, 0]]
+    full_table = metadata.block_table_tensor
+    before = full_table.clone(), canonical.clone()
+    slots, positions = metadata.slot_mapping, metadata.positions
+    with runtime.proposal_context(spec, state):
+        runtime.metadata_callback(3, 2)(0, metadata)
+    assert metadata.block_table_tensor[0, :3].tolist() == canonical[2, :3].tolist()
+    assert metadata.block_table_tensor[1, :3].tolist() == canonical[0, 4:7].tolist()
+    assert metadata.seq_lens.tolist() == [12, 11, 0]
+    assert torch.equal(full_table, before[0]) and torch.equal(canonical, before[1])
+    assert metadata.slot_mapping is slots and metadata.positions is positions

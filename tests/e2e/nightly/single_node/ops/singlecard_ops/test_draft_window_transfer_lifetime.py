@@ -11,7 +11,6 @@ torch_npu = pytest.importorskip("torch_npu")
 
 from vllm_ascend.worker.v2.spec_decode.draft_window_dense import DenseDraftRead, prepare_dense_draft_read  # noqa: E402
 from vllm_ascend.worker.v2.spec_decode.draft_window_lifetime import DraftWindowOwnerPool  # noqa: E402
-from vllm_ascend.worker.v2.spec_decode.draft_window_read import DirectPrefixSource  # noqa: E402
 
 pytestmark = pytest.mark.skipif(not torch.npu.is_available(), reason="requires an Ascend NPU")
 
@@ -20,9 +19,8 @@ pytestmark = pytest.mark.skipif(not torch.npu.is_available(), reason="requires a
 def test_real_private_copy_failure_retains_its_actual_operands(monkeypatch, stage):
     table = torch.arange(32, dtype=torch.int32, device="npu").reshape(2, 16)
     before = table.clone()
-    source = DirectPrefixSource(table, (1, 0), (16, 16), 128)
+    source = (table[list((1, 0))], (16, 16), 128)
     exact = torch.tensor([1151, 1408], dtype=torch.int32, device="npu")
-    rows = torch.tensor([1, 0], device="npu")
     pool = DraftWindowOwnerPool(1)
     events, submitted = [], []
     original_copy = torch.Tensor.copy_
@@ -52,9 +50,8 @@ def test_real_private_copy_failure_retains_its_actual_operands(monkeypatch, stag
     try:
         with pytest.raises(RuntimeError, match="after real NPU copy"), pool.operation(lambda: None) as owner:
             prepare_dense_draft_read(
-                source,
+                *source,
                 exact_device=exact,
-                row_indices=rows,
                 upper_cpu=torch.tensor([1154, 1411], dtype=torch.int32),
                 window_size=1024,
                 anchor_span=128,

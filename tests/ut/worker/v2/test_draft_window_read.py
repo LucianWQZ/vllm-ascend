@@ -5,16 +5,13 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
 from unittest.mock import patch
 
 import numpy as np
 import torch
 
 from vllm_ascend.worker.v2.spec_decode.draft_window_read import (
-    DirectPrefixSource,
-    NativeSWASource,
-    materialize_direct_prefix,
+    materialize_draft_read,
 )
 
 
@@ -31,36 +28,39 @@ class TestCanonicalRead(unittest.TestCase):
 
     def read(self, ends=(21, 11), starts=(12, 4), upper=(24, 15)):
         exact = torch.tensor(ends, dtype=torch.int32)
-        return materialize_direct_prefix(
-            DirectPrefixSource.from_block_tables(self.owner, 0, self.mapping),
+        return materialize_draft_read(
+            self.table[self.mapping.tolist()],
+            self.owner.num_blocks.np[0, self.mapping].tolist(),
+            4,
             exact_cpu=exact,
             exact_device=exact,
             upper_cpu=torch.tensor(upper),
             starts_cpu=torch.tensor(starts),
             padded_rows=3,
-            row_indices=torch.from_numpy(self.mapping).to(torch.int64),
             retain=lambda *values: self.retained.extend(values),
         )
 
-    def test_source_construction_checks_static_geometry_for_both_layouts(self):
-        for source_type in (DirectPrefixSource, NativeSWASource):
-            native: dict[str, Any] = {"native_window": 4096} if source_type is NativeSWASource else {}
-            arguments: dict[str, Any] = dict(table=self.table, request_rows=(2, 0), valid_columns=(8, 8), block_span=4)
-            source_type(**arguments, **native)
-            for field, invalid in (
-                ("table", self.table.flatten()),
-                ("table", self.table.float()),
-                ("block_span", 0),
-                ("request_rows", (-1, 0)),
-                ("request_rows", (3, 0)),
-                ("valid_columns", (8,)),
-                ("valid_columns", (9, 8)),
-                ("valid_columns", (-1, 8)),
-            ):
-                with self.subTest(source=source_type, field=field), self.assertRaises(ValueError):
-                    source_type(**dict(arguments, **{field: invalid}), **native)
-        with self.assertRaisesRegex(ValueError, "positive window"):
-            NativeSWASource(self.table, (2, 0), (8, 8), 4, 0)
+    def test_projection_rejects_invalid_compact_geometry(self):
+        for table, counts, span in (
+            (self.table.flatten(), (8, 8), 4),
+            (self.table.float(), (8, 8), 4),
+            (self.table[:1], (8, 8), 4),
+            (self.table, (9, 8), 4),
+            (self.table, (-1, 8), 4),
+            (self.table, (8, 8), 0),
+        ):
+            with self.subTest(table=table.shape, counts=counts, span=span), self.assertRaises(ValueError):
+                materialize_draft_read(
+                    table,
+                    counts,
+                    span,
+                    exact_cpu=torch.tensor([21, 11]),
+                    exact_device=torch.tensor([21, 11]),
+                    upper_cpu=torch.tensor([24, 15]),
+                    starts_cpu=torch.tensor([12, 4]),
+                    padded_rows=3,
+                    retain=lambda *values: None,
+                )
 
     def test_canonical_projection_preserves_upper_and_padding(self):
         view = self.read()
@@ -70,7 +70,7 @@ class TestCanonicalRead(unittest.TestCase):
         self.assertNotEqual(view.block_table.untyped_storage().data_ptr(), self.table.untyped_storage().data_ptr())
         self.assertEqual(self.table.tolist(), torch.arange(24).reshape(3, 8).tolist())
 
-    def test_owned_start_transfer_retains_actual_source_and_destination(self):
+    def test_projection_copies_retain_actual_source_and_destination(self):
         retained: list[torch.Tensor] = []
         copied: list[tuple[torch.Tensor, torch.Tensor]] = []
         original_copy = torch.Tensor.copy_
@@ -84,23 +84,24 @@ class TestCanonicalRead(unittest.TestCase):
 
         exact = torch.tensor([21, 11], dtype=torch.int32)
         with patch.object(torch.Tensor, "copy_", copy):
-            view = materialize_direct_prefix(
-                DirectPrefixSource.from_block_tables(self.owner, 0, self.mapping),
+            view = materialize_draft_read(
+                self.table[self.mapping.tolist()],
+                self.owner.num_blocks.np[0, self.mapping].tolist(),
+                4,
                 exact_cpu=exact,
                 exact_device=exact,
                 upper_cpu=exact + 3,
                 starts_cpu=torch.tensor([12, 4], dtype=torch.int32),
                 padded_rows=3,
                 retain=lambda *values: retained.extend(values),
-                row_indices=torch.from_numpy(self.mapping).to(torch.int64),
             )
-        self.assertEqual(len(copied), 1)
-        self.assertEqual(copied[0][0].dtype, torch.int64)
+        self.assertEqual(len(copied), 3)  # Two active-row D2D copies and one exact-length H2D.
+        self.assertEqual(copied[-1][0].dtype, torch.int32)
         self.assertEqual(view.seq_lens.tolist(), [9, 7, 0])
         self.assertTrue(any(value is view.block_table for value in retained))
         self.assertTrue(any(value is view.seq_lens for value in retained))
 
-    def test_retention_failure_prevents_owned_start_copy(self):
+    def test_retention_failure_prevents_first_table_copy(self):
         calls = []
 
         def retain(*values):
@@ -111,15 +112,16 @@ class TestCanonicalRead(unittest.TestCase):
         exact = torch.tensor([21, 11], dtype=torch.int32)
         with patch.object(torch.Tensor, "copy_") as copy:
             with self.assertRaisesRegex(RuntimeError, "retain destination"):
-                materialize_direct_prefix(
-                    DirectPrefixSource.from_block_tables(self.owner, 0, self.mapping),
+                materialize_draft_read(
+                    self.table[self.mapping.tolist()],
+                    self.owner.num_blocks.np[0, self.mapping].tolist(),
+                    4,
                     exact_cpu=exact,
                     exact_device=exact,
                     upper_cpu=exact + 3,
                     starts_cpu=torch.tensor([12, 4], dtype=torch.int32),
                     padded_rows=3,
                     retain=retain,
-                    row_indices=torch.from_numpy(self.mapping).to(torch.int64),
                 )
             copy.assert_not_called()
 
@@ -147,16 +149,22 @@ class TestCanonicalRead(unittest.TestCase):
             with self.subTest(strided=strided):
                 table = self.table if not strided else torch.arange(48, dtype=torch.int32).reshape(3, 16)[:, ::2]
                 before = table.clone()
-                source = DirectPrefixSource(table, (2, 0), (8, 8), 4)
+                # The framework's compact input can itself be strided.
+                compact = table[[2, 0]]
+                if strided:
+                    storage = torch.zeros((2, 16), dtype=torch.int32)
+                    storage[:, ::2] = compact
+                    compact = storage[:, ::2]
                 exact = torch.tensor([21, 11], dtype=torch.int32)
-                view = materialize_direct_prefix(
-                    source,
+                view = materialize_draft_read(
+                    compact,
+                    (8, 8),
+                    4,
                     exact_cpu=exact,
                     exact_device=exact,
                     upper_cpu=torch.tensor([24, 15]),
                     starts_cpu=torch.tensor([12, 4]),
                     padded_rows=3,
-                    row_indices=torch.tensor([2, 0]),
                     retain=lambda *values: self.retained.extend(values),
                 )
                 expected = torch.stack(
@@ -170,21 +178,19 @@ class TestCanonicalRead(unittest.TestCase):
                 torch.testing.assert_close(table, before, rtol=0, atol=0)
                 self.assertEqual(view.seq_lens.tolist(), [9, 7, 0])
 
-    def test_prepared_row_mapping_requires_integer_current_request_extent(self):
-        source = DirectPrefixSource.from_block_tables(self.owner, 0, self.mapping)
-        exact = torch.tensor([21, 11], dtype=torch.int32)
-        for rows in (torch.tensor([2]), torch.tensor([2.0, 0.0])):
-            with self.subTest(rows=rows), self.assertRaisesRegex(ValueError, "Prepared Draft row mapping"):
-                materialize_direct_prefix(
-                    source,
-                    exact_cpu=exact,
-                    exact_device=exact,
-                    upper_cpu=exact + 3,
-                    starts_cpu=torch.tensor([12, 4]),
-                    padded_rows=3,
-                    row_indices=rows,
-                    retain=lambda *values: self.retained.extend(values),
-                )
+    def test_prepared_compact_table_requires_active_request_extent(self):
+        with self.assertRaisesRegex(ValueError, "compact column extent"):
+            materialize_draft_read(
+                self.table[:1],
+                (8, 8),
+                4,
+                exact_cpu=torch.tensor([21, 11]),
+                exact_device=torch.tensor([21, 11]),
+                upper_cpu=torch.tensor([24, 15]),
+                starts_cpu=torch.tensor([12, 4]),
+                padded_rows=3,
+                retain=lambda *values: None,
+            )
 
     def test_typed_application_preserves_query_and_write_identity(self):
         slots, positions, query = object(), object(), object()
@@ -194,12 +200,9 @@ class TestCanonicalRead(unittest.TestCase):
         self.assertIs(common.positions, positions)
         self.assertIs(common.query_start_loc, query)
 
-    def test_reject_unrepresentable_start_and_inactive_mapping(self):
+    def test_reject_unrepresentable_start(self):
         with self.assertRaisesRegex(ValueError, "intra-block"):
             self.read(starts=(13, 4))
-        self.mapping[0] = -1
-        with self.assertRaisesRegex(ValueError, "inactive"):
-            self.read()
 
     def test_invalid_exact_upper_and_start_ordering_is_rejected(self):
         for kwargs in ({"upper": (20, 15)}, {"starts": (24, 4)}, {"ends": (-1, 11)}):
@@ -311,6 +314,62 @@ class TestCanonicalRead(unittest.TestCase):
                 setattr(common, field, getattr(common, field).clone())
                 with self.assertRaisesRegex(ValueError, "replaced"):
                     self.select_parallel_lengths(common)
+
+    def test_compact_kernel_columns_reach_the_original_mla_builder(self):
+        from vllm_ascend.attention.mla_v1 import AscendMLAMetadata, AscendMLAMetadataBuilder
+        from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
+
+        # Manager blocks are 256 tokens; the Ascend table is expanded to
+        # kernel-addressed 128-token columns before official batch gathering.
+        spec = AscendMLAAttentionSpec(block_size=256, num_kv_heads=1, head_size=128, dtype=torch.bfloat16)
+        compact = torch.arange(32, dtype=torch.int32).reshape(2, 16)
+        full = compact.clone()
+        exact = torch.tensor([1151, 1408], dtype=torch.int32)
+        view = materialize_draft_read(
+            compact,
+            (9, 11),
+            spec.block_size // 2,
+            exact_cpu=exact,
+            exact_device=exact,
+            upper_cpu=exact + 7,
+            starts_cpu=torch.tensor([0, 384]),
+            padded_rows=2,
+            retain=lambda *values: None,
+        )
+        slots, positions = torch.arange(16), torch.arange(16) + 1135
+        common = SimpleNamespace(
+            num_reqs=2,
+            slot_mapping=slots,
+            positions=positions,
+            query_start_loc_cpu=torch.tensor([0, 8, 16]),
+            query_start_loc=torch.tensor([0, 8, 16]),
+            pcp_context=None,
+            pcp_cache_group_idx=None,
+            context_parallel_metadata=None,
+            num_actual_tokens=16,
+            num_input_tokens=16,
+            max_query_len=8,
+            graph_pad_size=-1,
+            attn_state=object(),
+            causal=False,
+        )
+        view.apply(common)
+        builder = object.__new__(AscendMLAMetadataBuilder)
+        builder.flashmla_state, builder.use_pcp, builder.use_dcp = None, False, False
+        builder.decode_threshold = 8
+        builder.metadata_cls = AscendMLAMetadata
+        builder.model_config = SimpleNamespace(get_head_size=lambda: 128)
+        builder.attn_mask_builder = SimpleNamespace(get_splitfuse_attn_mask=lambda: None)
+        # This Host check covers the original builder's real common-field
+        # selection. Derived native operands are separately device-qualified.
+        builder.build_decode_metadata = lambda *args: None
+        with patch("vllm_ascend.attention.utils.is_pd_decode_recompute_scheduler_enabled", return_value=False):
+            result = builder.build(0, common)
+        self.assertEqual(result.block_tables.tolist(), [full[0, :9].tolist(), full[1, 3:11].tolist() + [0]])
+        self.assertEqual(result.seq_lens.tolist(), [1151, 1024])
+        self.assertIs(result.slot_mapping.untyped_storage(), slots.untyped_storage())
+        self.assertIs(common.positions, positions)
+        self.assertTrue(torch.equal(compact, full))
 
 
 if __name__ == "__main__":

@@ -8,21 +8,19 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_dense import (
     DenseDraftReadBatch,
     prepare_dense_draft_read,
 )
-from vllm_ascend.worker.v2.spec_decode.draft_window_read import DirectPrefixSource
 
 
 @pytest.mark.parametrize("causal", [False, True])
 def test_ragged_queries_keep_full_row_and_use_device_exact_at_boundary(causal):
     table = torch.arange(32, dtype=torch.int32).reshape(2, 16)
-    source = DirectPrefixSource(table, (1, 0), (16, 16), 128)
+    source = (table[list((1, 0))], (16, 16), 128)
     before = table.clone()
     offsets = torch.tensor([0, 3, 8], dtype=torch.int32)
     exact = torch.tensor([1151, 1408], dtype=torch.int32)
     held: list[object] = []
     read = prepare_dense_draft_read(
-        source,
+        *source,
         exact_device=exact,
-        row_indices=torch.tensor([1, 0]),
         upper_cpu=torch.tensor([1152, 1411], dtype=torch.int32),
         window_size=1024,
         anchor_span=128,
@@ -59,13 +57,12 @@ def test_ragged_queries_keep_full_row_and_use_device_exact_at_boundary(causal):
 
 def test_ragged_eagle_native_padding_preserves_frozen_anchor_and_full_continuation():
     table = torch.arange(64, dtype=torch.int32).reshape(2, 32)
-    source = DirectPrefixSource(table, (0, 1), (32, 32), 128)
+    source = (table[list((0, 1))], (32, 32), 128)
     offsets = torch.tensor([0, 4, 261], dtype=torch.int32)
     read = prepare_dense_draft_read(
-        source,
+        *source,
         exact_device=torch.tensor([1795, 2177], dtype=torch.int32),
         query_ends=torch.tensor([1796, 2177], dtype=torch.int32),
-        row_indices=torch.tensor([0, 1]),
         upper_cpu=torch.tensor([1800, 2180], dtype=torch.int32),
         window_size=1035,
         anchor_span=128,
@@ -88,11 +85,10 @@ def test_ragged_eagle_native_padding_preserves_frozen_anchor_and_full_continuati
 
 
 def test_uniform_full_read_rows_keep_original_query_layout():
-    source = DirectPrefixSource(torch.arange(24, dtype=torch.int32).reshape(2, 12), (0, 1), (12, 12), 128)
+    source = (torch.arange(24, dtype=torch.int32).reshape(2, 12)[list((0, 1))], (12, 12), 128)
     read = prepare_dense_draft_read(
-        source,
+        *source,
         exact_device=torch.tensor([1151, 1287], dtype=torch.int32),
-        row_indices=torch.tensor([0, 1]),
         upper_cpu=torch.tensor([1152, 1290], dtype=torch.int32),
         window_size=1024,
         anchor_span=128,
@@ -113,13 +109,12 @@ def test_uniform_full_read_rows_keep_original_query_layout():
 @pytest.mark.parametrize("full_rows", [None, [False, False, False]])
 def test_decode_ragged_widths_use_same_partition_without_query_padding(causal, full_rows):
     table = torch.arange(48, dtype=torch.int32).reshape(3, 16)
-    source = DirectPrefixSource(table, (2, 0, 1), (16, 16, 16), 128)
+    source = (table[list((2, 0, 1))], (16, 16, 16), 128)
     offsets = torch.tensor([0, 1, 4, 5], dtype=torch.int32)
     exact = torch.tensor([1151, 1291, 1408], dtype=torch.int32)
     read = prepare_dense_draft_read(
-        source,
+        *source,
         exact_device=exact,
-        row_indices=torch.tensor([2, 0, 1]),
         upper_cpu=exact + 3,
         window_size=1024,
         anchor_span=128,

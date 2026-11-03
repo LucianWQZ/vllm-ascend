@@ -11,11 +11,6 @@ import torch
 from vllm_ascend.attention.utils import _select_seq_lens
 from vllm_ascend.worker.v2.spec_decode import draft_window_runtime as runtime_module
 from vllm_ascend.worker.v2.spec_decode.draft_window_policy import resolve_draft_window_policy
-from vllm_ascend.worker.v2.spec_decode.draft_window_read import (
-    NativeSWASource,
-    materialize_direct_prefix,
-    materialize_native_swa_intersection,
-)
 
 
 @pytest.fixture
@@ -203,44 +198,22 @@ def test_native_projection_rejects_wrong_actual_preparation(prepared, changed):
     assert runtime.pool.poisoned
 
 
-def test_native_source_cannot_be_used_as_resident_full_prefix():
-    source = NativeSWASource(torch.ones((1, 16), dtype=torch.int32), (0,), (16,), 128, 4096)
-    with pytest.raises(ValueError, match="resident-prefix"):
-        materialize_direct_prefix(
-            source,
-            exact_cpu=torch.tensor([1024]),
-            exact_device=torch.tensor([1024]),
-            upper_cpu=torch.tensor([1024]),
-            starts_cpu=torch.tensor([0]),
-            padded_rows=1,
-            row_indices=torch.tensor([0]),
-            retain=lambda *args: None,
-        )
-
-
-def test_native_projection_must_cover_every_query():
-    source = NativeSWASource(torch.ones((1, 16), dtype=torch.int32), (0,), (16,), 128, 4096)
-    with pytest.raises(ValueError, match="every native query"):
-        materialize_native_swa_intersection(
-            source,
-            exact_cpu=torch.tensor([1024]),
-            exact_device=torch.tensor([1024]),
-            upper_cpu=torch.tensor([1024]),
-            starts_cpu=torch.tensor([1024]),
-            padded_rows=1,
-            query_width=8,
-            row_indices=torch.tensor([0]),
-            retain=lambda *args: None,
-        )
+def test_native_projection_must_cover_every_query(prepared):
+    runtime, spec, batch, common, _, _ = prepared(window=1)
+    common.seq_lens = torch.tensor([1025, 1025], dtype=torch.int32)
+    common.seq_lens_cpu_upper_bound = common.seq_lens + 1
+    with pytest.raises(ValueError, match="every native query"), runtime.proposal_context(spec, batch):
+        runtime.metadata_callback(8, 2)(0, common)
 
 
 def test_next_native_proposal_owns_independent_read_buffers(prepared):
-    runtime, spec, batch, common, _, completions = prepared()
+    runtime, spec, batch, common, canonical, completions = prepared()
     with runtime.proposal_context(spec, batch):
         runtime.metadata_callback(8, 2)(0, common)
     first = common.seq_lens.clone(), common.block_table_tensor.clone()
     second = SimpleNamespace(**vars(common))
     second.seq_lens = torch.tensor([1159, 1160], dtype=torch.int32)
+    second.block_table_tensor = canonical[batch.idx_mapping_np.tolist()].clone()
     second.seq_lens_cpu_upper_bound = second.seq_lens + 3
     del second._draft_window_read
     with runtime.proposal_context(spec, batch):
@@ -255,7 +228,7 @@ def test_next_native_proposal_owns_independent_read_buffers(prepared):
 
 @pytest.mark.parametrize("repeated", [False, True])
 def test_native_callback_keeps_owner_and_single_use_guards(prepared, repeated):
-    runtime, spec, batch, common, _, _ = prepared()
+    runtime, spec, batch, common, canonical, _ = prepared()
     with runtime.proposal_context(spec, batch):
         callback = runtime.metadata_callback(8, 2)
         callback(0, common)
@@ -263,6 +236,9 @@ def test_native_callback_keeps_owner_and_single_use_guards(prepared, repeated):
         if repeated:
             callback = runtime.metadata_callback(8, 2)
             fresh = SimpleNamespace(**vars(common))
+            fresh.block_table_tensor = canonical[batch.idx_mapping_np.tolist()].clone()
+            fresh.seq_lens = torch.tensor([1151, 1152], dtype=torch.int32)
+            fresh.seq_lens_cpu_upper_bound = torch.tensor([1152, 1159], dtype=torch.int32)
             del fresh._draft_window_read
             callback(0, fresh)
         callback(0, common)
@@ -277,11 +253,12 @@ def test_native_proposal_requires_every_group(prepared):
 
 
 def test_builder_failure_keeps_projected_read_operands_owned(prepared):
-    runtime, spec, batch, common, canonical, _ = prepared()
+    runtime, spec, batch, common, _, _ = prepared()
+    compact = common.block_table_tensor
     with pytest.raises(RuntimeError, match="builder failed"), runtime.proposal_context(spec, batch):
         owner = runtime._owner
         runtime.metadata_callback(8, 2)(0, common)
         assert any(item is common for item in owner.retained)
-        assert any(item is canonical for item in owner.retained)
+        assert any(item is compact for item in owner.retained)
         raise RuntimeError("builder failed")
     assert runtime.pool.poisoned

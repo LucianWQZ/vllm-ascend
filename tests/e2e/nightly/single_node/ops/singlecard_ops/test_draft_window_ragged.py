@@ -14,7 +14,6 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_dense import (  # noqa: E402
     dense_draft_attention,
     prepare_dense_draft_read,
 )
-from vllm_ascend.worker.v2.spec_decode.draft_window_read import DirectPrefixSource  # noqa: E402
 
 pytestmark = pytest.mark.skipif(not torch.npu.is_available(), reason="requires an Ascend NPU")
 TOLERANCES = {torch.bfloat16: (2**-7, 2**-6), torch.float16: (2**-10, 2**-9)}
@@ -57,14 +56,14 @@ def test_native_ragged_exact_read_with_full_continuation(dtype, dim, kv_heads, c
     table = table_backing[:, ::2]
     table.copy_(canonical)
     table_before = table_backing.clone()
-    source = DirectPrefixSource(table, rows, (32,) * len(rows), block)
+    source = (table_backing[list(rows)][:, ::2], (32,) * len(rows), block)
+    assert source[0].stride(1) == 2
     offsets = torch.tensor([0, *torch.tensor(widths).cumsum(0).tolist()], dtype=torch.int32)
     retained = []
     read = prepare_dense_draft_read(
-        source,
+        *source,
         exact_device=torch.tensor(ends, dtype=torch.int32, device="npu"),
         query_ends=torch.tensor(native_ends, dtype=torch.int32, device="npu"),
-        row_indices=torch.tensor(rows, dtype=torch.int64, device="npu"),
         upper_cpu=torch.tensor(ends, dtype=torch.int32) + 1,
         window_size=window,
         anchor_span=block,

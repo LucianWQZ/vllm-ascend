@@ -10,8 +10,7 @@ import torch
 torch_npu = pytest.importorskip("torch_npu")
 
 from vllm_ascend.worker.v2.spec_decode.draft_window_read import (  # noqa: E402
-    NativeSWASource,
-    materialize_native_swa_intersection,
+    materialize_draft_read,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -42,15 +41,13 @@ def test_native_swa_intersection_uses_current_exact_and_canonical_pages(ends, wi
     exact = torch.tensor(ends, dtype=torch.int32)
     starts = torch.tensor([max(end - window, 0) // block * block for end in ends], dtype=torch.int32)
     retained = []
-    read = materialize_native_swa_intersection(
-        NativeSWASource(table, rows, (columns, columns), block, native_window),
+    read = materialize_draft_read(
+        *(table[list(rows)], (columns, columns), block),
         exact_cpu=exact,
         exact_device=exact.npu(),
         upper_cpu=exact + 1,
         starts_cpu=starts,
         padded_rows=2,
-        query_width=width,
-        row_indices=torch.tensor(rows, dtype=torch.int64).npu(),
         retain=lambda *items: retained.extend(items),
     )
     mask = torch.ones((2048, 2048), dtype=torch.bool).triu(1).npu()
@@ -96,7 +93,7 @@ def test_native_swa_intersection_uses_current_exact_and_canonical_pages(ends, wi
     torch.testing.assert_close(value_device.cpu(), value, atol=0, rtol=0)
 
 
-def test_native_projection_retains_pinned_actual_dma_source(monkeypatch):
+def test_native_projection_retains_pinned_actual_length_dma_source(monkeypatch):
     """Check the real DMA input is pinned and retained before submission."""
     from types import SimpleNamespace
     from unittest.mock import patch
@@ -154,8 +151,8 @@ def test_native_projection_retains_pinned_actual_dma_source(monkeypatch):
     copy = torch.Tensor.copy_
 
     def checked(destination, source, *args, **kwargs):
-        if destination.device.type == "npu" and source.device.type == "cpu" and source.dtype == torch.int64:
-            assert source.is_pinned(), "Actual start DMA source must be pinned"
+        if destination.device.type == "npu" and source.device.type == "cpu" and source.dtype == torch.int32:
+            assert source.is_pinned(), "Actual exact-length DMA source must be pinned"
             assert any(value is source for value in owner.retained), "Retain the real DMA source before submit"
             copies.append(source)
         return copy(destination, source, *args, **kwargs)

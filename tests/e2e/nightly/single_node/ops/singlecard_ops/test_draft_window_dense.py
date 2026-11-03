@@ -15,7 +15,6 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_dense import (  # noqa: E402
     gather_dense_draft_kv,
     prepare_dense_draft_read,
 )
-from vllm_ascend.worker.v2.spec_decode.draft_window_read import DirectPrefixSource  # noqa: E402
 
 pytestmark = pytest.mark.skipif(not torch.npu.is_available(), reason="requires an Ascend NPU")
 TOLERANCES = {torch.bfloat16: (2**-7, 2**-6), torch.float16: (2**-10, 2**-9)}
@@ -29,16 +28,15 @@ def test_prepared_reads_preserve_frozen_window_across_queued_consumers(query_wid
     rows = torch.tensor([1, 0], dtype=torch.int64)
     exact = torch.tensor([1159, 1281], dtype=torch.int32)
     frozen = torch.tensor([0, 128], dtype=torch.int32)
-    table_device, rows_device, exact_device = [value.npu() for value in (canonical, rows, exact)]
-    source = DirectPrefixSource(table_device, (1, 0), (12, 12), block)
+    table_device, exact_device = [value.npu() for value in (canonical, exact)]
+    source = (table_device[list((1, 0))], (12, 12), block)
     retained, reads = [], []
     for _ in range(8):
         reads.append(
             prepare_dense_draft_read(
-                source,
+                *source,
                 exact_device=exact_device,
                 exact_cpu=exact,
-                row_indices=rows_device,
                 upper_cpu=exact + 2,
                 window_size=1035,
                 anchor_span=block,
@@ -111,13 +109,12 @@ def test_rejected_first_pass_preserves_query_alignment_without_gathering_native_
     values_cpu.view(-1, 2, dim)[end:] = torch.nan
     query_cpu = (torch.randn(4, 4, dim, generator=generator) * 0.2).to(dtype)
     keys, values, query = keys_cpu.npu(), values_cpu.npu(), query_cpu.npu()
-    source = DirectPrefixSource(torch.arange(12, dtype=torch.int32, device="npu").reshape(1, 12), (0,), (12,), block)
+    source = (torch.arange(12, dtype=torch.int32, device="npu").reshape(1, 12)[list((0,))], (12,), block)
     held = []
     read = prepare_dense_draft_read(
-        source,
+        *source,
         exact_device=torch.tensor([end], dtype=torch.int32, device="npu"),
         query_ends=torch.tensor([native_end], dtype=torch.int32, device="npu"),
-        row_indices=torch.tensor([0], device="npu"),
         upper_cpu=torch.tensor([native_end + 1]),
         window_size=1035,
         anchor_span=block,
@@ -188,16 +185,18 @@ def test_dense_device_exact_reader(geometry, query_width, future, causal, page_l
         assert not keys.is_contiguous() and values.storage_offset() > 0
         backing_before = backing.clone()
     source_table = canonical.npu()
+    compact_table = source_table[list(rows)]
     if page_layers:
-        # The planner must use real table strides, without a Full-table copy.
-        table_backing = torch.full((4, 24), -1, dtype=torch.int32, device="npu")
-        source_table = table_backing[:, ::2]
-        source_table.copy_(canonical.npu())
-        assert source_table.stride(1) == 2
-    source = DirectPrefixSource(source_table, rows, (12, 12), B)
+        # Reorder before constructing the strided compact consumer table:
+        # advanced indexing after this slice would silently make it contiguous.
+        table_backing = torch.full((len(rows), 24), -1, dtype=torch.int32, device="npu")
+        strided_table = table_backing[:, ::2]
+        strided_table.copy_(compact_table)
+        compact_table = strided_table
+        assert compact_table.stride(1) == 2
+    source = (compact_table, (12, 12), B)
     upper_cpu = torch.tensor(ends, dtype=torch.int32) + 1
     upper_device, rejected = upper_cpu.npu(), torch.ones(2, dtype=torch.int32, device="npu")
-    device_rows = torch.tensor(rows, dtype=torch.int64, device="npu")
     # E0=end-1, K=3 freezes H=end+2, independently of later current E.
     frozen_starts = (
         torch.div(torch.clamp(upper_device - rejected - 1 + 3 - W, min=0), B, rounding_mode="floor") * B
@@ -207,10 +206,11 @@ def test_dense_device_exact_reader(geometry, query_width, future, causal, page_l
     retained = []
 
     def execute():
+        if page_layers:
+            assert source[0].stride(1) == 2
         read = prepare_dense_draft_read(
-            source,
+            *source,
             exact_device=upper_device - rejected,
-            row_indices=device_rows,
             upper_cpu=upper_cpu,
             window_size=W,
             anchor_span=B,
@@ -234,6 +234,7 @@ def test_dense_device_exact_reader(geometry, query_width, future, causal, page_l
     for device, original in ((keys, keys_cpu), (values, values_cpu), (query, query_cpu), (source_table, canonical)):
         torch.testing.assert_close(device.cpu(), original, atol=0, rtol=0, equal_nan=True)
 
+    torch.testing.assert_close(compact_table.cpu(), canonical[list(rows)], atol=0, rtol=0)
     if page_layers:
         torch.testing.assert_close(backing, backing_before, atol=0, rtol=0, equal_nan=True)
 
@@ -251,12 +252,11 @@ def test_bfloat16_probability_cancellation():
     values = torch.zeros_like(keys)
     values[1, 0] = 128
     values[1, 1] = -128.5
-    source = DirectPrefixSource(torch.tensor([[1]], dtype=torch.int32, device="npu"), (0,), (1,), block)
+    source = (torch.tensor([[1]], dtype=torch.int32, device="npu")[list((0,))], (1,), block)
     retained = []
     read = prepare_dense_draft_read(
-        source,
+        *source,
         exact_device=torch.tensor([8], dtype=torch.int32, device="npu"),
-        row_indices=torch.tensor([0], device="npu"),
         upper_cpu=torch.tensor([8], device="cpu"),
         window_size=128,
         anchor_span=128,
@@ -278,12 +278,11 @@ def test_small_causal_window_empty_rows_are_zero():
     values = torch.full_like(keys, torch.nan)
     keys[2, 0] = 1
     values[2, 0] = 7
-    source = DirectPrefixSource(torch.tensor([[1, 2]], dtype=torch.int32, device="npu"), (0,), (2,), block)
+    source = (torch.tensor([[1, 2]], dtype=torch.int32, device="npu")[list((0,))], (2,), block)
     retained = []
     read = prepare_dense_draft_read(
-        source,
+        *source,
         exact_device=torch.tensor([129], dtype=torch.int32, device="npu"),
-        row_indices=torch.tensor([0], device="npu"),
         upper_cpu=torch.tensor([130], device="cpu"),
         window_size=1,
         anchor_span=block,
@@ -300,7 +299,7 @@ def test_small_causal_window_empty_rows_are_zero():
 
 
 def test_same_stream_prepared_inputs_are_consumed_before_reuse():
-    """Plan/pack owns its outputs, not copies of the next step's input bank."""
+    """Compact batch row order and query/length inputs survive later reuse."""
     block, dim, heads, width = 128, 128, 2, 4
     generator = torch.Generator().manual_seed(4317)
     table_cpu = torch.arange(24, dtype=torch.int32).reshape(2, 12)
@@ -308,12 +307,13 @@ def test_same_stream_prepared_inputs_are_consumed_before_reuse():
     values_cpu = (torch.randn(24, block, heads, dim, generator=generator) * 0.2).bfloat16()
     query_cpu = (torch.randn(7, 4, dim, generator=generator) * 0.2).bfloat16()
     keys, values, query = keys_cpu.npu(), values_cpu.npu(), query_cpu.npu()
-    source = DirectPrefixSource(table_cpu.npu(), (0, 1), (12, 12), block)
+    table_device = table_cpu.npu()
+    request_rows = (1, 0)
+    source = (table_device[list(request_rows)], (12, 12), block)
     exact = torch.empty(2, dtype=torch.int32, device="npu")
     query_ends = torch.empty_like(exact)
     offsets = torch.empty(3, dtype=torch.int32, device="npu")
     offsets_cpu = torch.tensor([0, 3, 7], dtype=torch.int32)
-    rows = torch.tensor([0, 1], dtype=torch.int64, device="npu")
     retained, results, references = [], [], []
     for ends in ((1151, 1281), (1152, 1279), (1149, 1280)):
         ends_cpu = torch.tensor(ends, dtype=torch.int32)
@@ -321,10 +321,9 @@ def test_same_stream_prepared_inputs_are_consumed_before_reuse():
         query_ends.copy_(ends_cpu + 1)
         offsets.copy_(offsets_cpu)
         read = prepare_dense_draft_read(
-            source,
+            *source,
             exact_device=exact,
             query_ends=query_ends,
-            row_indices=rows,
             upper_cpu=ends_cpu + 1,
             window_size=1024,
             anchor_span=block,
@@ -334,14 +333,14 @@ def test_same_stream_prepared_inputs_are_consumed_before_reuse():
             query_start_loc_device=offsets,
             retain=lambda *items: retained.extend(items),
         )
-        # Enqueued after plan/pack on the same stream, before attention. Neither
+        # Enqueued after read preparation on the same stream, before attention. Neither
         # later attention nor output restoration may consult these inputs again.
         exact.zero_()
         query_ends.zero_()
         offsets.zero_()
         results.append(dense_draft_attention(read, query, keys, values, 1 / math.sqrt(dim)))
         expected = []
-        for row, (end, begin, count) in enumerate(zip(ends, (0, 3), (3, 4))):
+        for row, end, begin, count in zip(request_rows, ends, (0, 3), (3, 4)):
             start = max(end - 1024, 0) // block * block
             key = keys_cpu[row * 12 : (row + 1) * 12].flatten(0, 1)[start:end].float().repeat_interleave(2, dim=1)
             value = values_cpu[row * 12 : (row + 1) * 12].flatten(0, 1)[start:end].float().repeat_interleave(2, dim=1)
@@ -355,4 +354,5 @@ def test_same_stream_prepared_inputs_are_consumed_before_reuse():
         torch.testing.assert_close(actual.cpu().float(), expected, atol=2**-7, rtol=2**-6)
     torch.testing.assert_close(keys.cpu(), keys_cpu, atol=0, rtol=0)
     torch.testing.assert_close(values.cpu(), values_cpu, atol=0, rtol=0)
-    torch.testing.assert_close(source.table.cpu(), table_cpu, atol=0, rtol=0)
+    torch.testing.assert_close(source[0].cpu(), table_cpu[list(request_rows)], atol=0, rtol=0)
+    torch.testing.assert_close(table_device.cpu(), table_cpu, atol=0, rtol=0)

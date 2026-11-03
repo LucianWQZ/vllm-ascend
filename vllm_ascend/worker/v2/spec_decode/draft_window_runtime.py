@@ -10,7 +10,7 @@ by a proposal until its final consumer event completes.
 
 from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Any, cast
+from typing import Any
 
 import numpy as np
 import torch
@@ -26,11 +26,8 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_plan import (
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_policy import DraftWindowPolicyDecision
 from vllm_ascend.worker.v2.spec_decode.draft_window_read import (
-    DirectPrefixSource,
     DraftReadView,
-    NativeSWASource,
-    materialize_direct_prefix,
-    materialize_native_swa_intersection,
+    materialize_draft_read,
 )
 
 
@@ -117,7 +114,6 @@ class DraftWindowRuntime:
         self._build_count = 0
         self._eagle_plans: tuple[DraftWindowPlan, ...] | None = None
         self._next_step = 0
-        self._sources: dict[int, DirectPrefixSource | NativeSWASource] = {}
 
     @property
     def reads_active(self) -> bool:
@@ -233,7 +229,6 @@ class DraftWindowRuntime:
             self._build_count = 0
             self._eagle_plans = None
             self._next_step = 0
-            self._sources.clear()
             try:
                 # Preparation and builders enqueue copies/kernels before model
                 # forward. Even a later host error must retain this proposal.
@@ -252,20 +247,6 @@ class DraftWindowRuntime:
                 self._owner = None
                 self._input_batch = None
                 self._eagle_plans = None
-                self._sources.clear()
-
-    def _source(self, gid: int, num_reqs: int) -> DirectPrefixSource | NativeSWASource:
-        # The runner allocates canonical pages before propose. AR changes KV
-        # contents/lengths, not this table owner or its allocated columns.
-        if gid not in self._sources:
-            rows = self._input_batch.idx_mapping_np[:num_reqs]
-            tables = self.speculator.block_tables
-            self._sources[gid] = (
-                NativeSWASource.from_block_tables(tables, gid, rows, self.native_swa_intersections[gid])
-                if gid in self.native_swa_intersections
-                else DirectPrefixSource.from_block_tables(tables, gid, rows)
-            )
-        return self._sources[gid]
 
     def metadata_callback(
         self,
@@ -556,6 +537,15 @@ class DraftWindowRuntime:
         def apply(gid: int, common_metadata: Any) -> None:
             retain = lambda *objects: self.pool.retain(owner, *objects)
             view: Any
+            table = common_metadata.block_table_tensor
+            # The framework gathered this batch order before Target forward.
+            # Canonical allocation counts remain indexed by persistent slots.
+            counts = self.speculator.block_tables.num_blocks.np
+            rows = batch.idx_mapping_np[:num_reqs]
+            if rows.shape != (num_reqs,) or np.any(rows < 0) or np.any(rows >= counts.shape[1]):
+                raise ValueError("Draft allocation counts require active persistent request slots")
+            columns = counts[gid, rows].tolist()
+            block_span = int(self.speculator.block_tables.kernel_block_sizes[gid])
             if gid in self.native_swa_intersections:
                 if (
                     common_metadata.num_reqs != num_reqs
@@ -582,21 +572,20 @@ class DraftWindowRuntime:
                         num_reqs,
                     )
                 else:
-                    source = cast(NativeSWASource, self._source(gid, num_reqs))
                     native_starts = torch.clamp(exact - self.window_size, min=0).to(torch.int64)
-                    native_starts = native_starts // source.block_span * source.block_span
+                    native_starts = native_starts // block_span * block_span
                     native_starts[torch.from_numpy(continuing)] = 0
-                    if source.table.device.type == "npu":
-                        native_starts = native_starts.pin_memory()
-                    view = materialize_native_swa_intersection(
-                        source,
+                    if bool((exact - native_starts < self.speculator.num_query_per_req).any()):
+                        raise ValueError("Extra Window must cover every native query")
+                    view = materialize_draft_read(
+                        table,
+                        columns,
+                        block_span,
                         exact_cpu=exact,
                         exact_device=common_metadata.seq_lens,
                         upper_cpu=common_metadata.seq_lens_cpu_upper_bound,
                         starts_cpu=native_starts,
                         padded_rows=num_reqs,
-                        query_width=self.speculator.num_query_per_req,
-                        row_indices=batch.idx_mapping[:num_reqs],
                         retain=retain,
                     )
             elif dense:
@@ -608,11 +597,12 @@ class DraftWindowRuntime:
                 query_width = int(widths.max())
                 ragged = not bool((widths == query_width).all())
                 view = prepare_dense_draft_read(
-                    cast(DirectPrefixSource, self._source(gid, num_reqs)),
+                    table,
+                    columns,
+                    block_span,
                     exact_device=common_metadata.seq_lens,
                     exact_cpu=proposal_exact if first else exact,
                     query_ends_cpu=exact,
-                    row_indices=batch.idx_mapping[:num_reqs],
                     upper_cpu=common_metadata.seq_lens_cpu_upper_bound[:num_reqs],
                     window_size=self.window_size,
                     anchor_span=self.anchor_block_span,
@@ -627,14 +617,15 @@ class DraftWindowRuntime:
                     retain=retain,
                 )
             else:
-                view = materialize_direct_prefix(
-                    cast(DirectPrefixSource, self._source(gid, num_reqs)),
+                view = materialize_draft_read(
+                    table,
+                    columns,
+                    block_span,
                     exact_cpu=exact,
                     exact_device=common_metadata.seq_lens,
                     upper_cpu=common_metadata.seq_lens_cpu_upper_bound[:num_reqs],
                     starts_cpu=starts,
                     padded_rows=common_metadata.num_reqs,
-                    row_indices=batch.idx_mapping[:num_reqs],
                     retain=retain,
                 )
             retain(view, common_metadata)

@@ -5,7 +5,6 @@
 import torch
 
 from vllm_ascend.worker.v2.spec_decode.draft_window_dense import prepare_dense_draft_read
-from vllm_ascend.worker.v2.spec_decode.draft_window_read import DirectPrefixSource
 
 
 def test_full_prompt_does_not_multiply_decode_scratch_by_full_capacity():
@@ -14,9 +13,8 @@ def test_full_prompt_does_not_multiply_decode_scratch_by_full_capacity():
     offsets = torch.tensor([4 * row for row in range(n)] + [4 * (n - 1) + full_width], dtype=torch.int32)
     table = torch.arange(n * 256, dtype=torch.int32).reshape(n, 256)
     read = prepare_dense_draft_read(
-        DirectPrefixSource(table, tuple(range(n)), (256,) * n, block),
+        *(table[list(tuple(range(n)))], (256,) * n, block),
         exact_device=ends,
-        row_indices=torch.arange(n),
         upper_cpu=ends + 1,
         window_size=1024,
         anchor_span=block,

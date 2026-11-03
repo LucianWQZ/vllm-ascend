@@ -12,7 +12,6 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_dense import (  # noqa: E402
     dense_draft_attention,
     prepare_dense_draft_read,
 )
-from vllm_ascend.worker.v2.spec_decode.draft_window_read import DirectPrefixSource  # noqa: E402
 
 pytestmark = pytest.mark.skipif(not torch.npu.is_available(), reason="requires an Ascend NPU")
 
@@ -27,9 +26,8 @@ def test_full_row_capacity_cohorts_have_independent_native_operands(decode_exact
     table = table_cpu.to("npu")
     held = []
     read = prepare_dense_draft_read(
-        DirectPrefixSource(table, tuple(rows.tolist()), tuple(((upper + 127) // 128).tolist()), 128),
+        *(table[list(tuple(rows.tolist()))], tuple(((upper + 127) // 128).tolist()), 128),
         exact_device=exact.to("npu"),
-        row_indices=rows.to("npu"),
         upper_cpu=upper,
         window_size=1024,
         anchor_span=128,

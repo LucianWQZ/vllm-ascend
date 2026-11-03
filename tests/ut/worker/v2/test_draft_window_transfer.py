@@ -14,7 +14,6 @@ import torch
 
 from vllm_ascend.worker.v2.spec_decode.draft_window_dense import DenseDraftRead, prepare_dense_draft_read
 from vllm_ascend.worker.v2.spec_decode.draft_window_lifetime import DraftWindowOwnerPool
-from vllm_ascend.worker.v2.spec_decode.draft_window_read import DirectPrefixSource
 
 
 def unrecorded_completion() -> NoReturn:
@@ -24,7 +23,7 @@ def unrecorded_completion() -> NoReturn:
 @pytest.mark.parametrize("stage", ["phase", "cohort"])
 def test_copy_failure_keeps_actual_input_and_output_owned(monkeypatch, stage):
     table = torch.arange(32, dtype=torch.int32).reshape(2, 16)
-    source = DirectPrefixSource(table, (1, 0), (16, 16), 128)
+    source = (table[list((1, 0))], (16, 16), 128)
     exact = torch.tensor([1151, 1408], dtype=torch.int32)
     pool = DraftWindowOwnerPool(1)
     submitted = []
@@ -49,9 +48,8 @@ def test_copy_failure_keeps_actual_input_and_output_owned(monkeypatch, stage):
     full_rows = torch.tensor([True, True] if stage == "phase" else [False, True])
     with pytest.raises(RuntimeError, match="deliberate error"), pool.operation(unrecorded_completion) as owner:
         prepare_dense_draft_read(
-            source,
+            *source,
             exact_device=exact,
-            row_indices=torch.tensor([1, 0]),
             upper_cpu=exact + 3,
             window_size=1024,
             anchor_span=128,
@@ -68,7 +66,7 @@ def test_copy_failure_keeps_actual_input_and_output_owned(monkeypatch, stage):
 
 
 def test_planning_copy_failure_keeps_prepared_input_owned(monkeypatch):
-    source = DirectPrefixSource(torch.arange(16, dtype=torch.int32)[None], (0,), (16,), 128)
+    source = (torch.arange(16, dtype=torch.int32)[None][list((0,))], (16,), 128)
     exact = torch.tensor([1151], dtype=torch.int32)
     pool = DraftWindowOwnerPool(1)
     original_copy = torch.Tensor.copy_
@@ -83,9 +81,8 @@ def test_planning_copy_failure_keeps_prepared_input_owned(monkeypatch):
     monkeypatch.setattr(torch.Tensor, "copy_", failed_copy)
     with pytest.raises(RuntimeError, match="planning copy"), pool.operation(unrecorded_completion) as owner:
         prepare_dense_draft_read(
-            source,
+            *source,
             exact_device=exact,
-            row_indices=torch.tensor([0]),
             upper_cpu=exact + 1,
             window_size=1024,
             anchor_span=128,

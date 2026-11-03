@@ -11,17 +11,15 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_dense import (
     gather_dense_draft_kv,
     prepare_dense_draft_read,
 )
-from vllm_ascend.worker.v2.spec_decode.draft_window_read import DirectPrefixSource
 
 
 def test_frozen_eagle_anchor_does_not_follow_later_exact_lengths():
-    source = DirectPrefixSource(torch.tensor([[3, 1, 2, 4]], dtype=torch.int32), (0,), (4,), 4)
+    source = (torch.tensor([[3, 1, 2, 4]], dtype=torch.int32)[list((0,))], (4,), 4)
     frozen = torch.tensor([4], dtype=torch.int32)  # E0=10,K3,W8,B4 -> H13,S4.
     for end in (11, 12, 13):
         read = prepare_dense_draft_read(
-            source,
+            *source,
             exact_device=torch.tensor([end], dtype=torch.int32),
-            row_indices=torch.tensor([0]),
             upper_cpu=torch.tensor([14]),
             window_size=8,
             anchor_span=4,
@@ -33,20 +31,19 @@ def test_frozen_eagle_anchor_does_not_follow_later_exact_lengths():
         assert isinstance(read, DenseDraftRead)
         assert (end - read.seq_lens).tolist() == [4]
         assert read.seq_lens.tolist() == [end - 4]
-        expected = [int(source.table[0, pos // 4]) * 4 + pos % 4 for pos in range(4, end)]
+        expected = [int(source[0][0, pos // 4]) * 4 + pos % 4 for pos in range(4, end)]
         assert read.slots[0, : end - 4].tolist() == expected
         assert not read.mask[0, 0, 0, : end - 4].any()
 
 
 def test_rejected_first_pass_keeps_native_query_alignment_and_excludes_unwritten_tail():
     end, native_end, block = 1159, 1160, 128
-    source = DirectPrefixSource(torch.arange(12, dtype=torch.int32).reshape(1, 12), (0,), (12,), block)
+    source = (torch.arange(12, dtype=torch.int32).reshape(1, 12)[list((0,))], (12,), block)
     held: list[object] = []
     read = prepare_dense_draft_read(
-        source,
+        *source,
         exact_device=torch.tensor([end], dtype=torch.int32),
         query_ends=torch.tensor([native_end], dtype=torch.int32),
-        row_indices=torch.tensor([0]),
         upper_cpu=torch.tensor([native_end + 1]),
         window_size=1035,
         anchor_span=block,
@@ -78,11 +75,10 @@ def test_device_exact_read_set_reorder_rejection_and_nan_tail(causal, query_widt
     ends = torch.tensor([1151, 1152], dtype=torch.int32)
     upper = torch.tensor([1152, 1152], dtype=torch.int32)
     held: list[object] = []
-    source = DirectPrefixSource(table, (1, 0), (12, 12), block)
+    source = (table[list((1, 0))], (12, 12), block)
     read = prepare_dense_draft_read(
-        source,
+        *source,
         exact_device=ends,
-        row_indices=torch.tensor([1, 0]),
         upper_cpu=upper,
         window_size=1024,
         anchor_span=block,
@@ -133,11 +129,10 @@ def test_device_exact_read_set_reorder_rejection_and_nan_tail(causal, query_widt
 
 
 def test_apply_keeps_full_write_and_absolute_query_operands():
-    source = DirectPrefixSource(torch.tensor([[2, 1]], dtype=torch.int32), (0,), (2,), 128)
+    source = (torch.tensor([[2, 1]], dtype=torch.int32)[list((0,))], (2,), 128)
     read = prepare_dense_draft_read(
-        source,
+        *source,
         exact_device=torch.tensor([129], dtype=torch.int32),
-        row_indices=torch.tensor([0]),
         upper_cpu=torch.tensor([130]),
         window_size=128,
         anchor_span=128,
@@ -146,7 +141,7 @@ def test_apply_keeps_full_write_and_absolute_query_operands():
         retain=lambda *objects: None,
     )
     assert isinstance(read, DenseDraftRead)
-    full = source.table
+    full = source[0]
     slots, positions = object(), object()
     common = SimpleNamespace(num_reqs=2, block_table_tensor=full, slot_mapping=slots, positions=positions)
     read.apply(common)
@@ -159,12 +154,11 @@ def test_apply_keeps_full_write_and_absolute_query_operands():
 
 
 def test_allocation_upper_cannot_authorize_uninitialized_columns():
-    source = DirectPrefixSource(torch.tensor([[1]], dtype=torch.int32), (0,), (1,), 128)
+    source = (torch.tensor([[1]], dtype=torch.int32)[list((0,))], (1,), 128)
     with pytest.raises(ValueError, match="exact lengths exceed"):
         prepare_dense_draft_read(
-            source,
+            *source,
             exact_device=torch.tensor([129]),
-            row_indices=torch.tensor([0]),
             upper_cpu=torch.tensor([129]),
             window_size=128,
             anchor_span=128,
@@ -175,13 +169,12 @@ def test_allocation_upper_cannot_authorize_uninitialized_columns():
 
 
 def test_cpu_capacity_fields_ignore_default_tensor_device():
-    source = DirectPrefixSource(torch.tensor([[2, 1]], dtype=torch.int32), (0,), (2,), 128)
-    exact, upper, rows = torch.tensor([129]), torch.tensor([130]), torch.tensor([0])
+    source = (torch.tensor([[2, 1]], dtype=torch.int32)[list((0,))], (2,), 128)
+    exact, upper = torch.tensor([129]), torch.tensor([130])
     with torch.device("meta"):
         read = prepare_dense_draft_read(
-            source,
+            *source,
             exact_device=exact,
-            row_indices=rows,
             upper_cpu=upper,
             window_size=128,
             anchor_span=128,
@@ -197,11 +190,10 @@ def test_cpu_capacity_fields_ignore_default_tensor_device():
 
 
 def test_short_context_large_window_does_not_gather_window_sized_padding():
-    source = DirectPrefixSource(torch.tensor([[1]], dtype=torch.int32), (0,), (1,), 128)
+    source = (torch.tensor([[1]], dtype=torch.int32)[list((0,))], (1,), 128)
     read = prepare_dense_draft_read(
-        source,
+        *source,
         exact_device=torch.tensor([31], dtype=torch.int32),
-        row_indices=torch.tensor([0]),
         upper_cpu=torch.tensor([34]),
         window_size=4096,
         anchor_span=128,
@@ -215,3 +207,45 @@ def test_short_context_large_window_does_not_gather_window_sized_padding():
     assert read.slots[0, :31].tolist() == list(range(128, 159))
     assert read.slots[0, 31:].tolist() == [158]
     assert not read.mask[..., :31].any() and read.mask[..., 31:].all()
+
+
+@pytest.mark.parametrize("strided", [False, True])
+def test_uniform_compact_table_needs_no_request_row_transfer(monkeypatch, strided):
+    from vllm_ascend.worker.v2.spec_decode import draft_window_dense as module
+
+    canonical = torch.arange(36, dtype=torch.int32).reshape(3, 12)
+    compact = canonical[[2, 0]]
+    if strided:
+        storage = torch.zeros((2, 24), dtype=torch.int32)
+        storage[:, ::2] = compact
+        compact = storage[:, ::2]
+    before = compact.clone()
+    copies = []
+    copy = module._copy_owned_read_tensor
+
+    def observed(source, *args, **kwargs):
+        copies.append(source)
+        return copy(source, *args, **kwargs)
+
+    monkeypatch.setattr(module, "_copy_owned_read_tensor", observed)
+    ends = torch.tensor([1151, 1281], dtype=torch.int32)
+    read = prepare_dense_draft_read(
+        compact,
+        (12, 12),
+        128,
+        exact_device=ends,
+        exact_cpu=ends,
+        upper_cpu=ends + 2,
+        window_size=1024,
+        anchor_span=128,
+        query_width=8,
+        causal=False,
+        retain=lambda *values: None,
+    )
+    assert len(copies) == 3  # Absolute addresses, mask, and visible lengths; no row IDs.
+    for row, end in enumerate(ends.tolist()):
+        start = max(end - 1024, 0) // 128 * 128
+        expected = [int(before[row, position // 128]) * 128 + position % 128 for position in range(start, end)]
+        assert read.slots[row, : end - start].tolist() == expected
+        assert read.slots[row, end - start :].tolist() == [expected[-1]] * (read.capacity - end + start)
+    torch.testing.assert_close(compact, before, rtol=0, atol=0)
