@@ -34,28 +34,11 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentA
     _eagle3_window_next_step: int
     _eagle3_capture_call: Iterator[DraftWindowGraphBucket] | None
 
-    def _initialize_draft_window_source_capability(self) -> None:
-        """Initialize the validated Graph source and its proposal state."""
-        policy = getattr(self, "_draft_window_policy", None)
-        if policy is None:
-            return
-        if hasattr(self, "_draft_window_graph_binding_provider"):
-            raise RuntimeError("draft-window runtime ownership is already initialized")
-        from vllm_ascend.worker.v2.spec_decode.draft_window import create_draft_window_graph_provider
-
-        self._draft_window_graph_binding_provider = create_draft_window_graph_provider(self)
-        self._initialize_eagle3_draft_window_state()
-
     def _configure_decode_metadata_update(self) -> None:
         super()._configure_decode_metadata_update()
         if getattr(self, "_draft_window_policy", None) is not None:
             # The fixed merged AR route stages a canonical view per consumer.
             self.supports_decode_metadata_update = False
-
-    def set_attn(self, *args, **kwargs):
-        result = super().set_attn(*args, **kwargs)
-        self._initialize_draft_window_source_capability()
-        return result
 
     def init_cudagraph_manager(self, cudagraph_mode):
         result = super().init_cudagraph_manager(cudagraph_mode)

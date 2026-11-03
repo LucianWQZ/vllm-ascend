@@ -428,13 +428,9 @@ class AscendTargetDependentARSpeculator(LmheadTPDraftSamplingMixin, TargetDepend
         else:
             raise ValueError(f"Unsupported attention backend: {self.attn_backend}")
 
-        from vllm_ascend.worker.v2.spec_decode.draft_window_native_attention import report_owner_draft_native_attention
+        from vllm_ascend.worker.v2.spec_decode import initialize_draft_window_owner
 
-        report_owner_draft_native_attention(self)
-        if hasattr(self, "draft_window_policy"):
-            from vllm_ascend.worker.v2.spec_decode.draft_window_runtime import DraftWindowRuntime
-
-            self._draft_window_runtime = DraftWindowRuntime(self, self.draft_window_policy)
+        initialize_draft_window_owner(self)
 
     def capture(self) -> None:
         logger.info("Capturing model for speculator...")

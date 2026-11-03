@@ -270,17 +270,9 @@ class AscendDSparkSpeculator(DraftWindowGraphInputMixin, LmheadTPDraftSamplingMi
                 block_tables,
             )
 
-        from vllm_ascend.worker.v2.spec_decode.draft_window_native_attention import report_owner_draft_native_attention
+        from vllm_ascend.worker.v2.spec_decode import initialize_draft_window_owner
 
-        report_owner_draft_native_attention(self)
-        if hasattr(self, "_draft_window_policy"):
-            if hasattr(self, "draft_window_policy"):
-                raise RuntimeError("Draft Window cannot initialize both eager and Graph policies")
-            self._initialize_draft_window_source_capability()
-        elif hasattr(self, "draft_window_policy"):
-            from vllm_ascend.worker.v2.spec_decode.draft_window_runtime import DraftWindowRuntime
-
-            self._draft_window_runtime = DraftWindowRuntime(self, self.draft_window_policy)
+        initialize_draft_window_owner(self)
 
     def _prepare_draft_dcp_metadata_inputs(
         self, num_reqs: int, num_reqs_padded: int, step: int

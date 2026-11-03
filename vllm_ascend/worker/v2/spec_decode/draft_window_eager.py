@@ -14,9 +14,6 @@ from typing import Any
 import torch
 from vllm.v1.worker.gpu.input_batch import InputBatch
 
-from vllm_ascend.worker.v2.spec_decode.draft_window import (
-    create_draft_window_graph_provider,
-)
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
     DraftWindowGraphBindingProvider,
 )
@@ -38,18 +35,6 @@ class DraftWindowGraphInputMixin:
     attn_groups: Any
     kv_cache_config: Any
     num_query_per_req: int
-
-    def _initialize_draft_window_source_capability(self) -> None:
-        """Bind the eligible Source and its Graph input owner atomically."""
-        policy = getattr(self, "_draft_window_policy", None)
-        if policy is None:
-            return
-        if hasattr(self, "_draft_window_graph_binding_provider"):
-            raise RuntimeError("draft-window runtime ownership is already initialized")
-        if hasattr(self, "_draft_window_runtime"):
-            raise RuntimeError("Graph Window cannot replace the typed eager runtime")
-        self._draft_window_graph_binding_provider = create_draft_window_graph_provider(self)
-        self._draft_window_dp_dummy_active = False
 
     @contextmanager
     def _draft_window_proposal_scope(

@@ -19,22 +19,17 @@ import torch
 def graph_source_initialization(request, monkeypatch):
     """Exercise actual owner initialization without loading a device model."""
     method = request.param
-    from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowGraphInputMixin
+    from vllm_ascend.worker.v2.spec_decode import draft_window, initialize_draft_window_owner
 
     provider = object()
     create_provider = Mock(return_value=provider)
-    if method == "eagle3":
-        from vllm_ascend.worker.v2.spec_decode import draft_window, draft_window_eagle3_adapter
-
-        initialize = draft_window_eagle3_adapter.Eagle3GraphIntegrationMixin._initialize_draft_window_source_capability
-        monkeypatch.setattr(draft_window, "create_draft_window_graph_provider", create_provider)
-    else:
-        from vllm_ascend.worker.v2.spec_decode import draft_window_eager
-
-        initialize = DraftWindowGraphInputMixin._initialize_draft_window_source_capability
-        monkeypatch.setattr(draft_window_eager, "create_draft_window_graph_provider", create_provider)
+    monkeypatch.setattr(draft_window, "create_draft_window_graph_provider", create_provider)
+    monkeypatch.setattr(
+        "vllm_ascend.worker.v2.spec_decode.draft_window_native_attention.report_owner_draft_native_attention", Mock()
+    )
+    initialize = initialize_draft_window_owner
     owner = SimpleNamespace(
-        _draft_window_policy=object(),
+        _draft_window_policy=1024,
         _speculator_name=method,
         method=method,
         attn_groups=object(),
@@ -63,6 +58,8 @@ def test_graph_owner_installs_only_its_admitted_source(graph_source_initializati
     assert not hasattr(c.owner, "_draft_window_runtime")
     if c.owner._speculator_name != "eagle3":
         assert c.owner._draft_window_dp_dummy_active is False
+    else:
+        c.owner._initialize_eagle3_draft_window_state.assert_called_once_with()
 
 
 def test_graph_source_rejection_has_no_eager_fallback_or_partial_owner(graph_source_initialization):

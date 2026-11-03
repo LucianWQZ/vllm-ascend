@@ -304,20 +304,9 @@ class AscendDFlashSpeculator(DraftWindowGraphInputMixin, LmheadTPDraftSamplingMi
             block_tables,
         )
 
-        from vllm_ascend.worker.v2.spec_decode.draft_window_native_attention import report_owner_draft_native_attention
+        from vllm_ascend.worker.v2.spec_decode import initialize_draft_window_owner
 
-        # Actual Draft layers/builders now exist. This startup-only inventory
-        # creates no eager runtime and does not infer attention from KV storage.
-        report_owner_draft_native_attention(self)
-
-        if hasattr(self, "_draft_window_policy"):
-            if hasattr(self, "draft_window_policy"):
-                raise RuntimeError("Draft Window cannot initialize both eager and Graph policies")
-            self._initialize_draft_window_source_capability()
-        elif hasattr(self, "draft_window_policy"):
-            from vllm_ascend.worker.v2.spec_decode.draft_window_runtime import DraftWindowRuntime
-
-            self._draft_window_runtime = DraftWindowRuntime(self, self.draft_window_policy)
+        initialize_draft_window_owner(self)
 
     def _build_attn_metadata(
         self,

@@ -152,12 +152,36 @@ def init_speculator(vllm_config: VllmConfig, device: torch.device, req_states: "
                 for name in ("_draft_window_policy", "draft_window_policy", "_draft_window_runtime")
             ):
                 raise RuntimeError("Graph owner and typed eager runtime must be mutually exclusive")
-            if not callable(getattr(speculator, "_initialize_draft_window_source_capability", None)):
-                raise NotImplementedError("the selected speculator has no Draft Window Graph owner")
             speculator._draft_window_policy = policy
         else:
             speculator.draft_window_policy = policy
     return speculator
+
+
+def initialize_draft_window_owner(owner) -> None:
+    """Install the resolved read owner once, after actual Draft attention exists."""
+    from vllm_ascend.worker.v2.spec_decode.draft_window_native_attention import report_owner_draft_native_attention
+
+    report_owner_draft_native_attention(owner)
+    graph = getattr(owner, "_draft_window_policy", None)
+    eager = getattr(owner, "draft_window_policy", None)
+    if graph is not None and eager is not None:
+        raise RuntimeError("Draft Window eager and Graph owners must be mutually exclusive")
+    if graph is not None or eager is not None:
+        if hasattr(owner, "_draft_window_runtime") or hasattr(owner, "_draft_window_graph_binding_provider"):
+            raise RuntimeError("Draft Window ownership is already initialized")
+        if graph is not None:
+            from vllm_ascend.worker.v2.spec_decode.draft_window import create_draft_window_graph_provider
+
+            owner._draft_window_graph_binding_provider = create_draft_window_graph_provider(owner)
+            if owner.method == "eagle3":
+                owner._initialize_eagle3_draft_window_state()
+            else:
+                owner._draft_window_dp_dummy_active = False
+        else:
+            from vllm_ascend.worker.v2.spec_decode.draft_window_runtime import DraftWindowRuntime
+
+            owner._draft_window_runtime = DraftWindowRuntime(owner, eager)
 
 
 def _init_speculator(
