@@ -8,7 +8,6 @@ This inventory neither creates a Window owner nor enables a read provider.
 """
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
 from typing import Any
 
 _MISSING = object()
@@ -24,34 +23,7 @@ _DRAFT_ARCHITECTURES = frozenset(
 )
 
 
-def _window(value: Any) -> int | None:
-    if value is None:
-        return None
-    if type(value) is not int or value <= 0:
-        raise ValueError("native sliding_window must be a positive integer or None")
-    return value
-
-
-def _kind(windows: Sequence[int | None]) -> str:
-    if not windows:
-        return "UNKNOWN"
-    if all(window is None for window in windows):
-        return "FULL"
-    return "SWA" if all(window is not None for window in windows) else "MIXED"
-
-
-@dataclass(frozen=True)
-class DraftNativeAttention:
-    kind: str
-    windows: tuple[int, ...]
-    issues: tuple[str, ...]
-
-    @property
-    def actual_complete(self) -> bool:
-        return self.kind != "UNKNOWN"
-
-
-def inspect_draft_native_attention(speculator: Any) -> DraftNativeAttention:
+def inspect_draft_native_attention(speculator: Any) -> tuple[str, tuple[int, ...], tuple[str, ...]]:
     """Inspect loaded Draft consumers, after the real loader and ``set_attn``.
 
     Normalized architecture/layer count bounds the inventory. Native windows
@@ -90,34 +62,28 @@ def inspect_draft_native_attention(speculator: Any) -> DraftNativeAttention:
                 if value is _MISSING:
                     issues.append(f"Draft consumer {name} has no native window descriptor")
                     continue
-                try:
-                    layers[name] = _window(value)
-                    if layers[name] is not None and type(causal) is not bool:
-                        issues.append(f"Draft consumer {name} has no actual native causality descriptor")
-                    if (
-                        layers[name] is not None
-                        and causal is False
-                        and (getattr(impl, "_dflash2_native_swa_mask", None) is None)
-                    ):
-                        issues.append(f"noncausal Draft consumer {name} has no native-SWA mask binding")
-                except ValueError as error:
-                    issues.append(f"Draft consumer {name}: {error}")
+                if value is not None and (type(value) is not int or value <= 0):
+                    issues.append(f"Draft consumer {name}: native sliding_window must be a positive integer or None")
+                    continue
+                layers[name] = value
+                if value is not None and type(causal) is not bool:
+                    issues.append(f"Draft consumer {name} has no actual native causality descriptor")
+                if value is not None and causal is False and getattr(impl, "_dflash2_native_swa_mask", None) is None:
+                    issues.append(f"noncausal Draft consumer {name} has no native-SWA mask binding")
     # The loader already identifies the Draft layer set, including any Target
     # layer offset. Use that registration instead of parsing layer-name strings.
     declared = speculator.draft_attn_layer_names
     complete = bool(layers) and known and type(count) is int and len(layers) == count
     if not complete or set(layers) != set(declared):
         issues.append("complete supported Draft architecture and actual consumer inventory are required")
-    values = tuple(layers.values())
-    kind = _kind(values) if complete and not issues else "UNKNOWN"
-    return DraftNativeAttention(
-        kind=kind,
-        windows=tuple(sorted({value for value in values if value is not None})),
-        issues=tuple(dict.fromkeys(issues)),
-    )
+    windows = tuple(sorted({value for value in layers.values() if value is not None}))
+    kind = "UNKNOWN"
+    if not issues:
+        kind = "FULL" if not windows else "MIXED" if None in layers.values() else "SWA"
+    return kind, windows, tuple(dict.fromkeys(issues))
 
 
-def report_owner_draft_native_attention(owner: Any, logger: Any) -> DraftNativeAttention:
+def report_owner_draft_native_attention(owner: Any, logger: Any) -> None:
     """Startup-only summary of the actual speculator's loaded attention.
 
     The fixed loader owns original/normalized configuration. No config file,
@@ -131,25 +97,21 @@ def report_owner_draft_native_attention(owner: Any, logger: Any) -> DraftNativeA
     # init_cudagraph_manager. Report the Draft request, not Target Graph mode
     # or a hypothetical already-created manager.
     graph_requested = not eager
-    inventory = inspect_draft_native_attention(owner)
+    kind, windows, issues = inspect_draft_native_attention(owner)
     logger.info_once(
         "Draft native attention=%s; native windows=%s; extra Draft window=%s; "
         "Draft Graph requested=%s; complete actual inventory=%s; issues=%s. "
         "Full KV retention does not imply Full attention.",
-        inventory.kind,
-        inventory.windows,
+        kind,
+        windows,
         window,
         graph_requested,
-        inventory.actual_complete,
-        inventory.issues,
+        kind != "UNKNOWN",
+        issues,
         scope="global",
     )
     # Only observed/certified native consumers establish this warning.
-    narrowed = (
-        tuple(value for value in inventory.windows if window < value)
-        if window is not None and inventory.actual_complete
-        else ()
-    )
+    narrowed = tuple(value for value in windows if window < value) if window is not None and kind != "UNKNOWN" else ()
     if narrowed:
         logger.warning_once(
             "The Draft model contains native SWA layers with windows %s. "
@@ -166,8 +128,5 @@ def report_owner_draft_native_attention(owner: Any, logger: Any) -> DraftNativeA
     # in this change and needs it even when the additional Window is OFF.
     architectures = getattr(owner.draft_model_config.hf_config, "architectures", ()) or ()
     new_dflash2_graph = graph_requested and tuple(architectures) == ("DFlash2DraftModel",)
-    if (window is not None or new_dflash2_graph) and not inventory.actual_complete:
-        raise NotImplementedError(
-            "Draft Window/Graph requires a known native attention contract: " + "; ".join(inventory.issues)
-        )
-    return inventory
+    if (window is not None or new_dflash2_graph) and kind == "UNKNOWN":
+        raise NotImplementedError("Draft Window/Graph requires a known native attention contract: " + "; ".join(issues))

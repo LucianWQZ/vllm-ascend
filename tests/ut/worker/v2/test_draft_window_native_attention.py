@@ -68,7 +68,8 @@ class NativeAttentionTests(unittest.TestCase):
         log = Log()
         with patch.object(Path, "read_text", side_effect=AssertionError("startup must not reload config")):
             for _ in range(2):
-                self.assertEqual(native.report_owner_draft_native_attention(owner, log).kind, "SWA")
+                native.report_owner_draft_native_attention(owner, log)
+                self.assertEqual(log.info[0][0][1], "SWA")
         self.assertEqual(len(log.info), 1)
         self.assertEqual(len(log.warnings), 1)
         self.assertFalse(hasattr(owner, "_draft_window_runtime"))
@@ -78,7 +79,7 @@ class NativeAttentionTests(unittest.TestCase):
             owner = loaded(cfg, [None, None])
             owner.speculative_config = SimpleNamespace(enforce_eager=True)
             owner.draft_window_policy = SimpleNamespace(effective_window_size=1024)
-            self.assertEqual(native.inspect_draft_native_attention(owner).kind, "UNKNOWN")
+            self.assertEqual(native.inspect_draft_native_attention(owner)[0], "UNKNOWN")
             with self.assertRaises(NotImplementedError, msg=str(cfg)):
                 native.report_owner_draft_native_attention(owner, Log())
 
@@ -86,22 +87,22 @@ class NativeAttentionTests(unittest.TestCase):
         for windows in ([0, 2048], [True, 2048], [2048], [None, None, None]):
             with self.subTest(windows=windows):
                 result = native.inspect_draft_native_attention(loaded(config(), windows))
-                self.assertEqual(result.kind, "UNKNOWN")
+                self.assertEqual(result[0], "UNKNOWN")
         owner = loaded(config(), [None, None])
         owner.attn_groups[0].append(owner.attn_groups[0][0])
-        self.assertEqual(native.inspect_draft_native_attention(owner).kind, "UNKNOWN")
+        self.assertEqual(native.inspect_draft_native_attention(owner)[0], "UNKNOWN")
 
     def test_eagle_uses_its_actual_loaded_attention_not_qwen_flags(self):
         cfg = config(architecture="LlamaForCausalLMEagle3", count=1)
         cfg.update(model_type="llama", use_sliding_window=True)
-        self.assertEqual(native.inspect_draft_native_attention(loaded(cfg, [None], causal=True)).kind, "FULL")
-        self.assertEqual(native.inspect_draft_native_attention(loaded(cfg, [2048], causal=True)).kind, "SWA")
+        self.assertEqual(native.inspect_draft_native_attention(loaded(cfg, [None], causal=True))[0], "FULL")
+        self.assertEqual(native.inspect_draft_native_attention(loaded(cfg, [2048], causal=True))[0], "SWA")
 
     def test_real_plain_mla_is_full_without_a_native_window_operand(self):
         owner = loaded(config(architecture="Glm5DSparkForCausalLM"), [None, None])
         for layer in owner.attn_vllm_config.compilation_config.static_forward_context.values():
             layer.impl = object.__new__(AscendMLAImpl)
-        self.assertEqual(native.inspect_draft_native_attention(owner).kind, "FULL")
+        self.assertEqual(native.inspect_draft_native_attention(owner)[0], "FULL")
 
     def test_startup_graph_request_uses_draft_flag_not_target_mode(self):
         owner = loaded(config(), [None, None])
@@ -119,7 +120,8 @@ class NativeAttentionTests(unittest.TestCase):
         owner.speculative_config = SimpleNamespace(method="mtp", enforce_eager=False)
         owner.query_cudagraph_manager = SimpleNamespace(cudagraph_mode=SimpleNamespace(name="FULL"))
         log = Log()
-        self.assertEqual(native.report_owner_draft_native_attention(owner, log).kind, "UNKNOWN")
+        native.report_owner_draft_native_attention(owner, log)
+        self.assertEqual(log.info[0][0][1], "UNKNOWN")
         self.assertEqual(log.info[0][0][4], True)
         owner.draft_window_policy = SimpleNamespace(effective_window_size=1024)
         with self.assertRaises(NotImplementedError):
@@ -135,8 +137,8 @@ class NativeAttentionTests(unittest.TestCase):
             # Deliberately Full-retained storage must not override the reader.
             owner.kv_cache_config = SimpleNamespace(kind="FullAttentionSpec")
             result = native.inspect_draft_native_attention(owner)
-            self.assertEqual(result.kind, expected)
-            self.assertTrue(result.actual_complete)
+            self.assertEqual(result[0], expected)
+            self.assertNotEqual(result[0], "UNKNOWN")
 
     def test_group_must_match_the_actual_loader_draft_layer_registration(self):
         owner = loaded(config(), [None, None])
@@ -145,26 +147,27 @@ class NativeAttentionTests(unittest.TestCase):
         new = old.replace("layers.65.", "layers.66.")
         context[new] = context.pop(old)
         owner.attn_groups[0][1].layer_names = [new]
-        self.assertEqual(native.inspect_draft_native_attention(owner).kind, "UNKNOWN")
+        self.assertEqual(native.inspect_draft_native_attention(owner)[0], "UNKNOWN")
 
     def test_missing_consumer_mask_and_unknown_implementation_rejected(self):
         cfg = config(kinds=["sliding_attention"] * 2)
         for owner in (loaded(cfg, [2048]), loaded(cfg, [2048, 2048], mask=False)):
-            self.assertEqual(native.inspect_draft_native_attention(owner).kind, "UNKNOWN")
+            self.assertEqual(native.inspect_draft_native_attention(owner)[0], "UNKNOWN")
         owner = loaded(cfg, [2048, 2048])
         next(iter(owner.attn_vllm_config.compilation_config.static_forward_context.values())).impl = object()
-        self.assertEqual(native.inspect_draft_native_attention(owner).kind, "UNKNOWN")
+        self.assertEqual(native.inspect_draft_native_attention(owner)[0], "UNKNOWN")
         # A same-named class does not acquire the actual implementation's contract.
         impostor = type(AscendAttentionBackendImpl.__name__, (), {"sliding_window": None})
         impostor.__module__ = AscendAttentionBackendImpl.__module__
         next(iter(owner.attn_vllm_config.compilation_config.static_forward_context.values())).impl = impostor()
-        self.assertEqual(native.inspect_draft_native_attention(owner).kind, "UNKNOWN")
+        self.assertEqual(native.inspect_draft_native_attention(owner)[0], "UNKNOWN")
 
     def test_off_no_runtime_and_unknown_window_graph_fail_closed(self):
         owner = loaded(config(), [2048, 2048], mask=False)
         owner.speculative_config = SimpleNamespace(enforce_eager=True)
         log = Log()
-        self.assertEqual(native.report_owner_draft_native_attention(owner, log).kind, "UNKNOWN")
+        native.report_owner_draft_native_attention(owner, log)
+        self.assertEqual(log.info[0][0][1], "UNKNOWN")
         for window, eager in ((1024, True), (None, False)):
             owner.draft_window_policy = SimpleNamespace(effective_window_size=window)
             owner.speculative_config.enforce_eager = eager
@@ -188,8 +191,8 @@ class NativeAttentionTests(unittest.TestCase):
             owner.draft_window_policy = SimpleNamespace(effective_window_size=window)
             log = Log()
             for _ in range(2):
-                result = native.report_owner_draft_native_attention(owner, log)
-            self.assertEqual(result.kind, "SWA")
+                native.report_owner_draft_native_attention(owner, log)
+            self.assertEqual(log.info[0][0][1], "SWA")
             self.assertEqual(len(log.info), 1)
             self.assertEqual(len(log.warnings), bool(expected))
             if expected:
