@@ -10,7 +10,7 @@ import torch
 torch_npu = pytest.importorskip("torch_npu")
 
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata  # noqa: E402
-from vllm_ascend.worker.v2.spec_decode.draft_window_plan import compute_draft_window_plan  # noqa: E402
+from vllm_ascend.worker.v2.spec_decode.draft_window_plan import compute_draft_window_start  # noqa: E402
 from vllm_ascend.worker.v2.spec_decode.draft_window_read import (  # noqa: E402
     materialize_draft_read,
 )
@@ -45,11 +45,11 @@ def test_same_window_attention_from_canonical_rows(causal, query_width, exact_en
     request_rows = (1, 0)
     source = (canonical[list(request_rows)], (columns, columns), block_size)
     ends = torch.tensor(exact_ends, dtype=torch.int32)
-    plans = [
-        compute_draft_window_plan(full_exact_end=end, window_size=window_size, block_span_tokens=block_size)
+    start_values = [
+        compute_draft_window_start(full_exact_end=end, window_size=window_size, block_span_tokens=block_size)
         for end in exact_ends
     ]
-    starts = torch.tensor([plan.window_start for plan in plans], dtype=torch.int32)
+    starts = torch.tensor(start_values, dtype=torch.int32)
     retained: list[torch.Tensor] = []
     query_offsets = torch.tensor([0, query_width, 2 * query_width, 2 * query_width], dtype=torch.int32)
     read = AscendCommonAttentionMetadata(
@@ -97,16 +97,16 @@ def test_same_window_attention_from_canonical_rows(causal, query_width, exact_en
         atten_mask=mask,
     )
     expected = []
-    for row, (source_row, end, plan) in enumerate(zip(request_rows, exact_ends, plans)):
+    for row, (source_row, end, start) in enumerate(zip(request_rows, exact_ends, start_values)):
         ids = canonical_cpu[source_row].long()
-        logical_key = key_cpu[ids].flatten(0, 1)[plan.window_start : end].float()
-        logical_value = value_cpu[ids].flatten(0, 1)[plan.window_start : end].float()
+        logical_key = key_cpu[ids].flatten(0, 1)[start:end].float()
+        logical_value = value_cpu[ids].flatten(0, 1)[start:end].float()
         logical_key = logical_key.repeat_interleave(heads // kv_heads, dim=1).transpose(0, 1)
         logical_value = logical_value.repeat_interleave(heads // kv_heads, dim=1).transpose(0, 1)
         q = query_cpu[row * query_width : (row + 1) * query_width].float().transpose(0, 1)
         scores = q @ logical_key.transpose(1, 2) * scale
         if causal:
-            absolute_keys = torch.arange(plan.window_start, end)
+            absolute_keys = torch.arange(start, end)
             absolute_queries = positions[row * query_width : (row + 1) * query_width]
             scores.masked_fill_(absolute_keys[None, :] > absolute_queries[:, None], -torch.inf)
         expected.append((scores.softmax(-1) @ logical_value).transpose(0, 1))
@@ -145,9 +145,7 @@ def test_same_window_mla_latent_and_rope(query_width, causal):
     ends = torch.tensor(exact_ends, dtype=torch.int32)
     starts = torch.tensor(
         [
-            compute_draft_window_plan(
-                full_exact_end=end, window_size=window_size, block_span_tokens=block_size
-            ).window_start
+            compute_draft_window_start(full_exact_end=end, window_size=window_size, block_span_tokens=block_size)
             for end in exact_ends
         ],
         dtype=torch.int32,

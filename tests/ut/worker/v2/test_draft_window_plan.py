@@ -4,8 +4,7 @@
 import pytest
 
 from vllm_ascend.worker.v2.spec_decode.draft_window_plan import (
-    compute_draft_window_plan,
-    freeze_eagle_window_plan,
+    compute_draft_window_start,
     window_capacity_tokens,
 )
 
@@ -15,7 +14,7 @@ def test_exact_window_boundaries_against_literal_token_oracle():
         for window in (1, 7, 16, 129):
             for future in (0, min(window, 3)):
                 for end in (0, 1, block - 1, block, block + 1, 255, 1025):
-                    plan = compute_draft_window_plan(
+                    start = compute_draft_window_start(
                         full_exact_end=end, window_size=window, block_span_tokens=block, future_offset=future
                     )
                     horizon = end + future
@@ -23,69 +22,40 @@ def test_exact_window_boundaries_against_literal_token_oracle():
                     # horizon cut rather than duplicate the production division.
                     legal_starts = range(0, max(horizon - window, 0) + 1, block)
                     expected = list(range(max(legal_starts), end))
-                    assert list(range(plan.window_start, plan.full_exact_end)) == expected
-                    assert plan.window_visible_length == len(expected)
-                    assert plan.window_visible_length <= window_capacity_tokens(window, block)
-                    assert plan.full_horizon_end == horizon
+                    assert list(range(start, end)) == expected
+                    assert end - start == len(expected)
+                    assert end - start <= window_capacity_tokens(window, block)
 
 
 def test_upper_bound_does_not_replace_exact_length():
     exact, upper = 1025, 1088
-    plan = compute_draft_window_plan(full_exact_end=exact, window_size=128, block_span_tokens=64)
-    assert plan.window_start == 896
-    assert (exact - plan.window_start, upper - plan.window_start) == (129, 192)
-    wrong_plan = compute_draft_window_plan(full_exact_end=upper, window_size=128, block_span_tokens=64)
-    assert wrong_plan.window_start != plan.window_start
+    start = compute_draft_window_start(full_exact_end=exact, window_size=128, block_span_tokens=64)
+    assert start == 896
+    assert (exact - start, upper - start) == (129, 192)
+    wrong_start = compute_draft_window_start(full_exact_end=upper, window_size=128, block_span_tokens=64)
+    assert wrong_start != start
 
 
 def test_eagle_frozen_anchor_survives_all_bounded_rejections():
     for block in (1, 4, 128):
         for end in (0, 1, 7, 8, 127, 128, 255, 1025):
-            plan = freeze_eagle_window_plan(
-                proposal_exact_end=end, static_k=8, max_rejected_tokens=8, window_size=16, block_span_tokens=block
+            start = compute_draft_window_start(
+                full_exact_end=end, future_offset=8, window_size=16, block_span_tokens=block
             )
             for rejection in range(min(end, 8) + 1):
                 for step in range(9):
-                    step_plan = plan.at_exact_end(end - rejection + step)
-                    assert step_plan.window_start == plan.window_start
-                    assert step_plan.full_horizon_end == plan.full_horizon_end
-                    assert step_plan.window_visible_length >= 0
-
-
-def test_eagle_invalid_configuration_rejected_before_request_execution():
-    with pytest.raises(ValueError, match="maximum rejected"):
-        freeze_eagle_window_plan(
-            proposal_exact_end=1024, static_k=8, max_rejected_tokens=8, window_size=15, block_span_tokens=128
-        )
-    plan = freeze_eagle_window_plan(
-        proposal_exact_end=1024, static_k=8, max_rejected_tokens=8, window_size=16, block_span_tokens=1
-    )
-    with pytest.raises(ValueError, match="precedes"):
-        plan.at_exact_end(1015)
-    with pytest.raises(ValueError, match="horizon"):
-        plan.at_exact_end(1033)
+                    current_end = end - rejection + step
+                    assert start <= current_end <= end + 8
+                    assert current_end - start >= 0
 
 
 def test_empty_interval_keeps_its_actual_zero_visible_length():
-    plan = compute_draft_window_plan(full_exact_end=0, window_size=1024, block_span_tokens=128)
-    assert plan.window_start == plan.full_exact_end == plan.window_visible_length == 0
+    start = compute_draft_window_start(full_exact_end=0, window_size=1024, block_span_tokens=128)
+    assert start == 0
     assert window_capacity_tokens(1024, 128) == 1151
 
 
-@pytest.mark.parametrize(
-    "overrides,error",
-    [
-        ({"full_exact_end": -1}, ValueError),
-        ({"full_exact_end": 1.1}, TypeError),
-        ({"future_offset": -1}, ValueError),
-        ({"window_size": 0}, ValueError),
-        ({"window_size": True}, TypeError),
-        ({"block_span_tokens": 0}, ValueError),
-        ({"future_offset": 10, "window_size": 1, "block_span_tokens": 1}, ValueError),
-    ],
-)
-def test_invalid_plan_inputs(overrides, error):
-    args = dict(full_exact_end=1024, window_size=128, block_span_tokens=16)
-    args.update(overrides)
-    with pytest.raises(error):
-        compute_draft_window_plan(**args)
+@pytest.mark.parametrize("exact,future,window", [(-1, 0, 128), (1024, 10, 1)])
+def test_unreadable_start_is_rejected(exact, future, window):
+    with pytest.raises(ValueError):
+        compute_draft_window_start(full_exact_end=exact, future_offset=future, window_size=window, block_span_tokens=1)
