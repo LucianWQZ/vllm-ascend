@@ -200,7 +200,7 @@ def test_dflash2_full_retention_keeps_full_and_native_consumers(parallel_config,
 @pytest.mark.parametrize("actual", [None, 1024, 4096])
 def test_dflash2_inventory_compares_native_band_to_actual_consumer(parallel_config, actual):
     spec = replace(full_spec(), sliding_window=2048)
-    with pytest.raises(NotImplementedError, match="inventory native band"):
+    with pytest.raises(NotImplementedError, match="coverage certificate"):
         inventory(
             parallel_config,
             specs=[spec],
@@ -387,16 +387,11 @@ def test_unmasked_rebased_read_covers_future_queries_without_fabricating_a_causa
 
 @pytest.mark.parametrize("change", [{"sliding_window": 1024}, {"sinks": object()}, {"use_bnsd_kv_cache": True}])
 def test_native_swa_actual_consumer_must_match_certificate(parallel_config, change):
-    routes, impl, context = native_swa_bundle(parallel_config)
-    for name, value in change.items():
-        setattr(impl, name, value)
     with pytest.raises(NotImplementedError, match="coverage certificate"):
-        require_routes(
-            routes,
-            window_size=32768,
-            max_query_tokens=2048,
-            future_offset_bound=7,
-            context=context,
+        inventory(
+            parallel_config,
+            specs=[sliding_spec(), full_spec()],
+            impl_changes=change,
         )
 
 

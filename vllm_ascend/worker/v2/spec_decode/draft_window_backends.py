@@ -165,7 +165,16 @@ def inventory_draft_window_groups(speculator: Any) -> tuple[DraftWindowGroupRout
             except NotImplementedError as error:
                 raise NotImplementedError(f"Draft Window gid={gid}: {error}") from error
             implementations = [getattr(context.get(name), "impl", None) for name in group.layer_names]
-            if full_retention_dflash2 and any(
+            if status is DraftWindowProviderStatus.NATIVE_SWA:
+                if any(
+                    type(impl) is not AscendAttentionBackendImpl
+                    or impl.sliding_window != native_window
+                    or impl.sinks is not None
+                    or impl.use_bnsd_kv_cache
+                    for impl in implementations
+                ):
+                    raise NotImplementedError(f"Draft Window native SWA gid={gid} has no coverage certificate")
+            elif full_retention_dflash2 and any(
                 impl is None or impl.sliding_window != native_window for impl in implementations
             ):
                 raise NotImplementedError("DFlash2 inventory native band differs from its actual Draft consumer")
@@ -212,8 +221,6 @@ def require_direct_prefix_routes(
     if native:
         if window_size is None or speculator.speculative_config.method != "dflash":
             raise NotImplementedError("Native SWA coverage is only certified for the DFlash extra-Window route")
-        from vllm_ascend.attention.attention_v1 import AscendAttentionBackendImpl
-
         scheduler = config.scheduler_config
         query_bound = max(
             scheduler.max_num_batched_tokens,
@@ -224,7 +231,6 @@ def require_direct_prefix_routes(
         if query_bound < 1 or future < 0:
             raise ValueError("Native SWA coverage requires a positive query bound")
         native_only = len(native) == len(routes)
-        context = config.compilation_config.static_forward_context
         declared = getattr(speculator, "_group_causal", True)
         omitted: set[DraftWindowGroupRoute] = set()
         for route in native:
@@ -248,15 +254,6 @@ def require_direct_prefix_routes(
                         "DFlash2 non-causal draft_window_size plus column alignment and query width "
                         "must fit its resident native window"
                     )
-            for name in route.layers:
-                impl = getattr(context.get(name), "impl", None)
-                if (
-                    type(impl) is not AscendAttentionBackendImpl
-                    or impl.sliding_window != native_window
-                    or impl.sinks is not None
-                    or impl.use_bnsd_kv_cache
-                ):
-                    raise NotImplementedError(f"Draft Window native SWA consumer {name} has no coverage certificate")
             # S <= max(E+f-W, 0); the first native query reads from
             # max(E-Q-P, 0). W >= P+Q+f contains that complete read set.
             # It then needs no projection beside Full groups. Native-only
