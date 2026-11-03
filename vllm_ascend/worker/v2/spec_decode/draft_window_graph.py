@@ -108,14 +108,16 @@ class DraftWindowGraphBindingProvider:
     """
 
     def __init__(self, *, policy: DraftWindowPolicyDecision, group: DraftWindowGroupRoute, block_tables: Any) -> None:
-        self.policy, self.group, self.block_tables = policy, group, block_tables
+        assert policy.effective_window_size is not None
+        self.window_size, self.method = policy.effective_window_size, policy.normalized_method
+        self.group, self.block_tables = group, block_tables
         if self.table.shape[1] * group.table_column_span < window_capacity_tokens(
             self.window_size, group.table_column_span
         ):
             raise ValueError("Draft Graph canonical table cannot cover the Window capacity")
         self.proposal: tuple[bool, ...] | None = None
         self._active_bank: DraftWindowGraphBucket | None = None
-        self._quarantined = False
+        self.quarantined = False
         self._carriers: dict[tuple[int, int], tuple[DraftWindowGraphBucket, ...]] = {}
         self._pending: list[DraftWindowGraphBucket] = []
 
@@ -123,18 +125,9 @@ class DraftWindowGraphBindingProvider:
     def table(self) -> torch.Tensor:
         return self.block_tables.input_block_tables[self.group.gid]
 
-    @property
-    def window_size(self) -> int:
-        assert self.policy.effective_window_size is not None
-        return self.policy.effective_window_size
-
-    @property
-    def quarantined(self) -> bool:
-        return self._quarantined
-
     def quarantine(self) -> None:
         """Retain all banks after uncertain work, even without active inputs."""
-        self._quarantined = True
+        self.quarantined = True
 
     @contextmanager
     def proposal_scope(self, full_read_rows: tuple[bool, ...]) -> Iterator[None]:
@@ -214,11 +207,6 @@ class DraftWindowGraphBindingProvider:
         if bank.descriptor != descriptor:
             raise RuntimeError(f"runtime descriptor does not resolve a captured consumer: {descriptor!r}")
         return bank
-
-    @property
-    def method(self) -> str:
-        """Return the policy-normalized method owned by this provider."""
-        return self.policy.normalized_method
 
     def register_capture_identity(
         self,

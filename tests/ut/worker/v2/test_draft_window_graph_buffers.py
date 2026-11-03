@@ -198,7 +198,11 @@ def test_actual_scope_quarantines_partial_or_uncertain_submission(graph_buffers,
 
 def test_prepare_and_publish_reject_unbound_pending_wrong_descriptor_and_foreign_bank(graph_buffers):
     c = graph_buffers
-    other = DraftWindowGraphBindingProvider(policy=c.provider.policy, group=c.provider.group, block_tables=c.owner)
+    other = DraftWindowGraphBindingProvider(
+        policy=resolve_draft_window_policy(requested_window_size=c.provider.window_size, method=c.provider.method),
+        group=c.provider.group,
+        block_tables=c.owner,
+    )
     foreign = other.register_capture_identity(descriptor=c.capture.descriptor)
     with c.provider.proposal_scope(_proposal()):
         before = c.capture.window_block_table.clone()

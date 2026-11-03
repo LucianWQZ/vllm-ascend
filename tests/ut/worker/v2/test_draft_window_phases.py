@@ -13,6 +13,7 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_backends import (
     DraftWindowProviderStatus,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphBindingProvider
+from vllm_ascend.worker.v2.spec_decode.draft_window_policy import resolve_draft_window_policy
 from vllm_ascend.worker.v2.spec_decode.draft_window_runtime import continuing_prefill_rows
 
 
@@ -117,7 +118,9 @@ def _materialize(full_source, batch, exact, counts, frozen=None):
         block_tables = full_source.block_tables
         block_tables.num_blocks.cpu[0] = torch.tensor(counts, dtype=torch.int32)
     provider = DraftWindowGraphBindingProvider(
-        policy=full_source.policy, group=full_source.group, block_tables=block_tables
+        policy=resolve_draft_window_policy(requested_window_size=full_source.window_size, method=full_source.method),
+        group=full_source.group,
+        block_tables=block_tables,
     )
     descriptor = BatchExecutionDescriptor(CUDAGraphMode.FULL, 4 * len(exact), len(exact), uniform_token_count=4)
     bank = provider.register_capture_identity(descriptor=descriptor)
