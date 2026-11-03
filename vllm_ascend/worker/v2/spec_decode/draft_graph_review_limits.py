@@ -209,13 +209,7 @@ def _validate_qualified_graph_config(vllm_config, profile):
         or parallel.enable_expert_parallel is not True
         or getattr(draft_parallel, "tensor_parallel_size", None) != 4
         or getattr(draft_parallel, "data_parallel_size", None) != 1
-        or (
-            eagle
-            and (
-                getattr(draft_parallel, "enable_expert_parallel", None) is not False
-                or getattr(draft_parallel, "use_sequence_parallel_moe", None) is not False
-            )
-        )
+        or (eagle and getattr(draft_parallel, "enable_expert_parallel", None) is not False)
         or not target_phase_valid
         or getattr(compilation.cudagraph_mode, "name", None) != "FULL_DECODE_ONLY"
         or additional.get("draft_window_size") not in (None, window)

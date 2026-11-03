@@ -373,18 +373,28 @@ class DraftGraphSupportTest(unittest.TestCase):
             self.resolve(config)
 
     def test_missing_bucket_and_wrong_draft_descriptor_are_rejected(self):
-        for damage in ("bucket", "draft_dp", "draft_sp", "capacity"):
+        for damage in ("bucket", "draft_dp", "draft_ep", "capacity"):
             config = self.config(rows=2)
             if damage == "bucket":
                 config.compilation_config.cudagraph_capture_sizes = [4]
             elif damage == "draft_dp":
                 config.speculative_config.draft_parallel_config.data_parallel_size = 2
-            elif damage == "draft_sp":
-                config.speculative_config.draft_parallel_config.use_sequence_parallel_moe = True
+            elif damage == "draft_ep":
+                config.speculative_config.draft_parallel_config.enable_expert_parallel = True
             else:
                 config.model_config.max_model_len = 3
             with self.subTest(damage=damage), self.assertRaises(NotImplementedError):
                 self.resolve(config)
+
+    def test_actual_draft_sp_property_is_disabled_by_its_required_ep_boundary(self):
+        from vllm_ascend.patch.platform import patch_parallel_config
+
+        parallel = object.__new__(patch_parallel_config.ParallelConfig)
+        parallel.__dict__.update(all2all_backend="allgather_reducescatter", tensor_parallel_size=4)
+        parallel.enable_expert_parallel = False
+        self.assertIs(parallel.use_sequence_parallel_moe, False)
+        parallel.enable_expert_parallel = True
+        self.assertIs(parallel.use_sequence_parallel_moe, True)
 
     def batch(self, *, rows=1):
         records = tuple((f"request-{i}", i, 1021, 1149, 1021) for i in range(rows))
