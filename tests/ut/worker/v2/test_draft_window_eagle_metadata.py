@@ -380,17 +380,20 @@ def parallel_hook():
         pass
 
     owner: Any = Owner()
-    owner._draft_window_graph_binding_provider = object()
     owner._draft_window_bypass_active = False
     owner.draft_attn_layer_names, owner.num_query_per_req = {"draft.layer"}, 8
     owner.block_tables = SimpleNamespace(slot_mappings=torch.arange(32, dtype=torch.int64).reshape(1, 32))
+    owner.input_batch = SimpleNamespace(num_reqs=1, idx_mapping_np=np.array([0]))
+    owner.input_buffers = SimpleNamespace(seq_lens=torch.tensor([16, 0]))
     inputs, calls = object(), []
 
-    def materialize(**kwargs):
+    def prepare(bank, **kwargs):
+        assert bank is inputs
         calls.append(kwargs)
-        return inputs
 
-    owner._materialize_draft_window_read_inputs = materialize
+    owner._draft_window_graph_binding_provider = SimpleNamespace(
+        proposal=(False,), capture_identity_for=lambda **kwargs: inputs, prepare=prepare
+    )
     desc = SimpleNamespace(cg_mode=SimpleNamespace(name="FULL"), num_reqs=2, num_tokens=16)
     return owner, desc, inputs, calls
 
@@ -420,12 +423,20 @@ def test_parallel_metadata_hook_prepares_one_bank_without_a_temporary_metadata_b
         slot_mappings=owner.block_tables.slot_mappings[:, :16],
     )
     assert result is None and not hasattr(owner, "_draft_window_live_inputs")
-    assert calls == [{"num_reqs": 1, "batch_desc": desc}]
+    assert len(calls) == 1 and calls[0]["step"] == 0
+    assert calls[0]["cpu_full_exact"].tolist() == [16, 0]
+    assert calls[0]["idx_mapping_np"] is owner.input_batch.idx_mapping_np
 
 
-@pytest.mark.parametrize("damage", ["mode", "query", "step", "tokens", "full_slots"])
+@pytest.mark.parametrize("damage", ["mode", "query", "step", "tokens", "full_slots", "proposal", "request_rows"])
 def test_parallel_metadata_hook_rejects_bad_actual_inputs_before_bank_materialization(parallel_hook, damage):
     owner, desc, _, calls = parallel_hook
+
+    class UnreadableExact:
+        def __getitem__(self, index):
+            raise AssertionError("invalid metadata must be rejected before the CPU exact copy")
+
+    owner.input_buffers.seq_lens = UnreadableExact()
     query, step, slots = np.array([0, 8], dtype=np.int32), 8, owner.block_tables.slot_mappings[:, :16]
     if damage == "mode":
         desc.cg_mode.name = "NONE"
@@ -437,7 +448,13 @@ def test_parallel_metadata_hook_rejects_bad_actual_inputs_before_bank_materializ
         desc.num_tokens = 15
     elif damage == "full_slots":
         slots = slots.clone()
-    with pytest.raises(RuntimeError, match="actual uniform FULL dispatch|canonical Full write slots"):
+    elif damage == "proposal":
+        owner._draft_window_graph_binding_provider.proposal = None
+    elif damage == "request_rows":
+        owner.input_batch.num_reqs = 2
+    with pytest.raises(
+        RuntimeError, match="actual uniform FULL dispatch|canonical Full write slots|active proposal|request count"
+    ):
         owner._build_attn_metadata(1, desc, query, torch.tensor([16]), step, slot_mappings=slots)
     assert not calls
 

@@ -325,23 +325,3 @@ class DraftWindowGraphBindingProvider:
     def finish_update(self) -> None:
         """Drop staged Host bindings after UPDATE; actual streams still own reuse."""
         self._pending.clear()
-
-
-def parallel_draft_window_graph_provider(
-    owner: Any,
-) -> DraftWindowGraphBindingProvider | None:
-    """Select the actual DFlash/DSpark instance-owned provider.
-
-    The class-name/debug label on a speculator is not a policy or capability
-    source.  When no provider is installed this remains an exact OFF-path
-    no-op.  A provider for any non-parallel method is a hard route mismatch.
-    """
-    provider = getattr(owner, "_draft_window_graph_binding_provider", None)
-    if provider is None:
-        return None
-    if not isinstance(provider, DraftWindowGraphBindingProvider):
-        raise TypeError("invalid instance-owned Draft Window graph binding provider")
-    method = provider.method
-    if method in ("dflash", "dspark"):
-        return provider
-    raise RuntimeError(f"parallel Draft Window graph manager cannot consume method {method!r}")

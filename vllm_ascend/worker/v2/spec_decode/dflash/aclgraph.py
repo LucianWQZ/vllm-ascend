@@ -27,7 +27,6 @@ from vllm_ascend.compilation.updatable_graph import (
 from vllm_ascend.utils import use_updatable_graph
 from vllm_ascend.worker.v2.aclgraph_utils import collect_sorted_captured_token_sizes, model_capture_wrapper
 from vllm_ascend.worker.v2.spec_decode.dflash.capture import draft_window_dflash_capture_scope
-from vllm_ascend.worker.v2.spec_decode.draft_window_graph import parallel_draft_window_graph_provider
 from vllm_ascend.worker.v2.utils import communicator_switch
 
 
@@ -131,7 +130,7 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
         """Override run_fullgraph to update full graph params in run_fullgraph."""
         num_tokens = desc.num_tokens
         dp_dummy = getattr(self.speculator, "_draft_window_dp_dummy_active", False)
-        window_provider = None if dp_dummy else parallel_draft_window_graph_provider(self.speculator)
+        window_provider = None if dp_dummy else getattr(self.speculator, "_draft_window_graph_binding_provider", None)
         attn_backend = list(self.speculator.attn_backends.values())[0]
         if window_provider is not None and not use_updatable_graph(attn_backend):
             raise NotImplementedError("Draft Window Graph requires the admitted updatable backend binding contract")

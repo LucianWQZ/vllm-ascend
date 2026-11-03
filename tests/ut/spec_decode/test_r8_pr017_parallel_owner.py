@@ -12,7 +12,7 @@ import unittest
 from contextlib import contextmanager, nullcontext
 from types import MethodType, SimpleNamespace
 from typing import Any
-from unittest.mock import PropertyMock, patch
+from unittest.mock import Mock, PropertyMock, patch
 
 import numpy as np
 import torch
@@ -266,13 +266,37 @@ class ParallelOwnerTests(unittest.TestCase):
             manager.capture(object(), object(), object(), [], object(), 4096, prepare_forward=callback)
         scope.assert_called_once()
         self.assertIs(capture.call_args.kwargs["prepare_forward"], callback)
-        manager.speculator = SimpleNamespace(attn_backends={"draft": dflash_graph.AscendFlashAttentionBackend})
+        manager.speculator = SimpleNamespace(
+            attn_backends={"draft": dflash_graph.AscendFlashAttentionBackend},
+            _draft_window_graph_binding_provider=object(),
+        )
         with (
-            patch.object(dflash_graph, "parallel_draft_window_graph_provider", return_value=object()),
             patch.object(dflash_graph, "use_updatable_graph", return_value=False),
             self.assertRaisesRegex(NotImplementedError, "updatable backend"),
         ):
             manager.run_fullgraph(SimpleNamespace(num_tokens=8))
+
+    def test_parallel_replay_retains_the_off_and_idle_dp_baseline_path(self):
+        for idle_dp in (False, True):
+            with self.subTest(idle_dp=idle_dp):
+                manager = object.__new__(dflash_graph.DFlashAclGraphManager)
+                backend, metadata, result = object(), object(), object()
+                owner = manager.speculator = SimpleNamespace(
+                    attn_backends={"draft": backend},
+                    input_batch=SimpleNamespace(seq_lens_cpu_upper_bound=object()),
+                    build_draft_attn_metadatas=Mock(return_value=metadata),
+                )
+                if idle_dp:
+                    owner._draft_window_dp_dummy_active = True
+                    owner._draft_window_graph_binding_provider = object()
+                desc = SimpleNamespace(num_tokens=8, num_reqs=1)
+                with (
+                    patch.object(manager, "_graph_replay", return_value=result) as replay,
+                    patch.object(dflash_graph, "use_updatable_graph", return_value=False),
+                ):
+                    self.assertIs(manager.run_fullgraph(desc), result)
+                owner.build_draft_attn_metadatas.assert_called_once_with(1, owner.input_batch.seq_lens_cpu_upper_bound)
+                replay.assert_called_once_with(desc, backend, 8, metadata)
 
 
 if __name__ == "__main__":

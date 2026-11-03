@@ -461,18 +461,23 @@ class DraftGraphSupportTest(unittest.TestCase):
         scope = self.resolve(self.config(method="dflash", rows=2))
         owner: Any = object.__new__(DraftWindowGraphInputMixin)
         owner._draft_graph_review_limit = scope
-        owner._draft_window_graph_binding_provider = object()
+        provider = owner._draft_window_graph_binding_provider = NS(
+            proposal=None, capture_identity_for=Mock(), prepare=Mock()
+        )
         owner._draft_window_bypass_active = False
         owner.draft_attn_layer_names = {"draft.layer"}
         owner.num_query_per_req = 8
         owner.block_tables = NS(slot_mappings=torch.zeros((1, 32), dtype=torch.int32))
-        owner._materialize_draft_window_read_inputs = Mock()
         for actual, padded in ((1, 1), (2, 2), (1, 2), (2, 4)):
             with self.subTest(actual=actual, padded=padded):
                 batch = self.batch(rows=actual)
                 GUARD.validate_draft_graph_review_requests(owner, batch)
                 descriptor = NS(num_reqs=padded, num_tokens=padded * 8, cg_mode=NS(name="FULL"))
-                owner._materialize_draft_window_read_inputs.reset_mock()
+                provider.proposal = (False,) * actual
+                owner.input_batch = NS(num_reqs=actual, idx_mapping_np=np.arange(actual))
+                owner.input_buffers = NS(seq_lens=torch.zeros(padded, dtype=torch.int32))
+                provider.prepare.reset_mock()
+                provider.capture_identity_for.reset_mock()
                 expected: Any = (
                     nullcontext() if actual == padded else self.assertRaisesRegex(RuntimeError, "uniform FULL")
                 )
@@ -487,11 +492,13 @@ class DraftGraphSupportTest(unittest.TestCase):
                         )
                     )
                 if actual == padded:
-                    owner._materialize_draft_window_read_inputs.assert_called_once_with(
-                        num_reqs=actual, batch_desc=descriptor
-                    )
+                    provider.capture_identity_for.assert_called_once_with(descriptor=descriptor)
+                    provider.prepare.assert_called_once()
+                    self.assertIs(provider.prepare.call_args.kwargs["idx_mapping_np"], owner.input_batch.idx_mapping_np)
+                    self.assertEqual(provider.prepare.call_args.kwargs["cpu_full_exact"].tolist(), [0] * padded)
                 else:
-                    owner._materialize_draft_window_read_inputs.assert_not_called()
+                    provider.prepare.assert_not_called()
+                    provider.capture_identity_for.assert_not_called()
         # Capacity is checked once before the proposal can change Graph ownership.
         with self.assertRaises(NotImplementedError):
             GUARD.validate_draft_graph_review_requests(owner, self.batch(rows=3))

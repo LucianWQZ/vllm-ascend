@@ -130,32 +130,6 @@ class DraftWindowGraphInputMixin:
             if provider._active_bank is None:
                 raise RuntimeError("Draft Graph proposal completed without consuming its current inputs")
 
-    def _materialize_draft_window_read_inputs(
-        self,
-        *,
-        num_reqs: int,
-        batch_desc: Any,
-    ) -> None:
-        provider = self._draft_window_graph_binding_provider
-        rows = provider.proposal
-        if rows is None:
-            raise RuntimeError("Draft Window metadata build has no active proposal")
-        input_batch = self.input_batch
-        num_reqs_padded = batch_desc.num_reqs
-        if num_reqs != input_batch.num_reqs or num_reqs != len(rows):
-            raise RuntimeError("metadata request count does not match proposal epoch")
-        if num_reqs_padded < num_reqs:
-            raise ValueError("padded request count must be at least actual requests")
-
-        selected = provider.capture_identity_for(descriptor=batch_desc)
-        cpu_full_exact = self.input_buffers.seq_lens[:num_reqs_padded].to(device="cpu", dtype=torch.int32, copy=True)
-        provider.prepare(
-            selected,
-            cpu_full_exact=cpu_full_exact,
-            idx_mapping_np=input_batch.idx_mapping_np,
-            step=0,
-        )
-
     def _build_attn_metadata(
         self,
         num_reqs: int,
@@ -202,6 +176,17 @@ class DraftWindowGraphInputMixin:
             or slot_mappings.data_ptr() != full_slots.data_ptr()
         ):
             raise RuntimeError("Draft Graph metadata must retain the canonical Full write slots")
-        self._materialize_draft_window_read_inputs(num_reqs=num_reqs, batch_desc=batch_desc)
+        provider = self._draft_window_graph_binding_provider
+        rows = provider.proposal
+        input_batch = self.input_batch
+        if rows is None:
+            raise RuntimeError("Draft Window metadata build has no active proposal")
+        if num_reqs != input_batch.num_reqs or num_reqs != len(rows):
+            raise RuntimeError("metadata request count does not match proposal epoch")
+        if padded < num_reqs:
+            raise ValueError("padded request count must be at least actual requests")
+        selected = provider.capture_identity_for(descriptor=batch_desc)
+        cpu_full_exact = self.input_buffers.seq_lens[:padded].to(device="cpu", dtype=torch.int32, copy=True)
+        provider.prepare(selected, cpu_full_exact=cpu_full_exact, idx_mapping_np=input_batch.idx_mapping_np, step=0)
         # The fixed manager builds this bank's metadata once immediately before replay.
         return None
