@@ -122,3 +122,47 @@ def test_stale_callback_cannot_retire_or_change_current_scope(setup):
         assert [id(value) for value in runtime._pending] == pending
         assert runtime._owner == []
         runtime.metadata_callback(3, 2)(0, runtime_tests.common())
+
+
+def test_context_only_retention_cannot_replace_previous_unfinished_reader(setup):
+    runtime, _, _, _ = setup
+    build(runtime)
+    previous = list(runtime._pending)
+    context = object()
+    with runtime.proposal_context(runtime_tests.batch(), context_kv_only=True):
+        runtime.retain_metadata(context)
+    assert all(any(value is old for value in runtime._pending) for old in previous)
+    assert any(value is context for value in runtime._pending)
+
+
+def test_real_dense_retention_cycles_end_at_the_next_completed_copy(setup):
+    import gc
+    import weakref
+
+    runtime, _, _, _ = setup
+    runtime._dense_reads = True
+
+    class Payload:
+        pass
+
+    previous = None
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        for _ in range(4):
+            payload = Payload()
+            current = weakref.ref(payload)
+            metadata = runtime_tests.common()
+            metadata.query_start_loc_cpu = torch.tensor([0, 3, 6, 6], dtype=torch.int32)
+            metadata.causal = False
+            with runtime.proposal_context(runtime_tests.batch()):
+                runtime.metadata_callback(3, 2)(0, metadata)
+                runtime.retain_metadata(payload)
+            del payload
+            assert current() is not None
+            if previous is not None:
+                assert previous() is None, "completion must break actual read/retain/owner cycles without GC"
+            previous = current
+    finally:
+        if was_enabled:
+            gc.enable()

@@ -126,7 +126,7 @@ def test_current_exact_rejection_and_group_geometry(prepared, span, starts):
             end_column = (int(target["seq_lens"][i]) + span - 1) // span
             expected = before[row, starts[i] // span : end_column]
             torch.testing.assert_close(result.block_tables[i, : len(expected)], expected, rtol=0, atol=0)
-        assert any(item is result for item in owner.retained)
+        assert any(item is result for item in owner)
         assert target["seq_lens"].tolist() == [1151, 1152]
         torch.testing.assert_close(target["block_table_tensor"], before[batch.idx_mapping_np], rtol=0, atol=0)
     torch.testing.assert_close(canonical, before, rtol=0, atol=0)
@@ -199,7 +199,7 @@ def test_native_projection_rejects_wrong_actual_preparation(prepared, changed):
         common.seq_lens = torch.cat((common.seq_lens, torch.zeros(1, dtype=torch.int32)))
     with pytest.raises(ValueError, match="Native SWA"), runtime.proposal_context(batch):
         runtime.metadata_callback(8, 2)(0, common)
-    assert runtime.pool.poisoned
+    assert runtime._poisoned
 
 
 def test_native_projection_must_cover_every_query(prepared):
@@ -214,6 +214,7 @@ def test_next_native_proposal_owns_independent_read_buffers(prepared):
     runtime, spec, batch, common, canonical, completions = prepared()
     with runtime.proposal_context(batch):
         runtime.metadata_callback(8, 2)(0, common)
+        first_owner = runtime._owner
     first = common.seq_lens.clone(), common.block_table_tensor.clone()
     second = SimpleNamespace(**vars(common))
     second.seq_lens = torch.tensor([1159, 1160], dtype=torch.int32)
@@ -224,10 +225,7 @@ def test_next_native_proposal_owns_independent_read_buffers(prepared):
         runtime.metadata_callback(8, 2)(0, second)
     torch.testing.assert_close(common.seq_lens, first[0], rtol=0, atol=0)
     torch.testing.assert_close(common.block_table_tensor, first[1], rtol=0, atol=0)
-    assert len(completions) == 2
-    assert runtime.pool.reclaim_completed() == 0
-    completions[0].complete = True
-    assert runtime.pool.reclaim_completed() == 1
+    assert not completions and first_owner == []
 
 
 def test_native_callback_cannot_cross_proposal_ownership(prepared):
@@ -245,7 +243,7 @@ def test_builder_failure_keeps_projected_read_operands_owned(prepared):
     with pytest.raises(RuntimeError, match="builder failed"), runtime.proposal_context(batch):
         owner = runtime._owner
         runtime.metadata_callback(8, 2)(0, common)
-        assert any(item is common for item in owner.retained)
-        assert any(item is compact for item in owner.retained)
+        assert any(item is common for item in owner)
+        assert any(item is compact for item in owner)
         raise RuntimeError("builder failed")
-    assert runtime.pool.poisoned
+    assert runtime._poisoned

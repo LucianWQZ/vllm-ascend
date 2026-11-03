@@ -196,7 +196,9 @@ class DraftWindowRuntime:
             self._poisoned = True
             raise
         else:
-            if owner:
+            if context_kv_only:
+                self._pending.extend(owner)
+            else:
                 self._pending = owner
         finally:
             self._owner = None

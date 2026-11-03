@@ -31,7 +31,7 @@ class Completion:
 @pytest.fixture
 def setup(monkeypatch):
     # Isolate backend discovery; its actual class/layout checks have their own
-    # inventory tests. The read provider and owner pool below are real code.
+    # inventory tests. The read provider and Runtime below are real code.
     monkeypatch.setattr(DraftWindowRuntime, "_validate_route", staticmethod(lambda spec: (0,)))
     completions = []
 
@@ -195,7 +195,7 @@ def test_callback_reads_canonical_source_and_preserves_write_query_objects(setup
     assert metadata.query_start_loc is query
     assert original_read.tolist() == [12, 27, 0]
     assert torch.equal(canonical, full)
-    assert len(completions) == 1
+    assert not completions
 
 
 def test_exact_after_rejection_controls_start_not_cpu_upper(setup):
@@ -235,7 +235,7 @@ def test_unprojected_native_group_metadata_is_untouched_while_full_group_windows
     assert full_metadata.block_table_tensor[1, :3].tolist() == other_table[3, 4:7].tolist()
     assert full_metadata.slot_mapping is original_slots
     assert torch.equal(other_table, canonical + 100)
-    assert len(completions) == 1
+    assert not completions
 
 
 def test_eagle_first_pass_snapshots_current_native_and_live_end_once(setup, monkeypatch):
@@ -314,7 +314,7 @@ def test_reorder_row_replacement_and_in_place_mapping_refresh_each_proposal(setu
     assert second.block_table_tensor[0, :3].tolist() == canonical[4, :3].tolist()
     assert second.block_table_tensor[1, :3].tolist() == canonical[2, 4:7].tolist()
     assert torch.equal(first.block_table_tensor, saved_first)
-    assert len(completions) == 2
+    assert not completions
 
 
 @pytest.mark.parametrize("phase", ["dummy_run", "is_profile"])
@@ -324,7 +324,7 @@ def test_dummy_and_profile_bypass_projection_and_completion(setup, phase):
         assert runtime.metadata_callback(3, 2) is None
         runtime.retain_metadata(object())
     assert not completions
-    assert not runtime.pool.poisoned
+    assert not runtime._poisoned
 
 
 def test_failed_native_proposal_poison_keeps_read_metadata(setup):
@@ -334,32 +334,18 @@ def test_failed_native_proposal_poison_keeps_read_metadata(setup):
         runtime.metadata_callback(3, 2)(0, metadata)
         owner = runtime._owner
         raise RuntimeError("after model enqueue")
-    assert runtime.pool.poisoned
-    assert metadata in owner.retained
+    assert runtime._poisoned
+    assert metadata in owner
     assert not completions
     with pytest.raises(RuntimeError, match="quarantined"), runtime.proposal_context(batch()):
         pytest.fail("must not enter another native proposal")
-
-
-def test_event_failure_after_successful_build_poison_keeps_read_metadata(setup, monkeypatch):
-    runtime, spec, _, _ = setup
-
-    def failed_record():
-        raise RuntimeError("record failed")
-
-    monkeypatch.setattr(torch.npu, "Event", failed_record)
-    with pytest.raises(RuntimeError, match="record failed"), runtime.proposal_context(batch()):
-        runtime.metadata_callback(3, 2)(0, common())
-        owner = runtime._owner
-    assert runtime.pool.poisoned
-    assert owner.retained
 
 
 def test_no_consumption_and_wrong_actual_query_width_are_errors(setup):
     runtime, spec, _, _ = setup
     with pytest.raises(ValueError, match="actual query width"), runtime.proposal_context(batch()):
         runtime.metadata_callback(8, 2)
-    assert runtime.pool.poisoned
+    assert runtime._poisoned
 
 
 @pytest.mark.parametrize("same_runtime", [False, True])
@@ -369,9 +355,7 @@ def test_stale_callback_cannot_modify_another_proposal(setup, same_runtime):
         stale = runtime.metadata_callback(3, 2)
         stale(0, common())
         retired = runtime._owner
-    completions[-1].complete = True
-    assert runtime.pool.reclaim_completed() == 1
-    assert retired.retained == []
+    assert retired
     other = (
         runtime
         if same_runtime
@@ -383,41 +367,33 @@ def test_stale_callback_cannot_modify_another_proposal(setup, same_runtime):
         current = other._owner
         with pytest.raises(RuntimeError, match="stale proposal"):
             stale(0, untouched)
-        assert retired is not current and not retired.retained and not current.retained
+        assert retired is not current and retired and current == []
         torch.testing.assert_close(untouched.block_table_tensor, before, rtol=0, atol=0)
         other.metadata_callback(3, 2)(0, common())
-    assert current.completion is not None and not other.pool.poisoned
+        if same_runtime:
+            assert not retired
+    assert current is other._pending and not other._poisoned and not completions
 
 
-def test_retention_uses_only_the_active_runtime_scope_before_event_record(setup, monkeypatch):
-    runtime, _, _, _ = setup
+def test_retention_uses_only_the_active_runtime_scope(setup):
+    runtime, _, _, completions = setup
     payload = object()
-
-    class AtRecord(Completion):
-        def record(self, stream):
-            assert runtime._owner is None
-            before = list(owner.retained)
-            with pytest.raises(RuntimeError, match="no active proposal"):
-                runtime.retain_metadata(object())
-            with pytest.raises(RuntimeError, match="stale proposal"):
-                callback(0, common())
-            assert [id(value) for value in owner.retained] == [id(value) for value in before]
-            super().record(stream)
-
-    completion = AtRecord()
-    monkeypatch.setattr(torch.npu, "Event", lambda: completion)
     with runtime.proposal_context(batch()):
         owner = runtime._owner
         with pytest.raises(RuntimeError, match="already active"), runtime.proposal_context(batch()):
-            pytest.fail("nested runtime must not acquire a second owner")
+            pytest.fail("nested runtime must not enter a second scope")
         callback = runtime.metadata_callback(3, 2)
         callback(0, common())
         runtime.retain_metadata(payload)
-    assert owner.completion is completion and not runtime.pool.poisoned
-    assert any(value is payload for value in owner.retained)
-    assert runtime.pool.reclaim_completed() == 0
-    completion.complete = True
-    assert runtime.pool.reclaim_completed() == 1 and not owner.retained
+    assert owner is runtime._pending and owner is not None
+    before = [id(value) for value in owner]
+    with pytest.raises(RuntimeError, match="no active proposal"):
+        runtime.retain_metadata(object())
+    with pytest.raises(RuntimeError, match="stale proposal"):
+        callback(0, common())
+    assert [id(value) for value in owner] == before
+    assert any(value is payload for value in owner)
+    assert not completions
 
 
 def test_target_only_group_is_not_projected(setup):
@@ -458,8 +434,8 @@ def test_eagle_freezes_anchor_across_rejection_and_retains_all_step_reads(setup)
     assert [metadata.seq_lens[1].item() for metadata in outputs] == [7, 5, 6]
     assert all(metadata.block_table_tensor[1, 0] == canonical[3, 5] for metadata in outputs)
     assert len({metadata.block_table_tensor.data_ptr() for metadata in outputs}) == 3
-    assert all(any(value is metadata for value in owner.retained) for metadata in outputs)
-    assert len(completions) == 1
+    assert all(any(value is metadata for value in owner) for metadata in outputs)
+    assert not completions
 
 
 @pytest.mark.parametrize("requested", [0, 1, 2, 3, None])
@@ -475,9 +451,9 @@ def test_eagle_scheduled_prefill_and_steps_keep_static_window_geometry(setup, re
             runtime.metadata_callback(step, 2)(0, metadata)
             outputs.append(metadata)
         owner = runtime._owner
-    assert owner is not None and owner.completion is not None
+    assert owner is runtime._pending and owner
     assert runtime.speculator.num_speculative_steps == 3
-    assert len(completions) == 1 and runtime._build_count == consumed
+    assert not completions and runtime._build_count == consumed
     # The configured three-step horizon still freezes S=20. A scheduled
     # zero/short proposal must not silently change the window formula.
     assert all(metadata.block_table_tensor[1, 0] == canonical[3, 5] for metadata in outputs)
@@ -505,7 +481,7 @@ def test_eagle_zero_drafts_still_requires_the_real_prefill_read(setup):
         runtime.proposal_context(batch(), num_speculative_tokens=0),
     ):
         pass
-    assert runtime.pool.poisoned
+    assert runtime._poisoned
 
 
 def test_eagle_partial_proposal_cannot_omit_a_requested_step(setup):
@@ -517,7 +493,7 @@ def test_eagle_partial_proposal_cannot_omit_a_requested_step(setup):
         runtime.proposal_context(batch(), num_speculative_tokens=2),
     ):
         runtime.metadata_callback(0, 2)(0, common())
-    assert runtime.pool.poisoned
+    assert runtime._poisoned
 
 
 def test_eagle_terminal_prefill_first_pass_stays_full_then_uses_window(setup):
@@ -674,12 +650,10 @@ def test_eagle_full_continuing_keeps_full_addressing_without_window_snapshot(set
         assert runtime._build_count == 3
         assert runtime._eagle_window is None
         for step, metadata in retained_common:
-            assert any(item is metadata for item in owner.retained)
+            assert any(item is metadata for item in owner)
             assert metadata.seq_lens_cpu.tolist() == [12 + step, 27 + step, 0]
-    assert len(completions) == 1
-    assert runtime.pool.reclaim_completed() == 0
-    completions[0].complete = True
-    assert runtime.pool.reclaim_completed() == 1
+    assert not completions
+    assert owner is runtime._pending and owner
 
 
 def test_first_group_metadata_must_cover_the_actual_active_requests(setup):
@@ -688,7 +662,7 @@ def test_first_group_metadata_must_cover_the_actual_active_requests(setup):
     metadata.num_reqs = 1
     with pytest.raises(ValueError, match="active requests"), runtime.proposal_context(batch()):
         runtime.metadata_callback(3, 2)(0, metadata)
-    assert runtime.pool.poisoned
+    assert runtime._poisoned
 
 
 def test_eagle_full_continuing_with_placeholders_keeps_exact_read(setup):
@@ -794,13 +768,13 @@ def test_real_builder_projects_every_group_and_quarantines_partial_failure(setup
         assert torch.equal(full_tables[gid], saved_tables[gid])
         assert metadata.slot_mapping.data_ptr() == full_slots[gid].data_ptr()
         assert metadata.positions is positions
-        assert any(value is metadata for value in owner.retained)
-    assert runtime.pool.poisoned is fail_second_builder
-    assert len(completions) == (0 if fail_second_builder else 1)
+        assert any(value is metadata for value in owner)
+    assert runtime._poisoned is fail_second_builder
+    assert not completions
 
 
 @pytest.mark.parametrize("method", ["dflash", "dspark"])
-def test_context_only_kv_write_keeps_completion_without_inventing_attention(setup, method):
+def test_context_only_kv_write_retains_explicit_operands_without_inventing_attention(setup, method):
     _, spec, canonical, completions = setup
     spec.method = method
     policy = resolve_draft_window_policy(requested_window_size=8, method=method)
@@ -809,16 +783,11 @@ def test_context_only_kv_write_keeps_completion_without_inventing_attention(setu
     payload = torch.ones(8)
     with runtime.proposal_context(batch(), context_kv_only=True):
         owner = runtime._owner
-        assert owner is not None and owner.completion is None
+        assert owner == []
         runtime.retain_metadata(payload)
-    assert owner.completion is not None
-    assert owner.completion is completions[-1]
-    assert any(value is payload for value in owner.retained)
-    assert runtime.pool.reclaim_completed() == 0
+    assert any(value is payload for value in runtime._pending)
+    assert not completions
     torch.testing.assert_close(canonical, before, rtol=0, atol=0)
-    completions[-1].complete = True
-    assert runtime.pool.reclaim_completed() == 1
-    assert not owner.retained and owner.completion is None
 
 
 def test_context_only_scope_cannot_hide_an_actual_draft_read(setup):
@@ -828,7 +797,7 @@ def test_context_only_scope_cannot_hide_an_actual_draft_read(setup):
         runtime.proposal_context(batch(), context_kv_only=True),
     ):
         runtime.metadata_callback(spec.num_query_per_req, 2)(0, common())
-    assert runtime.pool.poisoned
+    assert runtime._poisoned
 
 
 def test_eagle_cannot_select_parallel_context_only_scope(setup):
@@ -941,15 +910,10 @@ def test_prepared_exact_is_explicit_and_retained_until_completion(setup, monkeyp
     assert len(exact_copies) == (0 if with_prepared_exact else 1)
     assert metadata.seq_lens_cpu.tolist() == [12, 11, 0]
     if with_prepared_exact:
-        assert any(value is snapshot for value in owner.retained)
+        assert any(value is snapshot for value in owner)
         assert snapshot.tolist() == [12, 27]
-    assert owner.completion is not None
-    runtime.pool.reclaim_completed()
-    assert owner.completion is not None
-    completions[0].complete = True
-    runtime.pool.reclaim_completed()
-    assert not owner.retained and owner.completion is None
-    assert owner.retained == []
+    assert owner is runtime._pending and owner
+    assert not completions
 
 
 def test_prepared_exact_keeps_owner_and_step_guards(setup):
@@ -994,16 +958,16 @@ def test_dense_device_callback_or_exact_fallback_keeps_the_same_window(setup, up
         assert (torch.tensor([20, 27]) - read.seq_lens).tolist() == [12, 16]
         assert metadata.seq_lens_cpu.device.type == "cpu"
         assert metadata.block_table_tensor is full_table
-        assert any(value is read for value in runtime._owner.retained)
+        assert any(value is read for value in runtime._owner)
         assert metadata.slot_mapping is slots and metadata.positions is positions
     torch.testing.assert_close(canonical, original, rtol=0, atol=0)
-    assert len(completions) == 1
+    assert not completions
     with pytest.raises(RuntimeError, match="stale"):
         callback(0, common())
-    retained_before = len(owner.retained)
+    retained_before = len(owner)
     with pytest.raises(RuntimeError, match="stale"):
         read.retain(object())
-    assert len(owner.retained) == retained_before
+    assert len(owner) == retained_before
 
 
 @pytest.mark.parametrize("drafts", [None, (0, 0)])
@@ -1193,15 +1157,12 @@ def test_mla_final_metadata_is_owned_without_rotary_copies(setup):
         owner = runtime._owner
         runtime.metadata_callback(3, 2)(0, common())
         runtime.retain_metadata(metadata)
-        assert any(value is metadata for value in owner.retained)
+        assert any(value is metadata for value in owner)
         assert metadata["draft"].decode.cos is cos
         assert metadata["draft"].decode.sin is sin
-    assert owner.completion is completions[-1]
-    assert runtime.pool.reclaim_completed() == 0
-    assert any(value is metadata for value in owner.retained)
-    completions[-1].complete = True
-    assert runtime.pool.reclaim_completed() == 1
-    assert not owner.retained
+    assert owner is runtime._pending and owner
+    assert any(value is metadata for value in owner)
+    assert not completions
     torch.testing.assert_close(canonical, full, rtol=0, atol=0)
 
 
@@ -1213,7 +1174,7 @@ def test_eagle_next_preparation_rejects_incorrect_active_extent(setup):
         runtime.metadata_callback(0, 2)(0, common())
         state.num_reqs = 1
         runtime.metadata_callback(1, 2)
-    assert runtime.pool.poisoned
+    assert runtime._poisoned
 
 
 def test_exact_snapshot_failure_retains_original_prepared_input(setup, monkeypatch):
@@ -1224,7 +1185,7 @@ def test_exact_snapshot_failure_retains_original_prepared_input(setup, monkeypat
 
     def failed_snapshot(tensor, *args, **kwargs):
         if kwargs.get("device") == "cpu" and kwargs.get("copy") is True:
-            assert any(value is prepared for value in owner.retained)
+            assert any(value is prepared for value in owner)
             original(tensor, *args, **kwargs)
             raise RuntimeError("exact snapshot failed after native copy")
         return original(tensor, *args, **kwargs)
@@ -1233,8 +1194,8 @@ def test_exact_snapshot_failure_retains_original_prepared_input(setup, monkeypat
     with pytest.raises(RuntimeError, match="snapshot failed"), runtime.proposal_context(batch()):
         owner = runtime._owner
         runtime.metadata_callback(3, 2)(0, metadata)
-    assert runtime.pool.poisoned
-    assert any(value is prepared for value in owner.retained)
+    assert runtime._poisoned
+    assert any(value is prepared for value in owner)
 
 
 def test_current_compact_table_is_authoritative_without_a_second_persistent_gather(setup):

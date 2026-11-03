@@ -9,18 +9,22 @@ import torch
 
 torch_npu = pytest.importorskip("torch_npu")
 
+from tests.e2e.nightly.single_node.ops.singlecard_ops import (  # noqa: E402
+    test_draft_window_completion_boundary as runtime_tests,
+)
 from vllm_ascend.worker.v2.spec_decode.draft_window_dense import DenseDraftRead, prepare_dense_draft_read  # noqa: E402
-from vllm_ascend.worker.v2.spec_decode.draft_window_lifetime import DraftWindowOwnerPool  # noqa: E402
+
+prepared = runtime_tests.prepared
 
 pytestmark = pytest.mark.skipif(not torch.npu.is_available(), reason="requires an Ascend NPU")
 
 
 @pytest.mark.parametrize("stage", ["phase", "cohort"])
-def test_real_private_copy_failure_retains_its_actual_operands(monkeypatch, stage):
+def test_real_private_copy_failure_retains_its_actual_operands(monkeypatch, stage, prepared):
     table = torch.arange(32, dtype=torch.int32, device="npu").reshape(2, 16)
     before = table.clone()
     source = (table[list((1, 0))], (16, 16), 128)
-    pool = DraftWindowOwnerPool(1)
+    runtime, batch, _ = prepared
     events, submitted = [], []
     original_copy = torch.Tensor.copy_
 
@@ -34,8 +38,8 @@ def test_real_private_copy_failure_retains_its_actual_operands(monkeypatch, stag
         event.record(torch.npu.current_stream())
         events.append(event)
         submitted.append((input_tensor, output_tensor))
-        assert any(item is input_tensor for item in owner.retained), "copy source missing from active owner"
-        assert any(item is output_tensor for item in owner.retained), "copy destination missing from active owner"
+        assert any(item is input_tensor for item in owner), "copy source missing from active owner"
+        assert any(item is output_tensor for item in owner), "copy destination missing from active owner"
         raise RuntimeError("deliberate Host failure after real NPU copy")
 
     def copy(destination, tensor, *args, **kwargs):
@@ -47,7 +51,9 @@ def test_real_private_copy_failure_retains_its_actual_operands(monkeypatch, stag
     monkeypatch.setattr(torch.Tensor, "copy_", copy)
     full_rows = torch.tensor([True, True] if stage == "phase" else [False, True])
     try:
-        with pytest.raises(RuntimeError, match="after real NPU copy"), pool.operation() as owner:
+        with pytest.raises(RuntimeError, match="after real NPU copy"), runtime.proposal_context(batch):
+            owner = runtime._owner
+            assert owner is not None
             prepare_dense_draft_read(
                 *source,
                 exact_cpu=torch.tensor([1151, 1408], dtype=torch.int32),
@@ -57,13 +63,13 @@ def test_real_private_copy_failure_retains_its_actual_operands(monkeypatch, stag
                 query_width=4,
                 causal=False,
                 full_rows_cpu=full_rows,
-                retain=lambda *items: owner.retained.extend(items),
+                retain=lambda *items: owner.extend(items),
             )
         assert len(submitted) == 1
-        assert pool.poisoned
-        assert all(any(item is tensor for item in owner.retained) for tensor in submitted[0])
-        with pytest.raises(RuntimeError, match="quarantined"):
-            pool.acquire()
+        assert runtime._poisoned
+        assert all(any(item is tensor for item in owner) for tensor in submitted[0])
+        with pytest.raises(RuntimeError, match="quarantined"), runtime.proposal_context(batch):
+            pytest.fail("uncertain submission must not be reused")
     finally:
         # Diagnostic cleanup only. The product never receives these events
         # and must keep its unknown-completion owner quarantined.
@@ -72,15 +78,15 @@ def test_real_private_copy_failure_retains_its_actual_operands(monkeypatch, stag
     torch.testing.assert_close(table, before, atol=0, rtol=0)
 
 
-def test_cpu_metadata_fill_failure_keeps_device_operands_quarantined(monkeypatch):
-    pool = DraftWindowOwnerPool(1)
+def test_cpu_metadata_fill_failure_keeps_device_operands_quarantined(monkeypatch, prepared):
+    runtime, batch, _ = prepared
     read = DenseDraftRead(
         torch.zeros(2, 4, dtype=torch.int64, device="npu"),
         torch.tensor([3, 4], dtype=torch.int32, device="cpu"),
         torch.zeros(2, 1, 1, 4, dtype=torch.bool, device="npu"),
         4,
         1,
-        lambda *items: owner.retained.extend(items),
+        lambda *items: owner.extend(items),
     )
     original = torch.Tensor.__setitem__
     events, submitted = [], []
@@ -92,20 +98,22 @@ def test_cpu_metadata_fill_failure_keeps_device_operands_quarantined(monkeypatch
             event.record(torch.npu.current_stream())
             events.append(event)
             submitted.append(destination)
-            assert any(item is destination for item in owner.retained), "metadata destination is not owned"
+            assert any(item is destination for item in owner), "metadata destination is not owned"
             raise RuntimeError("deliberate Host failure after real metadata fill")
         return result
 
     monkeypatch.setattr(torch.Tensor, "__setitem__", filled)
     try:
-        with pytest.raises(RuntimeError, match="after real metadata fill"), pool.operation() as owner:
-            owner.retained.append(read)
+        with pytest.raises(RuntimeError, match="after real metadata fill"), runtime.proposal_context(batch):
+            owner = runtime._owner
+            assert owner is not None
+            owner.append(read)
             read.apply(SimpleNamespace(num_reqs=3))
         assert len(submitted) == 1
-        assert pool.poisoned
-        assert any(item is submitted[0] for item in owner.retained)
-        with pytest.raises(RuntimeError, match="quarantined"):
-            pool.acquire()
+        assert runtime._poisoned
+        assert any(item is submitted[0] for item in owner)
+        with pytest.raises(RuntimeError, match="quarantined"), runtime.proposal_context(batch):
+            pytest.fail("uncertain submission must not be reused")
     finally:
         for event in events:
             event.synchronize()

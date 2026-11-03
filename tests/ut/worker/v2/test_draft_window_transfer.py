@@ -7,30 +7,22 @@ enqueue, completion and mixed engine regression need separate device tests.
 """
 
 from types import SimpleNamespace
-from typing import NoReturn
 
 import pytest
 import torch
 
+from tests.ut.worker.v2 import test_draft_window_runtime as runtime_tests
 from vllm_ascend.worker.v2.spec_decode.draft_window_dense import DenseDraftRead, prepare_dense_draft_read
-from vllm_ascend.worker.v2.spec_decode.draft_window_lifetime import DraftWindowOwnerPool
 
-
-def unrecorded_completion() -> NoReturn:
-    raise AssertionError("failed preparation must not record a success event")
-
-
-@pytest.fixture(autouse=True)
-def no_event_after_partial_submission(monkeypatch):
-    monkeypatch.setattr(torch.npu, "Event", unrecorded_completion)
+setup = runtime_tests.setup
 
 
 @pytest.mark.parametrize("stage", ["phase", "cohort"])
-def test_copy_failure_keeps_actual_input_and_output_owned(monkeypatch, stage):
+def test_copy_failure_keeps_actual_input_and_output_owned(monkeypatch, stage, setup):
     table = torch.arange(32, dtype=torch.int32).reshape(2, 16)
     source = (table[list((1, 0))], (16, 16), 128)
     exact = torch.tensor([1151, 1408], dtype=torch.int32)
-    pool = DraftWindowOwnerPool(1)
+    runtime, _, _, _ = setup
     submitted = []
     original_copy = torch.Tensor.copy_
 
@@ -39,8 +31,8 @@ def test_copy_failure_keeps_actual_input_and_output_owned(monkeypatch, stage):
 
     def after_copy(input_tensor, output_tensor):
         submitted.append((input_tensor, output_tensor))
-        assert any(item is input_tensor for item in owner.retained), "copy source not owned before submission"
-        assert any(item is output_tensor for item in owner.retained), "copy destination not owned before submission"
+        assert any(item is input_tensor for item in owner), "copy source not owned before submission"
+        assert any(item is output_tensor for item in owner), "copy destination not owned before submission"
         raise RuntimeError("deliberate error after copy submission")
 
     def copy(destination, tensor, *args, **kwargs):
@@ -51,7 +43,9 @@ def test_copy_failure_keeps_actual_input_and_output_owned(monkeypatch, stage):
 
     monkeypatch.setattr(torch.Tensor, "copy_", copy)
     full_rows = torch.tensor([True, True] if stage == "phase" else [False, True])
-    with pytest.raises(RuntimeError, match="deliberate error"), pool.operation() as owner:
+    with pytest.raises(RuntimeError, match="deliberate error"), runtime.proposal_context(runtime_tests.batch()):
+        owner = runtime._owner
+        assert owner is not None
         prepare_dense_draft_read(
             *source,
             exact_cpu=exact,
@@ -63,30 +57,32 @@ def test_copy_failure_keeps_actual_input_and_output_owned(monkeypatch, stage):
             query_width=4,
             causal=False,
             full_rows_cpu=full_rows,
-            retain=lambda *items: owner.retained.extend(items),
+            retain=lambda *items: owner.extend(items),
         )
     assert len(submitted) == 1
-    assert pool.poisoned
-    assert all(any(item is tensor for item in owner.retained) for tensor in submitted[0])
-    with pytest.raises(RuntimeError, match="quarantined"):
-        pool.acquire()
+    assert runtime._poisoned
+    assert all(any(item is tensor for item in owner) for tensor in submitted[0])
+    with pytest.raises(RuntimeError, match="quarantined"), runtime.proposal_context(runtime_tests.batch()):
+        pytest.fail("uncertain copy must not be reused")
 
 
-def test_planning_copy_failure_keeps_prepared_input_owned(monkeypatch):
+def test_planning_copy_failure_keeps_prepared_input_owned(monkeypatch, setup):
     source = (torch.arange(16, dtype=torch.int32)[None][list((0,))], (16,), 128)
     exact = torch.tensor([1151], dtype=torch.int32)
-    pool = DraftWindowOwnerPool(1)
+    runtime, _, _, _ = setup
     original_copy = torch.Tensor.copy_
 
     def failed_copy(destination, value, *args, **kwargs):
-        assert any(item is exact for item in owner.retained)
-        assert any(item is value for item in owner.retained)
-        assert any(item is destination for item in owner.retained)
+        assert any(item is exact for item in owner)
+        assert any(item is value for item in owner)
+        assert any(item is destination for item in owner)
         original_copy(destination, value, *args, **kwargs)
         raise RuntimeError("deliberate error during planning copy")
 
     monkeypatch.setattr(torch.Tensor, "copy_", failed_copy)
-    with pytest.raises(RuntimeError, match="planning copy"), pool.operation() as owner:
+    with pytest.raises(RuntimeError, match="planning copy"), runtime.proposal_context(runtime_tests.batch()):
+        owner = runtime._owner
+        assert owner is not None
         prepare_dense_draft_read(
             *source,
             exact_cpu=exact,
@@ -96,13 +92,13 @@ def test_planning_copy_failure_keeps_prepared_input_owned(monkeypatch):
             upper_cpu=exact + 1,
             query_width=4,
             causal=False,
-            retain=lambda *items: owner.retained.extend(items),
+            retain=lambda *items: owner.extend(items),
         )
-    assert pool.poisoned and any(item is exact for item in owner.retained)
+    assert runtime._poisoned and any(item is exact for item in owner)
 
 
-def test_metadata_length_copy_is_owned_before_partial_fill(monkeypatch):
-    pool = DraftWindowOwnerPool(1)
+def test_metadata_length_copy_is_owned_before_partial_fill(monkeypatch, setup):
+    runtime, _, _, _ = setup
     original = torch.Tensor.__setitem__
     read = DenseDraftRead(
         torch.zeros(2, 4, dtype=torch.int64),
@@ -110,7 +106,7 @@ def test_metadata_length_copy_is_owned_before_partial_fill(monkeypatch):
         torch.zeros(2, 1, 1, 4, dtype=torch.bool),
         4,
         1,
-        lambda *items: owner.retained.extend(items),
+        lambda *items: owner.extend(items),
     )
     submitted = []
 
@@ -118,14 +114,16 @@ def test_metadata_length_copy_is_owned_before_partial_fill(monkeypatch):
         result = original(destination, index, values)
         if values is read.seq_lens:
             submitted.append(destination)
-            assert any(item is destination for item in owner.retained), "metadata copy destination is not owned"
+            assert any(item is destination for item in owner), "metadata copy destination is not owned"
             raise RuntimeError("deliberate error after metadata fill")
         return result
 
     monkeypatch.setattr(torch.Tensor, "__setitem__", filled)
-    with pytest.raises(RuntimeError, match="after metadata fill"), pool.operation() as owner:
-        owner.retained.append(read)
+    with pytest.raises(RuntimeError, match="after metadata fill"), runtime.proposal_context(runtime_tests.batch()):
+        owner = runtime._owner
+        assert owner is not None
+        owner.append(read)
         read.apply(SimpleNamespace(num_reqs=3))
     assert len(submitted) == 1
-    assert pool.poisoned
-    assert any(item is submitted[0] for item in owner.retained)
+    assert runtime._poisoned
+    assert any(item is submitted[0] for item in owner)

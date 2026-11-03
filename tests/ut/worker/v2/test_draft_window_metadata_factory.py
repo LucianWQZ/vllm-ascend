@@ -8,9 +8,9 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from vllm_ascend.worker.v2.spec_decode.draft_window_lifetime import (
-    DraftWindowOwnerPool,
-)
+from tests.ut.worker.v2 import test_draft_window_runtime as runtime_tests
+
+setup = runtime_tests.setup
 
 CALLBACK_NAMES = ("common_metadata_callback",)
 
@@ -314,9 +314,9 @@ def test_factory_wrapper_nesting_restores_outer_factory(factory_contract, fail_i
 
 
 @pytest.mark.parametrize("stage", ["backend", *CALLBACK_NAMES])
-def test_factory_error_restores_module_but_quarantines_active_owner(factory_contract, stage, monkeypatch):
+def test_factory_error_restores_module_but_quarantines_active_owner(factory_contract, stage, monkeypatch, setup):
     contract = factory_contract
-    pool = DraftWindowOwnerPool(1)
+    runtime, _, _, _ = setup
     payload = object()
     completion = Mock(side_effect=AssertionError("failed proposal cannot record a success completion"))
     monkeypatch.setattr(torch.npu, "Event", completion)
@@ -331,14 +331,19 @@ def test_factory_error_restores_module_but_quarantines_active_owner(factory_cont
 
     contract.ascend.side_effect = backend
     callbacks = {} if stage == "backend" else {stage: fail}
-    with pytest.raises(RuntimeError, match="partial-submit host error"), pool.operation() as owner:
-        owner.retained.append(payload)
+    with (
+        pytest.raises(RuntimeError, match="partial-submit host error"),
+        runtime.proposal_context(runtime_tests.batch()),
+    ):
+        owner = runtime._owner
+        assert owner is not None
+        owner.append(payload)
         # Entered proposal lifetime; no native operation is claimed here.
         with contract.wrapper(), contract.factory([0], 1, False, **callbacks):
             contract.module.build_attn_metadata()
     assert contract.module.build_attn_metadata is contract.original
-    assert pool.poisoned
-    assert owner.retained == [payload]
+    assert runtime._poisoned
+    assert owner == [payload]
     completion.assert_not_called()
-    with pytest.raises(RuntimeError, match="quarantined"):
-        pool.acquire()
+    with pytest.raises(RuntimeError, match="quarantined"), runtime.proposal_context(runtime_tests.batch()):
+        pytest.fail("uncertain builder must not be reused")

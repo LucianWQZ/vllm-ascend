@@ -166,7 +166,7 @@ def test_native_projection_retains_pinned_actual_length_dma_source(monkeypatch):
     def checked(destination, source, *args, **kwargs):
         if destination.device.type == "npu" and source.device.type == "cpu" and source.dtype == torch.int32:
             assert source.is_pinned(), "Actual exact-length DMA source must be pinned"
-            assert any(value is source for value in owner.retained), "Retain the real DMA source before submit"
+            assert any(value is source for value in owner), "Retain the real DMA source before submit"
             copies.append(source)
         return copy(destination, source, *args, **kwargs)
 
@@ -177,4 +177,4 @@ def test_native_projection_retains_pinned_actual_length_dma_source(monkeypatch):
     assert len(copies) == 1
     assert common.slot_mapping is write_slots
     torch.testing.assert_close(common.seq_lens.cpu(), torch.tensor([1151, 1024], dtype=torch.int32), atol=0, rtol=0)
-    assert any(value is common for value in owner.retained)
+    assert any(value is common for value in owner)
