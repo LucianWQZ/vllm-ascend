@@ -287,16 +287,16 @@ def test_first_and_ar_share_one_materialization_path_without_moving_the_anchor(p
     monkeypatch.setattr(runtime, "prepare", prepare)
     with owner._eagle3_draft_window_proposal_scope(batch, dummy_run=False, is_profile=False):
         session.stage(session.resolve(n=first_padding, tokens=4 * first_padding, ordinal=0), 0)
-        frozen = owner._eagle3_window_proposal_plan
-        assert frozen[0].window_start == 8
+        frozen = owner._eagle3_window_intervals
+        assert frozen[0][0] == 8
         runtime.finish_update()
         owner._snapshot_eagle3_decode_step_one(num_reqs=1, num_reqs_padded=1)
         for step in (1, 2):
             session.stage(session.resolve(n=1, tokens=1, ordinal=step - 1), step)
-            assert owner._eagle3_window_proposal_plan is frozen
+            assert owner._eagle3_window_intervals is frozen
         runtime.finish_update()
-    assert [call["cpu_full_exact"].tolist() for call in calls] == [[10] + [0] * (first_padding - 1), [8], [9]]
-    assert all(call["frozen_row_plans"] is frozen for call in calls)
+    assert [call["cpu_full_exact"].tolist() for call in calls] == [[10], [8], [9]]
+    assert all(call["frozen_intervals"] is frozen for call in calls)
 
 
 def test_eagle_startup_rejects_no_usable_capture_buckets():
@@ -451,9 +451,7 @@ def test_parallel_metadata_hook_rejects_bad_actual_inputs_before_bank_materializ
         owner._draft_window_graph_binding_provider.proposal = None
     elif damage == "request_rows":
         owner.input_batch.num_reqs = 2
-    with pytest.raises(
-        RuntimeError, match="actual uniform FULL dispatch|active proposal|request count"
-    ):
+    with pytest.raises(RuntimeError, match="actual uniform FULL dispatch|active proposal|request count"):
         owner._build_uniform_attn_metadata(desc, 1, query_width, torch.tensor([16]), step)
     assert not calls
 
@@ -735,8 +733,8 @@ def test_dp_synchronized_native_first_without_local_prefill(monkeypatch, mode, f
         assert bank.cpu_window_exact.tolist() == [full_end - start]
         assert bank.device_window_exact.tolist() == [full_end - start]
         assert bank.window_block_table[0, :9].tolist() == table[0, start // 128 : valid_blocks].tolist()
-        assert owner._eagle3_window_proposal_plan[0].window_start == start
-        assert owner._eagle3_window_proposal_plan[0].full_exact_end == full_end
+        assert owner._eagle3_window_intervals[0][0] == start
+        assert owner._eagle3_window_intervals[0][1] == full_end + owner.num_speculative_steps
         assert layer.query_start_loc is query and layer.positions is positions and layer.slot_mapping is slots
         assert mappings["draft"] is slots and target_layer.attn_state is AscendAttentionState.DecodeOnly
         torch.testing.assert_close(current.input_buffers.positions[:4], positions)
@@ -798,8 +796,8 @@ def test_mixed_prefill_query_guard_keeps_full_rows_and_checks_only_actual_window
     finally:
         runtime.proposal = None
     assert context == (True, False)
-    assert len(calls) == 1 and calls[0]["cpu_full_exact"].tolist() == [20, 10, 0, 0]
-    assert [plan.window_visible_length for plan in calls[0]["frozen_row_plans"]] == [4, 2]
+    assert len(calls) == 1 and calls[0]["cpu_full_exact"].tolist() == [20, 10]
+    assert [horizon - owner.num_speculative_steps - start for start, horizon in calls[0]["frozen_intervals"]] == [4, 2]
 
 
 @pytest.mark.parametrize("values", [np.array([10.5]), np.array([-1]), np.array([], dtype=np.int32)])

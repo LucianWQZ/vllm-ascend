@@ -10,7 +10,7 @@ import numpy as np
 import torch
 
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphBindingProvider
-from vllm_ascend.worker.v2.spec_decode.draft_window_plan import DraftWindowPlan, compute_draft_window_plan
+from vllm_ascend.worker.v2.spec_decode.draft_window_plan import compute_draft_window_start
 from vllm_ascend.worker.v2.spec_decode.draft_window_runtime import continuing_prefill_rows
 
 
@@ -32,7 +32,7 @@ class Eagle3DraftWindowMixin:
     """Proposal scope and frozen window geometry for static-K Eagle Graph."""
 
     _draft_window_graph_binding_provider: DraftWindowGraphBindingProvider
-    _eagle3_window_proposal_plan: tuple[DraftWindowPlan, ...] | None
+    _eagle3_window_intervals: tuple[tuple[int, int], ...] | None
     _eagle3_window_decode_step_one_exact: torch.Tensor | None
     _eagle3_window_bypass_active: bool
     _eagle3_window_next_step: int
@@ -46,7 +46,7 @@ class Eagle3DraftWindowMixin:
 
     def _initialize_eagle3_draft_window_state(self) -> None:
         """Initialize proposal state after source/configuration validation."""
-        self._eagle3_window_proposal_plan = None
+        self._eagle3_window_intervals = None
         self._eagle3_window_decode_step_one_exact = None
         self._eagle3_window_bypass_active = False
         self._eagle3_window_continuing_prefill = False
@@ -94,7 +94,7 @@ class Eagle3DraftWindowMixin:
         if graph_session is None:
             raise RuntimeError("Eagle3 Draft Window business proposals require their installed Graph manager")
         assert rows is not None
-        self._eagle3_window_proposal_plan = None
+        self._eagle3_window_intervals = None
         self._eagle3_window_decode_step_one_exact = None
         self._eagle3_window_next_step = 0
         self._eagle3_window_expected_steps = expected_steps
@@ -108,7 +108,7 @@ class Eagle3DraftWindowMixin:
                         f"static_K={self.num_speculative_steps}"
                     )
         finally:
-            self._eagle3_window_proposal_plan = None
+            self._eagle3_window_intervals = None
             self._eagle3_window_decode_step_one_exact = None
             self._eagle3_window_next_step = 0
             self._eagle3_window_expected_steps = self.num_speculative_steps
@@ -131,15 +131,7 @@ class Eagle3DraftWindowMixin:
         if self._eagle3_window_decode_step_one_exact is not None:
             raise RuntimeError("Eagle3 decode exact state was already snapshotted")
         self._validate_request_counts(num_reqs, num_reqs_padded)
-        exact = torch.zeros(num_reqs_padded, dtype=torch.int32, device="cpu")
-        if num_reqs:
-            exact[:num_reqs].copy_(
-                self.input_buffers.seq_lens[:num_reqs].to(
-                    device="cpu",
-                    dtype=torch.int32,
-                    copy=True,
-                )
-            )
+        exact = self.input_buffers.seq_lens[:num_reqs].to(device="cpu", dtype=torch.int32, copy=True)
         self._eagle3_window_decode_step_one_exact = exact
         return exact
 
@@ -163,7 +155,7 @@ class Eagle3DraftWindowMixin:
         num_reqs, num_reqs_padded = batch.num_reqs, capture.descriptor.num_reqs
         if num_reqs != len(rows):
             raise RuntimeError("Eagle3 request geometry changed within one proposal")
-        proposal = self._eagle3_window_proposal_plan
+        proposal = self._eagle3_window_intervals
         if step == 0:
             if proposal is not None:
                 raise RuntimeError("Eagle3 first-pass Window state is already materialized")
@@ -172,22 +164,24 @@ class Eagle3DraftWindowMixin:
                 raise ValueError("proposal Full exact lengths must cover the active integer request rows")
             if bool(np.any(values[:num_reqs] < 0)):
                 raise ValueError("proposal Full exact lengths must be non-negative")
-            exact = torch.zeros(num_reqs_padded, dtype=torch.int32)
-            exact[:num_reqs].copy_(torch.from_numpy(values[:num_reqs].copy()))
+            exact = torch.tensor(values[:num_reqs], dtype=torch.int32)
             proposal = tuple(
-                compute_draft_window_plan(
-                    full_exact_end=int(value),
-                    future_offset=self.num_speculative_steps,
-                    window_size=provider.window_size,
-                    block_span_tokens=provider.group.table_column_span,
+                (
+                    compute_draft_window_start(
+                        full_exact_end=int(value),
+                        future_offset=self.num_speculative_steps,
+                        window_size=provider.window_size,
+                        block_span_tokens=provider.group.table_column_span,
+                    ),
+                    int(value) + self.num_speculative_steps,
                 )
                 for value in exact[:num_reqs]
             )
             if batch.has_prefill:
                 widths = np.diff(batch.query_start_loc_np[: num_reqs + 1])
                 if any(
-                    not rows[row] and query > plan.window_visible_length
-                    for row, (query, plan) in enumerate(zip(widths, proposal))
+                    not rows[row] and query > int(exact[row]) - interval[0]
+                    for row, (query, interval) in enumerate(zip(widths, proposal))
                 ):
                     raise NotImplementedError(
                         "Eagle3 Window terminal prefill query begins before its frozen read window; "
@@ -199,9 +193,7 @@ class Eagle3DraftWindowMixin:
                 raise RuntimeError("Eagle3 decode step is missing proposal-owned state")
             if len(proposal) != num_reqs:
                 raise RuntimeError("Eagle3 request geometry changed within one proposal")
-            exact = torch.zeros(num_reqs_padded, dtype=torch.int32, device="cpu")
-            torch.add(step_one_exact[:num_reqs], step - 1, out=exact[:num_reqs])
-            exact[:num_reqs].clamp_(max=self.max_model_len)
+            exact = step_one_exact.add(step - 1).clamp_(max=self.max_model_len)
         from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import (
             validate_eagle_single_request_review_exact,
         )
@@ -211,12 +203,12 @@ class Eagle3DraftWindowMixin:
         )
         bank = provider.prepare(
             capture,
-            frozen_row_plans=proposal,
+            frozen_intervals=proposal,
             cpu_full_exact=exact,
             idx_mapping_np=batch.idx_mapping_np,
             step=step,
         )
-        self._eagle3_window_proposal_plan = proposal
+        self._eagle3_window_intervals = proposal
         return bank
 
     def _validate_request_counts(self, num_reqs: int, num_reqs_padded: int) -> None:

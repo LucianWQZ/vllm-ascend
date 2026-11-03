@@ -129,7 +129,7 @@ def _materialize(full_source, batch, exact, counts, frozen=None):
         bank,
         cpu_full_exact=torch.tensor(exact, dtype=torch.int32),
         idx_mapping_np=batch.idx_mapping_np,
-        frozen_row_plans=frozen,
+        frozen_intervals=frozen,
         step=0,
     )
 
@@ -142,15 +142,18 @@ def test_materialization_rejects_counts_outside_canonical_row(full_source, count
 
 @pytest.mark.parametrize("step,end", [(0, 14), (1, 13), (2, 14)])
 def test_actual_bank_keeps_eagle_anchor_and_full_prefill(full_source, step, end):
-    from vllm_ascend.worker.v2.spec_decode.draft_window_plan import compute_draft_window_plan
+    from vllm_ascend.worker.v2.spec_decode.draft_window_plan import compute_draft_window_start
 
     frozen = tuple(
-        compute_draft_window_plan(full_exact_end=value, future_offset=3, window_size=8, block_span_tokens=4)
+        (
+            compute_draft_window_start(full_exact_end=value, future_offset=3, window_size=8, block_span_tokens=4),
+            value + 3,
+        )
         for value in (14, 2)
     )
     before = full_source.table.clone()
     bank = _materialize(full_source, _batch([(8, 8, 1), (0, 8, 2)]), [end, 2 + step, 0], [4, 3, 0], frozen)
-    assert frozen[0].window_start == 8
+    assert frozen[0][0] == 8
     assert bank.cpu_window_exact.tolist() == [end - 8, 2 + step, 0]
     assert bank.window_block_table.tolist() == [[2, 3, 0, 0], [4, 5, 6, 0], [0, 0, 0, 0]]
     assert torch.equal(full_source.table, before)

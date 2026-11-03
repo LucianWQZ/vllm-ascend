@@ -17,7 +17,7 @@ from vllm.v1.worker.gpu.input_batch import InputBuffers
 from vllm_ascend.worker.v2.spec_decode.draft_window_backends import DraftWindowGroupRoute, DraftWindowProviderStatus
 from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowGraphInputMixin
 from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphBindingProvider
-from vllm_ascend.worker.v2.spec_decode.draft_window_plan import compute_draft_window_plan
+from vllm_ascend.worker.v2.spec_decode.draft_window_plan import compute_draft_window_start
 from vllm_ascend.worker.v2.spec_decode.draft_window_policy import resolve_draft_window_policy
 
 
@@ -88,7 +88,7 @@ def _prepare(case, ends=(11, 14), *, capture=None, step=0, plans=None, valid=Non
         cpu_full_exact=torch.tensor(ends, dtype=torch.int32),
         idx_mapping_np=np.arange(len(ends), dtype=np.int64),
         step=step,
-        frozen_row_plans=plans,
+        frozen_intervals=plans,
     )
 
 
@@ -120,9 +120,7 @@ def test_parallel_exact_is_an_independent_completed_cpu_snapshot(graph_buffers, 
     prepared = []
     monkeypatch.setattr(c.provider, "prepare", lambda capture, **kwargs: prepared.append(kwargs["cpu_full_exact"]))
     with c.provider.proposal_scope(_proposal(active)):
-        owner._build_uniform_attn_metadata(
-            c.capture.descriptor, active, 1, torch.tensor([11, 14]), 1
-        )
+        owner._build_uniform_attn_metadata(c.capture.descriptor, active, 1, torch.tensor([11, 14]), 1)
     exact = prepared[0]
     assert exact.device.type == "cpu" and exact.dtype == torch.int32
     owner.input_buffers.seq_lens.zero_()
@@ -287,7 +285,7 @@ def test_eagle_keeps_distinct_ordinals_and_one_frozen_anchor(graph_buffers):
     desc = BatchExecutionDescriptor(CUDAGraphMode.FULL, 2, 2, uniform_token_count=1)
     banks = [provider.register_capture_identity(descriptor=desc, consumer_ordinal=i) for i in range(2)]
     plans = tuple(
-        compute_draft_window_plan(full_exact_end=n, future_offset=3, window_size=4, block_span_tokens=4)
+        (compute_draft_window_start(full_exact_end=n, future_offset=3, window_size=4, block_span_tokens=4), n + 3)
         for n in (11, 14)
     )
     c.provider = provider
@@ -309,6 +307,24 @@ def test_eagle_keeps_distinct_ordinals_and_one_frozen_anchor(graph_buffers):
         provider.finish_update()
 
 
+@pytest.mark.parametrize("exact", [(7, 14), (11, 18)])
+def test_eagle_rejects_out_of_frozen_interval_before_any_bank_write(graph_buffers, exact):
+    c = graph_buffers
+    provider = DraftWindowGraphBindingProvider(
+        policy=resolve_draft_window_policy(requested_window_size=4, method="eagle3"),
+        group=c.provider.group,
+        block_tables=c.owner,
+    )
+    desc = BatchExecutionDescriptor(CUDAGraphMode.FULL, 2, 2, uniform_token_count=1)
+    bank = provider.register_capture_identity(descriptor=desc)
+    before = [tensor.clone() for tensor in _tensors(bank)]
+    c.provider = provider
+    with pytest.raises(ValueError, match="frozen proposal window/horizon"), provider.proposal_scope(_proposal()):
+        _prepare(c, exact, capture=bank, step=1, plans=((8, 14), (12, 17)))
+    assert provider.quarantined
+    assert all(torch.equal(left, right) for left, right in zip(before, _tensors(bank)))
+
+
 @pytest.mark.parametrize("span,boundary", [(4, 8), (128, 1024), (256, 2048)])
 def test_bank_projects_only_initialized_columns_across_boundaries(span, boundary):
     table = torch.arange(64, dtype=torch.int32).reshape(1, 64)
@@ -327,14 +343,14 @@ def test_bank_projects_only_initialized_columns_across_boundaries(span, boundary
     desc = BatchExecutionDescriptor(CUDAGraphMode.FULL, 1, 1, uniform_token_count=1)
     bank = provider.register_capture_identity(descriptor=desc)
     for exact in (boundary - 1, boundary, boundary + 1, 2 * boundary + 1):
-        plan = compute_draft_window_plan(full_exact_end=exact, window_size=boundary, block_span_tokens=span)
+        anchor = compute_draft_window_start(full_exact_end=exact, window_size=boundary, block_span_tokens=span)
         with provider.proposal_scope(_proposal(1)):
             provider.prepare(bank, cpu_full_exact=torch.tensor([exact]), idx_mapping_np=np.array([0]), step=0)
-            start = plan.window_start // span
-            count = (plan.window_visible_length + span - 1) // span
+            start = anchor // span
+            count = (exact - anchor + span - 1) // span
             assert torch.equal(bank.window_block_table[0, :count], table[0, start : start + count])
             assert not bank.window_block_table[0, count:].count_nonzero()
-            assert bank.cpu_window_exact.tolist() == [plan.window_visible_length]
+            assert bank.cpu_window_exact.tolist() == [exact - anchor]
             provider.bind_current(desc)
             provider.finish_update()
 

@@ -21,8 +21,7 @@ from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 
 from vllm_ascend.worker.v2.spec_decode.draft_window_backends import DraftWindowGroupRoute
 from vllm_ascend.worker.v2.spec_decode.draft_window_plan import (
-    DraftWindowPlan,
-    compute_draft_window_plan,
+    compute_draft_window_start,
     window_capacity_tokens,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_policy import DraftWindowPolicyDecision
@@ -48,7 +47,7 @@ class DraftWindowGraphBucket:
         self,
         cpu_full_exact: torch.Tensor,
         idx_mapping_np: np.ndarray,
-        frozen_row_plans: tuple[DraftWindowPlan, ...] | None,
+        frozen_intervals: tuple[tuple[int, int], ...] | None,
     ) -> None:
         source = self.owner
         assert source.proposal is not None
@@ -57,7 +56,7 @@ class DraftWindowGraphBucket:
         # snapshot; only its current row extent changes between proposals.
         if len(cpu_full_exact) < len(rows) or len(idx_mapping_np) < len(rows):
             raise ValueError("current CPU exact lengths and request slots are required")
-        if frozen_row_plans is not None and len(frozen_row_plans) != len(rows):
+        if frozen_intervals is not None and len(frozen_intervals) != len(rows):
             raise ValueError("frozen Window anchors must match active request rows")
         # BlockTables owns initialized counts in persistent request-slot order.
         # Gather only real rows here; padding belongs to this bank, not to a
@@ -75,16 +74,17 @@ class DraftWindowGraphBucket:
             if full_read:
                 start, required, visible = 0, valid, exact
             else:
-                plan = (
-                    compute_draft_window_plan(
+                if frozen_intervals is None:
+                    start_token = compute_draft_window_start(
                         full_exact_end=exact, window_size=source.window_size, block_span_tokens=span
                     )
-                    if frozen_row_plans is None
-                    else frozen_row_plans[row].at_exact_end(exact)
-                )
-                if plan.window_start % span:
+                else:
+                    start_token, horizon = frozen_intervals[row]
+                    if not start_token <= exact <= horizon:
+                        raise ValueError("exact end is outside the frozen proposal window/horizon")
+                if start_token % span:
                     raise NotImplementedError("Draft Graph cannot read an intra-block Window start")
-                start, visible = plan.window_start // span, plan.window_visible_length
+                start, visible = start_token // span, exact - start_token
                 required = (visible + span - 1) // span
             if required > self.window_block_table.shape[1]:
                 raise RuntimeError("draft-window table capacity exceeded")
@@ -154,7 +154,7 @@ class DraftWindowGraphBindingProvider:
         cpu_full_exact: torch.Tensor,
         idx_mapping_np: np.ndarray,
         step: int,
-        frozen_row_plans: tuple[DraftWindowPlan, ...] | None = None,
+        frozen_intervals: tuple[tuple[int, int], ...] | None = None,
     ) -> DraftWindowGraphBucket:
         """Select and update the actual consumer before any preparation write."""
         self.require_reusable()
@@ -170,7 +170,7 @@ class DraftWindowGraphBindingProvider:
         ar_consumer = self.method == "eagle3" and capture.descriptor.num_tokens == capture.descriptor.num_reqs
         if ar_consumer != (step > 0):
             raise RuntimeError("Graph route does not match the actual consumer step")
-        if frozen_row_plans is not None and self.method != "eagle3":
+        if frozen_intervals is not None and self.method != "eagle3":
             raise ValueError("proposal-frozen Window anchors belong only to Eagle3")
         if capture.consumer_ordinal != len(self._pending):
             raise RuntimeError("Graph Window consumers must prepare in their actual serial ordinal order")
@@ -178,7 +178,7 @@ class DraftWindowGraphBindingProvider:
             raise RuntimeError("Graph consumers belong to different execution buckets")
         capture.params = None
         self._active_bank = capture
-        capture.materialize(cpu_full_exact, idx_mapping_np, frozen_row_plans)
+        capture.materialize(cpu_full_exact, idx_mapping_np, frozen_intervals)
         return capture
 
     def complete_native(self) -> None:
