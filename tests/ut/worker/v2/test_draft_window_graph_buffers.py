@@ -236,6 +236,8 @@ def test_actual_scope_rejects_nesting_and_stream_changes_before_bank_writes(grap
     c.owner.input_block_tables[0] = SimpleNamespace(device=SimpleNamespace(type="npu"))
     current = SimpleNamespace(npu_stream=17)
     monkeypatch.setattr(torch.npu, "current_stream", lambda: current)
+    # A preceding bank preparation established its last-reader stream.
+    c.provider.require_reusable()
     with c.provider.proposal_scope(_proposal()):
         with pytest.raises(RuntimeError, match="already active"), c.provider.proposal_scope(_proposal()):
             pytest.fail("nested proposal reached preparation")
@@ -795,5 +797,8 @@ def test_parallel_baseline_scope_does_not_latch_its_startup_stream(parallel_bypa
         assert not hasattr(provider, "_owner_stream")
     stream.assert_not_called()
     with provider.proposal_scope((False,)):
+        assert not hasattr(provider, "_owner_stream")
+        stream.assert_not_called()
+        provider.require_reusable()
         assert provider._owner_stream == 17
     stream.assert_called_once()
