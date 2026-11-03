@@ -9,20 +9,6 @@ consumers without creating a Window generation or borrowing a business bank.
 from contextlib import contextmanager
 
 
-def _validate_eagle_dp_dummy(owner, session):
-    session.provider.require_reusable()
-    provider = session.provider
-    if (
-        owner.input_batch.is_dummy is not True
-        or getattr(owner, "_eagle3_window_bypass_active", False) is not True
-        or getattr(owner, "_eagle3_window_continuing_prefill", False) is not False
-        or provider.proposal is not None
-        or provider._active_bank is not None
-        or session._capture_call is not None
-    ):
-        raise RuntimeError("Eagle DP dummy requires its explicit local1 no-business-generation Full scope")
-
-
 @contextmanager
 def eagle3_dp_dummy_scope(owner, input_batch, *, dummy_run, is_profile):
     """Retain the fixed dummy computation and quarantine uncertain submissions.
@@ -47,9 +33,17 @@ def eagle3_dp_dummy_scope(owner, input_batch, *, dummy_run, is_profile):
         raise RuntimeError("Eagle DP dummy Graph scope cannot nest")
     owner._eagle3_graph_dp_dummy_active = True
     try:
-        _validate_eagle_dp_dummy(owner, session)
+        provider = session.provider
+        provider.require_reusable()
+        if (
+            owner.input_batch.is_dummy is not True
+            or owner._eagle3_window_bypass_active is not True
+            or owner._eagle3_window_continuing_prefill is not False
+            or provider.proposal is not None
+            or provider._active_bank is not None
+        ):
+            raise RuntimeError("Eagle DP dummy requires its explicit local1 no-business-generation Full scope")
         yield
-        _validate_eagle_dp_dummy(owner, session)
     except BaseException:
         session.provider.quarantine()
         raise
@@ -62,7 +56,7 @@ def validate_eagle_dp_dummy_replay(owner, manager, descriptor, metadata_batch):
     if not getattr(owner, "_eagle3_graph_dp_dummy_active", False):
         return False
     session = owner._eagle3_graph_session
-    _validate_eagle_dp_dummy(owner, session)
+    session.provider.require_reusable()
     first = manager.is_draft_model_prefill
     if (
         getattr(descriptor.cg_mode, "name", None) != "FULL"
