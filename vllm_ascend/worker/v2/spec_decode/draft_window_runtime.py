@@ -284,7 +284,9 @@ class DraftWindowRuntime:
                         int(common.query_start_loc_cpu[: num_reqs + 1].diff().max())
                         <= self.speculator.num_speculative_steps + 1
                     )
-                if first:
+                # Without Draft placeholders, continuing Full queries cannot
+                # reject tokens in the native sampler: E is already the live end.
+                if first and not native_full:
                     exact, proposal_exact = self._eagle_first_pass_lengths(full_exact, num_reqs)
                 elif prepared_exact_cpu is not None:
                     # The actual DSpark MLA helper completed this exact copy
@@ -301,10 +303,7 @@ class DraftWindowRuntime:
                 # completes all earlier proposal readers on that same stream.
                 # MLA supplies the copy completed immediately before this call.
                 self._pending.clear()
-                if native_full:
-                    if step == 0 and not torch.equal(exact, proposal_exact):
-                        raise ValueError("Full prompt metadata cannot include rejected query padding")
-                else:
+                if not native_full:
                     if eagle and self._eagle_window is None:
                         if step > 0:
                             raise RuntimeError("Eagle3 AR metadata has no frozen first-pass plan")

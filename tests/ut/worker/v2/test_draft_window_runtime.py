@@ -627,6 +627,10 @@ def test_eagle_full_continuing_keeps_full_addressing_without_window_snapshot(set
         pytest.fail("Full continuing prefill requested a Window exact snapshot or read projection")
 
     monkeypatch.setattr(runtime_module, "materialize_draft_read", unexpected)
+    # Fixed 544's no-draft continuing-prompt sampler rejects zero queries.
+    # The native first pass therefore uses the completed E directly, while
+    # rejected/decode first passes below still exercise the independent pair.
+    monkeypatch.setattr(runtime, "_eagle_first_pass_lengths", unexpected)
     retained_common = []
     with runtime.proposal_context(state):
         owner = runtime._owner
