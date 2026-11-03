@@ -327,7 +327,6 @@ class DraftWindowRuntime:
                 exact_cpu = torch.zeros(common.num_reqs, dtype=torch.int32, device="cpu")
                 exact_cpu[:num_reqs] = exact
                 common.seq_lens_cpu = common._seq_lens_cpu = exact_cpu
-                retain(common, exact_cpu, common.seq_lens, common.block_table_tensor)
             else:
                 assert starts is not None
                 table = common.block_table_tensor
@@ -354,7 +353,6 @@ class DraftWindowRuntime:
                         # snapshot so its builder need not read device E again.
                         common.seq_lens_cpu = common._seq_lens_cpu = exact
                         common._draft_window_exact_cpu = exact
-                        retain(exact)
                         return
                     read_starts = torch.clamp(exact - self.window_size, min=0).to(torch.int64)
                     read_starts = read_starts // block_span * block_span
@@ -386,7 +384,6 @@ class DraftWindowRuntime:
                         query_start_loc_device=common.query_start_loc[: num_reqs + 1] if ragged else None,
                         retain=retain,
                     )
-                    retain(view)
                     view.apply(common)
                     return
                 materialize_draft_read(
