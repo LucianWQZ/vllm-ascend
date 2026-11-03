@@ -192,14 +192,31 @@ def test_full_only_source_host_contract_does_not_fake_native_model(module, owner
 
 
 @pytest.mark.parametrize("sampling", ["greedy", "probabilistic"])
-def test_actual_conditional_full_vocab_logits_allocation(module, owner, sampling):
-    owner.speculative_config.draft_sample_method = sampling
+def test_actual_conditional_full_vocab_logits_allocation(monkeypatch, owner, sampling):
+    import torch
+    from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
+
+    from vllm_ascend.worker.v2.spec_decode.dflash2.speculator import AscendDFlash2Speculator
+
+    config = owner.vllm_config
+    config.speculative_config.draft_sample_method = sampling
+    config.speculative_config.use_local_argmax_reduction = False
+    config.speculative_config.draft_model_config = SimpleNamespace(get_hidden_size=lambda: 32, get_vocab_size=lambda: 8)
+    config.model_config = SimpleNamespace(max_model_len=128, dtype=torch.bfloat16, use_fp64_gumbel=False)
+    config.scheduler_config = SimpleNamespace(max_num_seqs=4, max_num_batched_tokens=32)
+    config.parallel_config.data_parallel_rank = 0
+    # Avoid loading an unrelated Target class; actual input/probability tensor
+    # allocations, draft_logits_spec and mode selection run unchanged on CPU.
+    monkeypatch.setattr("vllm.model_executor.model_loader.utils.get_model_cls", lambda _: object)
+    actual = AscendDFlash2Speculator.__new__(AscendDFlash2Speculator)
+    DraftModelSpeculator.__init__(actual, config, torch.device("cpu"))
+    assert actual.speculative_config is config.speculative_config
     if sampling == "probabilistic":
-        owner.draft_logits = TensorHeader((4, 7, 8), "torch.float32")
-    module.validate_dflash2_graph_source(owner)
-    owner.draft_logits = None if sampling == "probabilistic" else TensorHeader((4, 7, 8), "torch.float32")
-    with pytest.raises(ValueError, match="full-vocab cache"):
-        module.validate_dflash2_graph_source(owner)
+        assert actual.draft_logits.shape == (4, 7, 8)
+        assert actual.draft_logits.dtype is torch.float32
+        assert torch.isneginf(actual.draft_logits).all()
+    else:
+        assert actual.draft_logits is None
 
 
 @pytest.mark.parametrize(
@@ -315,7 +332,7 @@ def test_real_draft_attention_config_borrows_the_model_context():
 def test_first_graph_qualification_rejects_unvalidated_topologies(module, owner, field, value):
     setattr(owner.vllm_config.parallel_config, field, value)
     with pytest.raises(ValueError, match="actual Target/Draft TP2"):
-        module.validate_dflash2_graph_config(owner.vllm_config)
+        module.validate_dflash2_graph_source(owner)
 
 
 @pytest.mark.parametrize(
@@ -334,7 +351,7 @@ def test_first_graph_qualification_rejects_unvalidated_topologies(module, owner,
     ],
 )
 def test_first_graph_qualification_does_not_infer_k_or_features_from_name(module, owner, mutation, message):
-    module.validate_dflash2_graph_config(owner.vllm_config)
+    module.validate_dflash2_graph_source(owner)
     mutation(owner.vllm_config)
     with pytest.raises(ValueError, match=message):
-        module.validate_dflash2_graph_config(owner.vllm_config)
+        module.validate_dflash2_graph_source(owner)

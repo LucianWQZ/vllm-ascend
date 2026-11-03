@@ -343,9 +343,7 @@ def test_graph_manager_admits_real_selector_and_checks_off_without_second_owner(
     from vllm_ascend.worker.v2.spec_decode import draft_window_dflash2_graph as contract_module
 
     bind = MagicMock()
-    config_check = MagicMock()
     monkeypatch.setattr(contract_module, "validate_dflash2_graph_source", bind)
-    monkeypatch.setattr(contract_module, "validate_dflash2_graph_config", config_check)
     monkeypatch.setattr(envs, "VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH", True)
     monkeypatch.setattr(upstream, "_selector_walk_kernel", _selector_walk_kernel_ascend)
     calls = []
@@ -362,7 +360,6 @@ def test_graph_manager_admits_real_selector_and_checks_off_without_second_owner(
         speculator._draft_window_graph_binding_provider = object()
     speculator.init_cudagraph_manager(CUDAGraphMode.FULL_DECODE_ONLY)
     assert calls == [CUDAGraphMode.FULL_DECODE_ONLY]
-    config_check.assert_not_called()
     if window_on:
         bind.assert_not_called()
     else:
@@ -373,10 +370,8 @@ def test_graph_manager_rejects_cuda_walk_or_eager_fallback(monkeypatch):
     import vllm.v1.worker.gpu.spec_decode.dflash2.speculator as upstream
 
     from vllm_ascend import envs
-    from vllm_ascend.worker.v2.spec_decode import draft_window_dflash2_graph as contract_module
 
     monkeypatch.setattr(envs, "VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH", True)
-    monkeypatch.setattr(contract_module, "validate_dflash2_graph_config", MagicMock())
     speculator = AscendDFlash2Speculator.__new__(AscendDFlash2Speculator)
     speculator.speculative_config = SimpleNamespace(enforce_eager=False)
     speculator.vllm_config = object()
@@ -610,6 +605,12 @@ def test_dflash_attention_uses_only_draft_layers_and_int32_slots(monkeypatch, ac
     layers = {name: SimpleNamespace(get_attn_backend=lambda name=name: backends[name]) for name in backends}
     cache = SimpleNamespace(kv_cache_groups=[SimpleNamespace(layer_names=[name]) for name in backends])
     monkeypatch.setattr(DFlashSpeculator, "set_attn", MagicMock())
+    # This unit isolates the Ascend layer/slot hook; the base loader and its
+    # separately tested loaded-consumer inventory are outside this fixture.
+    monkeypatch.setattr(
+        "vllm_ascend.worker.v2.spec_decode.draft_window_native_attention.report_owner_draft_native_attention",
+        lambda *_: None,
+    )
     monkeypatch.setattr(dflash_module, "get_layers_from_vllm_config", lambda *args: layers)
     # set_attn installs an upstream callback; restore it after this test.
     monkeypatch.setattr(dflash_module.dflash_speculator, "prepare_dflash_inputs", object())

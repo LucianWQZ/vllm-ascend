@@ -18,14 +18,17 @@ def _require(condition: bool, message: str) -> None:
         raise ValueError("DFlash2 Graph: " + message)
 
 
-def validate_dflash2_graph_config(vllm_config: Any) -> None:
-    """First Graph qualification is static K7 on the actual uncombined TP2 route.
+def validate_dflash2_graph_source(owner: Any) -> None:
+    """Qualify actual TP2/K7 Graph inputs after loading, before capture.
 
-    The mode and experimental gate are checked at manager construction even
-    when the additional Draft Window is OFF. This check uses the real config,
-    never a model name or the KV block size as a proxy for K or topology.
+    Window ON calls this from its read-source admission; OFF calls it from
+    manager construction. The fixed constructor owns candidate probability
+    storage, while the loaded selector, convolution and native mask must match.
     """
-    config = vllm_config.speculative_config
+    from vllm_ascend.attention.attention_v1 import AscendAttentionBackendImpl
+
+    vllm_config = owner.vllm_config
+    config = owner.speculative_config
     parallel = vllm_config.parallel_config
     draft_parallel = config.draft_parallel_config
     topology = tuple(
@@ -56,44 +59,6 @@ def validate_dflash2_graph_config(vllm_config: Any) -> None:
         and getattr(draft_parallel, "use_sequence_parallel_moe", None) is False,
         "first Graph qualification excludes FlashComm, SP and legacy DSA-CP",
     )
-
-
-def validate_dflash2_graph_read_source(owner: Any, group: Any, *, window_size: int) -> None:
-    """Qualify the real owner and its inventory without a second buffer owner."""
-    validate_dflash2_graph_source(owner)
-    gid, kernel, native = group.gid, group.table_column_span, group.native_window
-    causal = owner._group_causal
-    context = owner.vllm_config.compilation_config.static_forward_context
-    _require(
-        len(group.layers) == len(owner.draft_attn_layer_names)
-        and set(group.layers) == owner.draft_attn_layer_names
-        and all(context[name].impl.sliding_window == native for name in group.layers),
-        "incomplete actual Draft layer inventory",
-    )
-    _require(
-        (causal if type(causal) is bool else causal.get(gid)) is False,
-        "DFlash2 Graph source requires actual noncausal attention",
-    )
-    # Policy validates W; inventory validates scheduler/kernel spans. The
-    # original BlockTables constructor owns the expanded int32 row layout.
-    if native is not None:
-        _require(
-            window_size + kernel - 1 + owner.num_query_per_req <= native,
-            "Window + block - 1 + query width exceeds the original noncausal native band",
-        )
-
-
-def validate_dflash2_graph_source(owner: Any) -> None:
-    """Validate the loaded owner's fixed capture inputs without allocating KV.
-
-    Called after set_attn has published the actual Draft consumers and before
-    its Source inventory is admitted; Graph OFF uses the same execution check
-    at manager construction, without creating a Window runtime or zero owner.
-    """
-    from vllm_ascend.attention.attention_v1 import AscendAttentionBackendImpl
-
-    validate_dflash2_graph_config(owner.vllm_config)
-    config = owner.speculative_config
     _require(
         tuple(owner.draft_model_config.architectures) == ("DFlash2DraftModel",), "actual DFlash2 architecture required"
     )
@@ -120,12 +85,6 @@ def validate_dflash2_graph_source(owner: Any) -> None:
     # Fixed DFlash/DFlash2 constructors own the sampler and per-request input
     # allocations. Capture retains those original tensors; Window does not
     # replace them or maintain a second allocation/layout schema.
-    _require(config.draft_sample_method in ("greedy", "probabilistic"), "unknown candidate sampling mode")
-    probabilistic = config.draft_sample_method == "probabilistic"
-    _require(
-        (owner.draft_logits is not None) is probabilistic,
-        "probabilistic selector requires its existing full-vocab cache; greedy must not add one",
-    )
     context = owner.vllm_config.compilation_config.static_forward_context
     _require(bool(owner.draft_attn_layer_names), "no actual Draft attention layers")
     for name in owner.draft_attn_layer_names:
@@ -153,3 +112,28 @@ def validate_dflash2_graph_source(owner: Any) -> None:
         len(model.model.layers) == len(owner.draft_attn_layer_names),
         "DFlash2 convolution/attention layer inventory differs",
     )
+
+
+def validate_dflash2_graph_read_source(owner: Any, group: Any, *, window_size: int) -> None:
+    """Qualify the real owner and its inventory without a second buffer owner."""
+    validate_dflash2_graph_source(owner)
+    gid, kernel, native = group.gid, group.table_column_span, group.native_window
+    causal = owner._group_causal
+    context = owner.vllm_config.compilation_config.static_forward_context
+    _require(
+        len(group.layers) == len(owner.draft_attn_layer_names)
+        and set(group.layers) == owner.draft_attn_layer_names
+        and all(context[name].impl.sliding_window == native for name in group.layers),
+        "incomplete actual Draft layer inventory",
+    )
+    _require(
+        (causal if type(causal) is bool else causal.get(gid)) is False,
+        "DFlash2 Graph source requires actual noncausal attention",
+    )
+    # Policy validates W; inventory validates scheduler/kernel spans. The
+    # original BlockTables constructor owns the expanded int32 row layout.
+    if native is not None:
+        _require(
+            window_size + kernel - 1 + owner.num_query_per_req <= native,
+            "Window + block - 1 + query width exceeds the original noncausal native band",
+        )
