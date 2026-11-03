@@ -569,8 +569,22 @@ class DraftGraphSupportTest(unittest.TestCase):
             input_batch=old_batch,
         )
         batch = self.batch(rows=2)
+        unused_tensor = torch.empty(0, device="cpu")
         with self.assertRaises(NotImplementedError):
-            owner.propose(batch, *([None] * 10), num_speculative_tokens=7)
+            owner.propose(
+                batch,
+                attn_metadata={},
+                slot_mappings={},
+                last_hidden_states=unused_tensor,
+                aux_hidden_states=None,
+                num_sampled=unused_tensor,
+                num_rejected=unused_tensor,
+                last_sampled=unused_tensor,
+                next_prefill_tokens=unused_tensor,
+                temperature=unused_tensor,
+                seeds=unused_tensor,
+                num_speculative_tokens=7,
+            )
         self.assertIs(owner.input_batch, old_batch)
 
 
@@ -646,6 +660,8 @@ class ActualGraphDescriptorControls(unittest.TestCase):
         old_batch = owner.input_batch = object()
         manager, seen = self.manager(owner)
         native_calls = []
+        # The controlled parent returns at replay; no tensor operand is read.
+        unused_tensor = torch.empty(0, device="cpu")
 
         def native_propose(actual, actual_batch, *args, **kwargs):
             native_calls.append(actual_batch)
@@ -664,11 +680,36 @@ class ActualGraphDescriptorControls(unittest.TestCase):
                 else:
                     invalid.draft_graph_request_bounds += ((513, 545),)
                 with self.subTest(damage=damage), self.assertRaises((RuntimeError, NotImplementedError)):
-                    owner.propose(invalid, *([None] * 10))
+                    owner.propose(
+                        invalid,
+                        attn_metadata={},
+                        slot_mappings={},
+                        last_hidden_states=unused_tensor,
+                        aux_hidden_states=None,
+                        num_sampled=unused_tensor,
+                        num_rejected=unused_tensor,
+                        last_sampled=unused_tensor,
+                        next_prefill_tokens=unused_tensor,
+                        temperature=unused_tensor,
+                        seeds=unused_tensor,
+                    )
                 self.assertIs(owner.input_batch, old_batch)
                 self.assertEqual(native_calls, [])
                 self.assertEqual(seen, [])
-            self.assertEqual(owner.propose(batch, *([None] * 10)), "legacy-result")
+            result = owner.propose(
+                batch,
+                attn_metadata={},
+                slot_mappings={},
+                last_hidden_states=unused_tensor,
+                aux_hidden_states=None,
+                num_sampled=unused_tensor,
+                num_rejected=unused_tensor,
+                last_sampled=unused_tensor,
+                next_prefill_tokens=unused_tensor,
+                temperature=unused_tensor,
+                seeds=unused_tensor,
+            )
+            self.assertEqual(result, "legacy-result")
         self.assertIs(owner.input_batch, batch)
         self.assertEqual(native_calls, [batch])
         self.assertEqual([kind for kind, _ in seen], ["metadata", "replay"])
