@@ -272,8 +272,6 @@ def draft_graph_request_bounds(owner, req_states, req_ids, idx_mapping_np):
     scope = getattr(owner, "_draft_graph_review_limit", None)
     if scope is None:
         return None
-    if len(set(req_ids)) != len(req_ids):
-        raise RuntimeError("Draft Graph request IDs must be unique in the runner batch")
     bounds = []
     blocked = getattr(owner, "_draft_graph_review_preempted_request_ids", ())
     lookahead = scope.static_k if scope.method == "eagle3" else scope.query_tokens
@@ -281,8 +279,6 @@ def draft_graph_request_bounds(owner, req_states, req_ids, idx_mapping_np):
         if req_id in blocked:
             raise NotImplementedError("Draft Graph does not qualify resumption after preemption")
         row = int(raw_index)
-        if req_states.req_id_to_index.get(req_id) != row:
-            raise RuntimeError("Draft Graph request mapping changed during input preparation")
         prompt = int(req_states.prompt_len.np[row])
         if int(req_states.prefill_len.np[row]) != prompt:
             raise NotImplementedError("Draft Graph does not qualify resumed request history")
@@ -338,8 +334,6 @@ def validate_eagle_single_request_graph_descriptor(owner, *, first, n, tokens):
     if scope is None or scope.method != "eagle3":
         return
     batch = owner.input_batch
-    if type(first) is not bool or type(n) is not int or type(tokens) is not int:
-        raise TypeError("Eagle review requires exact Graph descriptor types")
     # Propose already admitted active/padded rows and their request bounds.
     # Only the selected runtime descriptor can change before this replay.
     if n != batch.num_reqs or tokens != n * (scope.static_k + 1 if first else 1):

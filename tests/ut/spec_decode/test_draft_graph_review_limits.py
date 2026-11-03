@@ -373,10 +373,6 @@ class DraftGraphSupportTest(unittest.TestCase):
         batch.num_reqs_after_padding = 4
         with self.assertRaises(NotImplementedError):
             GUARD.validate_draft_graph_review_requests(owner, batch)
-        batch.num_reqs_after_padding = 2
-        batch.req_ids[1] = batch.req_ids[0]
-        with self.assertRaisesRegex(RuntimeError, "unique"):
-            runner_bounds(owner, batch)
 
     def test_preemption_state_is_kept_until_actual_finish(self):
         for method in ("eagle3", "dflash"):
@@ -413,7 +409,7 @@ class DraftGraphSupportTest(unittest.TestCase):
                 GUARD.note_eagle_single_request_review_lifecycle(owner, object())
                 self.assertFalse(hasattr(owner, "_draft_graph_review_preempted_request_ids"))
 
-    def test_bounds_use_runner_order_and_reject_changed_or_resumed_requests(self):
+    def test_bounds_use_actual_runner_mapping_and_reject_resumed_requests(self):
         import numpy as np
 
         scope = self.resolve(self.config(rows=2))
@@ -424,10 +420,26 @@ class DraftGraphSupportTest(unittest.TestCase):
             prefill_len=NS(np=np.array([513, 0, 1537])),
             max_seq_len=np.array([545, 0, 1569]),
         )
-        self.assertEqual(GUARD.draft_graph_request_bounds(owner, state, ["a", "b"], [2, 0]), ((1537, 1569), (513, 545)))
-        for ids, indices in ((["a", "b"], [0, 2]), (["other", "b"], [2, 0])):
-            with self.subTest(ids=ids, indices=indices), self.assertRaises(RuntimeError):
-                GUARD.draft_graph_request_bounds(owner, state, ids, indices)
+        state.num_computed_prefill_tokens = state.prefill_len.np.copy()
+        runner: Any = object.__new__(NPUModelRunner)
+        runner.req_states = state
+        runner.decode_query_len, runner.use_pp, runner._uses_flashmla = 4, False, False
+        runner.adaptive_verification, runner.pcp_manager = None, None
+        scheduled = NS(
+            num_scheduled_tokens={"b": 4, "a": 4},
+            total_num_scheduled_tokens=8,
+            scheduled_spec_decode_tokens={},
+        )
+        batch, _ = runner.gather_batch_req_state(scheduled, dummy_run=False)
+        self.assertEqual(batch.req_ids, ["b", "a"])
+        self.assertEqual(batch.idx_mapping_np.tolist(), [0, 2])
+        self.assertEqual(
+            GUARD.draft_graph_request_bounds(owner, state, batch.req_ids, batch.idx_mapping_np),
+            ((513, 545), (1537, 1569)),
+        )
+        scheduled.num_scheduled_tokens = {"unknown": 4, "a": 4}
+        with self.assertRaises(KeyError):
+            runner.gather_batch_req_state(scheduled, dummy_run=False)
         state.prefill_len.np[2] += 1
         with self.assertRaises(NotImplementedError):
             GUARD.draft_graph_request_bounds(owner, state, ["a", "b"], [2, 0])
@@ -562,11 +574,6 @@ class DraftGraphSupportTest(unittest.TestCase):
             self.assertEqual(seen, ["context-KV-only"])
             with self.assertRaises(NotImplementedError):
                 dflash_module._draft_window_owner_scope(owner, batch, num_speculative_tokens=7)
-            batch.req_ids[0] = "wrong-original-request"
-            with self.assertRaises(RuntimeError):
-                GUARD.draft_graph_request_bounds(
-                    owner, NS(req_id_to_index={"request-0": 0}), batch.req_ids, batch.idx_mapping_np
-                )
         self.assertFalse(hasattr(owner, "_draft_window_runtime"))
 
     def test_actual_propose_rejects_bad_rows_before_replacing_owner(self):
