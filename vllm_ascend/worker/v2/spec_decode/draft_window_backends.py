@@ -165,6 +165,10 @@ def inventory_draft_window_groups(speculator: Any) -> tuple[DraftWindowGroupRout
             except NotImplementedError as error:
                 raise NotImplementedError(f"Draft Window gid={gid}: {error}") from error
             implementations = [getattr(context.get(name), "impl", None) for name in group.layer_names]
+            if full_retention_dflash2 and any(
+                impl is None or impl.sliding_window != native_window for impl in implementations
+            ):
+                raise NotImplementedError("DFlash2 inventory native band differs from its actual Draft consumer")
             dense_read = (
                 status is DraftWindowProviderStatus.DIRECT_DENSE
                 and all(item.dtype in (torch.float16, torch.bfloat16) for item in specs)

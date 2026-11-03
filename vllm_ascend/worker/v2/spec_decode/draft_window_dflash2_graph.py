@@ -22,11 +22,9 @@ def validate_dflash2_graph_source(owner: Any, group: Any = None) -> None:
     """Qualify actual TP2/K7 Graph inputs after loading, before capture.
 
     Window ON calls this from its read-source admission; OFF calls it from
-    manager construction. The fixed constructor owns candidate probability
-    storage, while the loaded selector, convolution and native mask must match.
+    manager construction. Fixed constructors own selector/conv probability
+    storage; set_attn has already qualified the actual native consumers.
     """
-    from vllm_ascend.attention.attention_v1 import AscendAttentionBackendImpl
-
     vllm_config = owner.vllm_config
     config = owner.speculative_config
     parallel = vllm_config.parallel_config
@@ -70,27 +68,8 @@ def validate_dflash2_graph_source(owner: Any, group: Any = None) -> None:
         getattr(owner, "_dflash2_full_kv_reference", False) is True,
         "the actual DFlash2 full-retention loader contract is missing",
     )
-    context = owner.vllm_config.compilation_config.static_forward_context
-    _require(bool(owner.draft_attn_layer_names), "no actual Draft attention layers")
-    for name in owner.draft_attn_layer_names:
-        impl = context[name].impl
-        _require(
-            type(impl) is AscendAttentionBackendImpl,
-            "DFlash2 native Graph requires the actual dense FIA implementation",
-        )
-        native = impl.sliding_window
-        _require(native is None or type(native) is int and native > 0, "invalid model native window")
-        if group is not None:
-            _require(native == group.native_window, "inventory native band differs from the actual Draft consumer")
-        mask = getattr(impl, "_dflash2_native_swa_mask", None)
-        _require(
-            impl.sinks is None and impl.use_bnsd_kv_cache is False,
-            "sinks/packed KV need a separate native Graph contract",
-        )
-        _require(
-            native is None or (mask is not None and mask.data_ptr() != 0),
-            "noncausal native mask was not created by the DFlash2 loader",
-        )
+    # Real set_attn qualified loaded implementations and native mask bindings
+    # in its native-attention pass before this manager/source is constructed.
 
     if group is not None:
         causal = owner._group_causal
@@ -98,8 +77,8 @@ def validate_dflash2_graph_source(owner: Any, group: Any = None) -> None:
             (causal if type(causal) is bool else causal.get(group.gid)) is False,
             "DFlash2 Graph source requires actual noncausal attention",
         )
-        # Inventory owns layer coverage and column geometry. Actual native P
-        # above remains an attention fact, separate from Full KV retention.
+        # Inventory compares the native band against the loaded consumer;
+        # Full KV retention itself establishes no attention range.
         if group.native_window is not None:
             window = owner._draft_window_policy
             _require(

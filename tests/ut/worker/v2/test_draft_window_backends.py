@@ -197,6 +197,18 @@ def test_dflash2_full_retention_keeps_full_and_native_consumers(parallel_config,
     assert route.native_window == native
 
 
+@pytest.mark.parametrize("actual", [None, 1024, 4096])
+def test_dflash2_inventory_compares_native_band_to_actual_consumer(parallel_config, actual):
+    spec = replace(full_spec(), sliding_window=2048)
+    with pytest.raises(NotImplementedError, match="inventory native band"):
+        inventory(
+            parallel_config,
+            specs=[spec],
+            full_retention_dflash2=True,
+            impl_changes={"sliding_window": actual},
+        )
+
+
 @pytest.mark.parametrize("storage", ["sliding", "chunked", "wrapped_chunked"])
 def test_dflash2_reference_cannot_admit_recycling_or_chunked_storage(parallel_config, storage):
     spec = sliding_spec() if storage == "sliding" else full_spec()

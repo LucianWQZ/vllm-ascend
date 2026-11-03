@@ -25,7 +25,9 @@ _DRAFT_ARCHITECTURES = frozenset(
 )
 
 
-def inspect_draft_native_attention(speculator: Any) -> tuple[str, tuple[int, ...], tuple[str, ...]]:
+def inspect_draft_native_attention(
+    speculator: Any, *, dflash2_graph: bool = False
+) -> tuple[str, tuple[int, ...], tuple[str, ...]]:
     """Inspect loaded Draft consumers, after the real loader and ``set_attn``.
 
     Normalized architecture/layer count bounds the inventory. Native windows
@@ -57,6 +59,11 @@ def inspect_draft_native_attention(speculator: Any) -> tuple[str, tuple[int, ...
                     identity = f"{type(impl).__module__}.{type(impl).__qualname__}"
                     issues.append(f"Draft consumer {name} has unknown native attention implementation {identity}")
                     continue
+                if dflash2_graph and (
+                    type(impl) is not AscendAttentionBackendImpl or impl.sinks is not None or impl.use_bnsd_kv_cache
+                ):
+                    issues.append(f"DFlash2 Graph consumer {name} requires the actual unpacked dense FIA without sinks")
+                    continue
                 value = getattr(impl, "sliding_window", _MISSING)
                 if type(impl) is AscendMLAImpl:
                     # This dense implementation has no native window operand.
@@ -70,8 +77,10 @@ def inspect_draft_native_attention(speculator: Any) -> tuple[str, tuple[int, ...
                 layers[name] = value
                 if value is not None and type(causal) is not bool:
                     issues.append(f"Draft consumer {name} has no actual native causality descriptor")
-                if value is not None and causal is False and getattr(impl, "_dflash2_native_swa_mask", None) is None:
-                    issues.append(f"noncausal Draft consumer {name} has no native-SWA mask binding")
+                if value is not None and (causal is False or dflash2_graph):
+                    mask = getattr(impl, "_dflash2_native_swa_mask", None)
+                    if mask is None or (dflash2_graph and mask.data_ptr() == 0):
+                        issues.append(f"noncausal Draft consumer {name} has no native-SWA mask binding")
     # The loader already identifies the Draft layer set, including any Target
     # layer offset. Use that registration instead of parsing layer-name strings.
     declared = speculator.draft_attn_layer_names
@@ -99,7 +108,9 @@ def report_owner_draft_native_attention(owner: Any) -> None:
     # init_cudagraph_manager. Report the Draft request, not Target Graph mode
     # or a hypothetical already-created manager.
     graph_requested = not eager
-    kind, windows, issues = inspect_draft_native_attention(owner)
+    architectures = getattr(owner.draft_model_config.hf_config, "architectures", ()) or ()
+    new_dflash2_graph = graph_requested and tuple(architectures) == ("DFlash2DraftModel",)
+    kind, windows, issues = inspect_draft_native_attention(owner, dflash2_graph=new_dflash2_graph)
     logger.info_once(
         "Draft native attention=%s; native windows=%s; extra Draft window=%s; "
         "Draft Graph requested=%s; complete actual inventory=%s; issues=%s. "
@@ -128,7 +139,5 @@ def report_owner_draft_native_attention(owner: Any) -> None:
     # built-in MTP) into a newly rejected configuration. Additional Window
     # owners always need the contract; DFlash2 Graph is itself new admission
     # in this change and needs it even when the additional Window is OFF.
-    architectures = getattr(owner.draft_model_config.hf_config, "architectures", ()) or ()
-    new_dflash2_graph = graph_requested and tuple(architectures) == ("DFlash2DraftModel",)
     if (window is not None or new_dflash2_graph) and kind == "UNKNOWN":
         raise NotImplementedError("Draft Window/Graph requires a known native attention contract: " + "; ".join(issues))

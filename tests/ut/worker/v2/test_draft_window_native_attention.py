@@ -27,9 +27,9 @@ def loaded(configuration, windows, *, causal=False, mask=True, order=None):
     for index, window in enumerate(windows):
         name = f"draft.model.layers.{64 + index}.self_attn.attn"
         impl = object.__new__(AscendAttentionBackendImpl)
-        impl.sliding_window = window
+        impl.sliding_window, impl.sinks, impl.use_bnsd_kv_cache = window, None, False
         if mask:
-            impl._dflash2_native_swa_mask = object()
+            impl._dflash2_native_swa_mask = SimpleNamespace(data_ptr=lambda: 1)
         context[name] = SimpleNamespace(impl=impl)
         names.append(name)
     groups = [SimpleNamespace(layer_names=[names[index]]) for index in (order or range(len(names)))]
@@ -183,6 +183,18 @@ class NativeAttentionTests(unittest.TestCase):
         self.assertFalse(log.warnings)  # Partial native windows cannot certify narrowing.
         self.assertFalse(hasattr(owner, "_draft_window_runtime"))
         self.assertFalse(hasattr(owner, "_draft_window_runtime_state"))
+
+    def test_dflash2_graph_requires_nonempty_native_mask_without_changing_eager_off(self):
+        owner = loaded(config(), [2048, 2048])
+        owner.speculative_config = SimpleNamespace(enforce_eager=False)
+        context = owner.vllm_config.compilation_config.static_forward_context
+        next(iter(context.values())).impl._dflash2_native_swa_mask = SimpleNamespace(data_ptr=lambda: 0)
+        with self.assertRaisesRegex(NotImplementedError, "native-SWA mask"):
+            report(owner, Log())
+        owner.speculative_config.enforce_eager = True
+        log = Log()
+        report(owner, log)
+        self.assertEqual(log.info[0][0][1], "SWA")
 
     def test_summary_once_and_only_actual_narrowing_warns(self):
         for windows, window, expected in (

@@ -80,7 +80,11 @@ def owner():
     compilation = SimpleNamespace(static_forward_context=context)
     return SimpleNamespace(
         speculative_config=cfg,
-        draft_model_config=SimpleNamespace(architectures=["DFlash2DraftModel"]),
+        draft_model_config=SimpleNamespace(
+            architectures=["DFlash2DraftModel"],
+            hf_config=SimpleNamespace(architectures=["DFlash2DraftModel"], num_hidden_layers=1),
+            enforce_eager=False,
+        ),
         vllm_config=SimpleNamespace(
             compilation_config=compilation,
             speculative_config=cfg,
@@ -129,6 +133,7 @@ def owner():
         ),
         draft_logits=None,
         draft_attn_layer_names={"draft.0"},
+        attn_groups=[[SimpleNamespace(layer_names=["draft.0"])]],
     )
 
 
@@ -166,12 +171,15 @@ def test_graph_factory_qualifies_the_real_dflash2_owner(monkeypatch, owner):
         requested_window_size=1024, method="dflash", is_dflash2=True
     )
     owner._speculator_name = "DFlash2"
+    from vllm_ascend.worker.v2.spec_decode.draft_window_native_attention import report_owner_draft_native_attention
+
+    report_owner_draft_native_attention(owner)
     source = draft_window.create_draft_window_graph_provider(owner)
     assert source.table is owner.block_tables.input_block_tables[0]
     mask = owner.vllm_config.compilation_config.static_forward_context["draft.0"].impl._dflash2_native_swa_mask
     address, mask.address = mask.address, 0
-    with pytest.raises(ValueError, match="native mask"):
-        draft_window.create_draft_window_graph_provider(owner)
+    with pytest.raises(NotImplementedError, match="native-SWA mask"):
+        report_owner_draft_native_attention(owner)
     mask.address = address
     owner.draft_model_config.architectures = ["DFlash2DraftModel", "UnknownDraft"]
     with pytest.raises(ValueError, match="actual DFlash2 architecture"):
@@ -259,16 +267,16 @@ def test_malformed_capture_contract_is_rejected(module, owner, mutation, message
 
 
 @pytest.mark.parametrize("field,value", [("sinks", object()), ("use_bnsd_kv_cache", True)])
-def test_unsupported_loaded_attention_fails_before_capture(module, owner, field, value):
+def test_unsupported_loaded_attention_fails_at_set_attn_before_source(owner, field, value):
+    from vllm_ascend.worker.v2.spec_decode.draft_window_native_attention import report_owner_draft_native_attention
+
     setattr(owner.vllm_config.compilation_config.static_forward_context["draft.0"].impl, field, value)
-    with pytest.raises(ValueError, match="sinks/packed"):
-        module.validate_dflash2_graph_source(owner)
+    with pytest.raises(NotImplementedError, match="dense FIA without sinks"):
+        report_owner_draft_native_attention(owner)
 
 
 def test_shared_inventory_native_band_and_actual_layers_are_checked(module, owner):
     module.validate_dflash2_graph_source(owner)
-    with pytest.raises(ValueError, match="inventory native band"):
-        validate_source(module, owner, route(1024))
     for declaration in (True, {0: True}, {1: False}):
         owner._group_causal = declaration
         with pytest.raises(ValueError, match="noncausal"):
