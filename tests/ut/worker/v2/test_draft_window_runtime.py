@@ -35,12 +35,11 @@ def setup(monkeypatch):
     monkeypatch.setattr(DraftWindowRuntime, "_validate_route", staticmethod(lambda spec: (0,)))
     completions = []
 
-    def record():
-        completion = Completion()
-        completions.append(completion)
-        return completion
+    class RecordedCompletion(Completion):
+        def __init__(self):
+            completions.append(self)
 
-    monkeypatch.setattr(torch.npu, "Event", record)
+    monkeypatch.setattr(torch.npu, "Event", RecordedCompletion)
     monkeypatch.setattr(torch.npu, "current_stream", lambda: None)
     canonical = torch.arange(48, dtype=torch.int32).reshape(6, 8)
     spec = SimpleNamespace(
@@ -292,7 +291,7 @@ def test_eagle_allocation_upper_cannot_move_the_frozen_first_pass_anchor(setup, 
             metadata.causal = True
             metadata.query_start_loc_cpu = torch.tensor([0, width, 2 * width, 2 * width])
             runtime.metadata_callback(step, 2)(0, metadata)
-            assert metadata.seq_lens[:2].tolist() == ([1159, 1159] if step == 0 else list(ends))
+            assert metadata.seq_lens_cpu[:2].tolist() == ([1159, 1159] if step == 0 else list(ends))
         assert runtime._eagle_window is not None
 
 
@@ -618,7 +617,7 @@ def test_eagle_continuing_prefill_later_ar_preserves_full_read(setup, all_contin
             # Every AR read for an unfinished prompt is Full. The second
             # row also verifies the frozen decode anchor in a mixed batch.
             expected = [ends[0], ends[1] if all_continuing else ends[1] - 20]
-            assert metadata.seq_lens[:2].tolist() == expected
+            assert metadata.seq_lens_cpu[:2].tolist() == expected
             assert hasattr(metadata, "_draft_window_device_read") is (not all_continuing)
 
 
@@ -836,7 +835,8 @@ def test_eagle_metadata_update_cannot_bypass_per_step_reads(setup):
         DraftWindowRuntime(spec, policy)
 
 
-def test_actual_dense_builder_preserves_sp_padding_after_window_projection(setup, monkeypatch):
+@pytest.mark.parametrize("private_dense", [False, True])
+def test_actual_dense_builder_preserves_sp_padding_after_window_projection(setup, monkeypatch, private_dense):
     """Execute the actual builder class with CPU-only dependency seams.
 
     Pinning and phase classification are isolated; the production padding,
@@ -844,6 +844,7 @@ def test_actual_dense_builder_preserves_sp_padding_after_window_projection(setup
     the Host builder contract, not distributed/NPU execution.
     """
     runtime, spec, _, _ = setup
+    runtime._dense_reads = private_dense
     from vllm_ascend.attention.attention_v1 import AscendAttentionMetadataBuilder
 
     monkeypatch.setattr(torch.Tensor, "pin_memory", lambda tensor: tensor)
@@ -871,7 +872,7 @@ def test_actual_dense_builder_preserves_sp_padding_after_window_projection(setup
     metadata.attn_state = None
     metadata.is_prefilling = torch.tensor([False, False])
     metadata.causal = False
-    slots = metadata.slot_mapping
+    slots, full_exact = metadata.slot_mapping, metadata.seq_lens
     with runtime.proposal_context(batch()):
         runtime.metadata_callback(3, 2)(0, metadata)
         result = builder.build(0, metadata)
@@ -884,6 +885,10 @@ def test_actual_dense_builder_preserves_sp_padding_after_window_projection(setup
     assert result.slot_mapping.numel() == result.num_actual_tokens == 6
     assert result.seq_lens_gpu is metadata.seq_lens
     assert result.query_start_loc_gpu is metadata.query_start_loc
+    if private_dense:
+        assert metadata.seq_lens is full_exact
+        assert metadata._draft_window_device_read.seq_lens.device.type == "cpu"
+        assert metadata.seq_lens_cpu.tolist() == [12, 11]
 
 
 def test_eagle_has_no_parallel_num_query_per_req_attribute(setup):
@@ -963,13 +968,14 @@ def test_dense_device_callback_or_exact_fallback_keeps_the_same_window(setup, up
         callback = runtime.metadata_callback(3, 2)
         callback(0, metadata)
         runtime.retain_metadata(metadata)
-        assert metadata.seq_lens.tolist() == [8, 11, 0]
+        assert metadata.seq_lens.tolist() == [20, 27, 0]
+        assert metadata.seq_lens_cpu.tolist() == [8, 11, 0]
         # CPU exact proves E fits even if the scheduling upper exceeds the
         # source extent; no uninitialized upper-authorized page is read.
         read = metadata._draft_window_device_read
         owner = runtime._owner
         assert (torch.tensor([20, 27]) - read.seq_lens).tolist() == [12, 16]
-        assert metadata.seq_lens_cpu is None
+        assert metadata.seq_lens_cpu.device.type == "cpu"
         assert metadata.block_table_tensor is full_table
         assert any(value is read for value in runtime._owner.retained)
         assert metadata.slot_mapping is slots and metadata.positions is positions
@@ -1029,7 +1035,7 @@ def test_eagle_prompt_only_terminal_rows_snapshot_each_actual_preparation(
                 assert (torch.tensor(ends) - metadata._draft_window_device_read.seq_lens).tolist() == expected_starts
             else:
                 assert (torch.tensor(ends) - metadata.seq_lens[:2]).tolist() == expected_starts
-            assert metadata.seq_lens[:2].tolist() == [
+            assert metadata.seq_lens_cpu[:2].tolist() == [
                 ends[0] - expected_starts[0],
                 ends[1] - expected_starts[1],
             ]

@@ -25,19 +25,18 @@ def _apply_read_metadata(read: DenseDraftRead | DenseDraftReadBatch, common: Any
         lengths = read.seq_lens.new_zeros(n)
         read.retain(lengths)
         lengths[: read.num_reqs] = read.seq_lens
-    common.seq_lens = lengths
-    # These are explicitly capacity/workspace bounds, never CPU exact.
-    common.seq_lens_cpu_upper_bound = torch.full((n,), read.capacity, dtype=torch.int32, device="cpu")
-    common.seq_lens_cpu = None
-    common._seq_lens_cpu = None
-    common.max_seq_len = read.capacity
+    # The private FP32 reader consumes slots/mask, not seq_lens_gpu. Keep
+    # the framework's Full device lengths and give its builder this completed
+    # CPU projection; no H2D or per-group GPU scatter is needed for it.
+    common.seq_lens_cpu_upper_bound = common.seq_lens_cpu = common._seq_lens_cpu = lengths
+    common.max_seq_len = int(lengths.max())
     common._draft_window_device_read = read
 
 
 @dataclass(frozen=True)
 class DenseDraftRead:
     slots: torch.Tensor
-    seq_lens: torch.Tensor
+    seq_lens: torch.Tensor  # Completed CPU visible lengths for the normal builder.
     mask: torch.Tensor
     capacity: int
     query_width: int
@@ -69,7 +68,7 @@ class DenseDraftReadBatch:
     """
 
     parts: tuple[tuple[torch.Tensor, DenseDraftRead], ...]
-    seq_lens: torch.Tensor
+    seq_lens: torch.Tensor  # Completed CPU visible lengths for the normal builder.
     capacity: int
     num_query_tokens: int
     retain: Callable[..., None]
@@ -171,9 +170,8 @@ def prepare_dense_draft_read(
             excluded = excluded | (columns[None, None, :] > queries[:, :, None])
             may_have_empty_rows = bool((queries < 0).any())
         mask = _copy_owned_read_tensor(excluded[:, None].contiguous(), retain, device=block_table.device)
-        lengths = _copy_owned_read_tensor(visible, retain, device=block_table.device)
-        read = DenseDraftRead(slots, lengths, mask, capacity, width, retain, may_have_empty_rows)
-        retain(read, block_table, address, logical_columns, blocks, slots, lengths, mask)
+        read = DenseDraftRead(slots, visible, mask, capacity, width, retain, may_have_empty_rows)
+        retain(read, block_table, address, logical_columns, blocks)
         return read
 
     if widths is None and not bool(full_rows_cpu.any()):
@@ -187,7 +185,7 @@ def prepare_dense_draft_read(
     if len(groups) == 1:
         full, width, _ = next(iter(groups))
         return materialize(torch.arange(n, device="cpu"), width, full, None)
-    visible = torch.empty(n, dtype=exact_cpu.dtype, device=block_table.device)
+    visible = torch.empty(n, dtype=exact_cpu.dtype, device="cpu")
     retain(visible)
     parts = []
     for (full, width, _capacity), group in groups.items():
@@ -201,7 +199,7 @@ def prepare_dense_draft_read(
         queries = (bounds[:, None] + torch.arange(width, device=selected.device)[None, :]).flatten()
         retain(bounds, queries)
         read = materialize(host_rows, width, full, selected)
-        visible.index_copy_(0, selected, read.seq_lens)
+        visible.index_copy_(0, host_rows, read.seq_lens)
         parts.append((queries, read))
     result = DenseDraftReadBatch(
         tuple(parts), visible, max(read.capacity for _, read in parts), sum(q.numel() for q, _ in parts), retain

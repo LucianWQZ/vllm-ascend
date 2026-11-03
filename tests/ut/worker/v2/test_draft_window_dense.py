@@ -146,12 +146,16 @@ def test_apply_keeps_full_write_and_absolute_query_operands():
     assert isinstance(read, DenseDraftRead)
     full = source[0]
     slots, positions = object(), object()
-    common = SimpleNamespace(num_reqs=2, block_table_tensor=full, slot_mapping=slots, positions=positions)
+    original_exact = torch.tensor([129, 0], dtype=torch.int32)
+    common = SimpleNamespace(
+        num_reqs=2, block_table_tensor=full, slot_mapping=slots, positions=positions, seq_lens=original_exact
+    )
     read.apply(common)
     assert common.block_table_tensor is full and common.slot_mapping is slots and common.positions is positions
-    assert common.seq_lens.tolist() == [129, 0]
-    assert common.seq_lens_cpu is None and common._seq_lens_cpu is None
-    assert common.seq_lens_cpu_upper_bound.tolist() == [160, 160]
+    assert common.seq_lens is original_exact
+    assert common.seq_lens_cpu.tolist() == [129, 0]
+    assert common.seq_lens_cpu_upper_bound is common._seq_lens_cpu is common.seq_lens_cpu
+    assert common.max_seq_len == 129
 
 
 @pytest.mark.parametrize("end,upper", [(129, 129), (0, 1), (-1, 1), (127, 126), (1, 0)])
@@ -250,7 +254,8 @@ def test_uniform_compact_table_needs_no_request_row_transfer(monkeypatch, stride
         causal=False,
         retain=lambda *values: None,
     )
-    assert len(copies) == 3  # Absolute addresses, mask, and visible lengths; no row IDs.
+    assert len(copies) == 2  # Absolute addresses and mask; exact lengths stay on CPU.
+    assert read.seq_lens.device.type == "cpu"
     for row, end in enumerate(ends.tolist()):
         start = max(end - 1024, 0) // 128 * 128
         expected = [int(before[row, position // 128]) * 128 + position % 128 for position in range(start, end)]

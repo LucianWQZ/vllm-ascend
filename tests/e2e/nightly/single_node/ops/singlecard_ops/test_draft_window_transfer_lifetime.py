@@ -72,11 +72,11 @@ def test_real_private_copy_failure_retains_its_actual_operands(monkeypatch, stag
     torch.testing.assert_close(table, before, atol=0, rtol=0)
 
 
-def test_real_metadata_fill_keeps_destination_quarantined(monkeypatch):
+def test_cpu_metadata_fill_failure_keeps_device_operands_quarantined(monkeypatch):
     pool = DraftWindowOwnerPool(1)
     read = DenseDraftRead(
         torch.zeros(2, 4, dtype=torch.int64, device="npu"),
-        torch.tensor([3, 4], dtype=torch.int32, device="npu"),
+        torch.tensor([3, 4], dtype=torch.int32, device="cpu"),
         torch.zeros(2, 1, 1, 4, dtype=torch.bool, device="npu"),
         4,
         1,
