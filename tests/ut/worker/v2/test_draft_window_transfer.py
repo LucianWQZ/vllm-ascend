@@ -49,6 +49,9 @@ def test_copy_failure_keeps_actual_input_and_output_owned(monkeypatch, stage):
     with pytest.raises(RuntimeError, match="deliberate error"), pool.operation(unrecorded_completion) as owner:
         prepare_dense_draft_read(
             *source,
+            exact_cpu=exact,
+            query_ends_cpu=exact,
+            frozen_starts=torch.div(torch.clamp(exact - 1024, min=0), 128, rounding_mode="floor") * 128,
             exact_device=exact,
             upper_cpu=exact + 3,
             window_size=1024,
@@ -82,6 +85,10 @@ def test_planning_copy_failure_keeps_prepared_input_owned(monkeypatch):
     with pytest.raises(RuntimeError, match="planning copy"), pool.operation(unrecorded_completion) as owner:
         prepare_dense_draft_read(
             *source,
+            exact_cpu=exact,
+            query_ends_cpu=exact,
+            frozen_starts=torch.div(torch.clamp(exact - 1024, min=0), 128, rounding_mode="floor") * 128,
+            full_rows_cpu=torch.zeros_like(exact, dtype=torch.bool, device="cpu"),
             exact_device=exact,
             upper_cpu=exact + 1,
             window_size=1024,

@@ -26,7 +26,7 @@ class TestCanonicalRead(unittest.TestCase):
         self.mapping = np.array([2, 0])
         self.retained: list[torch.Tensor] = []
 
-    def read(self, ends=(21, 11), starts=(12, 4), upper=(24, 15)):
+    def read(self, ends=(21, 11), starts=(12, 4), upper=(24, 15), padded_rows=3):
         exact = torch.tensor(ends, dtype=torch.int32)
         return materialize_draft_read(
             self.table[self.mapping.tolist()],
@@ -36,7 +36,7 @@ class TestCanonicalRead(unittest.TestCase):
             exact_device=exact,
             upper_cpu=torch.tensor(upper),
             starts_cpu=torch.tensor(starts),
-            padded_rows=3,
+            padded_rows=padded_rows,
             retain=lambda *values: self.retained.extend(values),
         )
 
@@ -62,11 +62,12 @@ class TestCanonicalRead(unittest.TestCase):
                     retain=lambda *values: None,
                 )
 
-    def test_canonical_projection_preserves_upper_and_padding(self):
+    def test_canonical_projection_tightens_upper_and_preserves_padding(self):
         view = self.read()
         self.assertEqual(view.block_table.tolist(), [[19, 20, 21], [1, 2, 0], [0, 0, 0]])
         self.assertEqual(view.seq_lens_cpu.tolist(), [9, 7, 0])
-        self.assertEqual(view.seq_lens_cpu_upper_bound.tolist(), [12, 11, 0])
+        self.assertIs(view.seq_lens_cpu_upper_bound, view.seq_lens_cpu)
+        self.assertEqual(view.max_seq_len, 9)
         self.assertNotEqual(view.block_table.untyped_storage().data_ptr(), self.table.untyped_storage().data_ptr())
         self.assertEqual(self.table.tolist(), torch.arange(24).reshape(3, 8).tolist())
 
@@ -142,7 +143,7 @@ class TestCanonicalRead(unittest.TestCase):
         self.owner.num_blocks.np[0, 2] = 6
         view = self.read(upper=(31, 15))
         self.assertEqual(view.seq_lens.tolist(), [9, 7, 0])
-        self.assertEqual(view.seq_lens_cpu_upper_bound.tolist(), [19, 11, 0])
+        self.assertEqual(view.seq_lens_cpu_upper_bound.tolist(), [9, 7, 0])
 
     def test_current_prepared_rows_preserve_reorder_and_strided_sources(self):
         for strided in (False, True):
@@ -246,7 +247,7 @@ class TestCanonicalRead(unittest.TestCase):
         )
 
     def test_parallel_builder_reuses_the_current_window_exact_snapshot(self):
-        view = self.read()
+        view = self.read(padded_rows=2)
         common = SimpleNamespace(num_reqs=2)
         view.apply(common)
         selected = self.select_parallel_lengths(common)
@@ -293,7 +294,7 @@ class TestCanonicalRead(unittest.TestCase):
         selector.__globals__["_is_glm_model"] = lambda config: True
         for starts in ((0, 4), (12, 4)):
             with self.subTest(starts=starts):
-                view = self.read(starts=starts)
+                view = self.read(starts=starts, padded_rows=2)
                 common = SimpleNamespace(num_reqs=2)
                 view.apply(common)
                 selected = selector(
@@ -304,13 +305,14 @@ class TestCanonicalRead(unittest.TestCase):
                 )
                 self.assertEqual(selected.data_ptr(), view.seq_lens_cpu.data_ptr())
                 self.assertEqual(selected.tolist(), [21 - starts[0], 7])
-                self.assertNotEqual(selected.tolist(), view.seq_lens_cpu_upper_bound[:2].tolist())
+                self.assertEqual(selected.tolist(), view.seq_lens_cpu_upper_bound[:2].tolist())
+                self.assertNotEqual(selected.tolist(), [24 - starts[0], 11])
 
     def test_replacing_a_window_read_operand_invalidates_its_cpu_certificate(self):
         for field in ("seq_lens", "_seq_lens_cpu", "seq_lens_cpu", "block_table_tensor", "seq_lens_cpu_upper_bound"):
             with self.subTest(field=field):
                 common = SimpleNamespace(num_reqs=2)
-                self.read().apply(common)
+                self.read(padded_rows=2).apply(common)
                 setattr(common, field, getattr(common, field).clone())
                 with self.assertRaisesRegex(ValueError, "replaced"):
                     self.select_parallel_lengths(common)

@@ -20,6 +20,9 @@ def test_ragged_queries_keep_full_row_and_use_device_exact_at_boundary(causal):
     held: list[object] = []
     read = prepare_dense_draft_read(
         *source,
+        exact_cpu=exact,
+        query_ends_cpu=exact,
+        frozen_starts=torch.div(torch.clamp(exact - 1024, min=0), 128, rounding_mode="floor") * 128,
         exact_device=exact,
         upper_cpu=torch.tensor([1152, 1411], dtype=torch.int32),
         window_size=1024,
@@ -61,8 +64,9 @@ def test_ragged_eagle_native_padding_preserves_frozen_anchor_and_full_continuati
     offsets = torch.tensor([0, 4, 261], dtype=torch.int32)
     read = prepare_dense_draft_read(
         *source,
+        exact_cpu=torch.tensor([1795, 2177], dtype=torch.int32),
         exact_device=torch.tensor([1795, 2177], dtype=torch.int32),
-        query_ends=torch.tensor([1796, 2177], dtype=torch.int32),
+        query_ends_cpu=torch.tensor([1796, 2177], dtype=torch.int32),
         upper_cpu=torch.tensor([1800, 2180], dtype=torch.int32),
         window_size=1035,
         anchor_span=128,
@@ -88,6 +92,12 @@ def test_uniform_full_read_rows_keep_original_query_layout():
     source = (torch.arange(24, dtype=torch.int32).reshape(2, 12)[list((0, 1))], (12, 12), 128)
     read = prepare_dense_draft_read(
         *source,
+        exact_cpu=torch.tensor([1151, 1287], dtype=torch.int32),
+        query_ends_cpu=torch.tensor([1151, 1287], dtype=torch.int32),
+        frozen_starts=torch.div(
+            torch.clamp(torch.tensor([1151, 1287], dtype=torch.int32) - 1024, min=0), 128, rounding_mode="floor"
+        )
+        * 128,
         exact_device=torch.tensor([1151, 1287], dtype=torch.int32),
         upper_cpu=torch.tensor([1152, 1290], dtype=torch.int32),
         window_size=1024,
@@ -106,14 +116,15 @@ def test_uniform_full_read_rows_keep_original_query_layout():
 
 
 @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("full_rows", [None, [False, False, False]])
-def test_decode_ragged_widths_use_same_partition_without_query_padding(causal, full_rows):
+def test_decode_ragged_widths_use_same_partition_without_query_padding(causal):
     table = torch.arange(48, dtype=torch.int32).reshape(3, 16)
     source = (table[list((2, 0, 1))], (16, 16, 16), 128)
     offsets = torch.tensor([0, 1, 4, 5], dtype=torch.int32)
     exact = torch.tensor([1151, 1291, 1408], dtype=torch.int32)
     read = prepare_dense_draft_read(
         *source,
+        exact_cpu=exact,
+        query_ends_cpu=exact,
         exact_device=exact,
         upper_cpu=exact + 3,
         window_size=1024,
@@ -121,7 +132,7 @@ def test_decode_ragged_widths_use_same_partition_without_query_padding(causal, f
         query_width=3,
         causal=causal,
         frozen_starts=torch.tensor([0, 256, 384], dtype=torch.int32),
-        full_rows_cpu=None if full_rows is None else torch.tensor(full_rows),
+        full_rows_cpu=torch.zeros(3, dtype=torch.bool),
         query_start_loc_cpu=offsets,
         query_start_loc_device=offsets.clone(),
         retain=lambda *items: None,

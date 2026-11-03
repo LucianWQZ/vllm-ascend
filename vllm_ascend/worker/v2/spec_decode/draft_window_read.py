@@ -23,7 +23,7 @@ class DraftReadView:
     seq_lens_cpu: torch.Tensor
     seq_lens_cpu_upper_bound: torch.Tensor
     max_seq_len: int
-    num_reqs: int | None = None
+    num_reqs: int
 
     def apply(self, common_metadata: Any) -> None:
         """Apply only to a newly created draft common metadata object."""
@@ -38,7 +38,7 @@ class DraftReadView:
     def exact_cpu_for(self, common_metadata: Any) -> torch.Tensor:
         """Certify the snapshot only while all of its read operands are intact."""
         if (
-            (self.num_reqs is not None and common_metadata.num_reqs != self.num_reqs)
+            common_metadata.num_reqs != self.num_reqs
             or common_metadata.seq_lens is not self.seq_lens
             or common_metadata.seq_lens_cpu is not self.seq_lens_cpu
             or common_metadata._seq_lens_cpu is not self.seq_lens_cpu
@@ -104,10 +104,12 @@ def materialize_draft_read(
         padded_rows, dtype=exact_cpu.dtype, device="cpu", pin_memory=block_table.device.type == "npu"
     )
     lengths_cpu[:n] = ends - starts
-    upper_out = torch.zeros(padded_rows, dtype=upper_cpu.dtype, device="cpu")
-    upper_out[:n] = upper - starts
     lengths = exact_device.new_empty(padded_rows)
     # Retain both actual operands before a copy can partially submit and fail.
     retain(lengths_cpu, lengths)
     lengths.copy_(lengths_cpu, non_blocking=True)
-    return DraftReadView(table, lengths, lengths_cpu, upper_out, int(upper_out.max()) if padded_rows else 0)
+    # Once E is completed, its visible lengths are also the tight allocation
+    # bounds. Query extents and positions remain owned by the original builder.
+    return DraftReadView(
+        table, lengths, lengths_cpu, lengths_cpu, int(lengths_cpu.max()) if padded_rows else 0, padded_rows
+    )

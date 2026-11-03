@@ -49,7 +49,7 @@ def gather_draft_kv_fp32(
     keys: torch.Tensor,
     values: torch.Tensor,
     *,
-    retain: Callable[..., None] | None = None,
+    retain: Callable[..., None],
     output_buffers: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Gather validated ND token rows directly into private native FP32 operands.
@@ -85,8 +85,7 @@ def gather_draft_kv_fp32(
             start, size = regions[index]
             if any(start < other + count and other < start + size for other, count in regions[:index]):
                 raise ValueError("Reusable Draft outputs must not alias Full KV, slots or one another")
-    if retain is not None:
-        retain(slots, keys, values, gathered_keys, gathered_values)
+    retain(slots, keys, values, gathered_keys, gathered_values)
     token_size = keys.shape[2] * keys.shape[3]
     _gather_draft_kv_fp32[(triton.cdiv(slots.numel(), GATHER_TOKEN_BLOCK_SIZE),)](
         slots,

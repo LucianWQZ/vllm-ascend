@@ -105,17 +105,16 @@ def prepare_dense_draft_read(
     block_span: int,
     *,
     exact_device: torch.Tensor,
-    exact_cpu: torch.Tensor | None = None,
-    query_ends_cpu: torch.Tensor | None = None,
+    exact_cpu: torch.Tensor,
+    query_ends_cpu: torch.Tensor,
     upper_cpu: torch.Tensor,
     window_size: int,
     anchor_span: int,
     query_width: int,
     causal: bool,
     retain: Callable[..., None],
-    frozen_starts: torch.Tensor | None = None,
-    query_ends: torch.Tensor | None = None,
-    full_rows_cpu: torch.Tensor | None = None,
+    frozen_starts: torch.Tensor,
+    full_rows_cpu: torch.Tensor,
     query_start_loc_cpu: torch.Tensor | None = None,
     query_start_loc_device: torch.Tensor | None = None,
 ) -> DenseDraftRead | DenseDraftReadBatch:
@@ -145,34 +144,29 @@ def prepare_dense_draft_read(
     if exact_device.device != block_table.device:
         raise ValueError("Dense read operands must share their source device")
     retain(exact_device, block_table)
-    # A single completed snapshot certifies this preparation. The runtime
-    # shares it across groups; direct callers may request their own snapshot.
-    exact_cpu = exact_device[:n].to(device="cpu", dtype=torch.int32, copy=True) if exact_cpu is None else exact_cpu
+    # The runtime supplies its one current exact snapshot and frozen starts;
+    # this reader never derives lengths or synchronizes device values again.
     if exact_cpu.device.type != "cpu" or exact_cpu.shape != (n,) or exact_cpu.dtype not in (torch.int32, torch.int64):
         raise ValueError("Dense Draft read requires one completed CPU exact value per request")
     if bool(((exact_cpu <= 0) | (exact_cpu > upper_cpu) | (exact_cpu > available)).any()):
         raise ValueError("Dense Draft exact lengths exceed initialized canonical columns or preparation bounds")
-    if query_ends_cpu is None:
-        query_ends_cpu = exact_cpu if query_ends is None else query_ends.to(device="cpu", dtype=torch.int32, copy=True)
     if (
         query_ends_cpu.device.type != "cpu"
         or query_ends_cpu.shape != (n,)
         or query_ends_cpu.dtype not in (torch.int32, torch.int64)
     ):
         raise ValueError("Native query ends must match current request rows")
-    if frozen_starts is not None and frozen_starts.dtype not in (torch.int32, torch.int64):
-        raise ValueError("Frozen Draft anchors must contain integers")
-    starts = (
-        torch.div(torch.clamp(exact_cpu - window_size, min=0), anchor_span, rounding_mode="floor") * anchor_span
-        if frozen_starts is None
-        else frozen_starts.to(device="cpu", dtype=torch.int32)
-    )
-    if starts.shape != (n,) or bool(((starts < 0) | (starts > exact_cpu) | (starts % anchor_span != 0)).any()):
+    starts = frozen_starts
+    if (
+        starts.device.type != "cpu"
+        or starts.dtype not in (torch.int32, torch.int64)
+        or starts.shape != (n,)
+        or bool(((starts < 0) | (starts > exact_cpu) | (starts % anchor_span != 0)).any())
+    ):
         raise ValueError("Frozen Draft anchors must match current request rows")
     retain(exact_cpu, starts, query_ends_cpu)
-    if full_rows_cpu is not None:
-        if full_rows_cpu.device.type != "cpu" or full_rows_cpu.dtype != torch.bool or full_rows_cpu.shape != (n,):
-            raise ValueError("Full-read phase rows require one current CPU boolean per request")
+    if full_rows_cpu.device.type != "cpu" or full_rows_cpu.dtype != torch.bool or full_rows_cpu.shape != (n,):
+        raise ValueError("Full-read phase rows require one current CPU boolean per request")
     if (query_start_loc_cpu is None) != (query_start_loc_device is None):
         raise ValueError("Packed queries require current CPU and device boundaries")
     widths = None
@@ -224,11 +218,11 @@ def prepare_dense_draft_read(
         retain(read, block_table, address, logical_columns, blocks, slots, lengths, mask)
         return read
 
-    if widths is None and (full_rows_cpu is None or not bool(full_rows_cpu.any())):
+    if widths is None and not bool(full_rows_cpu.any()):
         return materialize(torch.arange(n, device="cpu"), query_width, False)
     groups: dict[tuple[bool, int, int], list[int]] = {}
     for row in range(n):
-        full = full_rows_cpu is not None and bool(full_rows_cpu[row])
+        full = bool(full_rows_cpu[row])
         capacity = (int(upper_cpu[row]) + DENSE_KV_ALIGNMENT - 1) // DENSE_KV_ALIGNMENT if full else 0
         key = (full, query_width if widths is None else int(widths[row]), capacity)
         groups.setdefault(key, []).append(row)
@@ -263,7 +257,6 @@ def gather_dense_draft_kv(
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
     *,
-    output_dtype: torch.dtype | None = None,
     output_buffers: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Gather ND token rows, including interleaved/padded physical KV pages."""
@@ -271,8 +264,6 @@ def gather_dense_draft_kv(
         raise ValueError("Dense Draft KV requires matching four-dimensional caches")
     if key_cache.dtype not in (torch.float16, torch.bfloat16) or value_cache.dtype != key_cache.dtype:
         raise ValueError("Dense Draft KV requires unquantized float16/bfloat16 storage")
-    if output_dtype not in (None, torch.float32):
-        raise ValueError("Dense Draft gather conversion supports only FP32 native operands")
     if key_cache.device != value_cache.device or read.slots.device != key_cache.device:
         raise ValueError("Dense Draft slots and KV caches must share their device")
     shape = (read.num_reqs, read.capacity, *key_cache.shape[2:])
@@ -289,7 +280,7 @@ def gather_dense_draft_kv(
             raise ValueError("Dense Draft KV requires contiguous ND token rows and aligned physical pages")
         stride_rows = page_stride // token_size
         layouts.append((cache, blocks, block_size, heads, dim, token_size, stride_rows))
-    if output_dtype == torch.float32 and key_cache.device.type == "npu":
+    if key_cache.device.type == "npu":
         import torch_npu
 
         from vllm_ascend.ops.triton.v2.spec_decode.draft_window import gather_draft_kv_fp32
@@ -323,7 +314,7 @@ def gather_dense_draft_kv(
             )
         operand = rows.index_select(0, indices_by_stride[stride_rows]).reshape(shape)
         read.retain(operand)
-        gathered.append(operand.to(output_dtype or cache.dtype))
+        gathered.append(operand.float())
     keys, values = gathered
     read.retain(keys, values)
     return keys, values
@@ -375,7 +366,6 @@ def dense_draft_attention(
         read,
         key_cache,
         value_cache,
-        output_dtype=torch.float32,
         **({"output_buffers": buffers} if buffers is not None else {}),
     )
     if workspace_key is not None:

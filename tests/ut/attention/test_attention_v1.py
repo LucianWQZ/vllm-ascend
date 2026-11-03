@@ -306,6 +306,10 @@ class TestAscendAttentionMetadataBuilder(TestBase):
         read = prepare_dense_draft_read(
             *(common.block_table_tensor[list((0,))], (2,), 128),
             exact_device=common.seq_lens,
+            exact_cpu=torch.tensor([129], dtype=torch.int32),
+            query_ends_cpu=torch.tensor([129], dtype=torch.int32),
+            frozen_starts=torch.zeros(1, dtype=torch.int32),
+            full_rows_cpu=torch.zeros(1, dtype=torch.bool),
             upper_cpu=common.seq_lens_cpu_upper_bound,
             window_size=128,
             anchor_span=128,
@@ -472,6 +476,7 @@ class TestAscendAttentionBackendImpl(TestBase):
         self.attention_type.DECODER = "decoder"
         self.attention_type.ENCODER = "encoder"
         self.attn_metadata = MagicMock()
+        self.attn_metadata._draft_window_device_read = None
         self.attn_metadata.uses_pcp_sharded_layout = False
         self.attn_metadata.return_value = "1"
         self.layer_no_quant = MagicMock(spec=["layer_name", "_k_scale_float", "_v_scale_float"])

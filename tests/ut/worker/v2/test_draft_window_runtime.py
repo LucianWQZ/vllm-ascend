@@ -149,12 +149,10 @@ def test_no_draft_placeholders_and_invalid_scheduled_counts():
     "field,value",
     [
         ("num_draft_tokens_per_req", np.array([-1, 2])),
-        ("num_draft_tokens_per_req", np.array([3])),
-        ("num_scheduled_tokens", np.array([7.5, 3.0])),
         ("prefill_len_np", np.array([-1, 16])),
     ],
 )
-def test_shared_phase_rejects_invalid_active_row_counters(field, value):
+def test_shared_phase_rejects_negative_dynamic_counters(field, value):
     state = batch()
     setattr(state, field, value)
     with pytest.raises((ValueError, TypeError)):
@@ -188,7 +186,7 @@ def test_callback_reads_canonical_source_and_preserves_write_query_objects(setup
         runtime.retain_metadata({"layer": metadata})
     # Continuing prefill is Full; decode E=27 W=8 B=4 gives S=16 V=11.
     assert metadata.seq_lens.tolist() == [12, 11, 0]
-    assert metadata.seq_lens_cpu_upper_bound.tolist() == [14, 14, 0]
+    assert metadata.seq_lens_cpu_upper_bound.tolist() == [12, 11, 0]
     assert metadata.block_table_tensor[0, :3].tolist() == canonical[1, :3].tolist()
     assert metadata.block_table_tensor[1, :3].tolist() == canonical[3, 4:7].tolist()
     assert metadata.block_table_tensor.data_ptr() != canonical.data_ptr()
@@ -525,6 +523,9 @@ def test_eagle_first_pass_anchor_uses_live_queries_after_rejection(setup):
     # H=1159+3=1162; H-W=127 gives S0. Native padded1160 would
     # incorrectly cross the block boundary to S128 for row1.
     assert [metadata.seq_lens[:2].tolist() for metadata in outputs] == [[1159, 1160], [1160, 1160], [1161, 1161]]
+    # The native first consumer retains its padded query extent1160, not
+    # the live KV end1159 used to freeze the anchor. Its tight upper does too.
+    assert [metadata.max_seq_len for metadata in outputs] == [1160, 1160, 1161]
     assert all(metadata.block_table_tensor[1, 0] == canonical[3, 0] for metadata in outputs)
 
 
@@ -656,16 +657,11 @@ def test_eagle_full_continuing_rejects_changed_preparation(setup, changed):
     assert runtime.pool.poisoned
 
 
-def test_eagle_full_continuing_with_placeholders_keeps_exact_fallback(setup, monkeypatch):
+def test_eagle_full_continuing_with_placeholders_keeps_exact_read(setup):
     runtime, spec, _, _ = setup
     runtime.method, runtime.static_k, runtime._dense_reads = "eagle3", 3, True
     spec.max_model_len, spec.advance_draft_positions = 4096, True
     state = batch(computed=(8, 24), prompt=(100, 100))
-    monkeypatch.setattr(
-        runtime,
-        "_full_prefill_metadata_callback",
-        lambda *args: pytest.fail("placeholder prompt took exact Host shortcut"),
-    )
     with runtime.proposal_context(spec, state):
         for step in range(3):
             metadata = common(exact=(12 + step, 27 + step))

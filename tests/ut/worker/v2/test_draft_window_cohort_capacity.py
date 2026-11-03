@@ -22,6 +22,9 @@ def test_different_full_row_bounds_do_not_multiply_largest_workspace(order):
     held: list[object] = []
     read = prepare_dense_draft_read(
         *(table[list(tuple(rows.tolist()))], tuple(((upper + 127) // 128).tolist()), 128),
+        exact_cpu=exact,
+        query_ends_cpu=exact,
+        frozen_starts=torch.div(torch.clamp(exact - 1024, min=0), 128, rounding_mode="floor") * 128,
         exact_device=exact,
         upper_cpu=upper,
         window_size=1024,
@@ -56,6 +59,12 @@ def test_equal_aligned_full_bounds_keep_one_existing_read():
     table = torch.arange(2 * 17, dtype=torch.int32).reshape(2, 17)
     read = prepare_dense_draft_read(
         *(table[list((0, 1))], (17, 17), 128),
+        exact_cpu=torch.tensor([2055, 2063], dtype=torch.int32),
+        query_ends_cpu=torch.tensor([2055, 2063], dtype=torch.int32),
+        frozen_starts=torch.div(
+            torch.clamp(torch.tensor([2055, 2063], dtype=torch.int32) - 1024, min=0), 128, rounding_mode="floor"
+        )
+        * 128,
         exact_device=torch.tensor([2055, 2063], dtype=torch.int32),
         upper_cpu=torch.tensor([2064, 2070], dtype=torch.int32),
         window_size=1024,

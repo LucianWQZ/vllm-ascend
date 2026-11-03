@@ -14,6 +14,9 @@ def test_full_prompt_does_not_multiply_decode_scratch_by_full_capacity():
     table = torch.arange(n * 256, dtype=torch.int32).reshape(n, 256)
     read = prepare_dense_draft_read(
         *(table[list(tuple(range(n)))], (256,) * n, block),
+        exact_cpu=ends,
+        query_ends_cpu=ends,
+        frozen_starts=torch.div(torch.clamp(ends - 1024, min=0), block, rounding_mode="floor") * block,
         exact_device=ends,
         upper_cpu=ends + 1,
         window_size=1024,

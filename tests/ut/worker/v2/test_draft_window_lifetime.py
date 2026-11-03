@@ -138,23 +138,22 @@ def test_completion_protocol_validation_failure_retains_the_token():
     assert pool.poisoned
 
 
-def test_free_lane_does_not_query_or_wait_for_unrelated_reader():
+def test_free_capacity_does_not_query_or_wait_for_unrelated_reader():
     pool = DraftWindowOwnerPool(2)
     completion = Completion(query_error=True)
     first = submit(pool, completion, Payload())
     second = pool.acquire()
-    assert second.lane != first.lane
+    assert second is not first
     assert completion.queries == completion.waits == 0
 
 
-def test_pressure_reuses_reverse_completed_lane_without_wait():
+def test_pressure_reclaims_reverse_completed_reader_without_wait():
     pool = DraftWindowOwnerPool(2)
     slow, fast = Completion(), Completion(complete=True)
     first = submit(pool, slow, Payload())
     second = submit(pool, fast, Payload())
     replacement = pool.acquire()
-    assert replacement.lane == second.lane
-    assert replacement.sequence > second.sequence
+    assert replacement is not second and replacement is not first
     assert first.retained
     assert not second.retained
     assert slow.waits == fast.waits == 0
@@ -171,7 +170,7 @@ def test_pressure_waits_for_oldest_and_retains_until_that_wait_completes():
     assert before_wait == [True]
     assert slow.waits == 1
     assert later.waits == 0
-    assert replacement.lane == first.lane
+    assert replacement is not first and not first.retained
     assert second.retained
 
 
@@ -260,7 +259,7 @@ def test_stale_or_cross_pool_owner_cannot_mutate_another_generation():
         other.retain(owner, Payload())
     assert pool.reclaim_completed() == 1
     replacement = pool.acquire()
-    assert replacement.lane == owner.lane
+    assert replacement is not owner
     with pytest.raises(RuntimeError, match="stale or belongs"):
         pool.retain(owner, Payload())
     assert not replacement.retained

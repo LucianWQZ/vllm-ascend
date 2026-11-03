@@ -13,7 +13,7 @@ def freeze_mla_read_metadata(
     mla_layer_names: Collection[str],
     *,
     retain: Callable[..., None],
-) -> tuple[Any, ...]:
+) -> None:
     """Detach only MLA decode RoPE from the builder's process-wide scratch.
 
     ``AscendMLAMetadataBuilder.build_decode_metadata`` calls
@@ -27,7 +27,6 @@ def freeze_mla_read_metadata(
     Ordinary prefill RoPE is allocated by the builder. Its context consumer
     allocates per-chunk gather outputs rather than using the workspace field.
     """
-    retained = []
     seen = set()
     for name in mla_layer_names:
         layer_metadata = metadata[name]
@@ -49,5 +48,3 @@ def freeze_mla_read_metadata(
                 retain(value, owned)
                 owned.copy_(value, non_blocking=True)
                 setattr(decode, field, owned)
-                retained.append(owned)
-    return tuple(retained)

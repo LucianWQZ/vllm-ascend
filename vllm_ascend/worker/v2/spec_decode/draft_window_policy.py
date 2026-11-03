@@ -17,10 +17,8 @@ class DraftWindowPolicyState(Enum):
 @dataclass(frozen=True)
 class DraftWindowPolicyDecision:
     state: DraftWindowPolicyState
-    requested_window_size: int | None
     effective_window_size: int | None
     normalized_method: str
-    target_model_type: str
     reason: str | None = None
 
     @property
@@ -55,10 +53,8 @@ def resolve_draft_window_policy(
     def decision(state: DraftWindowPolicyState, reason: str | None = None) -> DraftWindowPolicyDecision:
         return DraftWindowPolicyDecision(
             state=state,
-            requested_window_size=requested_window_size,
             effective_window_size=requested_window_size if state is DraftWindowPolicyState.ELIGIBLE_ON else None,
             normalized_method=method,
-            target_model_type=model_type,
             reason=reason,
         )
 

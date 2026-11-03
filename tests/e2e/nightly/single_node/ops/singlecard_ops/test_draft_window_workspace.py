@@ -29,6 +29,9 @@ def make_read(capacity, held):
     read = prepare_dense_draft_read(
         *(table[list((0,))], (blocks,), block),
         exact_device=torch.tensor([capacity], dtype=torch.int32, device="npu"),
+        exact_cpu=torch.tensor([capacity], dtype=torch.int32),
+        query_ends_cpu=torch.tensor([capacity], dtype=torch.int32),
+        frozen_starts=torch.zeros(1, dtype=torch.int32),
         upper_cpu=torch.tensor([capacity], dtype=torch.int32),
         window_size=1024,
         anchor_span=128,
@@ -74,9 +77,9 @@ def test_standalone_gather_outputs_remain_independent():
     held: list[object] = []
     read, keys, values, _ = make_read(1152, held)
     values.fill_(1)
-    first = gather_dense_draft_kv(read, keys, values, output_dtype=torch.float32)[1]
+    first = gather_dense_draft_kv(read, keys, values)[1]
     values.fill_(2)
-    second = gather_dense_draft_kv(read, keys, values, output_dtype=torch.float32)[1]
+    second = gather_dense_draft_kv(read, keys, values)[1]
     torch.npu.synchronize()
     assert first.untyped_storage().data_ptr() != second.untyped_storage().data_ptr()
     torch.testing.assert_close(first, torch.ones_like(first), atol=0, rtol=0)

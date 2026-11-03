@@ -58,16 +58,17 @@ def test_later_real_rope_build_cannot_overwrite_inflight_window_metadata(monkeyp
     layers = {"draft.a": metadata, "draft.b": metadata}
     submitted = []
     retain = lambda *objects: submitted.extend(objects)
-    retained = freeze_mla_read_metadata(layers, tuple(layers), retain=retain)
+    freeze_mla_read_metadata(layers, tuple(layers), retain=retain)
     assert any(value is cos for value in submitted)
     assert any(value is sin for value in submitted)
-    assert all(any(value is output for value in submitted) for output in retained)
+    assert any(value is metadata.decode.cos for value in submitted)
+    assert any(value is metadata.decode.sin for value in submitted)
     rotary_embedding.get_cos_and_sin_mla(torch.tensor([2, 3]), use_cache=True)
     # The original producer is demonstrably mutable; the Window read isn't.
     assert not torch.equal(cos, expected_cos)
     assert torch.equal(metadata.decode.cos, expected_cos)
     assert torch.equal(metadata.decode.sin, expected_sin)
-    assert len(retained) == 2
+    assert len(submitted) == 4
     assert metadata.slot_mapping is full_slots
     assert metadata.query_start_loc is query
     assert metadata.block_tables is table
@@ -78,9 +79,12 @@ def test_later_real_rope_build_cannot_overwrite_inflight_window_metadata(monkeyp
 
 def test_nope_and_prefill_do_not_copy_full_query_or_metadata():
     metadata = metadata_for_decode(torch.tensor([9, 10]), None, None)
-    assert freeze_mla_read_metadata({"draft": metadata}, ["draft"], retain=lambda *items: None) == ()
+    submitted = []
+    freeze_mla_read_metadata({"draft": metadata}, ["draft"], retain=lambda *items: submitted.extend(items))
+    assert submitted == []
     metadata.decode = None
-    assert freeze_mla_read_metadata({"draft": metadata}, ["draft"], retain=lambda *items: None) == ()
+    freeze_mla_read_metadata({"draft": metadata}, ["draft"], retain=lambda *items: submitted.extend(items))
+    assert submitted == []
 
 
 def test_flashmla_is_not_silently_treated_as_fia():

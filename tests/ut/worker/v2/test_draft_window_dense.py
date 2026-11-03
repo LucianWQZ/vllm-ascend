@@ -19,6 +19,9 @@ def test_frozen_eagle_anchor_does_not_follow_later_exact_lengths():
     for end in (11, 12, 13):
         read = prepare_dense_draft_read(
             *source,
+            exact_cpu=torch.tensor([end], dtype=torch.int32),
+            query_ends_cpu=torch.tensor([end], dtype=torch.int32),
+            full_rows_cpu=torch.zeros_like(torch.tensor([end], dtype=torch.int32), dtype=torch.bool, device="cpu"),
             exact_device=torch.tensor([end], dtype=torch.int32),
             upper_cpu=torch.tensor([14]),
             window_size=8,
@@ -42,8 +45,10 @@ def test_rejected_first_pass_keeps_native_query_alignment_and_excludes_unwritten
     held: list[object] = []
     read = prepare_dense_draft_read(
         *source,
+        exact_cpu=torch.tensor([end], dtype=torch.int32),
+        full_rows_cpu=torch.zeros_like(torch.tensor([end], dtype=torch.int32), dtype=torch.bool, device="cpu"),
         exact_device=torch.tensor([end], dtype=torch.int32),
-        query_ends=torch.tensor([native_end], dtype=torch.int32),
+        query_ends_cpu=torch.tensor([native_end], dtype=torch.int32),
         upper_cpu=torch.tensor([native_end + 1]),
         window_size=1035,
         anchor_span=block,
@@ -66,8 +71,7 @@ def test_rejected_first_pass_keeps_native_query_alignment_and_excludes_unwritten
 @pytest.mark.parametrize("page_layers", [0, 3])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("query_width", [8, 9])
-@pytest.mark.parametrize("output_dtype", [None, torch.float32])
-def test_device_exact_read_set_reorder_rejection_and_nan_tail(causal, query_width, page_layers, output_dtype):
+def test_device_exact_read_set_reorder_rejection_and_nan_tail(causal, query_width, page_layers):
     block = 128
     table = torch.tensor(
         [[3, 1, 8, 0, 11, 4, 2, 10, 9, 5, 6, 7], [16, 12, 20, 15, 13, 22, 14, 21, 23, 18, 17, 19]], dtype=torch.int32
@@ -78,6 +82,10 @@ def test_device_exact_read_set_reorder_rejection_and_nan_tail(causal, query_widt
     source = (table[list((1, 0))], (12, 12), block)
     read = prepare_dense_draft_read(
         *source,
+        exact_cpu=ends,
+        query_ends_cpu=ends,
+        frozen_starts=torch.div(torch.clamp(ends - 1024, min=0), block, rounding_mode="floor") * block,
+        full_rows_cpu=torch.zeros_like(ends, dtype=torch.bool, device="cpu"),
         exact_device=ends,
         upper_cpu=upper,
         window_size=1024,
@@ -110,8 +118,8 @@ def test_device_exact_read_set_reorder_rejection_and_nan_tail(causal, query_widt
         assert set(actual) == set(expected)
         reference.append(cache.flatten(0, 1)[expected].clone())
     backing_before = backing.clone() if backing is not None else None
-    keys, values = gather_dense_draft_kv(read, cache, cache, output_dtype=output_dtype)
-    assert keys.dtype == values.dtype == (output_dtype or cache.dtype)
+    keys, values = gather_dense_draft_kv(read, cache, cache)
+    assert keys.dtype == values.dtype == torch.float32
     assert torch.isfinite(keys).all() and torch.isfinite(values).all()
     for row, expected_values in enumerate(reference):
         torch.testing.assert_close(keys[row, : len(expected_values)], expected_values.to(keys.dtype), rtol=0, atol=0)
@@ -132,6 +140,13 @@ def test_apply_keeps_full_write_and_absolute_query_operands():
     source = (torch.tensor([[2, 1]], dtype=torch.int32)[list((0,))], (2,), 128)
     read = prepare_dense_draft_read(
         *source,
+        exact_cpu=torch.tensor([129], dtype=torch.int32),
+        query_ends_cpu=torch.tensor([129], dtype=torch.int32),
+        frozen_starts=torch.div(
+            torch.clamp(torch.tensor([129], dtype=torch.int32) - 128, min=0), 128, rounding_mode="floor"
+        )
+        * 128,
+        full_rows_cpu=torch.zeros_like(torch.tensor([129], dtype=torch.int32), dtype=torch.bool, device="cpu"),
         exact_device=torch.tensor([129], dtype=torch.int32),
         upper_cpu=torch.tensor([130]),
         window_size=128,
@@ -158,6 +173,10 @@ def test_allocation_upper_cannot_authorize_uninitialized_columns():
     with pytest.raises(ValueError, match="exact lengths exceed"):
         prepare_dense_draft_read(
             *source,
+            exact_cpu=torch.tensor([129]),
+            query_ends_cpu=torch.tensor([129]),
+            frozen_starts=torch.div(torch.clamp(torch.tensor([129]) - 128, min=0), 128, rounding_mode="floor") * 128,
+            full_rows_cpu=torch.zeros_like(torch.tensor([129]), dtype=torch.bool, device="cpu"),
             exact_device=torch.tensor([129]),
             upper_cpu=torch.tensor([129]),
             window_size=128,
@@ -174,6 +193,10 @@ def test_cpu_capacity_fields_ignore_default_tensor_device():
     with torch.device("meta"):
         read = prepare_dense_draft_read(
             *source,
+            exact_cpu=exact,
+            query_ends_cpu=exact,
+            frozen_starts=torch.div(torch.clamp(exact - 128, min=0), 128, rounding_mode="floor") * 128,
+            full_rows_cpu=torch.zeros_like(exact, dtype=torch.bool, device="cpu"),
             exact_device=exact,
             upper_cpu=upper,
             window_size=128,
@@ -193,6 +216,13 @@ def test_short_context_large_window_does_not_gather_window_sized_padding():
     source = (torch.tensor([[1]], dtype=torch.int32)[list((0,))], (1,), 128)
     read = prepare_dense_draft_read(
         *source,
+        exact_cpu=torch.tensor([31], dtype=torch.int32),
+        query_ends_cpu=torch.tensor([31], dtype=torch.int32),
+        frozen_starts=torch.div(
+            torch.clamp(torch.tensor([31], dtype=torch.int32) - 4096, min=0), 128, rounding_mode="floor"
+        )
+        * 128,
+        full_rows_cpu=torch.zeros_like(torch.tensor([31], dtype=torch.int32), dtype=torch.bool, device="cpu"),
         exact_device=torch.tensor([31], dtype=torch.int32),
         upper_cpu=torch.tensor([34]),
         window_size=4096,
@@ -233,6 +263,9 @@ def test_uniform_compact_table_needs_no_request_row_transfer(monkeypatch, stride
         compact,
         (12, 12),
         128,
+        query_ends_cpu=ends,
+        frozen_starts=torch.div(torch.clamp(ends - 1024, min=0), 128, rounding_mode="floor") * 128,
+        full_rows_cpu=torch.zeros_like(ends, dtype=torch.bool, device="cpu"),
         exact_device=ends,
         exact_cpu=ends,
         upper_cpu=ends + 2,

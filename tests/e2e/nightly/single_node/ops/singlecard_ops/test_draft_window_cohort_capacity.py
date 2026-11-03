@@ -28,6 +28,9 @@ def test_full_row_capacity_cohorts_have_independent_native_operands(decode_exact
     read = prepare_dense_draft_read(
         *(table[list(tuple(rows.tolist()))], tuple(((upper + 127) // 128).tolist()), 128),
         exact_device=exact.to("npu"),
+        exact_cpu=exact,
+        query_ends_cpu=exact,
+        frozen_starts=(exact - 1024).clamp(min=0) // 128 * 128,
         upper_cpu=upper,
         window_size=1024,
         anchor_span=128,
