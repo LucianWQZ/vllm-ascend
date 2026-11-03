@@ -350,7 +350,7 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         # TODO: This will be moved to propose and deleted after fia ops fixed.
         device_read = getattr(common_attn_metadata, "_draft_window_device_read", None)
         seq_lens = (
-            common_attn_metadata.seq_lens_cpu_upper_bound
+            device_read.seq_lens
             if device_read is not None
             else _select_seq_lens(
                 common_attn_metadata,
@@ -359,6 +359,8 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
                 vllm_config=self.vllm_config,
             )
         )
+        if device_read is not None and seq_lens.numel() < num_reqs:
+            seq_lens = torch.cat((seq_lens, seq_lens.new_zeros(num_reqs - seq_lens.numel())))
         slot_mapping = common_attn_metadata.slot_mapping[:num_actual_tokens]
         # this slot_mapping override doesn't work since vllm will override it again. We should fix it vllm.
         # see: https://github.com/vllm-project/vllm/blob/ce88756b967c2c5006746a424c15dd59a284ed8c/vllm/model_executor/layers/attention/cross_attention.py#L117
@@ -472,8 +474,8 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         if pcp_shard_slot_mapping is not None:
             self._finalize_pcp_metadata(attn_metadata, pcp_shard_slot_mapping)
         if device_read is not None:
-            # Only the dedicated eager reader consumes these capacity lengths.
-            # Device exact lengths/mask remain separately owned by the proposal.
+            # The ordinary reader owns its completed visible CPU lengths,
+            # slots and mask; the Common keeps the framework's Full operands.
             # This private eager extension is deliberately absent from the
             # baseline Target/Graph metadata schema and from all OFF objects.
             private_metadata: Any = attn_metadata

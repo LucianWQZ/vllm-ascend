@@ -314,7 +314,7 @@ class TestAscendAttentionMetadataBuilder(TestBase):
             causal=False,
             retain=lambda *objects: None,
         )
-        read.apply(common)
+        common._draft_window_device_read = read
         result = self.builder.build(0, common)
         arguments = metadata_cls.call_args.kwargs
         # The Full device exact remains E=129. U=130 only bounds the

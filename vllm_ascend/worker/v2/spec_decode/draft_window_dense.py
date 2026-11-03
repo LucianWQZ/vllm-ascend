@@ -11,26 +11,10 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import Any
 
 import torch
 
 DENSE_KV_ALIGNMENT = 32
-
-
-def _apply_read_metadata(read: DenseDraftRead | DenseDraftReadBatch, common: Any) -> None:
-    n = common.num_reqs
-    lengths = read.seq_lens
-    if n != read.num_reqs:
-        lengths = read.seq_lens.new_zeros(n)
-        read.retain(lengths)
-        lengths[: read.num_reqs] = read.seq_lens
-    # The private FP32 reader consumes slots/mask, not seq_lens_gpu. Keep
-    # the framework's Full device lengths and give its builder this completed
-    # CPU projection; no H2D or per-group GPU scatter is needed for it.
-    common.seq_lens_cpu_upper_bound = common.seq_lens_cpu = common._seq_lens_cpu = lengths
-    common.max_seq_len = int(lengths.max())
-    common._draft_window_device_read = read
 
 
 @dataclass(frozen=True)
@@ -54,8 +38,6 @@ class DenseDraftRead:
     def num_reqs(self) -> int:
         return self.slots.shape[0]
 
-    apply = _apply_read_metadata
-
 
 @dataclass(frozen=True)
 class DenseDraftReadBatch:
@@ -71,12 +53,6 @@ class DenseDraftReadBatch:
     seq_lens: torch.Tensor  # Completed CPU visible lengths for the normal builder.
     num_query_tokens: int
     retain: Callable[..., None]
-
-    @property
-    def num_reqs(self) -> int:
-        return self.seq_lens.numel()
-
-    apply = _apply_read_metadata
 
 
 def _copy_owned_read_tensor(source: torch.Tensor, retain: Callable[..., None], *, device: torch.device) -> torch.Tensor:

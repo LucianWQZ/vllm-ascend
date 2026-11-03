@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
 
-from types import SimpleNamespace
-
 import pytest
 import torch
 
@@ -127,37 +125,6 @@ def test_device_exact_read_set_reorder_rejection_and_nan_tail(causal, query_widt
     assert any(value is keys for value in held)
 
 
-def test_apply_keeps_full_write_and_absolute_query_operands():
-    source = (torch.tensor([[2, 1]], dtype=torch.int32)[list((0,))], (2,), 128)
-    read = prepare_dense_draft_read(
-        *source,
-        exact_cpu=torch.tensor([129], dtype=torch.int32),
-        query_ends_cpu=torch.tensor([129], dtype=torch.int32),
-        frozen_starts=torch.div(
-            torch.clamp(torch.tensor([129], dtype=torch.int32) - 128, min=0), 128, rounding_mode="floor"
-        )
-        * 128,
-        full_rows_cpu=torch.zeros_like(torch.tensor([129], dtype=torch.int32), dtype=torch.bool, device="cpu"),
-        upper_cpu=torch.tensor([130]),
-        query_width=9,
-        causal=False,
-        retain=lambda *objects: None,
-    )
-    assert isinstance(read, DenseDraftRead)
-    full = source[0]
-    slots, positions = object(), object()
-    original_exact = torch.tensor([129, 0], dtype=torch.int32)
-    common = SimpleNamespace(
-        num_reqs=2, block_table_tensor=full, slot_mapping=slots, positions=positions, seq_lens=original_exact
-    )
-    read.apply(common)
-    assert common.block_table_tensor is full and common.slot_mapping is slots and common.positions is positions
-    assert common.seq_lens is original_exact
-    assert common.seq_lens_cpu.tolist() == [129, 0]
-    assert common.seq_lens_cpu_upper_bound is common._seq_lens_cpu is common.seq_lens_cpu
-    assert common.max_seq_len == 129
-
-
 @pytest.mark.parametrize("end,upper", [(129, 129), (0, 1), (-1, 1), (127, 126), (1, 0)])
 def test_allocation_upper_cannot_authorize_uninitialized_columns(end, upper):
     source = (torch.tensor([[1]], dtype=torch.int32)[list((0,))], (1,), 128)
@@ -175,7 +142,7 @@ def test_allocation_upper_cannot_authorize_uninitialized_columns(end, upper):
         )
 
 
-def test_cpu_capacity_fields_ignore_default_tensor_device():
+def test_completed_visible_lengths_ignore_default_tensor_device():
     source = (torch.tensor([[2, 1]], dtype=torch.int32)[list((0,))], (2,), 128)
     exact, upper = torch.tensor([129]), torch.tensor([130])
     with torch.device("meta"):
@@ -191,10 +158,8 @@ def test_cpu_capacity_fields_ignore_default_tensor_device():
             retain=lambda *objects: None,
         )
         assert isinstance(read, DenseDraftRead)
-        common = SimpleNamespace(num_reqs=1)
-        read.apply(common)
-        assert common.seq_lens_cpu_upper_bound.device.type == "cpu"
-        assert common.seq_lens_cpu_upper_bound.device.type == "cpu"
+        assert read.seq_lens.device.type == "cpu"
+        assert read.seq_lens.tolist() == [129]
 
 
 def test_short_context_large_window_does_not_gather_window_sized_padding():

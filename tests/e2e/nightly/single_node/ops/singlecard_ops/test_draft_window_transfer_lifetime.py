@@ -2,8 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Quarantine actual private copies that return before a Host exception."""
 
-from types import SimpleNamespace
-
 import pytest
 import torch
 
@@ -12,7 +10,7 @@ torch_npu = pytest.importorskip("torch_npu")
 from tests.e2e.nightly.single_node.ops.singlecard_ops import (  # noqa: E402
     test_draft_window_completion_boundary as runtime_tests,
 )
-from vllm_ascend.worker.v2.spec_decode.draft_window_dense import DenseDraftRead, prepare_dense_draft_read  # noqa: E402
+from vllm_ascend.worker.v2.spec_decode.draft_window_dense import prepare_dense_draft_read  # noqa: E402
 
 prepared = runtime_tests.prepared
 
@@ -76,44 +74,3 @@ def test_real_private_copy_failure_retains_its_actual_operands(monkeypatch, stag
         for event in events:
             event.synchronize()
     torch.testing.assert_close(table, before, atol=0, rtol=0)
-
-
-def test_cpu_metadata_fill_failure_keeps_device_operands_quarantined(monkeypatch, prepared):
-    runtime, batch, _ = prepared
-    read = DenseDraftRead(
-        torch.zeros(2, 4, dtype=torch.int64, device="npu"),
-        torch.tensor([3, 4], dtype=torch.int32, device="cpu"),
-        torch.zeros(2, 1, 1, 4, dtype=torch.bool, device="npu"),
-        4,
-        1,
-        lambda *items: owner.extend(items),
-    )
-    original = torch.Tensor.__setitem__
-    events, submitted = [], []
-
-    def filled(destination, index, values):
-        result = original(destination, index, values)
-        if values is read.seq_lens:
-            event = torch.npu.Event()
-            event.record(torch.npu.current_stream())
-            events.append(event)
-            submitted.append(destination)
-            assert any(item is destination for item in owner), "metadata destination is not owned"
-            raise RuntimeError("deliberate Host failure after real metadata fill")
-        return result
-
-    monkeypatch.setattr(torch.Tensor, "__setitem__", filled)
-    try:
-        with pytest.raises(RuntimeError, match="after real metadata fill"), runtime.proposal_context(batch):
-            owner = runtime._owner
-            assert owner is not None
-            owner.append(read)
-            read.apply(SimpleNamespace(num_reqs=3))
-        assert len(submitted) == 1
-        assert runtime._poisoned
-        assert any(item is submitted[0] for item in owner)
-        with pytest.raises(RuntimeError, match="quarantined"), runtime.proposal_context(batch):
-            pytest.fail("uncertain submission must not be reused")
-    finally:
-        for event in events:
-            event.synchronize()

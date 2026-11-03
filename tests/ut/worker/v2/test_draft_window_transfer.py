@@ -6,13 +6,11 @@ CPU dispatch substitutes expose the ownership boundary only. Actual NPU
 enqueue, completion and mixed engine regression need separate device tests.
 """
 
-from types import SimpleNamespace
-
 import pytest
 import torch
 
 from tests.ut.worker.v2 import test_draft_window_runtime as runtime_tests
-from vllm_ascend.worker.v2.spec_decode.draft_window_dense import DenseDraftRead, prepare_dense_draft_read
+from vllm_ascend.worker.v2.spec_decode.draft_window_dense import prepare_dense_draft_read
 
 setup = runtime_tests.setup
 
@@ -95,35 +93,3 @@ def test_planning_copy_failure_keeps_prepared_input_owned(monkeypatch, setup):
             retain=lambda *items: owner.extend(items),
         )
     assert runtime._poisoned and any(item is exact for item in owner)
-
-
-def test_metadata_length_copy_is_owned_before_partial_fill(monkeypatch, setup):
-    runtime, _, _, _ = setup
-    original = torch.Tensor.__setitem__
-    read = DenseDraftRead(
-        torch.zeros(2, 4, dtype=torch.int64),
-        torch.tensor([3, 4], dtype=torch.int32),
-        torch.zeros(2, 1, 1, 4, dtype=torch.bool),
-        4,
-        1,
-        lambda *items: owner.extend(items),
-    )
-    submitted = []
-
-    def filled(destination, index, values):
-        result = original(destination, index, values)
-        if values is read.seq_lens:
-            submitted.append(destination)
-            assert any(item is destination for item in owner), "metadata copy destination is not owned"
-            raise RuntimeError("deliberate error after metadata fill")
-        return result
-
-    monkeypatch.setattr(torch.Tensor, "__setitem__", filled)
-    with pytest.raises(RuntimeError, match="after metadata fill"), runtime.proposal_context(runtime_tests.batch()):
-        owner = runtime._owner
-        assert owner is not None
-        owner.append(read)
-        read.apply(SimpleNamespace(num_reqs=3))
-    assert len(submitted) == 1
-    assert runtime._poisoned
-    assert any(item is submitted[0] for item in owner)

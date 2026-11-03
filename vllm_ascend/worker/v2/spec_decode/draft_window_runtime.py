@@ -382,7 +382,7 @@ class DraftWindowRuntime:
                     widths = boundaries.diff()
                     query_width = int(widths.max())
                     ragged = not bool((widths == query_width).all())
-                    view = prepare_dense_draft_read(
+                    common._draft_window_device_read = prepare_dense_draft_read(
                         table,
                         columns,
                         block_span,
@@ -399,7 +399,6 @@ class DraftWindowRuntime:
                         query_start_loc_device=common.query_start_loc[: num_reqs + 1] if ragged else None,
                         retain=retain,
                     )
-                    view.apply(common)
                     return
                 materialize_draft_read(
                     common,
