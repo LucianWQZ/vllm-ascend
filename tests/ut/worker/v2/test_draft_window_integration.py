@@ -74,6 +74,7 @@ def contract(request, monkeypatch):
     if request.param != "autoregressive":
         obj.num_query_per_req = 3
     obj.max_num_tokens, obj.max_num_reqs = 3, 1
+    obj.num_speculative_steps = 2
     obj.attn_architecture, obj.use_dcp, obj.replicated_pcp = "GQA", False, False
     obj.enable_adaptive_verification = False
     obj.vllm_config = SimpleNamespace(parallel_config=object(), attention_config=AttentionConfig())

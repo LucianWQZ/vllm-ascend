@@ -157,11 +157,10 @@ def test_native_source_keeps_actual_mask_and_exact_boundary(module, owner):
 
 
 def test_graph_factory_qualifies_the_real_dflash2_owner(monkeypatch, owner):
-    from vllm_ascend.worker.v2.spec_decode import draft_window, draft_window_graph_runtime
+    from vllm_ascend.worker.v2.spec_decode import draft_window
     from vllm_ascend.worker.v2.spec_decode.draft_window_policy import resolve_draft_window_policy
 
     actual_route = route()
-    monkeypatch.setattr(draft_window_graph_runtime, "validate_graph_context", lambda *_: None)
     monkeypatch.setattr(draft_window, "inventory_draft_window_groups", lambda _: (actual_route,))
     owner._draft_window_policy = resolve_draft_window_policy(
         requested_window_size=1024, method="dflash", is_dflash2=True
