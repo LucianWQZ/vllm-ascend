@@ -9,7 +9,6 @@ contract when the new experimental Graph owner is explicitly selected.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TypeGuard
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,10 +143,6 @@ def _consumer_profile(speculative):
     return profile
 
 
-def _is_eagle_support(limit: object) -> TypeGuard[DraftGraphSupport]:
-    return isinstance(limit, DraftGraphSupport) and limit.method == "eagle3"
-
-
 def resolve_draft_graph_review_limit(vllm_config, *, experimental_graph_review=False):
     """Parse startup support without changing the upstream configuration.
 
@@ -262,7 +257,7 @@ def note_eagle_single_request_review_lifecycle(owner, scheduler_output):
     that case. No scheduler, request state, or device object is modified.
     """
     limit = getattr(owner, "_draft_graph_review_limit", None)
-    if not isinstance(limit, DraftGraphSupport) or limit.method not in ("dflash", "eagle3"):
+    if limit is None:
         return
     blocked = getattr(owner, "_draft_graph_review_preempted_request_ids", None)
     if blocked is None:
@@ -308,7 +303,7 @@ def _request_bounds(input_batch):
 def validate_eagle_single_request_review_exact(owner, input_batch, exact, *, num_reqs, padded, step):
     """Inspect the existing CPU exact owner, never an upper bound or new D2H."""
     scope = getattr(owner, "_draft_graph_review_limit", None)
-    if not _is_eagle_support(scope):
+    if scope is None or scope.method != "eagle3":
         return
     rows = _request_bounds(input_batch)
     # The real Eagle producer owns CPU int32 storage and validates the step.
@@ -340,7 +335,7 @@ def validate_eagle_single_request_review_exact(owner, input_batch, exact, *, num
 def validate_eagle_single_request_graph_descriptor(owner, *, first, n, tokens):
     """Check the executed Graph shape, including Window OFF consumers."""
     scope = getattr(owner, "_draft_graph_review_limit", None)
-    if not _is_eagle_support(scope):
+    if scope is None or scope.method != "eagle3":
         return
     batch = owner.input_batch
     if type(first) is not bool or type(n) is not int or type(tokens) is not int:

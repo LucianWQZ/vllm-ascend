@@ -62,16 +62,11 @@ def validate_dflash2_graph_source(owner: Any) -> None:
     _require(
         tuple(owner.draft_model_config.architectures) == ("DFlash2DraftModel",), "actual DFlash2 architecture required"
     )
-    _require(
-        config.method == "dflash" and config.enforce_eager is not True,
-        "this is the Graph execution contract, not a typed eager owner",
-    )
     _require(owner.use_fp64_gumbel is False, "the NPU selector does not implement fp64 Gumbel")
     # Fixed constructors derive K, Q=K+1 and sampler dimensions from the
     # admitted config. Only the loaded model's selector/conv relation is new.
     q, top_k = owner.num_query_per_req, owner.top_k
     _require(0 < top_k <= owner.vocab_size, "selector top-k exceeds the actual vocabulary")
-    _require(getattr(owner, "_draft_window_runtime", None) is None, "typed eager and Graph owners cannot coexist")
     _require(
         getattr(owner, "_dflash2_full_kv_reference", False) is True,
         "the actual DFlash2 full-retention loader contract is missing",

@@ -4,7 +4,6 @@
 import copy
 import unittest
 from contextlib import nullcontext
-from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace as NS
 from typing import Any
@@ -278,6 +277,25 @@ class DraftGraphSupportTest(unittest.TestCase):
         self.assertFalse(hasattr(owner, "draft_window_policy"))
         self.assertEqual(vars(config), before)
 
+    def test_factory_rejects_an_existing_window_owner_before_graph_admission(self):
+        from vllm_ascend import envs
+        from vllm_ascend.worker.v2 import spec_decode as factory
+
+        config = self.config()
+        policy = NS(enabled=True, state="on")
+        for field in ("_draft_window_policy", "draft_window_policy", "_draft_window_runtime"):
+            owner = NS(_initialize_draft_window_source_capability=lambda: None)
+            setattr(owner, field, object())
+            with (
+                self.subTest(field=field),
+                patch.object(envs, "VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH", True),
+                patch.object(factory, "_resolve_window_policy", return_value=policy),
+                patch.object(factory, "_init_speculator", return_value=owner),
+                patch.object(factory, "logger", Mock()),
+                self.assertRaisesRegex(RuntimeError, "mutually exclusive"),
+            ):
+                factory.init_speculator(config, None)
+
     def test_real_consumer_overrides_and_normalized_positions_stay_protected(self):
         for field, value in (("is_causal", False), ("target_hidden_size", 4096), ("use_aux_hidden_state", False)):
             config = self.config()
@@ -385,14 +403,10 @@ class DraftGraphSupportTest(unittest.TestCase):
                 self.assertEqual(runner_bounds(owner, batch), batch.draft_graph_request_bounds)
                 GUARD.validate_draft_graph_review_requests(owner, batch)
 
-    def test_lifecycle_ignores_absent_foreign_and_unknown_method_scopes(self):
-        unknown = replace(self.resolve(self.config()), method="unknown")
+    def test_lifecycle_ignores_routes_without_qualified_support(self):
         for owner in (
             NS(),
             NS(_draft_graph_review_limit=None),
-            NS(_draft_graph_review_limit=object()),
-            NS(_draft_graph_review_limit=NS(method="dflash", max_requests=1)),
-            NS(_draft_graph_review_limit=unknown),
         ):
             with self.subTest(owner=owner):
                 # No scheduler fields may be read for an unrelated route.

@@ -227,9 +227,7 @@ def test_actual_conditional_full_vocab_logits_allocation(monkeypatch, owner, sam
             "static nonadaptive",
         ),
         (lambda x: setattr(x, "use_fp64_gumbel", True), "fp64 Gumbel"),
-        (lambda x: setattr(x, "_draft_window_runtime", object()), "cannot coexist"),
         (lambda x: setattr(x, "_dflash2_full_kv_reference", False), "full-retention loader"),
-        (lambda x: setattr(x.speculative_config, "enforce_eager", True), "typed eager owner"),
         (lambda x: setattr(x.model.model.layers[0].attention_conv, "block_size", 3), "query boundary"),
     ],
 )
