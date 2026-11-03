@@ -10,6 +10,8 @@ This inventory neither creates a Window owner nor enables a read provider.
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from vllm.logger import logger
+
 _MISSING = object()
 _DRAFT_ARCHITECTURES = frozenset(
     {
@@ -83,7 +85,7 @@ def inspect_draft_native_attention(speculator: Any) -> tuple[str, tuple[int, ...
     return kind, windows, tuple(dict.fromkeys(issues))
 
 
-def report_owner_draft_native_attention(owner: Any, logger: Any) -> None:
+def report_owner_draft_native_attention(owner: Any) -> None:
     """Startup-only summary of the actual speculator's loaded attention.
 
     The fixed loader owns original/normalized configuration. No config file,

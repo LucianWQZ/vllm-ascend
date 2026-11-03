@@ -42,6 +42,11 @@ def loaded(configuration, windows, *, causal=False, mask=True, order=None):
     )
 
 
+def report(owner, logger):
+    with patch.object(native, "logger", logger):
+        native.report_owner_draft_native_attention(owner)
+
+
 class Log:
     def __init__(self):
         self.info = []
@@ -68,7 +73,7 @@ class NativeAttentionTests(unittest.TestCase):
         log = Log()
         with patch.object(Path, "read_text", side_effect=AssertionError("startup must not reload config")):
             for _ in range(2):
-                native.report_owner_draft_native_attention(owner, log)
+                report(owner, log)
                 self.assertEqual(log.info[0][0][1], "SWA")
         self.assertEqual(len(log.info), 1)
         self.assertEqual(len(log.warnings), 1)
@@ -81,7 +86,7 @@ class NativeAttentionTests(unittest.TestCase):
             owner.draft_window_policy = SimpleNamespace(effective_window_size=1024)
             self.assertEqual(native.inspect_draft_native_attention(owner)[0], "UNKNOWN")
             with self.assertRaises(NotImplementedError, msg=str(cfg)):
-                native.report_owner_draft_native_attention(owner, Log())
+                report(owner, Log())
 
     def test_actual_window_and_complete_layer_registration_are_required(self):
         for windows in ([0, 2048], [True, 2048], [2048], [None, None, None]):
@@ -109,10 +114,10 @@ class NativeAttentionTests(unittest.TestCase):
         owner.speculative_config = SimpleNamespace(enforce_eager=True)
         owner.attn_vllm_config.compilation_config.cudagraph_mode = SimpleNamespace(name="FULL")
         log = Log()
-        native.report_owner_draft_native_attention(owner, log)
+        report(owner, log)
         self.assertEqual(log.info[0][0][4], False)
         owner.speculative_config.enforce_eager = False
-        native.report_owner_draft_native_attention(owner, log)
+        report(owner, log)
         self.assertEqual(log.info[-1][0][4], True)
 
     def test_startup_inventory_preserves_baseline_off_unknown_graph(self):
@@ -120,12 +125,12 @@ class NativeAttentionTests(unittest.TestCase):
         owner.speculative_config = SimpleNamespace(method="mtp", enforce_eager=False)
         owner.query_cudagraph_manager = SimpleNamespace(cudagraph_mode=SimpleNamespace(name="FULL"))
         log = Log()
-        native.report_owner_draft_native_attention(owner, log)
+        report(owner, log)
         self.assertEqual(log.info[0][0][1], "UNKNOWN")
         self.assertEqual(log.info[0][0][4], True)
         owner.draft_window_policy = SimpleNamespace(effective_window_size=1024)
         with self.assertRaises(NotImplementedError):
-            native.report_owner_draft_native_attention(owner, log)
+            report(owner, log)
 
     def test_full_swa_mixed_and_full_backing_not_attention(self):
         for kinds, windows, expected in (
@@ -166,13 +171,13 @@ class NativeAttentionTests(unittest.TestCase):
         owner = loaded(config(), [2048, 2048], mask=False)
         owner.speculative_config = SimpleNamespace(enforce_eager=True)
         log = Log()
-        native.report_owner_draft_native_attention(owner, log)
+        report(owner, log)
         self.assertEqual(log.info[0][0][1], "UNKNOWN")
         for window, eager in ((1024, True), (None, False)):
             owner.draft_window_policy = SimpleNamespace(effective_window_size=window)
             owner.speculative_config.enforce_eager = eager
             with self.assertRaises(NotImplementedError):
-                native.report_owner_draft_native_attention(owner, log)
+                report(owner, log)
         self.assertFalse(log.warnings)  # Partial native windows cannot certify narrowing.
         self.assertFalse(hasattr(owner, "_draft_window_runtime"))
         self.assertFalse(hasattr(owner, "_draft_window_runtime_state"))
@@ -191,7 +196,7 @@ class NativeAttentionTests(unittest.TestCase):
             owner.draft_window_policy = SimpleNamespace(effective_window_size=window)
             log = Log()
             for _ in range(2):
-                native.report_owner_draft_native_attention(owner, log)
+                report(owner, log)
             self.assertEqual(log.info[0][0][1], "SWA")
             self.assertEqual(len(log.info), 1)
             self.assertEqual(len(log.warnings), bool(expected))
