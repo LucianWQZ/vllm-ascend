@@ -42,7 +42,7 @@ def inspect_draft_native_attention(speculator: Any) -> tuple[str, tuple[int, ...
     known = len(architectures) == 1 and architectures[0] in _DRAFT_ARCHITECTURES
     if not known or type(count) is not int or count <= 0:
         issues.append("normalized Draft architecture or layer count has no supported implementation contract")
-    context = speculator.attn_vllm_config.compilation_config.static_forward_context
+    context = speculator.vllm_config.compilation_config.static_forward_context
     declared_causal = getattr(speculator, "_group_causal", _MISSING)
     layers: dict[str, int | None] = {}
     for gid, group_set in enumerate(speculator.attn_groups):

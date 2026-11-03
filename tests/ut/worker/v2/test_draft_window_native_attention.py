@@ -33,13 +33,15 @@ def loaded(configuration, windows, *, causal=False, mask=True, order=None):
         context[name] = SimpleNamespace(impl=impl)
         names.append(name)
     groups = [SimpleNamespace(layer_names=[names[index]]) for index in (order or range(len(names)))]
-    return SimpleNamespace(
+    owner = SimpleNamespace(
         draft_model_config=SimpleNamespace(hf_config=SimpleNamespace(**configuration)),
         attn_vllm_config=SimpleNamespace(compilation_config=SimpleNamespace(static_forward_context=context)),
         attn_groups=[groups],
         draft_attn_layer_names=set(names),
         _group_causal=causal,
     )
+    owner.vllm_config = owner.attn_vllm_config
+    return owner
 
 
 def report(owner, logger):

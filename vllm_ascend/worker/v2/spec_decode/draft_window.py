@@ -43,9 +43,9 @@ def create_draft_window_graph_provider(owner: Any) -> "DraftWindowGraphBindingPr
     if not dflash2 and (group.status is not DraftWindowProviderStatus.DIRECT_DENSE or group.native_window is not None):
         raise NotImplementedError("Draft Graph requires its supported dense or DFlash2 native reader")
     if dflash2:
-        from vllm_ascend.worker.v2.spec_decode.draft_window_dflash2_graph import validate_dflash2_graph_read_source
+        from vllm_ascend.worker.v2.spec_decode.draft_window_dflash2_graph import validate_dflash2_graph_source
 
-        validate_dflash2_graph_read_source(owner, group, window_size=policy.effective_window_size)
+        validate_dflash2_graph_source(owner, group)
     if vllm_config.speculative_config.uses_dynamic_speculative_decoding():
         raise NotImplementedError("Draft Window Graph source requires static speculative decoding")
     from vllm_ascend.worker.v2.spec_decode.draft_window_graph import DraftWindowGraphBindingProvider

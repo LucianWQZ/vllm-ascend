@@ -18,7 +18,7 @@ def _require(condition: bool, message: str) -> None:
         raise ValueError("DFlash2 Graph: " + message)
 
 
-def validate_dflash2_graph_source(owner: Any) -> None:
+def validate_dflash2_graph_source(owner: Any, group: Any = None) -> None:
     """Qualify actual TP2/K7 Graph inputs after loading, before capture.
 
     Window ON calls this from its read-source admission; OFF calls it from
@@ -80,6 +80,8 @@ def validate_dflash2_graph_source(owner: Any) -> None:
         )
         native = impl.sliding_window
         _require(native is None or type(native) is int and native > 0, "invalid model native window")
+        if group is not None:
+            _require(native == group.native_window, "inventory native band differs from the actual Draft consumer")
         mask = getattr(impl, "_dflash2_native_swa_mask", None)
         _require(
             impl.sinks is None and impl.use_bnsd_kv_cache is False,
@@ -90,27 +92,17 @@ def validate_dflash2_graph_source(owner: Any) -> None:
             "noncausal native mask was not created by the DFlash2 loader",
         )
 
-
-def validate_dflash2_graph_read_source(owner: Any, group: Any, *, window_size: int) -> None:
-    """Qualify the real owner and its inventory without a second buffer owner."""
-    validate_dflash2_graph_source(owner)
-    gid, kernel, native = group.gid, group.table_column_span, group.native_window
-    causal = owner._group_causal
-    context = owner.vllm_config.compilation_config.static_forward_context
-    _require(
-        len(group.layers) == len(owner.draft_attn_layer_names)
-        and set(group.layers) == owner.draft_attn_layer_names
-        and all(context[name].impl.sliding_window == native for name in group.layers),
-        "incomplete actual Draft layer inventory",
-    )
-    _require(
-        (causal if type(causal) is bool else causal.get(gid)) is False,
-        "DFlash2 Graph source requires actual noncausal attention",
-    )
-    # Policy validates W; inventory validates scheduler/kernel spans. The
-    # original BlockTables constructor owns the expanded int32 row layout.
-    if native is not None:
+    if group is not None:
+        causal = owner._group_causal
         _require(
-            window_size + kernel - 1 + owner.num_query_per_req <= native,
-            "Window + block - 1 + query width exceeds the original noncausal native band",
+            (causal if type(causal) is bool else causal.get(group.gid)) is False,
+            "DFlash2 Graph source requires actual noncausal attention",
         )
+        # Inventory owns layer coverage and column geometry. Actual native P
+        # above remains an attention fact, separate from Full KV retention.
+        if group.native_window is not None:
+            window = owner._draft_window_policy.effective_window_size
+            _require(
+                window + group.table_column_span - 1 + owner.num_query_per_req <= group.native_window,
+                "Window + block - 1 + query width exceeds the original noncausal native band",
+            )

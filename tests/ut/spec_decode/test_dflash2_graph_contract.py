@@ -142,11 +142,8 @@ def route(native=2048):
 
 
 def validate_source(module, owner, actual_route=None, *, window_size=1024):
-    return module.validate_dflash2_graph_read_source(
-        owner,
-        actual_route or route(),
-        window_size=window_size,
-    )
+    owner._draft_window_policy = SimpleNamespace(effective_window_size=window_size)
+    return module.validate_dflash2_graph_source(owner, actual_route or route())
 
 
 def test_native_source_keeps_actual_mask_and_exact_boundary(module, owner):
@@ -265,12 +262,8 @@ def test_unsupported_loaded_attention_fails_before_capture(module, owner, field,
 
 def test_shared_inventory_native_band_and_actual_layers_are_checked(module, owner):
     module.validate_dflash2_graph_source(owner)
-    with pytest.raises(ValueError, match="layer inventory"):
+    with pytest.raises(ValueError, match="inventory native band"):
         validate_source(module, owner, route(1024))
-    wrong = route()
-    wrong.layers = ("draft.0", "draft.0")
-    with pytest.raises(ValueError, match="layer inventory"):
-        validate_source(module, owner, wrong)
     for declaration in (True, {0: True}, {1: False}):
         owner._group_causal = declaration
         with pytest.raises(ValueError, match="noncausal"):

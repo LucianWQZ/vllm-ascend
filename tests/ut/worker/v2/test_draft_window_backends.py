@@ -82,6 +82,7 @@ def inventory(
     group_ids=None,
     full_retention_dflash2=False,
     impl_changes=None,
+    draft_layer_names=None,
 ):
     specs = [full_spec()] if specs is None else specs
     builders = [dense_builder() for _ in specs] if builders is None else builders
@@ -116,6 +117,7 @@ def inventory(
                 context[name] = SimpleNamespace(impl=impl)
     owner = SimpleNamespace(
         attn_groups=groups,
+        draft_attn_layer_names=set(context) if draft_layer_names is None else draft_layer_names,
         kv_cache_config=SimpleNamespace(kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec) for spec in specs]),
         block_tables=SimpleNamespace(
             block_sizes=table_spans
@@ -134,6 +136,7 @@ def inventory(
         ),
         _dflash2_full_kv_reference=full_retention_dflash2,
     )
+    owner.vllm_config = owner.attn_vllm_config
     return inventory_draft_window_groups(owner)
 
 
@@ -154,7 +157,7 @@ def require_routes(
         compilation_config=SimpleNamespace(static_forward_context=context or {}),
     )
     owner = SimpleNamespace(
-        attn_vllm_config=config,
+        vllm_config=config,
         attn_groups=(),
         kv_cache_config=None,
         block_tables=None,
@@ -223,6 +226,11 @@ def test_dflash2_reference_cannot_admit_recycling_or_chunked_storage(parallel_co
 def test_dense_read_uses_the_actual_consumer_and_spec_once(parallel_config, dtype, changes, expected):
     (route,) = inventory(parallel_config, specs=[replace(full_spec(), dtype=dtype)], impl_changes=changes)
     assert route.dense_read is expected
+
+
+def test_inventory_is_the_single_actual_layer_coverage_boundary(parallel_config):
+    with pytest.raises(ValueError, match="do not cover the actual draft"):
+        inventory(parallel_config, draft_layer_names={"unknown.draft.reader"})
 
 
 def test_consumer_gid_must_match_its_canonical_source(parallel_config):
@@ -579,7 +587,7 @@ def test_unqualified_draft_consumers_fail_before_proposal_work(parallel_config, 
                 attn_groups=[[group]],
                 kv_cache_config=SimpleNamespace(kv_cache_groups=[SimpleNamespace(kv_cache_spec=full_spec())]),
                 block_tables=SimpleNamespace(block_sizes=[256], kernel_block_sizes=[128]),
-                attn_vllm_config=SimpleNamespace(
+                vllm_config=SimpleNamespace(
                     parallel_config=parallel_config,
                     compilation_config=SimpleNamespace(static_forward_context={}),
                 ),

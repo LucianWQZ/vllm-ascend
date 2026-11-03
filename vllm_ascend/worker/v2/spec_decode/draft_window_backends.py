@@ -101,7 +101,7 @@ def inventory_draft_window_groups(speculator: Any) -> tuple[DraftWindowGroupRout
 
     attn_groups, block_tables = speculator.attn_groups, speculator.block_tables
     kv_cache_config = speculator.kv_cache_config
-    config = speculator.attn_vllm_config
+    config = speculator.vllm_config
     parallel_config = config.parallel_config
     context = config.compilation_config.static_forward_context
     full_retention_dflash2 = getattr(speculator, "_dflash2_full_kv_reference", False)
@@ -188,6 +188,8 @@ def inventory_draft_window_groups(speculator: Any) -> tuple[DraftWindowGroupRout
             )
     if not routes:
         raise ValueError("Draft Window requires at least one attention consumer")
+    if {name for route in routes for name in route.layers} != set(speculator.draft_attn_layer_names):
+        raise ValueError("Draft Window providers do not cover the actual draft attention layers")
     return tuple(routes)
 
 
@@ -200,10 +202,8 @@ def require_direct_prefix_routes(
     keep their original band and require the method's real causal/residency
     contract here. Each admitted route is the original inventory object.
     """
-    config = speculator.attn_vllm_config
+    config = speculator.vllm_config
     routes = inventory_draft_window_groups(speculator)
-    if {name for route in routes for name in route.layers} != set(speculator.draft_attn_layer_names):
-        raise ValueError("Draft Window providers do not cover the actual draft attention layers")
     native = tuple(route for route in routes if route.status is DraftWindowProviderStatus.NATIVE_SWA)
     if native:
         if window_size is None or speculator.speculative_config.method != "dflash":
