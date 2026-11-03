@@ -4,6 +4,7 @@
 import pytest
 import torch
 
+from vllm_ascend.worker.v2.spec_decode import draft_window_dense
 from vllm_ascend.worker.v2.spec_decode.draft_window_dense import (
     DenseDraftReadBatch,
     prepare_dense_draft_read,
@@ -107,7 +108,16 @@ def test_uniform_full_read_rows_keep_original_query_layout():
 
 
 @pytest.mark.parametrize("causal", [False, True])
-def test_decode_ragged_widths_use_same_partition_without_query_padding(causal):
+def test_decode_ragged_widths_use_same_partition_without_query_padding(causal, monkeypatch):
+    row_copies = []
+    copy = draft_window_dense._copy_owned_read_tensor
+
+    def track_row_copy(source, retain, *, device=None):
+        if source.ndim == 1 and source.dtype == torch.int64:
+            row_copies.append(source.tolist())
+        return copy(source, retain, device=device)
+
+    monkeypatch.setattr(draft_window_dense, "_copy_owned_read_tensor", track_row_copy)
     table = torch.arange(48, dtype=torch.int32).reshape(3, 16)
     source = (table[list((2, 0, 1))], (16, 16, 16), 128)
     offsets = torch.tensor([0, 1, 4, 5], dtype=torch.int32)
@@ -130,6 +140,8 @@ def test_decode_ragged_widths_use_same_partition_without_query_padding(causal):
     assert [indices.tolist() for indices, _ in read.parts] == [[0, 4], [1, 2, 3]]
     assert [part.query_width for _, part in read.parts] == [1, 3]
     assert read.seq_lens.tolist() == [1151, 1035, 1024]
+    # Query placement and KV table selection share each group's one row copy.
+    assert row_copies == [[0, 2], [1]]
     for indices, part in read.parts:
         assert indices.numel() == part.num_query_tokens
         for row in range(part.num_reqs):

@@ -168,7 +168,9 @@ def prepare_dense_draft_read(
         if int(query_start_loc_cpu[0]) != 0 or bool(((widths <= 0) | (widths > query_width)).any()):
             raise ValueError("Packed query widths exceed their current allocation bound")
 
-    def materialize(host_rows: torch.Tensor, width: int, full: bool) -> DenseDraftRead:
+    def materialize(
+        host_rows: torch.Tensor, width: int, full: bool, device_rows: torch.Tensor | None
+    ) -> DenseDraftRead:
         ends = exact_cpu.index_select(0, host_rows)
         origins = starts.index_select(0, host_rows)
         if full:
@@ -183,12 +185,12 @@ def prepare_dense_draft_read(
         if host_rows.numel() == n:
             blocks = block_table[:n].gather(1, logical_columns)
         else:
-            physical_rows = _copy_owned_read_tensor(host_rows, retain, device=block_table.device)
+            assert device_rows is not None
             if block_table.is_contiguous():
-                indices = physical_rows[:, None] * block_table.shape[1] + logical_columns
+                indices = device_rows[:, None] * block_table.shape[1] + logical_columns
                 blocks = block_table.view(-1).index_select(0, indices.flatten()).reshape_as(address)
             else:
-                blocks = block_table[physical_rows[:, None], logical_columns]
+                blocks = block_table[device_rows[:, None], logical_columns]
         slots = blocks.to(torch.int64) * block_span + address % block_span
         excluded = (columns[None, None, :] >= visible[:, None, None]).expand(-1, width, -1)
         may_have_empty_rows = False
@@ -204,7 +206,7 @@ def prepare_dense_draft_read(
         return read
 
     if widths is None and not bool(full_rows_cpu.any()):
-        return materialize(torch.arange(n, device="cpu"), query_width, False)
+        return materialize(torch.arange(n, device="cpu"), query_width, False, None)
     groups: dict[tuple[bool, int, int], list[int]] = {}
     for row in range(n):
         full = bool(full_rows_cpu[row])
@@ -213,7 +215,7 @@ def prepare_dense_draft_read(
         groups.setdefault(key, []).append(row)
     if len(groups) == 1:
         full, width, _ = next(iter(groups))
-        return materialize(torch.arange(n, device="cpu"), width, full)
+        return materialize(torch.arange(n, device="cpu"), width, full, None)
     visible = torch.empty(n, dtype=exact_cpu.dtype, device=block_table.device)
     retain(visible)
     parts = []
@@ -227,7 +229,7 @@ def prepare_dense_draft_read(
         )
         queries = (bounds[:, None] + torch.arange(width, device=selected.device)[None, :]).flatten()
         retain(bounds, queries)
-        read = materialize(host_rows, width, full)
+        read = materialize(host_rows, width, full, selected)
         visible.index_copy_(0, selected, read.seq_lens)
         parts.append((queries, read))
     result = DenseDraftReadBatch(
