@@ -56,9 +56,9 @@ def materialize_draft_read(
     retain(block_table, exact_device, table)
     for row, (start, count) in enumerate(zip(start_columns.tolist(), counts.tolist())):
         if count:
-            destination, source = table[row, :count], block_table[row, start : start + count]
-            retain(source, destination)
-            destination.copy_(source, non_blocking=True)
+            # Both complete storages are already owned; row views add no
+            # independent lifetime to this current-stream copy.
+            table[row, :count].copy_(block_table[row, start : start + count], non_blocking=True)
     lengths_cpu = torch.zeros(
         padded_rows, dtype=exact_cpu.dtype, device="cpu", pin_memory=block_table.device.type == "npu"
     )

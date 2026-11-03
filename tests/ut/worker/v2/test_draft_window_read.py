@@ -78,15 +78,20 @@ class TestCanonicalRead(unittest.TestCase):
         )
         self.assertEqual(self.table.tolist(), torch.arange(24).reshape(3, 8).tolist())
 
-    def test_projection_copies_retain_actual_source_and_destination(self):
+    def test_projection_copies_retain_both_underlying_storages(self):
         retained: list[torch.Tensor] = []
         copied: list[tuple[torch.Tensor, torch.Tensor]] = []
         original_copy = torch.Tensor.copy_
 
         def copy(destination, source, *args, **kwargs):
             if kwargs.get("non_blocking"):
-                self.assertTrue(any(value is source for value in retained))
-                self.assertTrue(any(value is destination for value in retained))
+                for operand in (source, destination):
+                    self.assertTrue(
+                        any(
+                            value.untyped_storage().data_ptr() == operand.untyped_storage().data_ptr()
+                            for value in retained
+                        )
+                    )
                 copied.append((source, destination))
             return original_copy(destination, source, *args, **kwargs)
 
@@ -107,12 +112,38 @@ class TestCanonicalRead(unittest.TestCase):
         self.assertTrue(any(value is common.block_table_tensor for value in retained))
         self.assertTrue(any(value is common.seq_lens for value in retained))
 
+    def test_partial_row_copy_keeps_source_and_destination_storages(self):
+        retained = []
+        copied = []
+        original_copy = torch.Tensor.copy_
+        exact = torch.tensor([21, 11], dtype=torch.int32)
+        source = self.table[self.mapping.tolist()]
+        before = source.clone()
+
+        def fail_after_copy(destination, operand, *args, **kwargs):
+            original_copy(destination, operand, *args, **kwargs)
+            copied.extend((operand.untyped_storage(), destination.untyped_storage()))
+            raise RuntimeError("partial row copy")
+
+        with patch.object(torch.Tensor, "copy_", fail_after_copy), self.assertRaisesRegex(RuntimeError, "partial row"):
+            materialize_draft_read(
+                self.common(source, exact, exact + 3),
+                (8, 8),
+                4,
+                exact_cpu=exact,
+                starts_cpu=torch.tensor([12, 4]),
+                retain=lambda *values: retained.extend(values),
+            )
+        for storage in copied:
+            self.assertTrue(any(value.untyped_storage().data_ptr() == storage.data_ptr() for value in retained))
+        torch.testing.assert_close(source, before, rtol=0, atol=0)
+
     def test_retention_failure_prevents_first_table_copy(self):
         calls = []
 
         def retain(*values):
             calls.append(values)
-            if len(calls) == 2:
+            if len(calls) == 1:
                 raise RuntimeError("retain destination failed")
 
         exact = torch.tensor([21, 11], dtype=torch.int32)
