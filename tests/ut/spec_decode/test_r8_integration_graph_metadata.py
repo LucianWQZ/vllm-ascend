@@ -55,28 +55,14 @@ def graph_source_initialization(request, monkeypatch):
 def test_graph_owner_installs_only_its_admitted_source(graph_source_initialization):
     c = graph_source_initialization
     c.initialize(c.owner)
-    expected = dict(
-        policy=c.owner._draft_window_policy,
-        runtime_route=c.owner.method,
-        attn_groups=c.owner.attn_groups,
-        block_tables=c.owner.block_tables,
-        kv_cache_config=c.owner.kv_cache_config,
-        vllm_config=c.owner.vllm_config,
-    )
-    if c.owner.method != "eagle3":
-        expected["dflash2_graph_owner"] = c.owner if c.owner.method == "dflash2" else None
-    c.create_provider.assert_called_once_with(**expected)
+    # The actual owner is the single source of policy, consumer and input facts.
+    c.create_provider.assert_called_once_with(c.owner)
     assert c.owner._draft_window_graph_binding_provider is c.provider
     assert not hasattr(c.owner, "_draft_window_source_capability")
     assert not hasattr(c.owner, "_draft_window_runtime_state")
     assert not hasattr(c.owner, "_draft_window_runtime")
     if c.owner._speculator_name != "eagle3":
-        assert c.owner._draft_window_bypass_active is False
-        assert c.owner._draft_window_prefill_bypass_active is False
         assert c.owner._draft_window_dp_dummy_active is False
-        assert c.create_provider.call_args.kwargs["dflash2_graph_owner"] is (
-            c.owner if c.owner._speculator_name == "dflash2" else None
-        )
 
 
 def test_graph_source_rejection_has_no_eager_fallback_or_partial_owner(graph_source_initialization):
@@ -206,7 +192,7 @@ def test_real_metadata_preparation_selects_the_final_descriptor_once(monkeypatch
 
     c = graph_buffers.__wrapped__()
     owner = DraftWindowGraphInputMixin()
-    owner._draft_window_graph_binding_provider, owner._draft_window_bypass_active = c.provider, False
+    owner._draft_window_graph_binding_provider = c.provider
     owner.block_tables, owner.num_query_per_req, owner.draft_attn_layer_names = c.owner, 1, {"draft.layer"}
     owner.input_batch = SimpleNamespace(num_reqs=2, idx_mapping_np=np.array([0, 1]))
     snapshot = Mock(return_value=torch.tensor([11, 14], dtype=torch.int32))
@@ -223,11 +209,11 @@ def test_real_metadata_preparation_selects_the_final_descriptor_once(monkeypatch
     context = (False, False)
     if wrong_descriptor:
         with pytest.raises(RuntimeError, match="runtime descriptor"), c.provider.proposal_scope(context):
-            owner._build_attn_metadata(2, desc, np.array([0, 1, 2]), torch.tensor([99, 99]), 1)
+            owner._build_uniform_attn_metadata(desc, 2, 1, torch.tensor([99, 99]), 1)
         snapshot.assert_not_called()
     else:
         with c.provider.proposal_scope(context):
-            assert owner._build_attn_metadata(2, desc, np.array([0, 1, 2]), torch.tensor([99, 99]), 1) is None
+            assert owner._build_uniform_attn_metadata(desc, 2, 1, torch.tensor([99, 99]), 1) is None
             assert c.provider._active_bank is c.capture
             assert c.capture.cpu_window_exact.tolist() == [7, 6]
             c.provider.bind_current(desc)
