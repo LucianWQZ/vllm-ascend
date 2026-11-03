@@ -29,7 +29,7 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_policy import DraftWindowPol
 
 @dataclass(slots=True, eq=False)
 class DraftWindowGraphBucket:
-    """Actual capture consumer, its read tensors and last prepared payload.
+    """Actual capture consumer and its strongly owned read tensors.
 
     Only its provider writes these private fields. Capture and replay borrow
     the same tensors; a proposal updates their contents, never their address.
