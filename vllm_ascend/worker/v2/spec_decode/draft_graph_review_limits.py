@@ -347,21 +347,12 @@ def _full8_review_capacity(vllm_config):
     target = vllm_config.model_config
     draft = vllm_config.speculative_config.draft_model_config
     capacity = target.max_model_len
-    ceilings: list[int] = []
     for config in (target, draft):
-        text = getattr(config, "hf_text_config", None)
-        if text is None:
-            text = getattr(config, "hf_config", None)
-        ceiling = getattr(text, "max_position_embeddings", None)
-        if type(ceiling) is not int or ceiling <= 0:
+        ceiling = getattr(config.hf_text_config, "max_position_embeddings", None)
+        if type(ceiling) is not int or not _FULL8_QUERY_TOKENS < capacity <= ceiling:
             raise NotImplementedError(
                 "Full8 review requires an exact positive configured capacity within both model position ceilings"
             )
-        ceilings.append(ceiling)
-    if capacity <= _FULL8_QUERY_TOKENS or capacity > min(ceilings):
-        raise NotImplementedError(
-            "Full8 review requires an exact positive configured capacity within both model position ceilings"
-        )
 
 
 def validate_draft_graph_review_requests(

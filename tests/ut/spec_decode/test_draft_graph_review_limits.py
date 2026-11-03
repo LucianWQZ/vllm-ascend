@@ -78,7 +78,7 @@ class DraftGraphSupportTest(unittest.TestCase):
                 cudagraph_capture_sizes=[query * n for n in range(1, rows + 1)],
                 max_cudagraph_capture_size=query * rows,
             ),
-            model_config=NS(max_model_len=4096 if method == "eagle3" else 40960, hf_config=hf),
+            model_config=NS(max_model_len=4096 if method == "eagle3" else 40960, hf_config=hf, hf_text_config=hf),
             additional_config={"draft_window_size": (1024 if method == "eagle3" else 32768) if window else None},
         )
 
@@ -517,6 +517,14 @@ class DraftGraphSupportTest(unittest.TestCase):
         batch.draft_graph_request_bounds = ((1021, 40960),)
         with self.assertRaises(NotImplementedError):
             runner_bounds(owner, batch)
+
+    def test_full8_capacity_uses_both_normalized_model_ceilings(self):
+        for model in ("target", "draft"):
+            config = self.config(method="dflash")
+            actual = config.model_config if model == "target" else config.speculative_config.draft_model_config
+            actual.hf_text_config = NS(max_position_embeddings=32768)
+            with self.subTest(model=model), self.assertRaisesRegex(NotImplementedError, "both model position ceilings"):
+                self.resolve(config)
 
     def test_full8_actual_metadata_boundary_rejects_unqualified_padding_before_materialize(self):
         from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowGraphInputMixin
