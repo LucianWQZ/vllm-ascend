@@ -1130,7 +1130,12 @@ def test_parallel_continuing_prefill_snapshots_actual_exact_without_full_gather(
 def test_parallel_prompt_producer_rejects_uncertified_preparation(setup, invalid):
     runtime, spec, _, _ = setup
     runtime._dense_reads = True
+    runtime.window_size, runtime.anchor_block_span = 1024, 128
     spec.max_model_len, spec.num_query_per_req = 4096, 8
+    table = torch.arange(6 * 32, dtype=torch.int32).reshape(6, 32)
+    spec.block_tables.block_tables = [SimpleNamespace(gpu=table)]
+    spec.block_tables.kernel_block_sizes = [128]
+    spec.block_tables.num_blocks.np = np.full((1, 6), 32, dtype=np.int32)
     state = batch(computed=(1136, 1264), prompt=(4096, 4096), scheduled=(7, 9), drafts=None)
     state.query_start_loc_np = np.array([0, 7, 16])
     if invalid == "mixed_decode":
@@ -1144,8 +1149,18 @@ def test_parallel_prompt_producer_rejects_uncertified_preparation(setup, invalid
         state.query_start_loc_np[-1] += 1
     else:
         spec.replicated_pcp = True
-    with pytest.raises(RuntimeError, match="did not consume"), runtime.proposal_context(state):
-        assert not runtime._parallel_full_prefill(2, continuing_prefill_rows(state, 2))
+    metadata = common(exact=(1151, 1281), upper=(1152, 1282))
+    metadata.query_start_loc_cpu = torch.tensor([0, 8, 16, 16], dtype=torch.int32)
+    metadata.causal = False
+    metadata.query_start_loc = metadata.query_start_loc_cpu.clone()
+    metadata.positions = torch.arange(16)
+    metadata.slot_mapping = torch.arange(16) + 20
+    slots, positions = metadata.slot_mapping, metadata.positions
+    with runtime.proposal_context(state):
+        runtime.metadata_callback(8, 2)(0, metadata)
+        assert hasattr(metadata, "_draft_window_device_read"), "Uncertified Full query bypassed its exact private read"
+        assert metadata.slot_mapping is slots and metadata.positions is positions
+        assert metadata._draft_window_device_read.seq_lens.tolist() == [1151, 1281]
 
 
 def test_mla_final_metadata_is_owned_without_rotary_copies(setup):

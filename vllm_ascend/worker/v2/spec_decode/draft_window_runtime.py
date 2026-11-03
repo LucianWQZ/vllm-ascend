@@ -94,7 +94,7 @@ class DraftWindowRuntime:
             require_direct_prefix_routes,
         )
 
-        config = speculator.attn_vllm_config
+        config = speculator.vllm_config
         if config.parallel_config.pipeline_parallel_size != 1:
             raise NotImplementedError("Draft Window pipeline parallelism requires a distributed reader provider")
         transfer = config.kv_transfer_config
@@ -237,6 +237,28 @@ class DraftWindowRuntime:
         assert continuing is not None
         counts = self.speculator.block_tables.num_blocks.np
         rows = batch.idx_mapping_np[:num_reqs]
+        eagle = self.speculator.method == "eagle3"
+        first = eagle and step == 0
+        dense, native_full = self._dense_reads, False
+        if dense:
+            prefilling = batch.is_prefilling_np[:num_reqs]
+            replicated = getattr(self.speculator, "replicated_pcp", False)
+            drafts = batch.num_draft_tokens_per_req
+            full_prompt = continuing.all() and not replicated and (drafts is None or not drafts[:num_reqs].any())
+            if eagle:
+                native_full = bool(continuing.any() and full_prompt)
+                dense = not native_full and not (
+                    (continuing.any() or first and prefilling.any()) and (prefilling.all() or replicated)
+                )
+            elif full_prompt:
+                # A local prompt-only DP rank can still execute drafts when
+                # another rank decodes. Keep large Full queries native, but
+                # not adaptive preparations whose query extent is only upper.
+                scheduled = batch.num_scheduled_tokens[:num_reqs]
+                dense = not (
+                    (batch.num_computed_prefill_tokens_np[:num_reqs] + scheduled <= self.speculator.max_model_len).all()
+                    and np.array_equal(np.diff(batch.query_start_loc_np[: num_reqs + 1]), scheduled)
+                )
 
         def retain(*objects: object) -> None:
             if self._owner is not owner:
@@ -244,10 +266,9 @@ class DraftWindowRuntime:
             owner.extend(objects)
 
         full_exact = exact = proposal_exact = starts = None
-        dense, native_full = False, False
 
         def apply(gid: int, common: Any) -> None:
-            nonlocal full_exact, exact, proposal_exact, starts, dense, native_full
+            nonlocal full_exact, exact, proposal_exact, starts, dense
             if gid not in self.gids:
                 return
             retain(common)
@@ -258,8 +279,12 @@ class DraftWindowRuntime:
                     raise ValueError("Draft Window metadata does not cover the active requests")
                 full_exact = common.seq_lens
                 retain(full_exact)
-                dense, native_full = self._read_mode(step, num_reqs, common, continuing)
-                if self.speculator.method == "eagle3" and step == 0:
+                if dense and first and not batch.is_prefilling_np[:num_reqs].any():
+                    dense = (
+                        int(common.query_start_loc_cpu[: num_reqs + 1].diff().max())
+                        <= self.speculator.num_speculative_steps + 1
+                    )
+                if first:
                     exact, proposal_exact = self._eagle_first_pass_lengths(full_exact, num_reqs)
                 elif prepared_exact_cpu is not None:
                     # The actual DSpark MLA helper completed this exact copy
@@ -280,7 +305,7 @@ class DraftWindowRuntime:
                     if step == 0 and not torch.equal(exact, proposal_exact):
                         raise ValueError("Full prompt metadata cannot include rejected query padding")
                 else:
-                    if self.speculator.method == "eagle3" and self._eagle_window is None:
+                    if eagle and self._eagle_window is None:
                         if step > 0:
                             raise RuntimeError("Eagle3 AR metadata has no frozen first-pass plan")
                         assert proposal_exact is not None
@@ -298,9 +323,7 @@ class DraftWindowRuntime:
                         )
                     starts_list = []
                     for row, end in enumerate(exact):
-                        if continuing[row] or (
-                            self.speculator.method == "eagle3" and step == 0 and batch.is_prefilling_np[row]
-                        ):
+                        if continuing[row] or (first and batch.is_prefilling_np[row]):
                             start = 0
                         elif self._eagle_window is not None:
                             start, horizon = self._eagle_window[row]
@@ -355,7 +378,6 @@ class DraftWindowRuntime:
                 elif dense:
                     from vllm_ascend.worker.v2.spec_decode.draft_window_dense import prepare_dense_draft_read
 
-                    first = self.speculator.method == "eagle3" and step == 0
                     boundaries = common.query_start_loc_cpu[: num_reqs + 1]
                     widths = boundaries.diff()
                     query_width = int(widths.max())
@@ -390,38 +412,6 @@ class DraftWindowRuntime:
 
         return apply
 
-    def _read_mode(
-        self,
-        step: int,
-        num_reqs: int,
-        common: Any,
-        continuing: np.ndarray,
-    ):
-        dense = self._dense_reads
-        if self.speculator.method == "eagle3" and continuing.any():
-            drafts = self._input_batch.num_draft_tokens_per_req
-            if (
-                dense
-                and continuing.all()
-                and (drafts is None or not drafts[:num_reqs].any())
-                and not getattr(self.speculator, "replicated_pcp", False)
-            ):
-                return False, True
-            dense = dense and not (
-                self._input_batch.is_prefilling_np[:num_reqs].all() or getattr(self.speculator, "replicated_pcp", False)
-            )
-        if self.speculator.method == "eagle3" and step == 0:
-            prefilling = self._input_batch.is_prefilling_np[:num_reqs]
-            dense = dense and (
-                not prefilling.all() and not getattr(self.speculator, "replicated_pcp", False)
-                if prefilling.any()
-                else int(common.query_start_loc_cpu[: num_reqs + 1].diff().max())
-                <= self.speculator.num_speculative_steps + 1
-            )
-        elif self.speculator.method != "eagle3" and dense and self._parallel_full_prefill(num_reqs, continuing):
-            dense = False
-        return dense, False
-
     def _eagle_first_pass_lengths(self, native_extent: torch.Tensor, num_reqs: int):
         """Snapshot native Q extent and initialized live KV end together.
 
@@ -454,23 +444,6 @@ class DraftWindowRuntime:
         ):
             raise ValueError("Eagle3 prepared live queries disagree with the current native padding extent")
         return extent_cpu, live_cpu
-
-    def _parallel_full_prefill(self, num_reqs: int, continuing: np.ndarray) -> bool:
-        """Keep large ongoing prompts on their native Full consumer.
-
-        This chooses a consumer, never an exact length. Unknown layouts keep
-        the existing private read path; all lengths come from actual device E.
-        """
-        batch = self._input_batch
-        drafts = batch.num_draft_tokens_per_req
-        scheduled = batch.num_scheduled_tokens[:num_reqs]
-        return bool(
-            continuing.all()
-            and not getattr(self.speculator, "replicated_pcp", False)
-            and (drafts is None or not drafts[:num_reqs].any())
-            and (batch.num_computed_prefill_tokens_np[:num_reqs] + scheduled <= self.speculator.max_model_len).all()
-            and np.array_equal(np.diff(batch.query_start_loc_np[: num_reqs + 1]), scheduled)
-        )
 
     def retain_metadata(self, metadata: Any) -> None:
         """Keep the final builder result, including newly allocated derived state."""

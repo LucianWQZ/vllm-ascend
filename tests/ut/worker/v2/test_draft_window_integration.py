@@ -533,9 +533,6 @@ def test_dspark_mla_reuses_prepared_exact_cpu_without_another_transfer(contract,
     runtime_module = draft_window_runtime
     runtime_class = runtime_module.DraftWindowRuntime
     monkeypatch.setattr(runtime_class, "_validate_route", staticmethod(lambda spec: (0,)))
-    completion = SimpleNamespace(record=lambda stream: None, query=lambda: False, synchronize=lambda: None)
-    monkeypatch.setattr(torch.npu, "Event", lambda: completion)
-    monkeypatch.setattr(torch.npu, "current_stream", lambda: object())
     obj = contract.obj
     del obj._prepare_draft_dcp_metadata_inputs  # Run the real completed CPU copy.
     obj.attn_architecture = "MLA"

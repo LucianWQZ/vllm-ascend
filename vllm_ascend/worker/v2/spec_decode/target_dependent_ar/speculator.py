@@ -219,8 +219,6 @@ class AscendTargetDependentARSpeculator(LmheadTPDraftSamplingMixin, TargetDepend
         num_reqs_padded: int,
         num_tokens_padded: int,
         cudagraph_runtime_mode: CUDAGraphMode,
-        *,
-        build_metadata: bool = True,
     ) -> tuple[
         dict[str, Any] | None,
         dict[str, torch.Tensor] | None,
@@ -276,10 +274,6 @@ class AscendTargetDependentARSpeculator(LmheadTPDraftSamplingMixin, TargetDepend
             slot_mappings_tensor,
             self.kv_cache_config,
         )
-        if not build_metadata:
-            # Window prefill builds its private metadata after this helper has
-            # restored the global Full table and write-slot coordinates.
-            return attn_metadata, slot_mappings
         # This is draft prefill, not the later one-token-per-request decode.
         # Query lengths may differ, so do not use _build_uniform_attn_metadata.
         attn_metadata = self._build_attn_metadata(
@@ -586,9 +580,8 @@ class AscendTargetDependentARSpeculator(LmheadTPDraftSamplingMixin, TargetDepend
             num_reqs,
             num_tokens,
             cudagraph_runtime_mode=cudagraph_runtime_mode,
-            build_metadata=not window_active,
         )
-        if window_active:
+        if window_active and not self.replicated_pcp:
             assert self.input_batch is not None
             attn_metadata = self._build_attn_metadata(
                 num_reqs=num_reqs,
