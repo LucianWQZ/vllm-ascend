@@ -7,6 +7,7 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 import numpy as np
+import pytest
 import torch
 from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.worker.gpu.spec_decode.target_dependent_ar.speculator import (
@@ -281,20 +282,26 @@ def test_prefill_filters_target_only_metadata():
     parent_prefill.assert_called_once_with(*expected_args)
 
 
-def test_prefill_forwards_skip_sample_on_main():
-    """main's propose passes `skip_sample`; the override must forward it upstream."""
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("skip_sample", [False, True])
+def test_prefill_preserves_official_version_signature(legacy, skip_sample):
+    """Window integration must retain both official parent call signatures."""
     speculator = AscendTargetDependentARSpeculator.__new__(AscendTargetDependentARSpeculator)
     draft_metadata = object()
     attn_metadata = {"draft": draft_metadata}
     speculator.draft_attn_layer_names = {"draft"}
     speculator._prepare_replicated_prefill_attn = MagicMock(return_value=(attn_metadata, None))
-    with patch.object(TargetDependentARSpeculator, "_prefill") as parent_prefill:
-        speculator._prefill(2, 4, attn_metadata, None, None, skip_sample=True)
-    if vllm_version_is("0.32.0"):
-        assert "skip_sample" not in parent_prefill.call_args.kwargs
-        assert len(parent_prefill.call_args.args) == 7
-    else:
-        assert parent_prefill.call_args.args[-1] is True
+    with (
+        patch(
+            "vllm_ascend.worker.v2.spec_decode.target_dependent_ar.speculator.vllm_version_is",
+            return_value=legacy,
+        ) as version,
+        patch.object(TargetDependentARSpeculator, "_prefill") as parent_prefill,
+    ):
+        speculator._prefill(2, 4, attn_metadata, None, None, skip_sample=skip_sample)
+    version.assert_called_once_with("0.32.0")
+    args = (2, 4, attn_metadata, None, None, CUDAGraphMode.NONE, None)
+    parent_prefill.assert_called_once_with(*(args if legacy else (*args, skip_sample)))
 
 
 def test_build_uniform_attn_metadata_sets_decode_only():
