@@ -100,20 +100,9 @@ def ascend_prepare_dflash_inputs_to_capture(
 ) -> AttentionState:
     """Preserve upstream OFF behavior or inject the explicit capture carrier."""
     context = getattr(input_buffers, _CAPTURE_CONTEXT_ATTRIBUTE, None)
-    if context is None or skip_attn:
-        return _ORIGINAL_PREPARE_DFLASH_INPUTS_TO_CAPTURE(
-            num_reqs,
-            num_tokens,
-            input_buffers,
-            block_tables,
-            attn_groups,
-            kv_cache_config,
-            max_model_len,
-            skip_attn,
-            causal,
-        )
-    identity = context.capture_banks_for(num_reqs=num_reqs, num_tokens=num_tokens)[0]
-    workspace = identity
+    workspace = (
+        None if context is None or skip_attn else context.capture_banks_for(num_reqs=num_reqs, num_tokens=num_tokens)[0]
+    )
 
     # Keep dummy InputBatch, Full slots, query geometry and model-specific
     # metadata construction in the fixed MRV2 helper. Only replace the actual
@@ -129,6 +118,8 @@ def ascend_prepare_dflash_inputs_to_capture(
         skip_attn,
         causal,
     )
+    if workspace is None:
+        return state
     if not state.attn_metadata:
         raise RuntimeError("Draft Window capture builder produced no attention metadata")
     capacity = _seed_capture_workspace(workspace, max_model_len=max_model_len, provider=context)
