@@ -186,7 +186,8 @@ class DraftWindowGraphInputMixin:
         if padded < num_reqs:
             raise ValueError("padded request count must be at least actual requests")
         selected = provider.capture_identity_for(descriptor=batch_desc)
-        cpu_full_exact = self.input_buffers.seq_lens[:padded].to(device="cpu", dtype=torch.int32, copy=True)
+        # The private bank initializes padded rows; snapshot only actual requests.
+        cpu_full_exact = self.input_buffers.seq_lens[:num_reqs].to(device="cpu", dtype=torch.int32, copy=True)
         provider.prepare(selected, cpu_full_exact=cpu_full_exact, idx_mapping_np=input_batch.idx_mapping_np, step=0)
         # The fixed manager builds this bank's metadata once immediately before replay.
         return None

@@ -107,23 +107,26 @@ def _resolve(provider, count=1):
 
 
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
-def test_parallel_exact_is_an_independent_completed_cpu_snapshot(graph_buffers, monkeypatch, dtype):
+@pytest.mark.parametrize("active", [1, 2])
+def test_parallel_exact_is_an_independent_completed_cpu_snapshot(graph_buffers, monkeypatch, dtype, active):
     c = graph_buffers
     owner = DraftWindowGraphInputMixin()
     owner._draft_window_graph_binding_provider = c.provider
     owner.input_buffers = SimpleNamespace(seq_lens=torch.tensor([11, 14], dtype=dtype))
-    owner.input_batch = SimpleNamespace(num_reqs=2, idx_mapping_np=np.array([0, 1]))
+    owner.input_batch = SimpleNamespace(num_reqs=active, idx_mapping_np=np.arange(active))
     owner._draft_window_bypass_active = False
     owner.draft_attn_layer_names, owner.num_query_per_req = {"draft.layer"}, 1
     owner.block_tables = c.owner
     prepared = []
     monkeypatch.setattr(c.provider, "prepare", lambda capture, **kwargs: prepared.append(kwargs["cpu_full_exact"]))
-    with c.provider.proposal_scope(_proposal()):
-        owner._build_attn_metadata(2, c.capture.descriptor, np.arange(3, dtype=np.int32), torch.tensor([11, 14]), 1)
+    with c.provider.proposal_scope(_proposal(active)):
+        owner._build_attn_metadata(
+            active, c.capture.descriptor, np.arange(active + 1, dtype=np.int32), torch.tensor([11, 14]), 1
+        )
     exact = prepared[0]
     assert exact.device.type == "cpu" and exact.dtype == torch.int32
     owner.input_buffers.seq_lens.zero_()
-    assert exact.tolist() == [11, 14]
+    assert exact.tolist() == [11, 14][:active]
 
 
 def test_count_gather_uses_request_slots_and_leaves_padding_inert(graph_buffers):
