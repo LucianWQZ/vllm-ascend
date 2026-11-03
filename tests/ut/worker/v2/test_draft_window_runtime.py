@@ -776,6 +776,7 @@ def test_real_builder_projects_every_group_and_quarantines_partial_failure(setup
     assert all(metadata.seq_lens.tolist() == [12, 11] for metadata in observed)
     assert observed[0].block_table_tensor[1, :3].tolist() == canonical[3, 4:7].tolist()
     assert observed[1].block_table_tensor[1, :6].tolist() == other_table[3, 8:14].tolist()
+    assert owner is not None
     for gid, metadata in enumerate(observed):
         assert torch.equal(full_tables[gid], saved_tables[gid])
         assert metadata.slot_mapping.data_ptr() == full_slots[gid].data_ptr()

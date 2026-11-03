@@ -113,8 +113,8 @@ class TestCanonicalRead(unittest.TestCase):
         self.assertTrue(any(value is common.seq_lens for value in retained))
 
     def test_partial_row_copy_keeps_source_and_destination_storages(self):
-        retained = []
-        copied = []
+        retained: list[torch.Tensor] = []
+        copied: list[torch.UntypedStorage] = []
         original_copy = torch.Tensor.copy_
         exact = torch.tensor([21, 11], dtype=torch.int32)
         source = self.table[self.mapping.tolist()]

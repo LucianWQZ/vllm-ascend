@@ -255,6 +255,7 @@ def test_uniform_compact_table_needs_no_request_row_transfer(monkeypatch, stride
         retain=lambda *values: None,
     )
     assert len(copies) == 2  # Absolute addresses and mask; exact lengths stay on CPU.
+    assert isinstance(read, DenseDraftRead)
     assert read.seq_lens.device.type == "cpu"
     for row, end in enumerate(ends.tolist()):
         start = max(end - 1024, 0) // 128 * 128

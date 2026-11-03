@@ -58,7 +58,7 @@ def test_full_row_capacity_cohorts_have_independent_native_operands(decode_exact
         for pair in part._attention_workspaces.values()
         for tensor in pair
     }
-    bounds = torch.where(full, upper, torch.minimum(upper, torch.tensor(1024 + 128 - 1)))
+    bounds = exact - starts
     expected_tokens = int(((bounds + 31) // 32 * 32).sum())
     assert sum(private_buffers.values()) == expected_tokens * 2 * 4 * 192 * 4
     assert len(private_buffers) == 6, "distinct Full/read cohorts share native scratch"
