@@ -210,3 +210,65 @@ def test_same_window_mla_latent_and_rope(query_width, causal):
         (latent, rope, query, query_rope, canonical), (latent_cpu, rope_cpu, query_cpu, query_rope_cpu, canonical_cpu)
     ):
         torch.testing.assert_close(device.cpu(), original, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_full_continuing_native_keeps_unused_table_columns_and_partial_pages_unread(causal):
+    """Check the unchanged native Full read before removing its S=0 table copy."""
+    generator = torch.Generator().manual_seed(93122)
+    block, heads, kv_heads, dim, width = 128, 32, 4, 128, 8
+    ends = (1151, 1281)
+    scale, dtype = 1 / math.sqrt(dim), torch.bfloat16
+    table_cpu = (torch.randperm(64, generator=generator) + 1).reshape(2, 32).to(torch.int32)
+    keys_cpu = torch.full((65, block, kv_heads, dim), torch.nan, dtype=dtype)
+    values_cpu = torch.full_like(keys_cpu, torch.nan)
+    # Both the last partial page and every later logical column remain NaN.
+    # The oracle below selects logical [0,E), independently of either read table.
+    for row, end in enumerate(ends):
+        for column in range(math.ceil(end / block)):
+            valid = min(block, end - column * block)
+            physical = int(table_cpu[row, column])
+            for cache in (keys_cpu, values_cpu):
+                cache[physical, :valid] = (torch.randn(valid, kv_heads, dim, generator=generator) * 0.2).to(dtype)
+    query_cpu = (torch.randn(2 * width, heads, dim, generator=generator) * 0.2).to(dtype)
+    reference = []
+    for row, end in enumerate(ends):
+        ids = table_cpu[row, : math.ceil(end / block)].long()
+        key = keys_cpu[ids].flatten(0, 1)[:end].double().repeat_interleave(heads // kv_heads, dim=1)
+        value = values_cpu[ids].flatten(0, 1)[:end].double().repeat_interleave(heads // kv_heads, dim=1)
+        queries = query_cpu[row * width : (row + 1) * width].double()
+        scores = torch.einsum("qhd,khd->hqk", queries, key) * scale
+        if causal:
+            scores.masked_fill_(torch.arange(end)[None, :] > torch.arange(end - width, end)[:, None], -torch.inf)
+        reference.append(torch.einsum("hqk,khd->qhd", scores.softmax(-1), value))
+    expected = torch.cat(reference)
+    assert torch.isfinite(expected).all()
+    cropped_cpu = torch.zeros((2, math.ceil(max(ends) / block)), dtype=torch.int32)
+    for row, end in enumerate(ends):
+        columns = math.ceil(end / block)
+        cropped_cpu[row, :columns] = table_cpu[row, :columns]
+    keys, values, query = keys_cpu.npu(), values_cpu.npu(), query_cpu.npu()
+    mask = torch.ones((2048, 2048), dtype=torch.bool).triu(1).npu() if causal else None
+    for table in (cropped_cpu.npu(), table_cpu.npu()):
+        output, _ = torch_npu.npu_fused_infer_attention_score(
+            query=query,
+            key=keys.view(65, block, -1),
+            value=values.view(65, block, -1),
+            block_table=table,
+            block_size=block,
+            input_layout="TND",
+            actual_seq_lengths=[width, 2 * width],
+            actual_seq_lengths_kv=list(ends),
+            num_key_value_heads=kv_heads,
+            num_heads=heads,
+            scale=scale,
+            sparse_mode=3 if causal else 0,
+            atten_mask=mask,
+        )
+        actual = output.cpu().double()
+        assert torch.isfinite(actual).all()
+        # Preserve the pre-existing BF16 contract, rather than establishing a
+        # new bitwise-equivalence requirement between two operator launches.
+        torch.testing.assert_close(actual, expected, atol=2**-7, rtol=2**-6)
+    for device, original in ((keys, keys_cpu), (values, values_cpu), (query, query_cpu)):
+        torch.testing.assert_close(device.cpu(), original, atol=0, rtol=0, equal_nan=True)
