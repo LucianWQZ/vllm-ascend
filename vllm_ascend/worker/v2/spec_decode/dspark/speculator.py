@@ -52,10 +52,7 @@ from vllm_ascend.worker.v2.spec_decode.dflash.speculator import (
     prepare_dflash_inputs_factory,
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowGraphInputMixin
-from vllm_ascend.worker.v2.spec_decode.draft_window_graph_runtime import (
-    draft_window_graph_enabled,
-    install_parallel_graph,
-)
+from vllm_ascend.worker.v2.spec_decode.draft_window_graph_runtime import install_parallel_graph
 from vllm_ascend.worker.v2.spec_decode.lmhead_tp_utils import LmheadTPDraftSamplingMixin
 from vllm_ascend.worker.v2.spec_decode.pcp_utils import (
     disable_profiling_chunk_for_draft,
@@ -152,10 +149,7 @@ class AscendDSparkSpeculator(DraftWindowGraphInputMixin, LmheadTPDraftSamplingMi
         # It needs this speculator to update full-graph params, so set it here.
         self.query_cudagraph_manager.speculator = self
         self.query_cudagraph_manager.update_stream = self.update_stream
-        if hasattr(self, "_draft_window_graph_binding_provider"):
-            if not draft_window_graph_enabled():
-                raise RuntimeError("Draft Graph configuration changed during initialization")
-            install_parallel_graph(self)
+        install_parallel_graph(self)
 
     @torch.inference_mode()
     def get_draft_context_group_layout(self) -> tuple[tuple[int, ...], tuple[int, ...], dict[int, int]]:

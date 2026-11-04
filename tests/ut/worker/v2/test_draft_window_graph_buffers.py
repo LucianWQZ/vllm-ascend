@@ -54,7 +54,7 @@ def graph_buffers():
     )
 
 
-def test_parallel_install_uses_the_actual_manager_descriptors(graph_buffers):
+def test_parallel_install_uses_the_actual_manager_descriptors(graph_buffers, monkeypatch):
     from vllm_ascend.worker.v2.spec_decode.draft_window_graph_runtime import install_parallel_graph
 
     c = graph_buffers
@@ -67,11 +67,25 @@ def test_parallel_install_uses_the_actual_manager_descriptors(graph_buffers):
         _draft_window_graph_binding_provider=provider,
         query_cudagraph_manager=SimpleNamespace(_capture_descs={CUDAGraphMode.FULL: [c.capture.descriptor]}),
     )
-    assert install_parallel_graph(owner) is provider
+    monkeypatch.setenv("VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH", "0")
+    with pytest.raises(RuntimeError, match="configuration changed"):
+        install_parallel_graph(owner)
+    assert not provider._carriers
+    monkeypatch.setenv("VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH", "1")
+    install_parallel_graph(owner)
     bank = provider.capture_identity_for(descriptor=c.capture.descriptor)
     assert bank.owner is provider and bank.descriptor is c.capture.descriptor
     with pytest.raises(RuntimeError, match="already installed"):
         install_parallel_graph(owner)
+
+
+def test_parallel_install_does_not_add_a_window_off_gate(monkeypatch):
+    from vllm_ascend.worker.v2.spec_decode.draft_window_graph_runtime import install_parallel_graph
+
+    monkeypatch.setenv("VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH", "not-a-window-setting")
+    owner = SimpleNamespace()
+    install_parallel_graph(owner)
+    assert not vars(owner)
 
 
 def _prepare(case, ends=(11, 14), *, capture=None, plans=None, valid=None):

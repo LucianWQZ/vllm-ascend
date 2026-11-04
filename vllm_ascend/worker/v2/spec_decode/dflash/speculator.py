@@ -20,10 +20,7 @@ from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm_ascend.ops.triton.v2.spec_decode.prepare_dflash_inputs import prepare_dflash_inputs_triton
 from vllm_ascend.worker.v2.attn_utils import build_attn_metadata_factory, build_attn_metadata_wrapper
 from vllm_ascend.worker.v2.spec_decode.draft_window_eager import DraftWindowGraphInputMixin
-from vllm_ascend.worker.v2.spec_decode.draft_window_graph_runtime import (
-    draft_window_graph_enabled,
-    install_parallel_graph,
-)
+from vllm_ascend.worker.v2.spec_decode.draft_window_graph_runtime import install_parallel_graph
 from vllm_ascend.worker.v2.spec_decode.lmhead_tp_utils import LmheadTPDraftSamplingMixin
 from vllm_ascend.worker.v2.spec_decode.pcp_utils import (
     disable_profiling_chunk_for_draft,
@@ -239,10 +236,7 @@ class AscendDFlashSpeculator(DraftWindowGraphInputMixin, LmheadTPDraftSamplingMi
         # It needs this speculator to update full-graph params, so set it here.
         self.query_cudagraph_manager.speculator = self
         self.query_cudagraph_manager.update_stream = self.update_stream
-        if hasattr(self, "_draft_window_graph_binding_provider"):
-            if not draft_window_graph_enabled():
-                raise RuntimeError("Draft Graph configuration changed during initialization")
-            install_parallel_graph(self)
+        install_parallel_graph(self)
 
     def set_attn(
         self,

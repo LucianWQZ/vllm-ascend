@@ -15,18 +15,15 @@ from typing import Any
 from vllm.config.compilation import CUDAGraphMode
 
 import vllm_ascend.envs as envs
-from vllm_ascend.worker.v2.spec_decode.draft_window_graph import (
-    DraftWindowGraphBindingProvider,
-)
 
 
-def draft_window_graph_enabled() -> bool:
-    return bool(envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH)
-
-
-def install_parallel_graph(owner: Any) -> DraftWindowGraphBindingProvider:
+def install_parallel_graph(owner: Any) -> None:
     """Install one provider and register every real startup capture bucket."""
-    provider = owner._draft_window_graph_binding_provider
+    provider = getattr(owner, "_draft_window_graph_binding_provider", None)
+    if provider is None:
+        return
+    if not envs.VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH:
+        raise RuntimeError("Draft Graph configuration changed during initialization")
     if provider._carriers:
         raise RuntimeError("Draft Window Graph capture buckets are already installed")
     capture_descs = owner.query_cudagraph_manager._capture_descs
@@ -42,4 +39,3 @@ def install_parallel_graph(owner: Any) -> DraftWindowGraphBindingProvider:
         provider.register_capture_identity(
             descriptor=descriptor,
         )
-    return provider
