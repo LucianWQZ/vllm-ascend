@@ -14,6 +14,7 @@ from vllm.v1.worker.gpu.input_batch import InputBuffers
 from vllm.v1.worker.gpu.spec_decode.dflash import cudagraph
 from vllm.v1.worker.utils import AttentionGroup
 
+from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionMetadataBuilder, AscendMetadata
 from vllm_ascend.worker.v2.spec_decode.dflash import capture
 from vllm_ascend.worker.v2.spec_decode.draft_window_backends import DraftWindowGroupRoute, DraftWindowProviderStatus
@@ -48,8 +49,8 @@ def contract(monkeypatch):
     builder.kv_cache_spec, builder.speculative_config = spec, NS(parallel_drafting=True, use_dspark=lambda: False)
     builder.model_config = NS(runner_type="generate", hf_text_config=NS(model_type="qwen3"))
     builder.vllm_config = NS(use_v2_model_runner=True, model_config=builder.model_config)
-    builder.attn_mask_builder = NS(get_attention_mask=lambda causal, config: ("mask", causal))
-    builder._split_decodes_and_prefills = lambda common: (common.num_reqs, 0, common.num_actual_tokens, 0)
+    builder.attn_mask_builder = AttentionMaskBuilder(torch.device("cpu"))
+    builder.decode_threshold = 8
     builder.metadata_cls = AscendMetadata
     group = AttentionGroup(AscendAttentionBackend, ["draft.a", "draft.b"], spec, 0, metadata_builders=[builder])
     config = NS(kv_cache_groups=[NS(kv_cache_spec=spec, layer_names=group.layer_names)])
@@ -120,7 +121,8 @@ def test_original_helper_builds_window_reads_once_and_preserves_full_inputs(cont
     assert layer.query_start_loc_gpu.data_ptr() == query.data_ptr()
     assert layer.slot_mapping.data_ptr() == slots.data_ptr() == on.slot_mappings["draft.a"].data_ptr()
     assert layer.causal is bool(causal if isinstance(causal, bool) else causal[0])
-    assert layer.attn_mask == off.attn_metadata["draft.a"].attn_mask
+    assert layer.attn_mask is off.attn_metadata["draft.a"].attn_mask
+    assert layer.num_decodes == 2 and layer.num_prefills == 0 and layer.num_decode_tokens == 16
     params = FIAParamProvider("draft.a", 2048 if method == "dflash2" else None, is_draft_model=True).resolve(
         on.attn_metadata
     )
