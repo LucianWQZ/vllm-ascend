@@ -475,7 +475,12 @@ class DraftGraphSupportTest(unittest.TestCase):
         ):
             with self.subTest(owner=owner):
                 # No scheduler fields may be read for an unrelated route.
-                GUARD.note_eagle_single_request_review_lifecycle(owner, object())
+                runner = NPUModelRunner.__new__(NPUModelRunner)
+                runner.speculator = owner
+                output = object()
+                with patch.object(NPUModelRunner.__mro__[1], "finish_requests") as original:
+                    runner.finish_requests(output)
+                    original.assert_called_once_with(output)
                 self.assertFalse(hasattr(owner, "_draft_graph_review_preempted_request_ids"))
 
     def test_bounds_use_actual_runner_mapping_and_reject_resumed_requests(self):

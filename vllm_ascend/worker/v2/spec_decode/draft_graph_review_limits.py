@@ -234,15 +234,12 @@ def _validate_qualified_graph_config(vllm_config, profile):
 
 
 def note_eagle_single_request_review_lifecycle(owner, scheduler_output):
-    """Keep only authoritative preemption IDs until real request completion.
+    """Record a qualified runner's preemption IDs until real completion.
 
     Fixed MRV2 resumption is re-emitted as scheduled_new_reqs, including the case
     where no output token exists yet. prefill_len==prompt_len cannot detect
     that case. No scheduler, request state, or device object is modified.
     """
-    limit = getattr(owner, "_draft_graph_review_limit", None)
-    if limit is None:
-        return
     blocked = getattr(owner, "_draft_graph_review_preempted_request_ids", None)
     if blocked is None:
         blocked = set()
@@ -252,14 +249,12 @@ def note_eagle_single_request_review_lifecycle(owner, scheduler_output):
 
 
 def validate_draft_graph_request_bounds(owner, input_batch):
-    """Check original CPU request limits before any Target attention writes.
+    """Check a qualified runner's CPU limits before Target attention writes.
 
     The fixed worker serializes request updates and proposals. Prompt/prefill
     limits change only when a request is added, not during Target sampling or
     Draft consumers; use that actual owner rather than a second bounds snapshot.
     """
-    if getattr(owner, "_draft_graph_review_limit", None) is None:
-        return
     req_states = owner._draft_graph_request_state
     blocked = getattr(owner, "_draft_graph_review_preempted_request_ids", ())
     lookahead = owner.num_speculative_steps if owner.method == "eagle3" else owner.num_query_per_req
