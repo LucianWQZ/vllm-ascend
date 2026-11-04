@@ -4,8 +4,7 @@
 
 One provider owns the captured read banks. Runtime preparation binds the
 current proposal to those banks while preserving canonical Full write slots,
-absolute query positions, and independent Target metadata. No recorder,
-output snapshot, artifact writer, or oracle participates in this path.
+absolute query positions, and independent Target metadata.
 """
 
 from __future__ import annotations

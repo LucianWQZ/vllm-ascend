@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Startup support and runtime shape bounds for qualified Draft Graph consumers.
 
-Startup qualification is shared by config and the speculator; actual request
-checks use the fixed speculator's existing capacity and method fields. This is
-not a numerical PASS receipt. Window OFF only enters this contract when the
-new experimental Graph owner is explicitly selected.
+Startup support and request checks use the speculator's existing capacity
+and method fields. Window OFF enters this contract only when the explicit
+experimental Graph entry is selected.
 """
 
 from __future__ import annotations

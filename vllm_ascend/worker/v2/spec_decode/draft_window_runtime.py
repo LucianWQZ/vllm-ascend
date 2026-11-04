@@ -166,8 +166,8 @@ class DraftWindowRuntime:
         self._build_count = 0
         self._eagle_window = None
         try:
-            # Fixed 544 preserves this Host mapping and prompt progress
-            # throughout propose; validate it once before native preparation.
+            # The worker preserves Host mapping and prompt progress throughout
+            # propose; validate them once before native preparation.
             num_reqs = input_batch.num_reqs
             rows = input_batch.idx_mapping_np[:num_reqs]
             counts = self.speculator.block_tables.num_blocks.np
@@ -295,7 +295,7 @@ class DraftWindowRuntime:
                     # routes still synchronize here. An upper is never exact.
                     exact = full_exact[:num_reqs].to(device="cpu", dtype=torch.int32, copy=True)
                 retain(exact)
-                # Fixed 544 prepares every ordinary Window consumer on the
+                # The worker prepares every ordinary Window consumer on the
                 # worker execution stream. Its existing blocking exact copy
                 # completes all earlier proposal readers on that same stream.
                 # MLA supplies the copy completed immediately before this call.

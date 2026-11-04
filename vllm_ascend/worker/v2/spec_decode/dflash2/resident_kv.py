@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Isolated DFlash2 reference: retain history required by its native consumer."""
+"""Retain Draft history required by the DFlash2 native consumer."""
 
 from typing import Any
 
