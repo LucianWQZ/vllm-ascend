@@ -143,7 +143,7 @@ def test_real_builder_constructs_private_window_metadata_without_touching_target
     # Native-prefill retains the real builder's query/write/state metadata;
     # only its private Draft copy receives the owned window read operands.
     draft = copy_draft_attention_metadata({"draft": target}, ("draft",))["draft"]
-    bind_draft_window_read(draft, bank, 7)
+    bind_draft_window_read(draft, bank)
     assert draft is not target
     assert draft.block_tables.data_ptr() == bank.window_block_table.data_ptr()
     assert draft.block_tables.shape == bank.window_block_table.shape
