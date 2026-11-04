@@ -1196,7 +1196,7 @@ def test_parallel_native_full_keeps_actual_read_bounds_before_forward(setup, inv
     else:
         metadata.seq_lens_cpu_upper_bound[1] = 1280
     full_table = metadata.block_table_tensor
-    with pytest.raises(ValueError, match="ordering|readable|initialized compact"), proposal_scope(runtime, state):
+    with pytest.raises(ValueError, match="ordering|unreadable|initialized compact"), proposal_scope(runtime, state):
         runtime.metadata_callback(8, 2)(0, metadata)
     assert metadata.block_table_tensor is full_table
     assert not hasattr(metadata, "_draft_window_exact_cpu")

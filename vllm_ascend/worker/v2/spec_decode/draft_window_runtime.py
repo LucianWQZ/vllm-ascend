@@ -20,7 +20,6 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_plan import (
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_read import (
     materialize_draft_read,
-    validate_draft_read_bounds,
 )
 
 
@@ -338,13 +337,14 @@ class DraftWindowRuntime:
             assert exact is not None
             if native_full:
                 if not eagle:
-                    validate_draft_read_bounds(
-                        common.block_table_tensor,
-                        counts[gid, rows].tolist(),
-                        int(self.speculator.block_tables.kernel_block_sizes[gid]),
-                        exact,
-                        common.seq_lens_cpu_upper_bound[:num_reqs],
-                    )
+                    columns = counts[gid, rows]
+                    span = int(self.speculator.block_tables.kernel_block_sizes[gid])
+                    if np.any((columns < 0) | (columns > common.block_table_tensor.shape[1])):
+                        raise ValueError("Invalid initialized compact column extent")
+                    if bool(((exact < 0) | (exact > common.seq_lens_cpu_upper_bound[:num_reqs])).any()) or any(
+                        int(end) > int(count) * span for end, count in zip(exact, columns)
+                    ):
+                        raise ValueError("Invalid exact/upper ordering or unreadable canonical extent")
                 exact_cpu = torch.zeros(common.num_reqs, dtype=torch.int32, device="cpu")
                 exact_cpu[:num_reqs] = exact
                 common.seq_lens_cpu = common._seq_lens_cpu = exact_cpu

@@ -128,7 +128,7 @@ def test_device_exact_read_set_reorder_rejection_and_nan_tail(causal, query_widt
 @pytest.mark.parametrize("end,upper", [(129, 129), (0, 1), (-1, 1), (127, 126), (1, 0)])
 def test_allocation_upper_cannot_authorize_uninitialized_columns(end, upper):
     source = (torch.tensor([[1]], dtype=torch.int32)[list((0,))], (1,), 128)
-    with pytest.raises(ValueError, match="exact|readable"):
+    with pytest.raises(ValueError, match="exact lengths exceed"):
         prepare_dense_draft_read(
             *source,
             exact_cpu=torch.tensor([end], dtype=torch.int32),
