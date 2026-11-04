@@ -4,7 +4,6 @@
 
 from dataclasses import replace
 from types import SimpleNamespace
-from typing import Any
 from unittest.mock import Mock
 
 import numpy as np
@@ -377,12 +376,14 @@ def test_bank_projects_only_initialized_columns_across_boundaries(span, boundary
             provider.finish_update()
 
 
-def test_parallel_capture_uses_registered_geometry_and_preserves_full_tables(graph_buffers):
+def test_parallel_capture_uses_registered_geometry_and_preserves_full_tables(graph_buffers, monkeypatch):
+    from vllm_ascend.worker.v2.spec_decode.dflash import capture
     from vllm_ascend.worker.v2.spec_decode.dflash.capture import (
         _seed_capture_workspace,
         draft_window_dflash_capture_scope,
     )
 
+    monkeypatch.setattr(capture.cudagraph_module, "build_attn_metadata", capture.build_attn_metadata)
     case = graph_buffers
     buffers = object.__new__(InputBuffers)
     owner = SimpleNamespace(
@@ -406,9 +407,12 @@ def test_parallel_capture_uses_registered_geometry_and_preserves_full_tables(gra
 
 
 @pytest.mark.parametrize("capture_fails", [False, True])
-def test_parallel_capture_scope_owns_its_attachment_until_normal_or_error_exit(graph_buffers, capture_fails):
+def test_parallel_capture_scope_restores_its_builder_alias_on_normal_or_error_exit(
+    graph_buffers, capture_fails, monkeypatch
+):
     from vllm_ascend.worker.v2.spec_decode.dflash import capture
 
+    monkeypatch.setattr(capture.cudagraph_module, "build_attn_metadata", capture.build_attn_metadata)
     case = graph_buffers
     buffers = case.input_buffers
     owner = SimpleNamespace(input_buffers=buffers, _draft_window_graph_binding_provider=case.provider)
@@ -416,13 +420,13 @@ def test_parallel_capture_scope_owns_its_attachment_until_normal_or_error_exit(g
     slots_before = case.owner.slot_mappings.clone()
     try:
         with capture.draft_window_dflash_capture_scope(owner) as context:
-            assert getattr(buffers, capture._CAPTURE_CONTEXT_ATTRIBUTE) is context
+            assert capture.cudagraph_module.build_attn_metadata is not capture.build_attn_metadata
             assert context is not None
             bucket = context.capture_banks_for(num_reqs=2, num_tokens=2)[0]
             bank = bucket
             assert bucket is case.capture and bank is case.capture
             with (
-                pytest.raises(RuntimeError, match="already attached"),
+                pytest.raises(RuntimeError, match="already scoped"),
                 capture.draft_window_dflash_capture_scope(owner),
             ):
                 pytest.fail("nested capture must not start")
@@ -430,74 +434,10 @@ def test_parallel_capture_scope_owns_its_attachment_until_normal_or_error_exit(g
                 raise RuntimeError("capture failed")
     except RuntimeError as error:
         assert capture_fails and str(error) == "capture failed"
-    assert not hasattr(buffers, capture._CAPTURE_CONTEXT_ATTRIBUTE)
+    assert capture.cudagraph_module.build_attn_metadata is capture.build_attn_metadata
+    assert not hasattr(buffers, "_ascend_draft_window_capture_context")
     assert torch.equal(case.owner.input_block_tables[0], full_before)
     assert torch.equal(case.owner.slot_mappings, slots_before)
-
-
-def test_window_capture_delegates_original_dummy_preparation_then_only_rebinds_reads(graph_buffers, monkeypatch):
-    from vllm.v1.worker.gpu.cudagraph_utils import AttentionState
-
-    from vllm_ascend.worker.v2.spec_decode.dflash import capture
-
-    case = graph_buffers
-    buffers = object.__new__(InputBuffers)
-    buffers.query_start_loc = torch.tensor([0, 1, 2], dtype=torch.int32)
-    owner = SimpleNamespace(input_buffers=buffers, _draft_window_graph_binding_provider=case.provider)
-    slots, state_marker = object(), object()
-    original_full_lengths = torch.tensor([16, 16], dtype=torch.int32)
-    layer = SimpleNamespace(
-        slot_mapping=slots,
-        actual_seq_lengths_q=[1, 2],
-        attn_state=state_marker,
-        causal=False,
-        seq_lens=original_full_lengths,
-        seq_lens_gpu=original_full_lengths,
-    )
-    state = AttentionState({"draft.layer": layer}, {"draft.layer": slots})
-    calls = []
-
-    def upstream(*args):
-        calls.append(args)
-        return state
-
-    monkeypatch.setattr(capture, "_ORIGINAL_PREPARE_DFLASH_INPUTS_TO_CAPTURE", upstream)
-    full = case.owner.input_block_tables[0].clone()
-    with capture.draft_window_dflash_capture_scope(owner):
-        result = capture.ascend_prepare_dflash_inputs_to_capture(
-            2, 2, buffers, case.owner, [], object(), 16, False, False
-        )
-    assert result is state and len(calls) == 1
-    bank = case.capture
-    assert layer.block_tables is bank.window_block_table
-    assert layer.seq_lens is layer.seq_lens_gpu is original_full_lengths
-    assert layer.seq_lens_cpu is bank.cpu_window_exact
-    assert layer.seq_lens_list == [7, 7] and layer.max_seq_len == 7
-    assert layer.query_start_loc.data_ptr() == buffers.query_start_loc.data_ptr()
-    assert layer.slot_mapping is slots and layer.actual_seq_lengths_q == [1, 2]
-    assert layer.attn_state is state_marker and layer.causal is False
-    assert result.slot_mappings["draft.layer"] is slots
-    assert torch.equal(case.owner.input_block_tables[0], full)
-
-
-def test_context_only_capture_preserves_upstream_preparation_without_a_read_bank(graph_buffers, monkeypatch):
-    from vllm_ascend.worker.v2.spec_decode.dflash import capture
-
-    case = graph_buffers
-    buffers = SimpleNamespace(_ascend_draft_window_capture_context=object())
-    arguments: tuple[Any, ...] = (2, 2, buffers, object(), [], object(), 16, True, False)
-    expected = object()
-    received = []
-
-    def upstream(*args):
-        received.append(args)
-        return expected
-
-    monkeypatch.setattr(capture, "_ORIGINAL_PREPARE_DFLASH_INPUTS_TO_CAPTURE", upstream)
-    banks = tuple(case.provider._carriers)
-    assert capture.ascend_prepare_dflash_inputs_to_capture(*arguments) is expected
-    assert received == [arguments] and tuple(case.provider._carriers) == banks
-    assert case.provider._active_bank is None
 
 
 @pytest.mark.parametrize(
