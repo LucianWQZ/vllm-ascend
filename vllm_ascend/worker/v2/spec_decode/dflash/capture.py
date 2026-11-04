@@ -46,7 +46,8 @@ def draft_window_dflash_capture_scope(owner: Any) -> Iterator[DraftWindowGraphBi
                 common._draft_window_exact_cpu = bank.cpu_window_exact
                 common.max_seq_len = capacity
 
-        return raw(**kwargs, common_metadata_callback=bind)
+        kwargs["common_metadata_callback"] = bind
+        return raw(**kwargs)
 
     try:
         cudagraph_module.build_attn_metadata = build
