@@ -1,0 +1,4 @@
+pr: 20288
+entries:
+  - category: feature
+    text: Added MRV2 Draft sliding-window reads for supported Eagle3, DFlash, DFlash2 and external DSpark consumers, with an explicit experimental Draft Graph entry and checked model and request limits. Target attention and Full KV writes retain their original coordinates; native Draft SWA remains active when no additional window is configured.
