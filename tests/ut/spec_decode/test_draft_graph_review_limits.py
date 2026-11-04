@@ -14,7 +14,6 @@ import torch
 
 from vllm_ascend.worker.v2.model_runner import NPUModelRunner
 from vllm_ascend.worker.v2.spec_decode import draft_graph_review_limits as GUARD
-from vllm_ascend.worker.v2.spec_decode import draft_window_eagle3_dp as DP
 from vllm_ascend.worker.v2.spec_decode.dflash import speculator as dflash_module
 from vllm_ascend.worker.v2.spec_decode.target_dependent_ar import aclgraph as ar_graph
 from vllm_ascend.worker.v2.spec_decode.target_dependent_ar import speculator as ar_module
@@ -966,84 +965,6 @@ class EagleMixedRequestControls(unittest.TestCase):
                 GUARD.validate_eagle_single_request_review_exact(
                     owner, batch, torch.tensor([1280, 513], dtype=torch.int32), num_reqs=2, padded=2, step=0
                 )
-
-
-def idle_owner():
-    provider = NS(method="eagle3", _active_bank=None, proposal=(), quarantined=False, _carriers={"ready": object()})
-    batch = NS(is_dummy=True, num_reqs=1, num_reqs_after_padding=1)
-    owner = NS(
-        method="eagle3",
-        dp_size=2,
-        num_speculative_steps=3,
-        max_num_reqs=1,
-        input_batch=batch,
-        vllm_config=NS(additional_config={}),
-        _draft_graph_review_limit=True,
-        update_stream=object(),
-        _eagle3_capture_call=None,
-        _draft_window_graph_binding_provider=provider,
-    )
-
-    def require_reusable():
-        if provider.quarantined:
-            raise RuntimeError("quarantined")
-
-    provider.require_reusable = require_reusable
-    provider.quarantine = lambda: setattr(provider, "quarantined", True)
-    return owner, batch, provider
-
-
-class EagleIdleOwnershipControls(unittest.TestCase):
-    def test_actual_idle_uses_full_baseline_and_both_consumer_managers(self):
-        owner, batch, session = idle_owner()
-        with DP.eagle3_dp_dummy_scope(owner, batch, dummy_run=True, is_profile=False):
-            self.assertTrue(owner._eagle3_graph_dp_dummy_active)
-            for first, tokens, count in ((True, 4, 1), (False, 1, 2)):
-                manager = NS(speculator=owner, update_stream=owner.update_stream, is_draft_model_prefill=first)
-                descriptor = NS(cg_mode=NS(name="FULL"), num_reqs=1, num_tokens=tokens)
-                self.assertTrue(DP.validate_eagle_dp_dummy_replay(owner, manager, descriptor, [{}] * count))
-                with self.assertRaises(RuntimeError):
-                    DP.validate_eagle_dp_dummy_replay(owner, manager, descriptor, [{}] * (count + 1))
-            self.assertEqual(owner._draft_window_graph_binding_provider.proposal, ())
-        self.assertFalse(owner._eagle3_graph_dp_dummy_active)
-        self.assertFalse(owner._draft_window_graph_binding_provider.quarantined)
-        # K0 business first-only is a genuine request, never dummy/idle.
-        batch.is_dummy = False
-        with DP.eagle3_dp_dummy_scope(owner, batch, dummy_run=False, is_profile=False):
-            self.assertFalse(owner._eagle3_graph_dp_dummy_active)
-
-    def test_idle_failure_or_live_generation_cannot_reuse(self):
-        owner, batch, session = idle_owner()
-        with (
-            self.assertRaisesRegex(RuntimeError, "injected"),
-            DP.eagle3_dp_dummy_scope(owner, batch, dummy_run=True, is_profile=False),
-        ):
-            raise RuntimeError("injected submission uncertainty")
-        self.assertTrue(owner._draft_window_graph_binding_provider.quarantined)
-        self.assertFalse(owner._eagle3_graph_dp_dummy_active)
-        with (
-            self.assertRaisesRegex(RuntimeError, "quarantined"),
-            DP.eagle3_dp_dummy_scope(owner, batch, dummy_run=True, is_profile=False),
-        ):
-            self.fail("uncertain idle work must reject the next Graph scope")
-        owner, batch, session = idle_owner()
-        owner._draft_window_graph_binding_provider.proposal = object()
-        with (
-            self.assertRaises(RuntimeError),
-            DP.eagle3_dp_dummy_scope(owner, batch, dummy_run=True, is_profile=False),
-        ):
-            self.fail("live business generation entered dummy replay")
-        self.assertTrue(owner._draft_window_graph_binding_provider.quarantined)
-        owner, batch, session = idle_owner()
-        owner._draft_window_graph_binding_provider._active_bank = object()
-        with (
-            self.assertRaises(RuntimeError),
-            DP.eagle3_dp_dummy_scope(owner, batch, dummy_run=True, is_profile=False),
-        ):
-            self.fail("live scratch entered dummy replay")
-        owner, batch, session = idle_owner()
-        with DP.eagle3_dp_dummy_scope(owner, batch, dummy_run=True, is_profile=True):
-            self.assertFalse(getattr(owner, "_eagle3_graph_dp_dummy_active", False))
 
 
 if __name__ == "__main__":

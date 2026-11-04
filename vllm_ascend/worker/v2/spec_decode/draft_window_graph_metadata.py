@@ -8,26 +8,14 @@ from copy import copy
 from typing import Any
 
 
-def copy_draft_attention_metadata(metadata: Mapping[str, Any]) -> dict[str, Any]:
-    """Give Draft its own mutable header, preserving read-only Full operands.
+def copy_draft_attention_metadata(metadata: Mapping[str, Any], layers: tuple[str, ...]) -> dict[str, Any]:
+    """Copy the admitted single Draft group's header, keeping its layer aliases.
 
-    Builders create one metadata object per attention group. Preserve those
-    layer aliases. Both callers immediately replace read fields with the
-    bank; the supported dense consumer only reads inherited query/Full fields.
-    Copy the header rather than reconstructing it so dynamic fields survive.
+    The real builder publishes one header for the already inventoried group.
+    Both callers replace read fields; inherited Full/query operands stay read-only.
     """
-    if not metadata:
-        raise ValueError("Draft attention metadata must be a non-empty layer mapping")
-    copies: dict[int, Any] = {}
-    result: dict[str, Any] = {}
-    for name, layer in metadata.items():
-        if layer is None:
-            result[name] = None
-            continue
-        if id(layer) not in copies:
-            copies[id(layer)] = copy(layer)
-        result[name] = copies[id(layer)]
-    return result
+    layer = copy(metadata[layers[0]])
+    return dict.fromkeys(layers, layer)
 
 
 def bind_draft_window_read(layer: Any, bank: Any, max_seq_len: int) -> None:

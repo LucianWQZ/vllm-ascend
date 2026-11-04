@@ -27,6 +27,7 @@ from vllm_ascend.compilation.updatable_graph import (
 from vllm_ascend.utils import use_updatable_graph
 from vllm_ascend.worker.v2.aclgraph_utils import collect_sorted_captured_token_sizes, model_capture_wrapper
 from vllm_ascend.worker.v2.spec_decode.dflash.capture import draft_window_dflash_capture_scope
+from vllm_ascend.worker.v2.spec_decode.draft_window_graph import draft_window_all_continuing
 from vllm_ascend.worker.v2.utils import communicator_switch
 
 
@@ -70,13 +71,8 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
         max_query_len: int | None = None,
         num_ubatches: int = 1,
     ) -> BatchExecutionDescriptor:
-        provider = getattr(self.speculator, "_draft_window_graph_binding_provider", None)
-        rows = None if provider is None else provider.proposal
-        if rows and all(rows):
-            # Continuing prefill owns no Window generation. Captured Window
-            # operands cannot stand in for its baseline full read. Select the
-            # existing eager branch before upstream metadata/padding is built;
-            # this is a declared phase rule, never a missing-bucket fallback.
+        if draft_window_all_continuing(self.speculator):
+            # This explicit phase keeps Full reads; never a missing-bucket or UPDATE fallback.
             return BatchExecutionDescriptor(
                 cg_mode=CUDAGraphMode.NONE,
                 num_tokens=num_tokens,

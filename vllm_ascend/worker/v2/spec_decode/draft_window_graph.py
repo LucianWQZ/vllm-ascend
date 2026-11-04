@@ -26,6 +26,13 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_plan import (
 )
 
 
+def draft_window_all_continuing(owner: Any) -> bool:
+    """Select the original Full prefill reader before metadata/padding."""
+    provider = getattr(owner, "_draft_window_graph_binding_provider", None)
+    rows = provider.proposal if provider is not None else None
+    return bool(rows) and all(rows)
+
+
 @dataclass(slots=True, eq=False)
 class DraftWindowGraphBucket:
     """Actual capture consumer and its strongly owned read tensors.

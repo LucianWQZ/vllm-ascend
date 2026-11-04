@@ -33,7 +33,6 @@ class Eagle3DraftWindowMixin:
 
     _draft_window_graph_binding_provider: DraftWindowGraphBindingProvider
     _eagle3_window_intervals: tuple[tuple[int, int], ...] | None
-    _eagle3_window_decode_step_one_exact: torch.Tensor | None
     _eagle3_window_next_step: int
     input_batch: Any
     input_buffers: Any
@@ -45,7 +44,6 @@ class Eagle3DraftWindowMixin:
     def _initialize_eagle3_draft_window_state(self) -> None:
         """Initialize proposal state after source/configuration validation."""
         self._eagle3_window_intervals = None
-        self._eagle3_window_decode_step_one_exact = None
         self._eagle3_window_next_step = 0
         self._eagle3_window_expected_steps = self.num_speculative_steps
 
@@ -68,19 +66,37 @@ class Eagle3DraftWindowMixin:
         if not dummy_run and not is_profile and not bool(getattr(input_batch, "is_dummy", False)):
             rows = tuple(map(bool, continuing_prefill_rows(input_batch, input_batch.num_reqs)))
         if not rows or all(rows):
-            from vllm_ascend.worker.v2.spec_decode.draft_window_eagle3_dp import eagle3_dp_dummy_scope
-
-            with (
-                provider.proposal_scope(rows),
-                eagle3_dp_dummy_scope(self, input_batch, dummy_run=dummy_run, is_profile=is_profile),
-            ):
-                yield
+            with provider.proposal_scope(rows):
+                # An idle DP replica executes the original Full/PAD first/AR
+                # graphs. Keep that work in the same owning proposal scope,
+                # so any failed preparation or UPDATE quarantines its banks.
+                idle = (
+                    bool(provider._carriers)
+                    and getattr(self, "dp_size", None) == 2
+                    and not is_profile
+                    and getattr(self, "_eagle3_capture_call", None) is None
+                    and (dummy_run or getattr(input_batch, "is_dummy", False))
+                )
+                if idle:
+                    if (
+                        dummy_run is not True
+                        or input_batch.is_dummy is not True
+                        or self.input_batch.is_dummy is not True
+                    ):
+                        raise RuntimeError(
+                            "Eagle DP idle requires the fixed core's real dummy input, not a K0 business row"
+                        )
+                    provider.require_reusable()
+                self._eagle3_graph_dp_dummy_active = idle
+                try:
+                    yield
+                finally:
+                    self._eagle3_graph_dp_dummy_active = False
             return
 
         if not provider._carriers:
             raise RuntimeError("Eagle3 Draft Window business proposals require their installed Graph manager")
         self._eagle3_window_intervals = None
-        self._eagle3_window_decode_step_one_exact = None
         self._eagle3_window_next_step = 0
         self._eagle3_window_expected_steps = expected_steps
         try:
@@ -94,7 +110,6 @@ class Eagle3DraftWindowMixin:
                     )
         finally:
             self._eagle3_window_intervals = None
-            self._eagle3_window_decode_step_one_exact = None
             self._eagle3_window_next_step = 0
             self._eagle3_window_expected_steps = self.num_speculative_steps
 
@@ -103,27 +118,11 @@ class Eagle3DraftWindowMixin:
         rows = provider.proposal if provider is not None else None
         return bool(rows) and not all(rows)
 
-    def _snapshot_eagle3_decode_step_one(
-        self,
-        *,
-        num_reqs: int,
-        num_reqs_padded: int,
-    ) -> torch.Tensor:
-        """Take the sole feature D2H exact snapshot after rejection correction."""
-        if self._eagle3_window_next_step != 1:
-            raise RuntimeError("decode exact snapshot requires a completed Eagle3 first pass")
-        if self._eagle3_window_decode_step_one_exact is not None:
-            raise RuntimeError("Eagle3 decode exact state was already snapshotted")
-        if num_reqs != self.input_batch.num_reqs or num_reqs_padded < num_reqs:
-            raise ValueError("Eagle3 decode snapshot requires actual rows within its selected capture bucket")
-        exact = self.input_buffers.seq_lens[:num_reqs].to(device="cpu", dtype=torch.int32, copy=True)
-        self._eagle3_window_decode_step_one_exact = exact
-        return exact
-
     def _materialize_eagle3_step(
         self,
         capture: DraftWindowGraphBucket,
         step: int,
+        cpu_full_exact: torch.Tensor | None = None,
     ) -> DraftWindowGraphBucket:
         """Freeze the first anchor, then project each AR end into its own bank."""
         if (
@@ -173,12 +172,9 @@ class Eagle3DraftWindowMixin:
                         "use a smaller chunked-prefill budget"
                     )
         else:
-            step_one_exact = self._eagle3_window_decode_step_one_exact
-            if proposal is None or step_one_exact is None:
-                raise RuntimeError("Eagle3 decode step is missing proposal-owned state")
-            if len(proposal) != num_reqs:
-                raise RuntimeError("Eagle3 request geometry changed within one proposal")
-            exact = step_one_exact.add(step - 1).clamp_(max=self.max_model_len)
+            if proposal is None or cpu_full_exact is None:
+                raise RuntimeError("Eagle3 decode step requires its frozen anchor and corrected exact length")
+            exact = cpu_full_exact
         from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import (
             validate_eagle_single_request_review_exact,
         )

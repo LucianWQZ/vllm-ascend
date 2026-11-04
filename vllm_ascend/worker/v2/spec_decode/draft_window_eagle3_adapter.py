@@ -107,7 +107,7 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentA
                 raise RuntimeError("Eagle3 capture visited more consumers than its real descriptor")
             n = bank.descriptor.num_reqs
             capacity = min(self.max_model_len, provider.window_size + provider.group.table_column_span - 1)
-            attn_metadata = copy_draft_attention_metadata(attn_metadata)
+            attn_metadata = copy_draft_attention_metadata(attn_metadata, provider.group.layers)
             query = self.input_buffers.query_start_loc
             if query.dtype != torch.int32 or query.ndim != 1 or query.numel() < n + 1:
                 raise RuntimeError("Eagle3 capture requires its owned int32 Full input query")
@@ -147,7 +147,7 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentA
             capture = provider.capture_banks_for(num_reqs=n, num_tokens=n * (self.num_speculative_steps + 1))[0]
             self.block_tables.gather_block_tables(self.input_batch.idx_mapping, num_reqs_padded=n)
             bank = prefill_inputs = self._materialize_eagle3_step(capture, 0)
-            attn_metadata = copy_draft_attention_metadata(attn_metadata)
+            attn_metadata = copy_draft_attention_metadata(attn_metadata, provider.group.layers)
             max_seq_len = int(bank.cpu_window_exact.max().item())
             for layer in attn_metadata.values():
                 if layer is not None:
@@ -179,18 +179,23 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentA
     ):
         if self._eagle3_window_is_active():
             provider = self._draft_window_graph_binding_provider
+            padded = batch_desc.num_reqs or num_reqs
             if (
                 self._eagle3_window_expected_steps == 1
+                or self._eagle3_window_next_step != 1
+                or num_reqs != self.input_batch.num_reqs
+                or padded < num_reqs
                 or batch_desc.cg_mode != CUDAGraphMode.FULL
                 or skip_attn
                 or num_speculative_steps not in (None, self.num_speculative_steps)
             ):
                 raise RuntimeError("Eagle3 Window requires its actual static-K FULL AR descriptor; no eager fallback")
-            padded = batch_desc.num_reqs or num_reqs
-            self._snapshot_eagle3_decode_step_one(num_reqs=num_reqs, num_reqs_padded=padded)
+            # Rejection correction is already applied. Keep its sole D2H
+            # snapshot local while staging all merged AR consumers.
+            exact = self.input_buffers.seq_lens[:num_reqs].to(device="cpu", dtype=torch.int32, copy=True)
             for step in range(1, self.num_speculative_steps):
                 capture = provider.capture_banks_for(num_reqs=padded, num_tokens=batch_desc.num_tokens)[step - 1]
-                self._materialize_eagle3_step(capture, step)
+                self._materialize_eagle3_step(capture, step, exact.add(step - 1).clamp_(max=self.max_model_len))
                 provider.bind_current(capture.descriptor)
                 self._eagle3_window_next_step = step + 1
         return super()._multi_step_decode(

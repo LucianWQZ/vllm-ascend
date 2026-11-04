@@ -748,14 +748,24 @@ def parallel_bypass_scope(graph_buffers, request):
     return owner, batch, request.param == "dummy", request.param == "profile"
 
 
-def test_parallel_scope_rows_control_the_real_dispatch_phase(parallel_bypass_scope, monkeypatch):
-    from vllm_ascend.worker.v2.spec_decode.dflash import aclgraph
+@pytest.mark.parametrize("method", ["parallel", "ar"])
+def test_window_scope_rows_control_the_actual_manager_dispatch(parallel_bypass_scope, monkeypatch, method):
+    if method == "parallel":
+        from vllm_ascend.worker.v2.spec_decode.dflash.aclgraph import DFlashAclGraphManager, DFlashCudaGraphManager
 
+        manager_type, base = DFlashAclGraphManager, DFlashCudaGraphManager
+    else:
+        from vllm_ascend.worker.v2.spec_decode.target_dependent_ar.aclgraph import (
+            AutoRegressiveAclGraphManager,
+            SpeculatorCudaGraphManager,
+        )
+
+        manager_type, base = AutoRegressiveAclGraphManager, SpeculatorCudaGraphManager
     owner, batch, dummy, profile = parallel_bypass_scope
     baseline = object()
     dispatch = Mock(return_value=baseline)
-    monkeypatch.setattr(aclgraph.DFlashCudaGraphManager, "dispatch", dispatch)
-    manager = object.__new__(aclgraph.DFlashAclGraphManager)
+    monkeypatch.setattr(base, "dispatch", dispatch)
+    manager = object.__new__(manager_type)
     manager.speculator = owner
     manager._resolve_effective_loras = lambda value: value
     with owner._draft_window_proposal_scope(batch, dummy_run=dummy, is_profile=profile):

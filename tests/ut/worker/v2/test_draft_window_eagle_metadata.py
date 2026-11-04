@@ -28,7 +28,15 @@ def captured_bank(owner, *, n, tokens, ordinal):
 
 
 def stage_reader(owner, bank, step):
-    owner._materialize_eagle3_step(bank, step)
+    exact = (
+        None
+        if step == 0
+        else owner.input_buffers.seq_lens[: owner.input_batch.num_reqs]
+        .to(device="cpu", dtype=torch.int32, copy=True)
+        .add(step - 1)
+        .clamp_(max=owner.max_model_len)
+    )
+    owner._materialize_eagle3_step(bank, step, exact)
     owner._draft_window_graph_binding_provider.bind_current(bank.descriptor)
     owner._eagle3_window_next_step = step + 1
 
@@ -187,7 +195,6 @@ def test_real_proposal_keeps_each_submitted_consumer_until_update(proposal):
         stage_reader(owner, first, 0)
         assert runtime._active_bank is None and [bank for bank, _ in runtime._pending] == [first]
         runtime.finish_update()
-        owner._snapshot_eagle3_decode_step_one(num_reqs=1, num_reqs_padded=1)
         ar = [captured_bank(owner, n=1, tokens=1, ordinal=i) for i in range(2)]
         for step, bank in enumerate(ar, 1):
             stage_reader(owner, bank, step)
@@ -242,7 +249,6 @@ def test_actual_manager_failure_stays_inside_the_proposal_quarantine(monkeypatch
         if not first:
             stage_reader(owner, captured_bank(owner, n=1, tokens=4, ordinal=0), 0)
             provider.finish_update()
-            owner._snapshot_eagle3_decode_step_one(num_reqs=1, num_reqs_padded=1)
             for step in (1, 2):
                 stage_reader(owner, captured_bank(owner, n=1, tokens=1, ordinal=step - 1), step)
         desc = captured_bank(owner, n=1, tokens=4 if first else 1, ordinal=0).descriptor
@@ -330,7 +336,6 @@ def test_first_and_ar_share_one_materialization_path_without_moving_the_anchor(p
         frozen = owner._eagle3_window_intervals
         assert frozen[0][0] == 8
         runtime.finish_update()
-        owner._snapshot_eagle3_decode_step_one(num_reqs=1, num_reqs_padded=1)
         for step in (1, 2):
             stage_reader(owner, captured_bank(owner, n=1, tokens=1, ordinal=step - 1), step)
             assert owner._eagle3_window_intervals is frozen
@@ -431,7 +436,7 @@ def test_eagle_capture_borrows_full_query_write_fields_and_owns_only_reads(monke
     owner.max_model_len, owner.input_buffers = 32, SimpleNamespace(query_start_loc=query)
     owner._draft_window_graph_binding_provider = SimpleNamespace(
         window_size=4,
-        group=SimpleNamespace(table_column_span=2),
+        group=SimpleNamespace(table_column_span=2, layers=("layer", "shared")),
     )
     capture = SimpleNamespace(descriptor=SimpleNamespace(num_reqs=1), **vars(bank))
     owner._eagle3_capture_call = iter((capture,))
@@ -439,7 +444,8 @@ def test_eagle_capture_borrows_full_query_write_fields_and_owns_only_reads(monke
     result = owner._run_model(4, metadata, None, None)
     assert result["layer"] is result["shared"]
     layer = result["layer"]
-    assert layer is not original and result["empty"] is None
+    assert layer is not original and set(result) == {"layer", "shared"}
+    assert metadata["empty"] is None
     assert layer.block_tables is bank.window_block_table
     assert layer.seq_lens is original.seq_lens and layer.seq_lens_gpu is original.seq_lens_gpu
     assert layer.seq_lens_cpu is bank.cpu_window_exact
@@ -546,8 +552,6 @@ def test_eagle_stage_uses_the_bank_without_rebuilding_or_reading_target_metadata
         batch, dummy_run=False, is_profile=False, num_speculative_tokens=scheduled
     ):
         for step in range(1 if scheduled == 0 else scheduled):
-            if step == 1:
-                owner._snapshot_eagle3_decode_step_one(num_reqs=1, num_reqs_padded=1)
             capture = captured_bank(owner, n=1, tokens=4 if step == 0 else 1, ordinal=max(0, step - 1))
             stage_reader(owner, capture, step)
             assert runtime._active_bank is None and runtime._pending[-1][0] is capture
@@ -917,7 +921,7 @@ def test_capture_scope_selects_banks_once_and_requires_every_real_consumer(monke
 
     owner._draft_window_graph_binding_provider = SimpleNamespace(
         window_size=4,
-        group=SimpleNamespace(table_column_span=2),
+        group=SimpleNamespace(table_column_span=2, layers=("layer",)),
         capture_banks_for=select,
     )
     full = AscendMetadata(slot_mapping=torch.tensor([10]), seq_lens_list=[99], actual_seq_lengths_q=[4])
@@ -942,3 +946,125 @@ def test_capture_scope_selects_banks_once_and_requires_every_real_consumer(monke
             num_tokens=4 if consumers == 1 else 1,
         )
     ]
+
+
+@pytest.mark.parametrize("profile", [False, True])
+def test_idle_dp_uses_real_proposal_scope_and_both_manager_consumers(proposal, profile):
+    from vllm_ascend.worker.v2.spec_decode.draft_window_eagle3_dp import validate_eagle_dp_dummy_replay
+
+    owner, batch, _, provider, _ = proposal
+    owner.dp_size, batch.is_dummy = 2, True
+    banks = tuple(provider._carriers.values())
+    with owner._eagle3_draft_window_proposal_scope(batch, dummy_run=True, is_profile=profile):
+        assert owner._eagle3_graph_dp_dummy_active is not profile
+        assert provider.proposal == () and provider._active_bank is None and not provider._pending
+        for first, tokens, count in ((True, 4, 1), (False, 1, 2)):
+            manager = SimpleNamespace(is_draft_model_prefill=first)
+            descriptor = SimpleNamespace(cg_mode=CUDAGraphMode.FULL, num_reqs=1, num_tokens=tokens)
+            assert validate_eagle_dp_dummy_replay(owner, manager, descriptor, [{}] * count) is not profile
+            if not profile:
+                with pytest.raises(RuntimeError, match="real first Q4 or two AR Q1"):
+                    validate_eagle_dp_dummy_replay(owner, manager, descriptor, [{}] * (count + 1))
+    assert not owner._eagle3_graph_dp_dummy_active and provider.proposal is None
+    assert tuple(provider._carriers.values()) == banks and not provider.quarantined
+
+
+@pytest.mark.parametrize("failure", ["body", "stream", "argument_dummy", "owner_dummy"])
+def test_idle_dp_uncertain_work_quarantines_in_its_real_owning_scope(proposal, monkeypatch, failure):
+    owner, batch, _, provider, _ = proposal
+    owner.dp_size, batch.is_dummy = 2, True
+    banks = tuple(provider._carriers.values())
+    if failure == "argument_dummy":
+        batch.is_dummy = False
+    elif failure == "owner_dummy":
+        owner.input_batch = SimpleNamespace(is_dummy=False)
+    elif failure == "stream":
+
+        def fail_stream():
+            raise RuntimeError("injected changed stream")
+
+        monkeypatch.setattr(provider, "require_reusable", fail_stream)
+    with (
+        pytest.raises(RuntimeError),
+        owner._eagle3_draft_window_proposal_scope(batch, dummy_run=True, is_profile=False),
+    ):
+        assert failure == "body" and owner._eagle3_graph_dp_dummy_active
+        raise RuntimeError("injected uncertain UPDATE")
+    assert provider.quarantined and provider.proposal is None
+    assert not getattr(owner, "_eagle3_graph_dp_dummy_active", False)
+    assert tuple(provider._carriers.values()) == banks
+    with (
+        pytest.raises(RuntimeError, match="quarantined"),
+        owner._eagle3_draft_window_proposal_scope(batch, dummy_run=True, is_profile=False),
+    ):
+        pytest.fail("uncertain idle work was reused")
+
+
+@pytest.mark.parametrize("occupied", ["proposal", "_active_bank", "_pending"])
+def test_idle_dp_never_overwrites_a_live_business_consumer(proposal, occupied):
+    owner, batch, _, provider, _ = proposal
+    owner.dp_size, batch.is_dummy = 2, True
+    previous = [object()] if occupied == "_pending" else object()
+    setattr(provider, occupied, previous)
+    with (
+        pytest.raises(RuntimeError, match="already active"),
+        owner._eagle3_draft_window_proposal_scope(batch, dummy_run=True, is_profile=False),
+    ):
+        pytest.fail("live business consumer entered an idle scope")
+    assert getattr(provider, occupied) is previous and not provider.quarantined
+
+
+def test_real_merged_ar_entry_owns_one_corrected_snapshot_without_persistent_state(proposal, monkeypatch):
+    owner, batch, _, provider, _ = proposal
+    parent_calls, prepared = [], []
+    original = provider.prepare
+    desc = captured_bank(owner, n=1, tokens=1, ordinal=0).descriptor
+    first = captured_bank(owner, n=1, tokens=4, ordinal=0)
+    full = provider.table.clone()
+
+    def prepare(bank, **kwargs):
+        result = original(bank, **kwargs)
+        prepared.append(kwargs["cpu_full_exact"].clone())
+        # The second AR consumer must use the completed local snapshot, not
+        # re-read the now changed persistent input or move the first anchor.
+        owner.input_buffers.seq_lens.zero_()
+        return result
+
+    def parent(current, *args):
+        parent_calls.append(args)
+        assert current is owner and owner._eagle3_window_next_step == 3
+        assert [bank.cpu_window_exact.tolist() for bank, _ in provider._pending] == [[0], [1]]
+        return "original merged AR"
+
+    monkeypatch.setattr(AscendTargetDependentARSpeculator, "_multi_step_decode", parent)
+    with owner._eagle3_draft_window_proposal_scope(batch, dummy_run=False, is_profile=False):
+        stage_reader(owner, first, 0)
+        first_contents = first.window_block_table.clone(), first.cpu_window_exact.clone()
+        provider.finish_update()
+        monkeypatch.setattr(provider, "prepare", prepare)
+        assert owner._multi_step_decode(1, False, desc, None) == "original merged AR"
+        assert [value.tolist() for value in prepared] == [[8], [9]]
+        assert not hasattr(owner, "_eagle3_window_decode_step_one_exact")
+        torch.testing.assert_close(first.window_block_table, first_contents[0])
+        torch.testing.assert_close(first.cpu_window_exact, first_contents[1])
+        torch.testing.assert_close(provider.table, full)
+        provider.finish_update()
+    assert parent_calls == [(1, False, desc, None, None, None)]
+
+
+@pytest.mark.parametrize("damage", ["before_first", "wrong_rows", "wrong_bucket"])
+def test_real_ar_entry_rejects_bad_first_or_row_geometry_before_preparation(proposal, monkeypatch, damage):
+    owner, batch, _, provider, _ = proposal
+    desc = captured_bank(owner, n=1, tokens=1, ordinal=0).descriptor
+    with (
+        pytest.raises(RuntimeError, match="actual static-K FULL AR descriptor"),
+        owner._eagle3_draft_window_proposal_scope(batch, dummy_run=False, is_profile=False),
+    ):
+        if damage != "before_first":
+            stage_reader(owner, captured_bank(owner, n=1, tokens=4, ordinal=0), 0)
+            provider.finish_update()
+        if damage == "wrong_bucket":
+            batch.num_reqs = 2
+        monkeypatch.setattr(provider, "prepare", lambda *args, **kwargs: pytest.fail("bad AR geometry wrote a bank"))
+        owner._multi_step_decode(1 if damage == "before_first" else 2, False, desc, None)
+    assert provider.quarantined and provider._active_bank is None and not provider._pending

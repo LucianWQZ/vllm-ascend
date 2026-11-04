@@ -38,6 +38,7 @@ from vllm_ascend.worker.v2.aclgraph_utils import (
     collect_sorted_captured_token_sizes,
     model_capture_wrapper,
 )
+from vllm_ascend.worker.v2.spec_decode.draft_window_graph import draft_window_all_continuing
 from vllm_ascend.worker.v2.utils import communicator_switch
 
 
@@ -306,12 +307,8 @@ class AutoRegressiveAclGraphManager(SpeculatorCudaGraphManager):
         return ret
 
     def dispatch(self, num_reqs, num_tokens, uniform_token_count, num_active_loras, max_query_len=None, num_ubatches=1):
-        owner = self.speculator
-        provider = getattr(owner, "_draft_window_graph_binding_provider", None)
-        rows = provider.proposal if provider is not None else None
-        if rows and all(rows):
-            # Only the explicit existing nonuniform/continuing-prefill phase.
-            # Missing buckets and UPDATE exceptions never enter this branch.
+        if draft_window_all_continuing(self.speculator):
+            # This explicit phase keeps Full reads; never a missing-bucket or UPDATE fallback.
             return BatchExecutionDescriptor(
                 cg_mode=CUDAGraphMode.NONE,
                 num_tokens=num_tokens,

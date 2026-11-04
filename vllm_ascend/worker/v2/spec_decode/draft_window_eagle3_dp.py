@@ -6,44 +6,6 @@ collectives. Its original Full/PAD operands must update the captured first/AR
 consumers without creating a Window generation or borrowing a business bank.
 """
 
-from contextlib import contextmanager
-
-
-@contextmanager
-def eagle3_dp_dummy_scope(owner, input_batch, *, dummy_run, is_profile):
-    """Retain the fixed dummy computation and quarantine uncertain submissions.
-
-    A real K0 proposal is not dummy and never enters this scope. Initial
-    profile/capture keeps its existing path and is not runtime idle evidence.
-    No device completion is inferred from leaving this Host scope.
-    """
-    provider = getattr(owner, "_draft_window_graph_binding_provider", None)
-    if (
-        provider is None
-        or not provider._carriers
-        or getattr(owner, "dp_size", None) != 2
-        or is_profile
-        or getattr(owner, "_eagle3_capture_call", None) is not None
-        or not (dummy_run or getattr(input_batch, "is_dummy", False))
-    ):
-        yield
-        return
-    if dummy_run is not True or getattr(input_batch, "is_dummy", False) is not True:
-        raise RuntimeError("Eagle DP idle must be the fixed core's real dummy input, not a K0 business row")
-    if getattr(owner, "_eagle3_graph_dp_dummy_active", False) is not False:
-        raise RuntimeError("Eagle DP dummy Graph scope cannot nest")
-    owner._eagle3_graph_dp_dummy_active = True
-    try:
-        provider.require_reusable()
-        if owner.input_batch.is_dummy is not True or provider.proposal != () or provider._active_bank is not None:
-            raise RuntimeError("Eagle DP dummy requires its explicit local1 no-business-generation Full scope")
-        yield
-    except BaseException:
-        provider.quarantine()
-        raise
-    finally:
-        owner._eagle3_graph_dp_dummy_active = False
-
 
 def validate_eagle_dp_dummy_replay(owner, manager, descriptor, metadata_batch):
     """Attribute both actual managers without changing their baseline operands."""

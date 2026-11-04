@@ -42,7 +42,7 @@ def _attention_metadata():
 def test_metadata_copy_owns_header_and_borrows_read_only_operands(metadata_isolation):
     copy_metadata = metadata_isolation
     layer = _attention_metadata()
-    private = copy_metadata({"draft": layer})
+    private = copy_metadata({"draft": layer}, ("draft",))
     copied = private["draft"]
     assert copied is not layer
     for field in (
@@ -70,7 +70,7 @@ def test_real_ascend_metadata_preserves_canonical_full_operands(metadata_isolati
 
     copy_metadata = metadata_isolation
     layer = AscendMetadata(**vars(_attention_metadata()))
-    private = copy_metadata({"draft": layer})
+    private = copy_metadata({"draft": layer}, ("draft",))
     copied = private["draft"]
     copied.attn_state = AscendAttentionState.DecodeOnly
     copied.seq_lens_list = [9, 4]
@@ -79,17 +79,12 @@ def test_real_ascend_metadata_preserves_canonical_full_operands(metadata_isolati
     assert copied.query_start_loc is layer.query_start_loc
 
 
-def test_metadata_copy_preserves_group_aliases_and_missing_layers(metadata_isolation):
+def test_metadata_copy_uses_the_actual_group_and_preserves_its_aliases(metadata_isolation):
     copy_metadata = metadata_isolation
     layer = _attention_metadata()
-    private = copy_metadata({"a": layer, "b": layer, "unused": None})
+    private = copy_metadata({"a": layer, "b": layer, "target": _attention_metadata()}, ("a", "b"))
+    assert set(private) == {"a", "b"}
     assert private["a"] is private["b"] and private["a"] is not layer
-    assert private["unused"] is None
-
-
-def test_metadata_copy_requires_an_actual_consumer(metadata_isolation):
-    with pytest.raises(ValueError, match="non-empty layer mapping"):
-        metadata_isolation({})
 
 
 def test_real_builder_constructs_private_window_metadata_without_touching_target(monkeypatch):
@@ -147,7 +142,7 @@ def test_real_builder_constructs_private_window_metadata_without_touching_target
     )
     # Native-prefill retains the real builder's query/write/state metadata;
     # only its private Draft copy receives the owned window read operands.
-    draft = copy_draft_attention_metadata({"draft": target})["draft"]
+    draft = copy_draft_attention_metadata({"draft": target}, ("draft",))["draft"]
     bind_draft_window_read(draft, bank, 7)
     assert draft is not target
     assert draft.block_tables.data_ptr() == bank.window_block_table.data_ptr()
