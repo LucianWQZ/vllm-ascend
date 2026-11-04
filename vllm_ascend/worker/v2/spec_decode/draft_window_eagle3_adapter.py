@@ -41,7 +41,7 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentA
             self.supports_decode_metadata_update = False
 
     def init_cudagraph_manager(self, cudagraph_mode):
-        result = super().init_cudagraph_manager(cudagraph_mode)
+        super().init_cudagraph_manager(cudagraph_mode)
         provider = getattr(self, "_draft_window_graph_binding_provider", None)
         if provider is not None:
             self._eagle3_capture_call = None
@@ -60,11 +60,9 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentA
                         for ordinal in range(1 if first else self.num_speculative_steps - 1):
                             bank = provider.register_capture_identity(descriptor=desc, consumer_ordinal=ordinal)
                             # Seed before GLOBAL capture; no H2D belongs in its callback.
-                            bank.window_block_table.zero_()
                             bank.cpu_window_exact.fill_(capacity)
             if not provider._carriers:
                 raise RuntimeError("Eagle3 Window requires a nonempty capture bucket inventory")
-        return result
 
     @contextmanager
     def _eagle3_capture_scope(self, *, n: int, tokens: int):
