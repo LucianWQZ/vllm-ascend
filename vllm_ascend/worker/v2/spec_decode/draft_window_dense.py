@@ -104,7 +104,6 @@ def prepare_dense_draft_read(
     if bool(((starts < 0) | (starts >= exact_cpu)).any()):
         raise ValueError("Frozen Draft anchors must match current request rows")
     visible_lengths = exact_cpu - starts
-    retain(exact_cpu, starts, query_ends_cpu, visible_lengths)
     widths = None
     if query_start_loc_cpu is not None:
         assert query_start_loc_device is not None
