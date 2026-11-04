@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
+from contextlib import nullcontext
 from types import SimpleNamespace as NS
+from unittest.mock import Mock
 
 import pytest
 
@@ -97,3 +99,53 @@ def test_other_draft_dcp_routes_keep_the_original_head_validation(method, v2, dr
 def test_replicated_gqa_draft_keeps_dynamic_dcp_rejection():
     with pytest.raises(ValueError, match="Dynamic speculative decoding"):
         _validate_draft_decode_context_parallel_config(gqa_draft_config("dspark", dynamic=True))
+
+
+@pytest.mark.parametrize(
+    "mla,draft_dcp,target_dcp,filtered",
+    [(True, 1, 16, True), (False, 1, 16, False), (True, 16, 16, False), (True, 1, 1, False)],
+)
+def test_only_replicated_mla_skips_target_context_draft_builders(monkeypatch, mla, draft_dcp, target_dcp, filtered):
+    from vllm_ascend.patch.worker import patch_model_runner as patch
+
+    speculator = Mock(spec=patch.upstream.DraftModelSpeculator)
+    speculator.draft_attn_layer_names = {"draft"}
+    speculator.draft_model_config = NS(use_mla=mla)
+    speculator.dcp_size = draft_dcp
+    cache_spec = NS(
+        block_size=128,
+        uses_slot_mapping=True,
+        dcp_sharded=False,
+        block_table_token_alignment=1,
+        max_num_blocks_per_req=lambda *args: 16,
+    )
+    cache_config = NS(kv_cache_groups=[NS(layer_names=["target", "draft"], kv_cache_spec=cache_spec)])
+    owner = NS(
+        parallel_config=NS(cp_kv_cache_interleave_size=1, decode_context_parallel_size=target_dcp),
+        speculator=speculator,
+        max_model_len=2048,
+        is_encoder_decoder=False,
+        jit_warmup_registry=NS(activate=nullcontext),
+        vllm_config=object(),
+        device="cpu",
+    )
+    calls = []
+
+    class ReachedOriginalBuilder(Exception):
+        pass
+
+    def stop_at_original_builder(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise ReachedOriginalBuilder
+
+    monkeypatch.setattr(patch.upstream, "init_attn_backend", stop_at_original_builder)
+    with pytest.raises(ReachedOriginalBuilder):
+        patch.initialize_kv_cache(owner, cache_config)
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert kwargs["active_layer_names"] == ({"target"} if filtered else None)
+    assert kwargs["draft_layer_names"] is speculator.draft_attn_layer_names
+    assert args[1] is owner.vllm_config
+    assert owner.parallel_config.decode_context_parallel_size == target_dcp
+    assert speculator.dcp_size == draft_dcp
+    assert cache_config.kv_cache_groups[0].layer_names == ["target", "draft"]

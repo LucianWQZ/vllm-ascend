@@ -75,8 +75,17 @@ def initialize_kv_cache(
             layer_name for group in self.kv_cache_config.kv_cache_groups for layer_name in group.layer_names
         } - self.speculator.draft_attn_layer_names
     draft_attn_layer_names = None
+    active_target_layer_names = None
     if isinstance(self.speculator, upstream.DraftModelSpeculator):
         draft_attn_layer_names = self.speculator.draft_attn_layer_names
+        if (
+            self.speculator.draft_model_config.use_mla
+            and self.speculator.dcp_size == 1
+            and self.parallel_config.decode_context_parallel_size > 1
+        ):
+            # Replicated MLA Draft owns its DCP=1 builders in set_attn;
+            # the Target must not rebuild them under its sharded config.
+            active_target_layer_names = target_attn_layer_names
     # Metadata builders select attention kernels that need JIT warmup.
     with self.jit_warmup_registry.activate():
         (
@@ -88,6 +97,7 @@ def initialize_kv_cache(
             self.vllm_config,
             self.device,
             draft_layer_names=draft_attn_layer_names,
+            active_layer_names=active_target_layer_names,
         )
     additional_attn_cg_support = self.model_state.get_additional_cg_support()
     attn_cg_support = attn_cg_support.narrow(*additional_attn_cg_support)
