@@ -6,6 +6,7 @@ from contextlib import AbstractContextManager
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu import model_runner as upstream
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp as _dispatch_cg_and_sync_dp
+from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 
 from vllm_ascend.attention.context_parallel.common_cp import is_pcp_decode_sharding_enabled
 from vllm_ascend.utils import vllm_version_is
@@ -79,11 +80,11 @@ def initialize_kv_cache(
     if isinstance(self.speculator, upstream.DraftModelSpeculator):
         draft_attn_layer_names = self.speculator.draft_attn_layer_names
         if (
-            self.speculator.draft_model_config.use_mla
+            (self.speculator.draft_model_config.use_mla or isinstance(self.speculator, DFlashSpeculator))
             and self.speculator.dcp_size == 1
             and self.parallel_config.decode_context_parallel_size > 1
         ):
-            # Replicated MLA Draft owns its DCP=1 builders in set_attn;
+            # Replicated MLA and parallel Draft own their DCP=1 builders in set_attn;
             # the Target must not rebuild them under its sharded config.
             active_target_layer_names = target_attn_layer_names
     # Metadata builders select attention kernels that need JIT warmup.

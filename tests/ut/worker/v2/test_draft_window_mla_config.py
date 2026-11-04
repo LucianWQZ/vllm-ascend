@@ -102,13 +102,31 @@ def test_replicated_gqa_draft_keeps_dynamic_dcp_rejection():
 
 
 @pytest.mark.parametrize(
-    "mla,draft_dcp,target_dcp,filtered",
-    [(True, 1, 16, True), (False, 1, 16, False), (True, 16, 16, False), (True, 1, 1, False)],
+    "mla,family,draft_dcp,target_dcp,filtered",
+    [
+        (True, "ar", 1, 16, True),
+        (False, "ar", 1, 16, False),
+        (True, "ar", 16, 16, False),
+        (True, "ar", 1, 1, False),
+        (False, "dflash", 1, 16, True),
+        (False, "dspark", 1, 16, True),
+        (False, "dflash", 16, 16, False),
+        (False, "dflash", 1, 1, False),
+    ],
 )
-def test_only_replicated_mla_skips_target_context_draft_builders(monkeypatch, mla, draft_dcp, target_dcp, filtered):
+def test_replicated_draft_builders_stay_out_of_target_context(
+    monkeypatch, mla, family, draft_dcp, target_dcp, filtered
+):
+    from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
+
     from vllm_ascend.patch.worker import patch_model_runner as patch
 
-    speculator = Mock(spec=patch.upstream.DraftModelSpeculator)
+    speculator_type = {
+        "ar": patch.upstream.DraftModelSpeculator,
+        "dflash": patch.DFlashSpeculator,
+        "dspark": DSparkSpeculator,
+    }
+    speculator = Mock(spec=speculator_type[family])
     speculator.draft_attn_layer_names = {"draft"}
     speculator.draft_model_config = NS(use_mla=mla)
     speculator.dcp_size = draft_dcp
@@ -149,6 +167,53 @@ def test_only_replicated_mla_skips_target_context_draft_builders(monkeypatch, ml
     assert owner.parallel_config.decode_context_parallel_size == target_dcp
     assert speculator.dcp_size == draft_dcp
     assert cache_config.kv_cache_groups[0].layer_names == ["target", "draft"]
+
+
+@pytest.mark.parametrize(
+    "dcp,active,expected", [(16, None, ["target", "draft"]), (16, {"target"}, ["target"]), (1, {"draft"}, ["draft"])]
+)
+def test_actual_backend_group_filter_keeps_empty_gid_and_kernel_size(monkeypatch, dcp, active, expected):
+    import torch
+    from vllm.config import set_current_vllm_config
+    from vllm.v1.attention.backend import AttentionCGSupport
+    from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec
+    from vllm.v1.worker.gpu import attn_utils
+
+    from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionMetadataBuilder
+    from vllm_ascend.attention.context_parallel.attention_cp import AscendAttentionDCPMetadataBuilder
+
+    config = NS(
+        parallel_config=NS(decode_context_parallel_size=dcp, use_ubatching=False),
+        cache_config=NS(kv_sharing_fast_prefill=False),
+    )
+    spec = FullAttentionSpec(block_size=128, num_kv_heads=4, head_size=128, dtype=torch.bfloat16, dcp_sharded=False)
+    cache = KVCacheConfig(32, [], [KVCacheGroupSpec(["target"], spec), KVCacheGroupSpec(["draft"], spec)])
+    layers = {
+        name: NS(get_attn_backend=lambda: AscendAttentionBackend, num_heads=32, kv_sharing_target_layer_name=None)
+        for name in ("target", "draft")
+    }
+    monkeypatch.setattr(
+        attn_utils,
+        "get_layers_from_vllm_config",
+        lambda config, kind, names=None: {name: layers[name] for name in layers if names is None or name in names},
+    )
+    selected = []
+
+    def construct_without_model_allocation(group, **kwargs):
+        # Keep real discovery, block sizing and ambient backend selection;
+        # this CPU unit omits distributed model/buffer construction only.
+        selected.append((group.layer_names, group.backend.get_builder_cls()))
+        group.metadata_builders = [NS(get_cudagraph_support=lambda *args: AttentionCGSupport.ALWAYS)]
+
+    monkeypatch.setattr(attn_utils.AttentionGroup, "create_metadata_builders", construct_without_model_allocation)
+    with set_current_vllm_config(config):
+        groups, _, kernel_sizes = attn_utils.init_attn_backend(cache, config, torch.device("cpu"), active)
+    builder = AscendAttentionDCPMetadataBuilder if dcp > 1 else AscendAttentionMetadataBuilder
+    assert selected == [([name], builder) for name in expected]
+    assert len(groups) == len(cache.kv_cache_groups) == len(kernel_sizes) == 2
+    assert kernel_sizes == [128, 128]
+    assert [name for group in groups for entry in group for name in entry.layer_names] == expected
+    assert [group.layer_names for group in cache.kv_cache_groups] == [["target"], ["draft"]]
 
 
 @pytest.mark.parametrize("target_dcp,draft_dcp", [(16, 1), (16, 16), (1, 1)])
