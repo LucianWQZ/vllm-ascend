@@ -282,9 +282,16 @@ class AutoRegressiveAclGraphManager(SpeculatorCudaGraphManager):
         return ret
 
     def _updatable_graph_replay(self, desc, draft_attn_metadatas, *, window_source=None):
-        from vllm_ascend.worker.v2.spec_decode.draft_window_eagle3_dp import validate_eagle_dp_dummy_replay
-
-        dp_dummy = validate_eagle_dp_dummy_replay(self.speculator, self, desc, draft_attn_metadatas)
+        dp_dummy = getattr(self.speculator, "_eagle3_graph_dp_dummy_active", False)
+        if dp_dummy:
+            self.speculator._draft_window_graph_binding_provider.require_reusable()
+            if (
+                desc.cg_mode != CUDAGraphMode.FULL
+                or desc.num_reqs != 1
+                or desc.num_tokens != (4 if self.is_draft_model_prefill else 1)
+                or len(draft_attn_metadatas) != (1 if self.is_draft_model_prefill else 2)
+            ):
+                raise RuntimeError("Eagle DP dummy lost its real first Q4 or two AR Q1 consumer/update-stream identity")
         graph = self.graphs[desc]
         assert isinstance(graph, UpdatableGraph)
         if window_source is None:

@@ -949,8 +949,27 @@ def test_capture_scope_selects_banks_once_and_requires_every_real_consumer(monke
 
 
 @pytest.mark.parametrize("profile", [False, True])
-def test_idle_dp_uses_real_proposal_scope_and_both_manager_consumers(proposal, profile):
-    from vllm_ascend.worker.v2.spec_decode.draft_window_eagle3_dp import validate_eagle_dp_dummy_replay
+def test_idle_dp_uses_real_proposal_scope_and_both_manager_consumers(proposal, profile, monkeypatch):
+    from contextlib import nullcontext
+
+    from vllm_ascend.worker.v2.spec_decode.target_dependent_ar import aclgraph
+
+    # Keep the actual manager UPDATE entry and guard. Device enqueue is the
+    # isolated Host boundary here; model/reader qualification is separate.
+    events = []
+
+    class Graph:
+        def resolve_tasks(self, source):
+            events.append("resolve")
+            return ()
+
+        def update(self, stream, tasks):
+            events.append("update")
+
+    monkeypatch.setattr(aclgraph, "UpdatableGraph", Graph)
+    monkeypatch.setattr(aclgraph, "set_current_vllm_config", lambda config: nullcontext())
+    monkeypatch.setattr(torch.npu, "current_stream", lambda: "current")
+    monkeypatch.setattr(aclgraph.SpeculatorCudaGraphManager, "run_fullgraph", lambda *args: events.append("replay"))
 
     owner, batch, _, provider, _ = proposal
     owner.dp_size, batch.is_dummy = 2, True
@@ -959,12 +978,19 @@ def test_idle_dp_uses_real_proposal_scope_and_both_manager_consumers(proposal, p
         assert owner._eagle3_graph_dp_dummy_active is not profile
         assert provider.proposal == () and provider._active_bank is None and not provider._pending
         for first, tokens, count in ((True, 4, 1), (False, 1, 2)):
-            manager = SimpleNamespace(is_draft_model_prefill=first)
-            descriptor = SimpleNamespace(cg_mode=CUDAGraphMode.FULL, num_reqs=1, num_tokens=tokens)
-            assert validate_eagle_dp_dummy_replay(owner, manager, descriptor, [{}] * count) is not profile
+            manager = object.__new__(aclgraph.AutoRegressiveAclGraphManager)
+            manager.speculator, manager.is_draft_model_prefill = owner, first
+            descriptor = captured_bank(owner, n=1, tokens=tokens, ordinal=0).descriptor
+            manager.graphs, manager.vllm_config = {descriptor: Graph()}, object()
+            manager.update_stream = SimpleNamespace(wait_stream=lambda stream: events.append("wait"))
+            owner.build_fia_params = lambda *args: []
+            manager._updatable_graph_replay(descriptor, [{}] * count)
+            assert events == ["resolve", "wait", "replay", "update"]
+            events.clear()
             if not profile:
                 with pytest.raises(RuntimeError, match="real first Q4 or two AR Q1"):
-                    validate_eagle_dp_dummy_replay(owner, manager, descriptor, [{}] * (count + 1))
+                    manager._updatable_graph_replay(descriptor, [{}] * (count + 1))
+                assert not events
     assert not owner._eagle3_graph_dp_dummy_active and provider.proposal is None
     assert tuple(provider._carriers.values()) == banks and not provider.quarantined
 
