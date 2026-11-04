@@ -249,6 +249,7 @@ def test_full_continuing_native_keeps_unused_table_columns_and_partial_pages_unr
         cropped_cpu[row, :columns] = table_cpu[row, :columns]
     keys, values, query = keys_cpu.npu(), values_cpu.npu(), query_cpu.npu()
     mask = torch.ones((2048, 2048), dtype=torch.bool).triu(1).npu() if causal else None
+    outputs = []
     for table in (cropped_cpu.npu(), table_cpu.npu()):
         output, _ = torch_npu.npu_fused_infer_attention_score(
             query=query,
@@ -265,10 +266,12 @@ def test_full_continuing_native_keeps_unused_table_columns_and_partial_pages_unr
             sparse_mode=3 if causal else 0,
             atten_mask=mask,
         )
-        actual = output.cpu().double()
-        assert torch.isfinite(actual).all()
-        # Preserve the pre-existing BF16 contract, rather than establishing a
-        # new bitwise-equivalence requirement between two operator launches.
+        outputs.append(output.cpu().double())
+    finite = [bool(torch.isfinite(actual).all()) for actual in outputs]
+    assert all(finite), f"cropped/full table finite outputs: {finite}"
+    # Preserve the pre-existing BF16 contract, rather than establishing a new
+    # bitwise-equivalence requirement between two operator launches.
+    for actual in outputs:
         torch.testing.assert_close(actual, expected, atol=2**-7, rtol=2**-6)
     for device, original in ((keys, keys_cpu), (values, values_cpu), (query, query_cpu)):
         torch.testing.assert_close(device.cpu(), original, atol=0, rtol=0, equal_nan=True)
