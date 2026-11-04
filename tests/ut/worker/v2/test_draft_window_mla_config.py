@@ -149,3 +149,51 @@ def test_only_replicated_mla_skips_target_context_draft_builders(monkeypatch, ml
     assert owner.parallel_config.decode_context_parallel_size == target_dcp
     assert speculator.dcp_size == draft_dcp
     assert cache_config.kv_cache_groups[0].layer_names == ["target", "draft"]
+
+
+@pytest.mark.parametrize("target_dcp,draft_dcp", [(16, 1), (16, 16), (1, 1)])
+@pytest.mark.parametrize("parent_raises", [False, True])
+def test_dflash_backend_selection_uses_actual_draft_context_and_restores_target(
+    monkeypatch, target_dcp, draft_dcp, parent_raises
+):
+    from vllm.config import get_current_vllm_config, set_current_vllm_config
+
+    from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionMetadataBuilder
+    from vllm_ascend.attention.context_parallel.attention_cp import AscendAttentionDCPMetadataBuilder
+    from vllm_ascend.worker.v2.spec_decode.dflash import speculator as module
+
+    target = NS(parallel_config=NS(decode_context_parallel_size=target_dcp))
+    draft = NS(parallel_config=NS(decode_context_parallel_size=draft_dcp))
+    owner = module.AscendDFlashSpeculator.__new__(module.AscendDFlashSpeculator)
+    owner.draft_kv_cache_group_ids, owner.max_num_tokens, owner.device = [0], 1, "cpu"
+    monkeypatch.setattr(module.AscendDFlashSpeculator, "attn_vllm_config", property(lambda self: draft))
+    inputs = tuple(object() for _ in range(5))
+    seen = []
+
+    class StopAtBoundary(Exception):
+        pass
+
+    def parent(actual_owner, *args):
+        assert actual_owner is owner and args == inputs
+        seen.append((get_current_vllm_config(), AscendAttentionBackend.get_builder_cls()))
+        if parent_raises:
+            raise StopAtBoundary("parent")
+
+    def stop_before_allocation(*args, **kwargs):
+        # A normal parent return must restore Target before child allocation.
+        assert get_current_vllm_config() is target
+        raise StopAtBoundary("allocation")
+
+    monkeypatch.setattr(module.DFlashSpeculator, "set_attn", parent)
+    monkeypatch.setattr(module.torch, "zeros", stop_before_allocation)
+    target_builder = AscendAttentionDCPMetadataBuilder if target_dcp > 1 else AscendAttentionMetadataBuilder
+    draft_builder = AscendAttentionDCPMetadataBuilder if draft_dcp > 1 else AscendAttentionMetadataBuilder
+    with set_current_vllm_config(target):
+        assert AscendAttentionBackend.get_builder_cls() is target_builder
+        with pytest.raises(StopAtBoundary, match="parent" if parent_raises else "allocation"):
+            owner.set_attn(*inputs)
+        assert get_current_vllm_config() is target
+        assert AscendAttentionBackend.get_builder_cls() is target_builder
+    assert seen == [(draft, draft_builder)]
+    assert target.parallel_config.decode_context_parallel_size == target_dcp
+    assert draft.parallel_config.decode_context_parallel_size == draft_dcp
