@@ -2034,12 +2034,23 @@ def _validate_draft_decode_context_parallel_config(vllm_config: VllmConfig) -> N
     if draft_model_config.use_mla:
         return
 
+    draft_parallel_config = speculative_config.draft_parallel_config
+    if (
+        vllm_config.use_v2_model_runner
+        and speculative_config.method in ("dflash", "dspark")
+        and draft_parallel_config is not None
+        and draft_parallel_config.prefill_context_parallel_size == 1
+        and draft_parallel_config.decode_context_parallel_size == 1
+    ):
+        # MRV2 DFlash (also DSpark's base) constructs a private non-MLA
+        # Draft config with PCP/DCP1. Target DCP does not shard this Draft.
+        return
+
     pcp_size = parallel_config.prefill_context_parallel_size
     if pcp_size > 1:
         _validate_model_pcp_dcp_config(draft_model_config, pcp_size, decode_context_parallel_size)
         return
 
-    draft_parallel_config = speculative_config.draft_parallel_config
     if draft_parallel_config is not None:
         draft_tensor_parallel_size = draft_parallel_config.tensor_parallel_size
     elif speculative_config.draft_tensor_parallel_size is not None:
