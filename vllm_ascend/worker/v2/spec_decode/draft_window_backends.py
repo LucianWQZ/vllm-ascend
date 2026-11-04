@@ -170,7 +170,9 @@ def inventory_draft_window_groups(speculator: Any) -> tuple[DraftWindowGroupRout
                 for impl in implementations
             )
             if status is DraftWindowProviderStatus.NATIVE_SWA:
-                if not unpacked_dense or any(impl.sliding_window != native_window for impl in implementations):
+                if not unpacked_dense or any(
+                    cast(AscendAttentionBackendImpl, impl).sliding_window != native_window for impl in implementations
+                ):
                     raise NotImplementedError(f"Draft Window native SWA gid={gid} has no coverage certificate")
             elif full_retention_dflash2 and any(
                 impl is None or impl.sliding_window != native_window for impl in implementations
@@ -180,7 +182,7 @@ def inventory_draft_window_groups(speculator: Any) -> tuple[DraftWindowGroupRout
                 status is DraftWindowProviderStatus.DIRECT_DENSE
                 and all(item.dtype in (torch.float16, torch.bfloat16) for item in specs)
                 and unpacked_dense
-                and all(impl.sliding_window is None for impl in implementations)
+                and all(cast(AscendAttentionBackendImpl, impl).sliding_window is None for impl in implementations)
             )
             routes.append(
                 DraftWindowGroupRoute(
