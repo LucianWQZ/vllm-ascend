@@ -36,15 +36,12 @@ def draft_window_dflash_capture_scope(owner: Any) -> Iterator[DraftWindowGraphBi
         if kwargs.get("common_metadata_callback") is not None:
             raise ValueError("Draft Window capture metadata already has a read callback")
         bank = provider.capture_banks_for(num_reqs=kwargs["num_reqs"], num_tokens=kwargs["num_tokens"])[0]
-        capacity = _seed_capture_workspace(bank, max_model_len=kwargs["max_seq_len"])
+        _seed_capture_workspace(bank, max_model_len=kwargs["max_seq_len"])
 
         def bind(gid, common):
             if gid == provider.group.gid:
                 common.block_table_tensor = bank.window_block_table
-                common.seq_lens_cpu = common._seq_lens_cpu = bank.cpu_window_exact
-                common.seq_lens_cpu_upper_bound = bank.cpu_window_exact
                 common._draft_window_exact_cpu = bank.cpu_window_exact
-                common.max_seq_len = capacity
 
         kwargs["common_metadata_callback"] = bind
         return raw(**kwargs)
@@ -60,7 +57,7 @@ def _seed_capture_workspace(
     workspace: DraftWindowGraphBucket,
     *,
     max_model_len: int,
-) -> int:
+) -> None:
     # The actual provider borrows this same canonical BlockTables owner.
     # Capture prepares its Full dummy tables before seeding the private bank.
     provider = workspace.owner
@@ -78,4 +75,3 @@ def _seed_capture_workspace(
     destination.zero_()
     destination[:, :valid_num_blocks].copy_(source[:, :valid_num_blocks])
     workspace.cpu_window_exact.fill_(capture_upper)
-    return capture_upper

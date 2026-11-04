@@ -117,6 +117,11 @@ def test_original_helper_builds_window_reads_once_and_preserves_full_inputs(cont
     assert layer.block_tables.data_ptr() == c.bank.window_block_table.data_ptr()
     assert layer.seq_lens_cpu.data_ptr() == c.bank.cpu_window_exact.data_ptr()
     assert layer.seq_lens_list == [1151, 1151] and layer.actual_seq_lengths_q == [8, 16]
+    # The real builder selects the read snapshot directly; its original
+    # Common Full/upper operands need no second Window mirror.
+    common = c.calls[0]
+    assert common.seq_lens_cpu.tolist() == common.seq_lens_cpu_upper_bound.tolist() == [4096, 4096]
+    assert common.max_seq_len == 4096 and common._draft_window_exact_cpu is c.bank.cpu_window_exact
     assert layer.seq_lens_gpu.data_ptr() == full_gpu.data_ptr()
     assert layer.query_start_loc_gpu.data_ptr() == query.data_ptr()
     assert layer.slot_mapping.data_ptr() == slots.data_ptr() == on.slot_mappings["draft.a"].data_ptr()

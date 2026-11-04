@@ -398,8 +398,8 @@ def test_parallel_capture_uses_registered_geometry_and_preserves_full_tables(gra
         assert identity is case.capture
         full = case.provider.table
         before = full.clone()
-        maximum = _seed_capture_workspace(read, max_model_len=16)
-        assert maximum == 7 and read.cpu_window_exact.tolist() == [7, 7]
+        _seed_capture_workspace(read, max_model_len=16)
+        assert read.cpu_window_exact.tolist() == [7, 7]
         assert torch.equal(full, before)
         assert torch.equal(read.window_block_table[:, :2], full[:, :2])
         with pytest.raises(RuntimeError, match="no captured consumer for this geometry"):
