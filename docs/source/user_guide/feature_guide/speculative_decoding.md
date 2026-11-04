@@ -671,6 +671,8 @@ For Draft eager execution, use the example above with
 `VLLM_USE_V2_MODEL_RUNNER=1` and speculative `enforce_eager=true`. This does
 not disable Target Graph. Only resident, supported Draft KV layouts are
 admitted; transferred, offloaded, and sharded Draft KV require other readers.
+A replicated MLA Draft with Target DCP also needs the corresponding
+[vLLM metadata compatibility change](https://github.com/LucianWQZ/vllm/tree/review/mrv2-mla-draft-dcp-compat-20261104).
 
 Draft Graph is a separate, default-off experimental entry:
 
