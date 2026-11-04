@@ -159,10 +159,9 @@ def resolve_draft_graph_review_limit(vllm_config, *, experimental_graph_review=F
             "This six-layer native-SWA DFlash Graph combination has an unresolved valid-output counterexample; "
             "use the independently supported Draft eager path. No fallback is selected."
         )
-    scope = None
     if profile in ("dflash_full8", "eagle3"):
-        scope = _validate_qualified_graph_config(vllm_config, profile)
-    elif profile != "glm_dflash":
+        return _validate_qualified_graph_config(vllm_config, profile)
+    if profile != "glm_dflash":
         hf = speculative.draft_model_config.hf_config
         # Familiar names do not open an unknown normalized consumer geometry.
         architectures = getattr(hf, "architectures", ()) or ()
@@ -172,7 +171,7 @@ def resolve_draft_graph_review_limit(vllm_config, *, experimental_graph_review=F
             and getattr(hf, "model_type", None) == "qwen3"
         ):
             raise NotImplementedError("This dense Draft Graph model configuration has not been qualified")
-    return scope
+    return None
 
 
 def _validate_qualified_graph_config(vllm_config, profile):

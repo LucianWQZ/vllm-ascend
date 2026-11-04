@@ -100,8 +100,7 @@ def report_owner_draft_native_attention(owner: Any) -> None:
     The fixed loader owns original/normalized configuration. No config file,
     runtime, metadata tensor or completion object is read or allocated here.
     """
-    policies = (getattr(owner, "_draft_window_policy", None), getattr(owner, "draft_window_policy", None))
-    window = next((policy for policy in policies if policy is not None), None)
+    window = getattr(owner, "_draft_window_policy", None) or getattr(owner, "draft_window_policy", None)
     speculative = owner.speculative_config
     eager = speculative.enforce_eager is True or getattr(owner.draft_model_config, "enforce_eager", False) is True
     # All real callers run here from set_attn, before the fixed runner calls
