@@ -20,6 +20,7 @@ from vllm_ascend.worker.v2.spec_decode.draft_window_plan import (
 )
 from vllm_ascend.worker.v2.spec_decode.draft_window_read import (
     materialize_draft_read,
+    validate_draft_read_bounds,
 )
 
 
@@ -251,10 +252,11 @@ class DraftWindowRuntime:
                 # another rank decodes. Keep large Full queries native, but
                 # not adaptive preparations whose query extent is only upper.
                 scheduled = batch.num_scheduled_tokens[:num_reqs]
-                dense = not (
+                native_full = bool(
                     (batch.num_computed_prefill_tokens_np[:num_reqs] + scheduled <= self.speculator.max_model_len).all()
                     and np.array_equal(np.diff(batch.query_start_loc_np[: num_reqs + 1]), scheduled)
                 )
+                dense = not native_full
 
         def retain(*objects: object) -> None:
             if self._owner is not owner:
@@ -335,9 +337,20 @@ class DraftWindowRuntime:
                 self._build_count += 1
             assert exact is not None
             if native_full:
+                if not eagle:
+                    validate_draft_read_bounds(
+                        common.block_table_tensor,
+                        counts[gid, rows].tolist(),
+                        int(self.speculator.block_tables.kernel_block_sizes[gid]),
+                        exact,
+                        common.seq_lens_cpu_upper_bound[:num_reqs],
+                    )
                 exact_cpu = torch.zeros(common.num_reqs, dtype=torch.int32, device="cpu")
                 exact_cpu[:num_reqs] = exact
                 common.seq_lens_cpu = common._seq_lens_cpu = exact_cpu
+                if not eagle:
+                    # Parallel builders otherwise select device lengths again.
+                    common._draft_window_exact_cpu = exact_cpu
             else:
                 assert starts is not None
                 table = common.block_table_tensor

@@ -1131,18 +1131,76 @@ def test_parallel_continuing_prefill_snapshots_actual_exact_without_full_gather(
     monkeypatch.setattr(torch.Tensor, "to", record_snapshot)
     before = table.clone()
     slots, positions = metadata.slot_mapping, metadata.positions
+    full_table, full_lengths = metadata.block_table_tensor, metadata.seq_lens
+    original_copy = torch.Tensor.copy_
+    copies = []
+
+    def observe_copy(destination, source, *args, **kwargs):
+        copies.append((destination, source))
+        return original_copy(destination, source, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "copy_", observe_copy)
     with proposal_scope(runtime, state):
         runtime.metadata_callback(8, 2)(0, metadata)
         assert not hasattr(metadata, "_draft_window_device_read"), "Full prompt unexpectedly gathered private FP32 KV"
-        expected_table = table[state.idx_mapping_np, :11].clone()
-        expected_table[0, 9:] = 0
-        assert torch.equal(metadata.block_table_tensor[:2], expected_table)
+        assert metadata.block_table_tensor is full_table
+        assert metadata.seq_lens is full_lengths
         assert metadata.seq_lens.cpu().tolist() == [1151, 1281, 0]
         assert metadata._draft_window_exact_cpu[:2].tolist() == [1151, 1281]
+        from vllm_ascend.attention.attention_v1 import AscendAttentionBackendImpl, AscendAttentionState
+        from vllm_ascend.attention.utils import _select_seq_lens
+
+        # The real selector feeds this CPU exact list to the ordinary native
+        # FIA parameters, even for parallel Draft's usual device-length path.
+        selected = _select_seq_lens(
+            metadata,
+            kv_cache_spec=None,
+            speculative_config=SimpleNamespace(parallel_drafting=True),
+            vllm_config=SimpleNamespace(model_config=SimpleNamespace()),
+        )
+        impl = AscendAttentionBackendImpl.__new__(AscendAttentionBackendImpl)
+        impl.key_cache = torch.empty((64, 128, 1, 4), dtype=torch.bfloat16)
+        impl.value_cache = torch.empty_like(impl.key_cache)
+        impl.use_bnsd_kv_cache = False
+        native = SimpleNamespace(
+            attn_state=AscendAttentionState.ChunkedPrefill,
+            block_tables=metadata.block_table_tensor,
+            seq_lens_list=selected.tolist(),
+        )
+        _key, _value, span, read_table, read_ends = impl._get_fia_params(None, None, native)
+        assert read_table is full_table and span == 128
+        assert read_ends == [1151, 1281, 0]
         assert metadata.slot_mapping is slots and metadata.positions is positions
         assert torch.equal(table, before)
 
     assert snapshots == [(2,)]
+    assert not copies, "Full continuing reads must not allocate/re-copy their unchanged table or GPU lengths"
+
+
+@pytest.mark.parametrize("invalid", ["allocation", "table", "upper"])
+def test_parallel_native_full_keeps_actual_read_bounds_before_forward(setup, invalid):
+    runtime, spec, _, _ = setup
+    runtime._dense_reads = True
+    runtime.window_size, runtime.anchor_block_span = 1024, 128
+    spec.max_model_len, spec.num_query_per_req = 4096, 8
+    state = batch(computed=(1136, 1264), prompt=(4096, 4096), scheduled=(7, 9), drafts=None)
+    state.query_start_loc_np = np.array([0, 7, 16])
+    spec.block_tables.kernel_block_sizes = [128]
+    spec.block_tables.num_blocks.np = np.full((1, 6), 32, dtype=np.int32)
+    metadata = common(exact=(1151, 1281), upper=(1152, 1282))
+    metadata.block_table_tensor = torch.arange(96, dtype=torch.int32).reshape(3, 32)
+    if invalid == "allocation":
+        spec.block_tables.num_blocks.np[0, state.idx_mapping_np[1]] = 10
+    elif invalid == "table":
+        metadata.block_table_tensor = metadata.block_table_tensor[:, :10]
+    else:
+        metadata.seq_lens_cpu_upper_bound[1] = 1280
+    full_table = metadata.block_table_tensor
+    with pytest.raises(ValueError, match="ordering|readable|initialized compact"), proposal_scope(runtime, state):
+        runtime.metadata_callback(8, 2)(0, metadata)
+    assert metadata.block_table_tensor is full_table
+    assert not hasattr(metadata, "_draft_window_exact_cpu")
+    assert runtime._poisoned
 
 
 @pytest.mark.parametrize("invalid", ["mixed_decode", "terminal", "placeholder", "query_width", "replicated_pcp"])

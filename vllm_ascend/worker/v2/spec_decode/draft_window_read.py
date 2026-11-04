@@ -13,6 +13,26 @@ from typing import Any
 import torch
 
 
+def validate_draft_read_bounds(
+    block_table: torch.Tensor,
+    valid_columns: Sequence[int],
+    block_span: int,
+    exact_cpu: torch.Tensor,
+    upper_cpu: torch.Tensor,
+) -> None:
+    """Validate the initialized logical extent, independently of read layout."""
+    n = len(valid_columns)
+    if block_table.shape[0] < n or any(count < 0 or count > block_table.shape[1] for count in valid_columns):
+        raise ValueError("Invalid initialized compact column extent")
+    if exact_cpu.numel() != n or upper_cpu.numel() != n:
+        raise ValueError("Draft read planning requires one value per active request")
+    if bool(((exact_cpu < 0) | (upper_cpu < exact_cpu)).any()):
+        raise ValueError("Invalid exact or upper length ordering")
+    available = torch.tensor(valid_columns, dtype=torch.int64, device="cpu") * block_span
+    if bool((exact_cpu > available).any()):
+        raise ValueError("Compact source does not cover the exact readable extent")
+
+
 def materialize_draft_read(
     common_metadata: Any,
     valid_columns: Sequence[int],
@@ -34,21 +54,17 @@ def materialize_draft_read(
     exact_device = common_metadata.seq_lens
     upper_cpu = common_metadata.seq_lens_cpu_upper_bound[:n]
     padded_rows = common_metadata.num_reqs
-    if block_table.shape[0] < n or any(count < 0 or count > block_table.shape[1] for count in valid_columns):
-        raise ValueError("Invalid initialized compact column extent")
-    cpu_values = (exact_cpu, upper_cpu, starts_cpu)
-    if any(t.numel() != n for t in cpu_values):
-        raise ValueError("Draft read planning requires one value per active request")
+    validate_draft_read_bounds(block_table, valid_columns, block_span, exact_cpu, upper_cpu)
+    if starts_cpu.numel() != n:
+        raise ValueError("Draft read planning requires one start per active request")
     if padded_rows < n or exact_device.numel() < n:
         raise ValueError("Missing device exact lengths or padded row extent")
-    ends, upper, starts = (t.to(torch.int64) for t in cpu_values)
-    if bool(((ends < 0) | (upper < ends) | (starts < 0) | (starts > ends)).any()):
+    ends, starts = (t.to(torch.int64) for t in (exact_cpu, starts_cpu))
+    if bool(((starts < 0) | (starts > ends)).any()):
         raise ValueError("Invalid exact, upper, or start ordering")
     if bool((starts % block_span != 0).any()):
         raise ValueError("This consumer cannot represent an intra-block read start")
     end_columns = (ends + block_span - 1) // block_span
-    if any(count < int(end) for count, end in zip(valid_columns, end_columns)):
-        raise ValueError("Compact source does not cover the exact readable extent")
     start_columns = starts // block_span
     counts = end_columns - start_columns
     width = max(1, int(counts.max()) if n else 0)

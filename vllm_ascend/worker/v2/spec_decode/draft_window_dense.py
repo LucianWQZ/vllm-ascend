@@ -14,6 +14,8 @@ from dataclasses import dataclass, field
 
 import torch
 
+from vllm_ascend.worker.v2.spec_decode.draft_window_read import validate_draft_read_bounds
+
 DENSE_KV_ALIGNMENT = 32
 
 
@@ -88,18 +90,16 @@ def prepare_dense_draft_read(
     padding and Full continuing rows retain the method's existing semantics.
     """
     n = len(valid_columns)
-    if block_table.shape[0] < n or any(count < 0 or count > block_table.shape[1] for count in valid_columns):
-        raise ValueError("Invalid initialized compact column extent")
+    validate_draft_read_bounds(block_table, valid_columns, block_span, exact_cpu, upper_cpu)
     if n < 1 or query_width < 1:
         raise ValueError("Invalid dense Draft read geometry")
-    if any(t.numel() != n for t in (exact_cpu, query_ends_cpu, upper_cpu, frozen_starts, full_rows_cpu)):
+    if any(t.numel() != n for t in (query_ends_cpu, frozen_starts, full_rows_cpu)):
         raise ValueError("Draft read inputs must cover the current active requests")
-    available = torch.tensor(valid_columns, dtype=torch.int64, device="cpu") * block_span
     retain(block_table)
     # The runtime supplies its one current exact snapshot and frozen starts;
     # this reader never derives lengths or synchronizes device values again.
-    if bool(((exact_cpu <= 0) | (exact_cpu > upper_cpu) | (exact_cpu > available)).any()):
-        raise ValueError("Dense Draft exact lengths exceed initialized canonical columns or preparation bounds")
+    if bool((exact_cpu == 0).any()):
+        raise ValueError("Dense Draft exact lengths must be positive")
     starts = frozen_starts
     if bool(((starts < 0) | (starts >= exact_cpu)).any()):
         raise ValueError("Frozen Draft anchors must match current request rows")
