@@ -133,9 +133,12 @@ def init_speculator(vllm_config: VllmConfig, device: torch.device, req_states: "
         )
     policy = _resolve_window_policy(vllm_config)
     use_graph_owner = _use_graph_window_owner(vllm_config, policy, review_limit)
+    if review_limit is not None and req_states is None:
+        raise ValueError("Qualified Draft Graph requires the runner's actual RequestState")
     speculator = _init_speculator(vllm_config, device, req_states)
     if review_limit is not None:
         speculator._draft_graph_review_limit = review_limit
+        speculator._draft_graph_request_state = req_states
         logger.info_once(
             "Draft Graph support: %s, TP4/DP%d, local request capacity %d, static K%d, "
             "model capacity %d; actual request/padded shapes are checked before execution.",

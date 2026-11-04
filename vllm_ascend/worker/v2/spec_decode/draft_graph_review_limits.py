@@ -251,15 +251,19 @@ def note_eagle_single_request_review_lifecycle(owner, scheduler_output):
     blocked.difference_update(scheduler_output.finished_req_ids)
 
 
-def draft_graph_request_bounds(owner, req_states, req_ids, idx_mapping_np):
-    """Borrow the runner's row order; copy only CPU limits absent from InputBatch."""
-    scope = getattr(owner, "_draft_graph_review_limit", None)
-    if scope is None:
-        return None
-    bounds = []
+def validate_draft_graph_request_bounds(owner, input_batch):
+    """Check original CPU request limits before any Target attention writes.
+
+    The fixed worker serializes request updates and proposals. Prompt/prefill
+    limits change only when a request is added, not during Target sampling or
+    Draft consumers; use that actual owner rather than a second bounds snapshot.
+    """
+    if getattr(owner, "_draft_graph_review_limit", None) is None:
+        return
+    req_states = owner._draft_graph_request_state
     blocked = getattr(owner, "_draft_graph_review_preempted_request_ids", ())
     lookahead = owner.num_speculative_steps if owner.method == "eagle3" else owner.num_query_per_req
-    for req_id, raw_index in zip(req_ids, idx_mapping_np, strict=True):
+    for req_id, raw_index in zip(input_batch.req_ids, input_batch.idx_mapping_np, strict=True):
         if req_id in blocked:
             raise NotImplementedError("Draft Graph does not qualify resumption after preemption")
         row = int(raw_index)
@@ -269,15 +273,6 @@ def draft_graph_request_bounds(owner, req_states, req_ids, idx_mapping_np):
         maximum = int(req_states.max_seq_len[row])
         if not 0 < prompt < maximum or maximum + lookahead > owner.max_model_len:
             raise NotImplementedError("Draft Graph prompt/output budget and query lookahead exceed allocated capacity")
-        bounds.append((prompt, maximum))
-    return tuple(bounds)
-
-
-def _request_bounds(input_batch):
-    bounds = input_batch.draft_graph_request_bounds
-    if bounds is None:
-        raise RuntimeError("Draft Graph lacks authoritative CPU request bounds")
-    return bounds
 
 
 def validate_eagle_single_request_review_exact(owner, input_batch, exact, *, num_reqs, padded, step):
@@ -285,14 +280,15 @@ def validate_eagle_single_request_review_exact(owner, input_batch, exact, *, num
     scope = getattr(owner, "_draft_graph_review_limit", None)
     if scope is None or owner.method != "eagle3":
         return
-    rows = _request_bounds(input_batch)
     # The real Eagle producer owns CPU int32 storage and validates the step.
-    # Only the admitted active/padded extent and current values can vary here.
-    if num_reqs != len(rows) or padded != num_reqs:
+    if num_reqs != len(input_batch.idx_mapping_np) or padded != num_reqs:
         raise RuntimeError("Eagle review lost its exact admitted-row CPU consumer input")
+    state = owner._draft_graph_request_state
     provider = getattr(owner, "_draft_window_graph_binding_provider", None)
     continuing_rows = getattr(provider, "proposal", None) or ()
-    for position, (prompt, maximum) in enumerate(rows):
+    for position, raw_index in enumerate(input_batch.idx_mapping_np):
+        row = int(raw_index)
+        prompt, maximum = int(state.prompt_len.np[row]), int(state.max_seq_len[row])
         value = exact[position].item()
         lower = prompt
         upper = min(maximum + owner.num_speculative_steps, owner.max_model_len)
@@ -354,12 +350,12 @@ def validate_draft_graph_review_requests(
         return
     if owner.method == "dflash" and type(input_batch.num_reqs) is int and input_batch.num_reqs == 0:
         return
-    rows = _request_bounds(input_batch)
     active, padded = input_batch.num_reqs, input_batch.num_reqs_after_padding
     if (
         type(active) is not int
         or not 1 <= active <= owner.max_num_reqs
         or (not context_kv_only and (type(padded) is not int or padded != active))
-        or len(rows) != active
+        or len(input_batch.req_ids) != active
+        or len(input_batch.idx_mapping_np) != active
     ):
         raise NotImplementedError("Draft Graph requires admitted actual rows and their corresponding padded bank")

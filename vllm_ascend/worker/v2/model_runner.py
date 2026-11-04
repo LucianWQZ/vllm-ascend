@@ -1084,18 +1084,11 @@ class NPUModelRunner(GPUModelRunner):
             seq_lens_np=self.input_buffers.seq_lens_np,
             attn_state=attn_state,
         )
-        # Graph capacity checks need the original prompt/max-output limits.
-        # prefill_len may include generated tokens after preemption and is not
-        # an original prompt-length substitute. This reads existing CPU state.
+        # Validate original prompt/output limits before Target attention writes.
         if getattr(self.speculator, "_draft_graph_review_limit", None) is not None:
-            from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import draft_graph_request_bounds
+            from vllm_ascend.worker.v2.spec_decode.draft_graph_review_limits import validate_draft_graph_request_bounds
 
-            input_batch.draft_graph_request_bounds = draft_graph_request_bounds(
-                self.speculator,
-                self.req_states,
-                req_ids,
-                idx_mapping_np,
-            )
+            validate_draft_graph_request_bounds(self.speculator, input_batch)
         # vLLM main (#57980) dropped the module-level maybe_partition_pcp_batch
         # helper; PCPManager.partition_batch now takes the batch descriptor.
         if self.pcp_manager is not None:

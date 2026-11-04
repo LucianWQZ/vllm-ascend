@@ -82,8 +82,6 @@ class AscendInputBatch(InputBatch):
     attn_state: AscendAttentionState | None = None
     is_dummy: bool = False
     is_cpp_profile: bool = False
-    # Original prompt/output bounds; row identity/order remain in InputBatch.
-    draft_graph_request_bounds: tuple[tuple[int, int], ...] | None = None
 
     @staticmethod
     def _prepare_cpp_profile_dummy(

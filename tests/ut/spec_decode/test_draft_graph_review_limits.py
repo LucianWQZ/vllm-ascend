@@ -20,19 +20,27 @@ from vllm_ascend.worker.v2.spec_decode.target_dependent_ar import aclgraph as ar
 from vllm_ascend.worker.v2.spec_decode.target_dependent_ar import speculator as ar_module
 
 
-def runner_bounds(owner, batch):
-    """Exercise the canonical runner boundary before using its private batch."""
+def bind_request_state(owner, batch):
+    """Give the actual consumer its runner-owned CPU request state."""
     count = max(batch.idx_mapping_np, default=-1) + 1
     prompt, maximum = [0] * count, [0] * count
-    for row, (start, end) in zip(batch.idx_mapping_np, batch.draft_graph_request_bounds, strict=True):
+    for row, (start, end) in zip(batch.idx_mapping_np, batch.request_limits, strict=True):
         prompt[row], maximum[row] = start, end
     state = NS(
         req_id_to_index=dict(zip(batch.req_ids, batch.idx_mapping_np, strict=True)),
-        prompt_len=NS(np=prompt),
-        prefill_len=NS(np=prompt),
-        max_seq_len=maximum,
+        prompt_len=NS(np=np.asarray(prompt, dtype=np.int32)),
+        prefill_len=NS(np=np.asarray(prompt, dtype=np.int32)),
+        max_seq_len=np.asarray(maximum, dtype=np.int32),
     )
-    return GUARD.draft_graph_request_bounds(owner, state, batch.req_ids, batch.idx_mapping_np)
+    owner._draft_graph_request_state = state
+    return state
+
+
+def runner_bounds(owner, batch):
+    """Exercise the earliest canonical boundary, without a copied bounds field."""
+    if not hasattr(owner, "_draft_graph_request_state"):
+        bind_request_state(owner, batch)
+    return GUARD.validate_draft_graph_request_bounds(owner, batch)
 
 
 class DraftGraphSupportTest(unittest.TestCase):
@@ -303,12 +311,33 @@ class DraftGraphSupportTest(unittest.TestCase):
                 wraps=ascend_config.validate_draft_window_graph_config,
             ) as validate,
         ):
-            self.assertIs(factory.init_speculator(config, None), owner)
+            state = NS(prompt_len=NS(np=np.array([17])), max_seq_len=np.array([49]))
+            self.assertIs(factory.init_speculator(config, None, state), owner)
+            self.assertIs(owner._draft_graph_request_state, state)
             self.assertEqual(resolve.call_count, 1)
         self.assertIs(validate.call_args.kwargs["support"], owner._draft_graph_review_limit)
         self.assertIs(owner._draft_window_policy, policy)
         self.assertFalse(hasattr(owner, "draft_window_policy"))
         self.assertEqual(vars(config), before)
+
+    def test_only_qualified_graph_requires_the_actual_runner_state(self):
+        from vllm_ascend import envs
+        from vllm_ascend.worker.v2 import spec_decode as factory
+
+        config = self.config(window=False)
+        owner = NS()
+        with (
+            patch.object(envs, "VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH", True),
+            patch.object(factory, "_resolve_window_policy", return_value=None),
+            patch.object(factory, "_init_speculator", return_value=owner) as construct,
+        ):
+            with self.assertRaisesRegex(ValueError, "actual RequestState"):
+                factory.init_speculator(config, None)
+            construct.assert_not_called()
+            # An original eager/OFF route does not acquire this Graph owner.
+            config.speculative_config.enforce_eager = True
+            self.assertIs(factory.init_speculator(config, None), owner)
+            self.assertFalse(hasattr(owner, "_draft_graph_request_state"))
 
     def test_factory_rejects_an_existing_window_owner_before_graph_admission(self):
         from vllm_ascend import envs
@@ -327,7 +356,7 @@ class DraftGraphSupportTest(unittest.TestCase):
                 patch.object(factory, "logger", Mock()),
                 self.assertRaisesRegex(RuntimeError, "mutually exclusive"),
             ):
-                factory.init_speculator(config, None)
+                factory.init_speculator(config, None, object())
 
     def test_real_consumer_overrides_and_normalized_positions_stay_protected(self):
         for field, value in (("is_causal", False), ("target_hidden_size", 4096), ("use_aux_hidden_state", False)):
@@ -404,7 +433,7 @@ class DraftGraphSupportTest(unittest.TestCase):
             req_ids=[r[0] for r in records],
             idx_mapping_np=list(range(rows)),
             prefill_len_np=[1021] * rows,
-            draft_graph_request_bounds=tuple((r[2], r[3]) for r in records),
+            request_limits=tuple((r[2], r[3]) for r in records),
             num_draft_tokens_per_req=None,
         )
 
@@ -437,7 +466,7 @@ class DraftGraphSupportTest(unittest.TestCase):
                     with self.assertRaises(NotImplementedError):
                         runner_bounds(owner, batch)
                     runner.finish_requests(NS(finished_req_ids={"request-0"}, preempted_req_ids=set()))
-                self.assertEqual(runner_bounds(owner, batch), batch.draft_graph_request_bounds)
+                self.assertIsNone(runner_bounds(owner, batch))
                 GUARD.validate_draft_graph_review_requests(owner, batch)
 
     def test_lifecycle_ignores_routes_without_qualified_support(self):
@@ -473,20 +502,42 @@ class DraftGraphSupportTest(unittest.TestCase):
         batch, _ = runner.gather_batch_req_state(scheduled, dummy_run=False)
         self.assertEqual(batch.req_ids, ["b", "a"])
         self.assertEqual(batch.idx_mapping_np.tolist(), [0, 2])
-        self.assertEqual(
-            GUARD.draft_graph_request_bounds(owner, state, batch.req_ids, batch.idx_mapping_np),
-            ((513, 545), (1537, 1569)),
-        )
+        owner._draft_graph_request_state = state
+        self.assertIsNone(GUARD.validate_draft_graph_request_bounds(owner, batch))
+        self.assertIs(owner._draft_graph_request_state, state)
+        self.assertFalse(hasattr(batch, "draft_graph_request_bounds"))
         scheduled.num_scheduled_tokens = {"unknown": 4, "a": 4}
         with self.assertRaises(KeyError):
             runner.gather_batch_req_state(scheduled, dummy_run=False)
         state.prefill_len.np[2] += 1
         with self.assertRaises(NotImplementedError):
-            GUARD.draft_graph_request_bounds(owner, state, ["a", "b"], [2, 0])
+            GUARD.validate_draft_graph_request_bounds(owner, NS(req_ids=["a", "b"], idx_mapping_np=[2, 0]))
         state.prefill_len.np[2] -= 1
         owner._draft_graph_review_preempted_request_ids = {"b"}
         with self.assertRaises(NotImplementedError):
-            GUARD.draft_graph_request_bounds(owner, state, ["a", "b"], [2, 0])
+            GUARD.validate_draft_graph_request_bounds(owner, NS(req_ids=["a", "b"], idx_mapping_np=[2, 0]))
+
+    def test_next_proposal_reads_the_same_request_owner_without_a_bounds_snapshot(self):
+        owner = self.qualified_owner()
+        batch = self.batch()
+        state = bind_request_state(owner, batch)
+        runner_bounds(owner, batch)
+        GUARD.validate_eagle_single_request_review_exact(
+            owner, batch, torch.tensor([1021]), num_reqs=1, padded=1, step=0
+        )
+        # The next scheduled request/streaming prompt is installed by the runner
+        # before preparing that batch. The speculator retains the actual state.
+        state.prompt_len.np[0] = state.prefill_len.np[0] = 1537
+        state.max_seq_len[0] = 1569
+        runner_bounds(owner, batch)
+        GUARD.validate_eagle_single_request_review_exact(
+            owner, batch, torch.tensor([1537]), num_reqs=1, padded=1, step=0
+        )
+        with self.assertRaises(NotImplementedError):
+            GUARD.validate_eagle_single_request_review_exact(
+                owner, batch, torch.tensor([1021]), num_reqs=1, padded=1, step=0
+            )
+        self.assertIs(owner._draft_graph_request_state, state)
 
     def test_changed_normalized_head_dimension_stays_blocked(self):
         config = self.config()
@@ -507,6 +558,7 @@ class DraftGraphSupportTest(unittest.TestCase):
         batch.num_computed_prefill_tokens_np = np.array([512], dtype=np.int32)
         batch.num_scheduled_tokens = np.array([128], dtype=np.int32)
         batch.prefill_len_np = np.asarray(batch.prefill_len_np, dtype=np.int32)
+        runner_bounds(owner, batch)
         for step in (0, 1, 2):
             GUARD.validate_eagle_single_request_review_exact(
                 owner, batch, Exact(640 + step), num_reqs=1, padded=1, step=step
@@ -526,7 +578,7 @@ class DraftGraphSupportTest(unittest.TestCase):
         owner = self.qualified_owner(config)
         batch = self.batch()
         GUARD.validate_draft_graph_review_requests(owner, batch)
-        batch.draft_graph_request_bounds = ((1021, 40960),)
+        batch.request_limits = ((1021, 40960),)
         with self.assertRaises(NotImplementedError):
             runner_bounds(owner, batch)
 
@@ -640,9 +692,10 @@ def _single_owner_batch(prompt=257, output=32, capacity=4096):
         req_ids=["actual-A"],
         idx_mapping_np=[7],
         prefill_len_np=[prompt],
-        draft_graph_request_bounds=((prompt, prompt + output),),
+        request_limits=((prompt, prompt + output),),
     )
     owner.input_batch = batch
+    bind_request_state(owner, batch)
     return owner, batch
 
 
@@ -656,9 +709,10 @@ def _pair_owner_batch():
         req_ids=["request-A", "request-B"],
         idx_mapping_np=[7, 3],
         prefill_len_np=[1537, 513],
-        draft_graph_request_bounds=((1537, 1569), (513, 545)),
+        request_limits=((1537, 1569), (513, 545)),
     )
     owner.input_batch = batch
+    bind_request_state(owner, batch)
     return owner, batch
 
 
@@ -714,16 +768,16 @@ class ActualGraphDescriptorControls(unittest.TestCase):
             return self.run_actual(manager, NS(num_reqs=1, num_tokens=1))
 
         with patch.object(ar_module.TargetDependentARSpeculator, "propose", native_propose):
-            for damage in ("active", "padded", "missing-bounds", "row-bounds"):
+            for damage in ("active", "padded", "request-rows", "mapping-rows"):
                 invalid = copy.deepcopy(batch)
                 if damage == "active":
                     invalid.num_reqs = invalid.num_reqs_after_padding = 2
                 elif damage == "padded":
                     invalid.num_reqs_after_padding = 2
-                elif damage == "missing-bounds":
-                    invalid.draft_graph_request_bounds = None
+                elif damage == "request-rows":
+                    invalid.req_ids = []
                 else:
-                    invalid.draft_graph_request_bounds += ((513, 545),)
+                    invalid.idx_mapping_np = []
                 with self.subTest(damage=damage), self.assertRaises((RuntimeError, NotImplementedError)):
                     owner.propose(
                         invalid,
@@ -842,6 +896,7 @@ class EagleMixedRequestControls(unittest.TestCase):
         batch.num_scheduled_tokens = np.array([128, 129], dtype=np.int32)
         batch.prefill_len_np = np.asarray(batch.prefill_len_np, dtype=np.int32)
         owner._draft_window_graph_binding_provider = NS(proposal=(True, False))
+        runner_bounds(owner, batch)
         for step in (0, 1, 2):
             GUARD.validate_eagle_single_request_review_exact(
                 owner,
@@ -869,7 +924,6 @@ class EagleMixedRequestControls(unittest.TestCase):
 
     def test_continuing_prefill_does_not_relax_identity_capacity_or_counter_contract(self):
         for damage in (
-            "wrong-id",
             "bad-index",
             "capacity",
             "preempted",
@@ -884,12 +938,10 @@ class EagleMixedRequestControls(unittest.TestCase):
             batch.prefill_len_np = np.asarray(batch.prefill_len_np, dtype=np.int32)
             batch.num_draft_tokens_per_req = None
             batch.is_prefilling_np, batch.has_prefill = [True, True], True
-            if damage == "wrong-id":
-                batch.req_ids[0] = "different-request"
-            elif damage == "bad-index":
+            if damage == "bad-index":
                 batch.idx_mapping_np[0] = 6
             elif damage == "capacity":
-                batch.draft_graph_request_bounds = ((1537, 4096), (513, 545))
+                owner._draft_graph_request_state.max_seq_len[7] = 4096
             elif damage == "preempted":
                 owner._draft_graph_review_preempted_request_ids = {batch.req_ids[0]}
             elif damage == "missing":
@@ -904,11 +956,6 @@ class EagleMixedRequestControls(unittest.TestCase):
                 self.subTest(damage=damage),
                 self.assertRaises((RuntimeError, NotImplementedError, ValueError, TypeError, AttributeError)),
             ):
-                if damage in ("wrong-id", "bad-index"):
-                    # Identity is established when the actual runner builds the
-                    # batch, not repeatedly reconstructed by each AR reader.
-                    state = NS(req_id_to_index={"request-A": 7, "request-B": 3})
-                    GUARD.draft_graph_request_bounds(owner, state, batch.req_ids, batch.idx_mapping_np)
                 from vllm_ascend.worker.v2.spec_decode.draft_window_runtime import continuing_prefill_rows
 
                 runner_bounds(owner, batch)

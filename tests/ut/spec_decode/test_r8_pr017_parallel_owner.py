@@ -277,7 +277,6 @@ class ParallelOwnerTests(unittest.TestCase):
         self.batch.req_ids = ["a"]
         self.batch.idx_mapping_np = [0]
         self.batch.prefill_len_np = [33025]
-        self.batch.draft_graph_request_bounds = ((33025, 33089),)
         with self.scope(0):
             pass
         self.assertEqual(self.normal, [])
