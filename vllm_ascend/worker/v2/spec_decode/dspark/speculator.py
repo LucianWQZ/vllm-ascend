@@ -16,6 +16,7 @@
 # This file is a part of the vllm-ascend project.
 #
 from collections.abc import Mapping, Sequence
+from copy import copy
 from typing import Any, cast
 
 import numpy as np
@@ -60,6 +61,25 @@ from vllm_ascend.worker.v2.spec_decode.pcp_utils import (
 )
 
 
+def _replicated_mla_draft_config(vllm_config: VllmConfig) -> VllmConfig:
+    speculative = vllm_config.speculative_config
+    assert speculative is not None and speculative.draft_model_config is not None
+    draft = speculative.draft_model_config
+    if (
+        draft.use_mla
+        and draft.hf_config.architectures == ["Glm5DSparkForCausalLM"]
+        and (speculative.enforce_eager or draft.enforce_eager)
+        and vllm_config.parallel_config.decode_context_parallel_size > 1
+    ):
+        # Keep this adapter's delivered replicated Draft semantics under a
+        # sharded Target. OFF and ON share it; other MLA/Graph routes retain
+        # the upstream DCP policy. Do not mutate either caller-owned config.
+        vllm_config = copy(vllm_config)
+        vllm_config.parallel_config = copy(vllm_config.parallel_config)
+        vllm_config.parallel_config.decode_context_parallel_size = 1
+    return vllm_config
+
+
 class AscendDSparkSpeculator(DraftWindowGraphInputMixin, LmheadTPDraftSamplingMixin, DSparkSpeculator):
     _speculator_name = "DSpark"
     # DSpark samples via compute_draft_logits and never calls sample_draft, so
@@ -76,6 +96,7 @@ class AscendDSparkSpeculator(DraftWindowGraphInputMixin, LmheadTPDraftSamplingMi
             return False
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+        vllm_config = _replicated_mla_draft_config(vllm_config)
         vllm_config, self.replicated_pcp = prepare_replicated_pcp_config(vllm_config)
         super().__init__(vllm_config, device)
         self._lmhead_tp_validate_draft_sampling()

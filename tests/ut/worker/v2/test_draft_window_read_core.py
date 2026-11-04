@@ -87,9 +87,7 @@ def test_invalid_read_does_not_publish(columns, ends, starts, error):
 
 @pytest.mark.parametrize("enabled", [False, True])
 def test_complete_draft_kv_retention_does_not_change_native_or_target(enabled):
-    native = SlidingWindowSpec(
-        block_size=128, num_kv_heads=4, head_size=128, dtype=torch.bfloat16, sliding_window=2048
-    )
+    native = SlidingWindowSpec(block_size=128, num_kv_heads=4, head_size=128, dtype=torch.bfloat16, sliding_window=2048)
     target = FullAttentionSpec(block_size=128, num_kv_heads=4, head_size=128, dtype=torch.bfloat16)
     original = {"draft": native, "target": target}
     owner = SimpleNamespace(_dflash2_full_kv_reference=enabled, draft_attn_layer_names={"draft"})
