@@ -18,9 +18,8 @@ def copy_draft_attention_metadata(metadata: Mapping[str, Any], layers: tuple[str
     return dict.fromkeys(layers, layer)
 
 
-def bind_draft_window_read(layer: Any, bank: Any, max_seq_len: int) -> None:
+def bind_draft_window_read(layer: Any, bank: Any) -> None:
     """FIA1 reads Host exact lengths; keep builder-owned Full GPU/shape fields."""
     layer.block_tables = bank.window_block_table
     layer.seq_lens_cpu = bank.cpu_window_exact
     layer.seq_lens_list = bank.cpu_window_exact.tolist()
-    layer.max_seq_len = max_seq_len

@@ -104,17 +104,15 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentA
             if bank is None:
                 raise RuntimeError("Eagle3 capture visited more consumers than its real descriptor")
             n = bank.descriptor.num_reqs
-            capacity = min(self.max_model_len, provider.window_size + provider.group.table_column_span - 1)
             attn_metadata = copy_draft_attention_metadata(attn_metadata, provider.group.layers)
             query = self.input_buffers.query_start_loc
             if query.dtype != torch.int32 or query.ndim != 1 or query.numel() < n + 1:
                 raise RuntimeError("Eagle3 capture requires its owned int32 Full input query")
-            for layer in attn_metadata.values():
-                if layer is not None:
-                    bind_draft_window_read(layer, bank, capacity)
-                    layer.causal = True
-                    # Use the owned Full query, not a builder's transient GPU copy.
-                    layer.query_start_loc = query[: n + 1]
+            layer = attn_metadata[provider.group.layers[0]]
+            bind_draft_window_read(layer, bank)
+            layer.causal = True
+            # Use the owned Full query, not a builder's transient GPU copy.
+            layer.query_start_loc = query[: n + 1]
         elif self._eagle3_window_is_active():
             provider = self._draft_window_graph_binding_provider
             if (
@@ -146,11 +144,9 @@ class Eagle3GraphIntegrationMixin(Eagle3DraftWindowMixin, AscendTargetDependentA
             self.block_tables.gather_block_tables(self.input_batch.idx_mapping, num_reqs_padded=n)
             bank = prefill_inputs = self._materialize_eagle3_step(capture, 0)
             attn_metadata = copy_draft_attention_metadata(attn_metadata, provider.group.layers)
-            max_seq_len = int(bank.cpu_window_exact.max().item())
-            for layer in attn_metadata.values():
-                if layer is not None:
-                    bind_draft_window_read(layer, bank, max_seq_len)
-                    layer.attn_state = AscendAttentionState.ChunkedPrefill
+            layer = attn_metadata[provider.group.layers[0]]
+            bind_draft_window_read(layer, bank)
+            layer.attn_state = AscendAttentionState.ChunkedPrefill
         output = super()._run_model(
             num_tokens,
             attn_metadata,
