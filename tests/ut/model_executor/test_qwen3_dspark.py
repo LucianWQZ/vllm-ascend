@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -30,7 +31,8 @@ from torch import nn
 from vllm.model_executor.models.qwen3_dflash import DFlashQwen3ForCausalLM
 
 import vllm_ascend.models.qwen3_dspark as qwen3_dspark
-from vllm_ascend.models import qwen3_dflash, qwen3_dflash2
+from vllm_ascend import utils
+from vllm_ascend.models import qwen3_dflash2
 from vllm_ascend.models.qwen3_dflash2 import DFlash2Qwen3ForCausalLM
 
 
@@ -109,12 +111,20 @@ def test_quarot_loads_missing_target_vocab_shards(tmp_path, model_cls) -> None:
     with (
         patch.object(qwen3_dspark, "get_rotation_path", return_value=rotation_path),
         patch.object(qwen3_dflash2, "get_rotation_path", return_value=rotation_path),
-        patch.object(qwen3_dflash, "get_rotation_path", return_value=rotation_path),
+        patch.object(utils, "get_rotation_path", return_value=rotation_path),
         patch.object(qwen3_dspark, "VocabParallelEmbedding", side_effect=vocab_layer),
         patch.object(qwen3_dspark, "ParallelLMHead", side_effect=vocab_layer),
     ):
         if model_cls is DFlashQwen3ForCausalLM:
-            qwen3_dflash.align_dflash_weights(model, config)
+            from vllm_ascend.worker.v2.spec_decode.dflash import speculator as module
+
+            owner = module.AscendDFlashSpeculator.__new__(module.AscendDFlashSpeculator)
+            owner.vllm_config = config
+            with (
+                patch.object(module.DFlashSpeculator, "load_draft_model", return_value=model),
+                patch.object(module, "disable_profiling_chunk_for_draft", return_value=nullcontext()),
+            ):
+                assert owner.load_draft_model(object(), {"target.attention"}) is model
         else:
             model.post_process(config)
     assert model.model.embed_tokens is not original_embed

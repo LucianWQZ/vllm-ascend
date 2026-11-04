@@ -10,6 +10,7 @@ import numpy as np
 import torch
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.config.compilation import CUDAGraphMode
+from vllm.logger import logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
@@ -176,12 +177,25 @@ class AscendDFlashSpeculator(DraftWindowGraphInputMixin, LmheadTPDraftSamplingMi
     ) -> torch.nn.Module:
         with disable_profiling_chunk_for_draft(self.vllm_config):
             model = super().load_draft_model(target_model, target_attn_layer_names)
-        # Upstream's MRV2 loader shares the target's vocab layers, but does
-        # not align a DFlash head with a QuaRot residual stream. Reuse the
-        # existing Ascend load-time alignment before any graph or KV setup.
-        from vllm_ascend.models.qwen3_dflash import align_dflash_weights
+        from vllm_ascend.utils import get_rotation_path
 
-        align_dflash_weights(model, self.vllm_config)
+        rotation_path = get_rotation_path(self.vllm_config)
+        if rotation_path is not None and model.model.use_aux_hidden_state:
+            from vllm_ascend.models.qwen3_dspark import align_draft_weights
+
+            projection = getattr(model.model, "fc", None)
+            if projection is None:
+                raise ValueError("DFlash with a QuaRot target requires an auxiliary-hidden-state projection")
+            if projection.weight.ndim != 2 or projection.weight.dtype not in (
+                torch.float16,
+                torch.bfloat16,
+                torch.float32,
+            ):
+                raise ValueError("QuaRot DFlash alignment requires an unquantized floating-point fc weight")
+            # Fixed load_dflash_model constructs a fresh module on every load.
+            # Align it once here, before capture/KV setup; shared vocab stays owned by Target.
+            align_draft_weights(model, projection, self.vllm_config)
+            logger.info("[spec_decode/quarot] Aligned MRV2 DFlash fc and owned vocab layers for %s", rotation_path)
         return model
 
     def build_draft_attn_metadatas(self, num_reqs_padded, seq_lens_cpu_upper_bound):
