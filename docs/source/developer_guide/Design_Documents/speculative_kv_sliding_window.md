@@ -245,6 +245,11 @@ Eagle capture binds its owned Full query coordinates and sets `causal=True`.
 Its native first consumer retains the prepared query layout and uses
 `ChunkedPrefill`. DFlash preserves its per-group causality. Both bind bank CPU
 exact lengths for FIA1 while retaining builder-owned Full GPU/shape fields.
+DFlash uses the fixed upstream capture helper, including Full dummy slots
+and context preparation. During serialized worker capture, a scoped builder
+alias passes the read callback through the existing Ascend Common metadata
+entry and is restored on exit. An upstream instance-level builder hook can
+replace this local patch when that interface becomes available.
 Captured `GraphUpdateTask` arguments hold the table and cumulative query lengths;
 the existing `ParamSource` supplies only current exact KV lengths for UPDATE.
 Bank addresses remain stable. Current/update-stream
