@@ -97,3 +97,39 @@ def test_complete_draft_kv_retention_does_not_change_native_or_target(enabled):
     assert native.sliding_window == 2048
     assert result["draft"].block_size == native.block_size
     assert result["draft"].num_kv_heads == native.num_kv_heads
+
+
+@pytest.mark.parametrize("combined", [False, True])
+def test_dense_gather_uses_actual_slot_extent_and_preserves_page_offsets(combined):
+    from vllm_ascend.worker.v2.spec_decode.draft_window_dense import gather_dense_draft_kv, prepare_dense_draft_read
+
+    if combined:
+        backing = torch.arange(6 * 2 * 128 * 2 * 4, dtype=torch.float32).reshape(6, 2, 128, 2, 4).bfloat16()
+        key_cache, value_cache = backing[:, 0], backing[:, 1]
+    else:
+        key_cache = torch.arange(6 * 128 * 2 * 4, dtype=torch.float32).reshape(6, 128, 2, 4).bfloat16()
+        value_cache = -key_cache
+    owned = []
+    read = prepare_dense_draft_read(
+        torch.tensor([[3, 1], [4, 2]], dtype=torch.int32),
+        [2, 2],
+        128,
+        exact_cpu=torch.tensor([129, 130], dtype=torch.int32),
+        query_ends_cpu=torch.tensor([129, 130], dtype=torch.int32),
+        upper_cpu=torch.tensor([129, 130], dtype=torch.int32),
+        query_width=1,
+        causal=True,
+        retain=lambda *objects: owned.extend(objects),
+        frozen_starts=torch.tensor([128, 128], dtype=torch.int32),
+        full_rows_cpu=torch.tensor([False, False]),
+    )
+    actual = gather_dense_draft_kv(read, key_cache, value_cache)
+    for cache, gathered in zip((key_cache, value_cache), actual):
+        expected = torch.stack(
+            (cache[1, 0].expand(32, -1, -1), torch.cat((cache[2, :2], cache[2, 1].expand(30, -1, -1))))
+        ).float()
+        torch.testing.assert_close(gathered, expected, rtol=0, atol=0)
+        assert any(value is gathered for value in owned)
+    assert read.seq_lens.tolist() == [1, 2]
+    assert read.mask[0, 0, 0].tolist() == [False] + [True] * 31
+    assert read.mask[1, 0, 0].tolist() == [False, False] + [True] * 30

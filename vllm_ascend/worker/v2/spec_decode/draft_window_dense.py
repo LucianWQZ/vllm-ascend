@@ -22,7 +22,6 @@ class DenseDraftRead:
     slots: torch.Tensor
     seq_lens: torch.Tensor  # Completed CPU visible lengths for the normal builder.
     mask: torch.Tensor
-    capacity: int
     query_width: int
     retain: Callable[..., None]
     may_have_empty_rows: bool = False
@@ -140,7 +139,7 @@ def prepare_dense_draft_read(
             excluded = excluded | (columns[None, None, :] > queries[:, :, None])
             may_have_empty_rows = bool((queries < 0).any())
         mask = _copy_owned_read_tensor(excluded[:, None].contiguous(), retain, device=block_table.device)
-        read = DenseDraftRead(slots, visible, mask, capacity, width, retain, may_have_empty_rows)
+        read = DenseDraftRead(slots, visible, mask, width, retain, may_have_empty_rows)
         retain(read)
         return read
 
@@ -191,7 +190,7 @@ def gather_dense_draft_kv(
         raise ValueError("Dense Draft slots and KV caches must share their device")
     blocks, block_size, heads, dim = key_cache.shape
     token_size = heads * dim
-    shape = (read.num_reqs, read.capacity, heads, dim)
+    shape = (*read.slots.shape, heads, dim)
     layouts = []
     for cache in (key_cache, value_cache):
         page_stride = cache.stride(0)

@@ -187,7 +187,8 @@ def test_ar_banks_survive_together_and_failed_submission_quarantines(capture_inp
 
 
 @pytest.mark.parametrize("has_hook", [True, False])
-def test_fresh_dflash_load_aligns_exactly_once(monkeypatch, has_hook):
+@pytest.mark.parametrize("second_generation", [False, True])
+def test_fresh_dflash_load_aligns_exactly_once(monkeypatch, has_hook, second_generation):
     calls = []
     model = NS(model=NS(use_aux_hidden_state=True, fc=NS(weight=torch.ones(2, 2))))
     if has_hook:
@@ -198,10 +199,14 @@ def test_fresh_dflash_load_aligns_exactly_once(monkeypatch, has_hook):
     from vllm_ascend.models import qwen3_dspark
 
     monkeypatch.setattr(qwen3_dspark, "align_draft_weights", lambda actual, fc, config: calls.append(("align", config)))
-    owner = object.__new__(dflash.AscendDFlashSpeculator)
+    from vllm_ascend.worker.v2.spec_decode.dflash2.speculator import AscendDFlash2Speculator
+
+    owner = object.__new__(AscendDFlash2Speculator if second_generation else dflash.AscendDFlashSpeculator)
     owner.vllm_config = object()
     assert owner.load_draft_model(object(), set()) is model
     assert calls == [("post_process" if has_hook else "align", owner.vllm_config)]
+    if second_generation:
+        assert owner._dflash2_full_kv_reference is True
 
 
 @pytest.mark.parametrize("fail_forward", [False, True])

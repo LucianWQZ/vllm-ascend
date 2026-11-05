@@ -141,3 +141,51 @@ def test_unknown_attention_does_not_reject_legal_window_off():
     owner.draft_window_policy = 1024
     with pytest.raises(NotImplementedError, match="known native attention"):
         report_owner_draft_native_attention(owner)
+
+
+@pytest.mark.parametrize("mode_name,eager,gate", [("NONE", False, False), ("NONE", False, True), ("FULL", True, False)])
+def test_dflash2_actual_eager_manager_does_not_require_graph_gate(monkeypatch, mode_name, eager, gate):
+    import torch
+    from vllm.config.compilation import CUDAGraphMode
+    from vllm.v1.attention.backend import AttentionCGSupport
+
+    from vllm_ascend import envs
+    from vllm_ascend.attention import attention_v1  # noqa: F401
+    from vllm_ascend.worker.v2.spec_decode.dflash import speculator as dflash
+    from vllm_ascend.worker.v2.spec_decode.dflash2.speculator import AscendDFlash2Speculator
+
+    owner = object.__new__(AscendDFlash2Speculator)
+    owner.speculative_config = NS(enforce_eager=eager)
+    owner.attn_cg_support = NS(min_cg_support=AttentionCGSupport.ALWAYS)
+    owner.vllm_config, owner.device, owner.update_stream = object(), torch.device("cpu"), object()
+    owner.num_query_per_req = 8
+    calls = []
+
+    def manager(config, device, mode, *, decode_query_len):
+        assert config is owner.vllm_config and device == owner.device and decode_query_len == 8
+        calls.append(mode)
+        return NS(cudagraph_mode=mode)
+
+    monkeypatch.setattr(envs, "VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH", gate)
+    monkeypatch.setattr(dflash.dflash_speculator, "DFlashCudaGraphManager", manager)
+    owner.init_cudagraph_manager(getattr(CUDAGraphMode, mode_name))
+    assert calls == [CUDAGraphMode.NONE]
+    assert owner.query_cudagraph_manager.speculator is owner
+    assert owner.query_cudagraph_manager.update_stream is owner.update_stream
+
+
+@pytest.mark.parametrize(
+    "mode_name,gate,error", [("FULL", False, ValueError), ("PIECEWISE", True, NotImplementedError)]
+)
+def test_dflash2_graph_gate_and_unsupported_mode_remain_closed(monkeypatch, mode_name, gate, error):
+    from vllm.config.compilation import CUDAGraphMode
+
+    from vllm_ascend import envs
+    from vllm_ascend.attention import attention_v1  # noqa: F401
+    from vllm_ascend.worker.v2.spec_decode.dflash2.speculator import AscendDFlash2Speculator
+
+    owner = object.__new__(AscendDFlash2Speculator)
+    owner.speculative_config = NS(enforce_eager=False)
+    monkeypatch.setattr(envs, "VLLM_ASCEND_EXPERIMENTAL_DRAFT_WINDOW_GRAPH", gate)
+    with pytest.raises(error):
+        owner.init_cudagraph_manager(getattr(CUDAGraphMode, mode_name))

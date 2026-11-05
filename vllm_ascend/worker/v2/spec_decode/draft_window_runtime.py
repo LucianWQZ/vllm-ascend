@@ -69,8 +69,6 @@ class DraftWindowRuntime:
         self._dense_reads = False
         self.gids = self._validate_route(speculator)
         read_groups = tuple(gid for gid in self.gids if gid not in self.native_swa_causal) or self.gids
-        if not read_groups:
-            raise NotImplementedError("Draft Window requires at least one certified read group")
         self.anchor_block_span = int(speculator.block_tables.kernel_block_sizes[read_groups[0]])
         self._pending: list[object] = []
         self._poisoned = False
