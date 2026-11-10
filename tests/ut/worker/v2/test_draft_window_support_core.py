@@ -224,9 +224,71 @@ def test_existing_execution_settings_select_the_window_owner(
     assert calls == ([True] if expected else [])
 
 
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        (None, None),
+        ("method", "dflash"),
+        ("model_type", "qwen3"),
+        ("use_mla", True),
+        ("tensor_parallel_size", 16),
+        ("prefill_context_parallel_size", 2),
+        ("decode_context_parallel_size", 4),
+        ("data_parallel_size", 2),
+        ("pipeline_parallel_size", 2),
+        ("enable_expert_parallel", False),
+        ("num_speculative_tokens", 7),
+        ("enable_adaptive_verification", True),
+        ("draft_pcp", 4),
+        ("draft_dcp", 4),
+    ],
+)
+def test_graph_pcp_keeps_replicated_dspark_boundary(monkeypatch, field, value):
+    from vllm.config.compilation import CUDAGraphMode
+
+    from vllm_ascend.device import hardware_profile
+    from vllm_ascend.worker.v2.spec_decode.draft_window.config import validate_draft_window_graph_config
+
+    monkeypatch.setattr(
+        hardware_profile,
+        "get_current_hardware_profile",
+        lambda: NS(attention_backend_family=hardware_profile.AttentionBackendFamily.STANDARD),
+    )
+    config = full8_config()
+    config.parallel_config.prefill_context_parallel_size = 4
+    speculative = config.speculative_config
+    speculative.method = "dspark"
+    speculative.num_speculative_tokens = 8
+    speculative.draft_model_config.use_mla = False
+    speculative.draft_parallel_config.prefill_context_parallel_size = 1
+    speculative.draft_parallel_config.decode_context_parallel_size = 1
+    config.model_config.hf_text_config.model_type = "glm_moe_dsa"
+    config.additional_config["draft_window_size"] = 1024
+    config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
+    if field in ("method", "num_speculative_tokens", "enable_adaptive_verification"):
+        setattr(speculative, field, value)
+    elif field == "model_type":
+        config.model_config.hf_text_config.model_type = value
+    elif field == "use_mla":
+        speculative.draft_model_config.use_mla = value
+    elif field in ("draft_pcp", "draft_dcp"):
+        setattr(
+            speculative.draft_parallel_config,
+            "prefill_context_parallel_size" if field == "draft_pcp" else "decode_context_parallel_size",
+            value,
+        )
+    elif field is not None:
+        setattr(config.parallel_config, field, value)
+    if field is None:
+        validate_draft_window_graph_config(config, support=None)
+    else:
+        with pytest.raises((NotImplementedError, RuntimeError)):
+            validate_draft_window_graph_config(config, support=None)
+
+
 @pytest.mark.parametrize("target_pcp", [1, 4])
 @pytest.mark.parametrize("draft_eager", [True, False])
-def test_window_pcp_split_boundary_precedes_owner_creation(monkeypatch, target_pcp, draft_eager):
+def test_pcp_window_restores_both_execution_modes(monkeypatch, target_pcp, draft_eager):
     import torch
     from vllm.config.compilation import CUDAGraphMode
 
@@ -264,11 +326,6 @@ def test_window_pcp_split_boundary_precedes_owner_creation(monkeypatch, target_p
         lambda: NS(attention_backend_family=hardware_profile.AttentionBackendFamily.STANDARD),
     )
     monkeypatch.setattr(factory, "_init_speculator", original_factory)
-    if target_pcp != 1:
-        with pytest.raises(NotImplementedError, match="delivered separately"):
-            factory.init_speculator(config, torch.device("cpu"))
-        assert calls == [] and vars(owner) == {}
-        return
     assert factory.init_speculator(config, torch.device("cpu")) is owner
     assert calls == [config]
     assert vars(owner) == ({"draft_window_policy": 1024} if draft_eager else {"_draft_window_policy": 1024})

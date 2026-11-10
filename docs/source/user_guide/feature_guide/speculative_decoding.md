@@ -674,9 +674,10 @@ admitted; transferred, offloaded, and sharded Draft KV require other readers.
 This feature requires an officially supported Target/Draft parallel
 configuration and does not add general context-parallel support. Disabling
 other applicable features does not qualify a rejected combination.
-The additional MRV2 window currently requires Target PCP1 for both Draft eager
-and Draft Graph. PCP window integration is delivered separately. With the
-additional window OFF, the original official PCP execution remains unchanged.
+The validated PCP window combination is GLM DSpark Target TP4/PCP4 with
+PP1/DP1/DCP1, static K8, no adaptive verification, and a dense replicated
+PCP1/DCP1 Draft. It reuses the official global-input restoration. Draft eager
+and the admitted Draft Graph route have separate validation boundaries.
 
 With `VLLM_USE_V2_MODEL_RUNNER=1`, speculative `enforce_eager=true`, an eager
 Draft model, or `cudagraph_mode=NONE` selects Draft eager execution. Draft Graph
